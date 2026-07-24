@@ -26,10 +26,12 @@ from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import (
     EncryptInput,
     RecipientDevice,
+    build_plaintext_message,
     decrypt_message,
     encrypt_message,
     read_plaintext_message,
 )
+from . import send_mode
 from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
 from ..crypto.ws_client import PuffoCoreWsClient
 from . import disk_cache
@@ -1572,6 +1574,11 @@ class PuffoCoreMessageClient:
             except asyncio.CancelledError:
                 raise
 
+            # Missing key counts as encrypted — never downgrade on doubt.
+            send_mode.note_turn_bundle(
+                [getattr(self, "slug", "")],
+                any(m.get("is_encrypted", True) for m in batch),
+            )
             try:
                 await on_message_batch(root_id, batch, channel_meta)
             except AgentAPIError as exc:
@@ -4369,12 +4376,18 @@ class PuffoCoreMessageClient:
         signing_key = Ed25519KeyPair.from_secret_bytes(
             decode_secret(sess.subkey_secret_key)
         )
-        devices = await self._fetch_device_keys([self.slug, recipient_slug])
-        if not devices:
-            self._log.warning(
-                "no recipient devices for DM to %s — dropping", recipient_slug,
-            )
-            return None
+        encrypt = await send_mode.encryption_required(
+            self.slug, self.store, root_id or None,
+        )
+        devices: list[RecipientDevice] = []
+        if encrypt:
+            devices = await self._fetch_device_keys([self.slug, recipient_slug])
+            if not devices:
+                self._log.warning(
+                    "no recipient devices for DM to %s — dropping",
+                    recipient_slug,
+                )
+                return None
         inp = EncryptInput(
             envelope_kind="dm",
             sender_slug=self.slug,
@@ -4387,9 +4400,14 @@ class PuffoCoreMessageClient:
             content=text,
             recipients=devices,
         )
-        envelope = encrypt_message(inp, signing_key)
+        if encrypt:
+            envelope = encrypt_message(inp, signing_key)
+            path = "/messages"
+        else:
+            envelope = build_plaintext_message(inp, signing_key)
+            path = "/v2/messages/plaintext"
         try:
-            await self.http.post("/messages", envelope)
+            await self.http.post(path, envelope)
         except HttpError:
             self._log.exception("DM send to %s failed", recipient_slug)
             raise
@@ -4489,20 +4507,6 @@ class PuffoCoreMessageClient:
                     channel_id,
                 )
                 return
-            members_resp = await self.http.get(
-                f"/spaces/{target_space_id}/channels/{channel_id}/members"
-            )
-            member_slugs = [
-                m.get("slug", "")
-                for m in members_resp.get("members", [])
-                if m.get("slug")
-            ]
-            if not member_slugs:
-                self._log.warning(
-                    "channel %s has no members — dropping reply", channel_id,
-                )
-                return
-            devices = await self._fetch_device_keys(member_slugs)
             envelope_kind = "channel"
             recipient_slug: Optional[str] = None
             send_space_id: Optional[str] = target_space_id
@@ -4516,22 +4520,45 @@ class PuffoCoreMessageClient:
                     "context — dropping reply",
                 )
                 return
-            devices = await self._fetch_device_keys([self.slug, recipient])
             envelope_kind = "dm"
             recipient_slug = recipient
             send_space_id = None
             send_channel_id = None
 
-        if not devices:
-            self._log.warning(
-                "no recipient devices found (kind=%s target=%s) — dropping",
-                envelope_kind, recipient_slug or channel_id,
-            )
-            return
+        encrypt = await send_mode.encryption_required(
+            self.slug, self.store, root_id or None,
+        )
+        devices: list[RecipientDevice] = []
+        if encrypt:
+            if envelope_kind == "channel":
+                members_resp = await self.http.get(
+                    f"/spaces/{send_space_id}/channels/{channel_id}/members"
+                )
+                member_slugs = [
+                    m.get("slug", "")
+                    for m in members_resp.get("members", [])
+                    if m.get("slug")
+                ]
+                if not member_slugs:
+                    self._log.warning(
+                        "channel %s has no members — dropping reply", channel_id,
+                    )
+                    return
+                devices = await self._fetch_device_keys(member_slugs)
+            else:
+                devices = await self._fetch_device_keys(
+                    [self.slug, recipient_slug or ""]
+                )
+            if not devices:
+                self._log.warning(
+                    "no recipient devices found (kind=%s target=%s) — dropping",
+                    envelope_kind, recipient_slug or channel_id,
+                )
+                return
 
         self._log.info(
-            "send_fallback_message: kind=%s target=%s devices=%d",
-            envelope_kind, recipient_slug or channel_id, len(devices),
+            "send_fallback_message: kind=%s target=%s encrypt=%s devices=%d",
+            envelope_kind, recipient_slug or channel_id, encrypt, len(devices),
         )
 
         # Fallback shares the visibility_level="default" floor; the
@@ -4557,18 +4584,23 @@ class PuffoCoreMessageClient:
             content=text,
             recipients=devices,
         )
-        envelope = encrypt_message(inp, signing_key)
-        # POST /messages takes the envelope at the top level, not
-        # wrapped in ``{"envelope": ...}``.
+        if encrypt:
+            envelope = encrypt_message(inp, signing_key)
+            path = "/messages"
+        else:
+            envelope = build_plaintext_message(inp, signing_key)
+            path = "/v2/messages/plaintext"
+        # POST takes the envelope at the top level, not wrapped in
+        # ``{"envelope": ...}``.
         try:
-            resp = await self.http.post("/messages", envelope)
+            resp = await self.http.post(path, envelope)
             self._log.info(
                 "send_fallback_message sent: envelope_id=%s queued=%s",
                 envelope.get("envelope_id"),
                 (resp or {}).get("devices_queued"),
             )
         except Exception:
-            self._log.exception("send_fallback_message: POST /messages failed")
+            self._log.exception("send_fallback_message: POST %s failed", path)
             raise
 
         # No mirror-write here anymore. The WS echo path now persists
