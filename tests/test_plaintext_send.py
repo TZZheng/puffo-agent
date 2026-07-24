@@ -188,3 +188,16 @@ async def test_send_dm_encrypts_when_turn_bundle_was_encrypted():
     assert env["type"] == "message_envelope"
     assert posts[0][0] == "/messages"
     assert fetched  # devices resolved for sealing
+
+
+@pytest.mark.asyncio
+async def test_in_process_data_client_delegates_to_send_mode():
+    from puffo_agent.portal.ws_local.in_process_data_client import (
+        InProcessDataClient,
+    )
+
+    c = InProcessDataClient.__new__(InProcessDataClient)
+    c._store = _Store(_Row(False))
+    assert await c.get_send_encryption("a-1", "msg_r") is False
+    send_mode.note_turn_bundle(["a-1"], True)
+    assert await c.get_send_encryption("a-1", None) is True
