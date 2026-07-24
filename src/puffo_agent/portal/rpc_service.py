@@ -113,6 +113,35 @@ async def permission_request_route(request: web.Request) -> web.Response:
     )
 
 
+async def cron_create_route(request: web.Request) -> web.Response:
+    """POST /v1/rpc/{agent_id}/cron-create — ``{name, cron_expr, prompt, channel_id}``."""
+    return await _dispatch(
+        request, host_mcp_handler.cron_create,
+        body_keys=("name", "cron_expr", "prompt", "channel_id"),
+    )
+
+
+async def cron_list_route(request: web.Request) -> web.Response:
+    """POST /v1/rpc/{agent_id}/cron-list — no body."""
+    return await _dispatch(request, host_mcp_handler.cron_list, body_keys=())
+
+
+async def cron_update_route(request: web.Request) -> web.Response:
+    """POST /v1/rpc/{agent_id}/cron-update —
+    ``{job_id, name?, cron_expr?, prompt?, channel_id?, enabled?}``."""
+    return await _dispatch(
+        request, host_mcp_handler.cron_update,
+        body_keys=("job_id", "name", "cron_expr", "prompt", "channel_id", "enabled"),
+    )
+
+
+async def cron_delete_route(request: web.Request) -> web.Response:
+    """POST /v1/rpc/{agent_id}/cron-delete — ``{job_id}``."""
+    return await _dispatch(
+        request, host_mcp_handler.cron_delete, body_keys=("job_id",),
+    )
+
+
 def build_app(cfg: RpcServiceConfig) -> web.Application:
     app = web.Application()
     app.router.add_post(
@@ -131,6 +160,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
         "/v1/rpc/{agent_id}/permission-request",
         permission_request_route,
     )
+    app.router.add_post("/v1/rpc/{agent_id}/cron-create", cron_create_route)
+    app.router.add_post("/v1/rpc/{agent_id}/cron-list", cron_list_route)
+    app.router.add_post("/v1/rpc/{agent_id}/cron-update", cron_update_route)
+    app.router.add_post("/v1/rpc/{agent_id}/cron-delete", cron_delete_route)
     return app
 
 

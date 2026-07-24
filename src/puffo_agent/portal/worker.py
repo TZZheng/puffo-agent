@@ -365,6 +365,7 @@ def _build_puffo_core_client(
         PuffoCoreMessageClient,
         max_image_edge_px,
     )
+    from ..agent.scheduler_store import SchedulerStore
     from ..crypto.http_client import PuffoCoreHttpClient
     from ..crypto.keystore import KeyStore
 
@@ -374,6 +375,7 @@ def _build_puffo_core_client(
     ks = KeyStore(ks_dir)
     http = PuffoCoreHttpClient(pc.server_url, ks, pc.slug)
     ms = MessageStore(str(agent_dir(agent_id) / "messages.db"))
+    scheduler_store = SchedulerStore(str(agent_dir(agent_id) / "scheduler.db"))
 
     max_inline = (
         daemon_cfg.max_inline_message_chars if daemon_cfg is not None else MAX_INLINE_MESSAGE_CHARS
@@ -407,6 +409,7 @@ def _build_puffo_core_client(
         keystore=ks,
         http_client=http,
         message_store=ms,
+        scheduler_store=scheduler_store,
         workspace=str(agent_cfg.resolve_workspace_dir()),
         max_inline_chars=max_inline,
         segment_chars=segment_chars,
@@ -916,6 +919,7 @@ class Worker:
             keystore=client.keystore,
             http_client=client.http,
             message_client=client,
+            scheduler_store=client.scheduler_store,
         )
 
     async def stop(self) -> None:
@@ -1117,6 +1121,14 @@ class Worker:
             # Init crashed before warm() — release the startup gate.
             self._warm_done.set()
             return
+
+        # PUF-394: per-agent persistent scheduler engine. Shares the client's
+        # scheduler_store; fires due jobs by injecting a synthetic system turn.
+        from ..agent.scheduler import SchedulerEngine
+
+        scheduler_engine = SchedulerEngine(
+            client.scheduler_store, fire=client.fire_cron_job,
+        )
 
         # Per-agent refresh_ping retired; daemon-level CredentialRefresher is
         # the single writer of ~/.claude/.credentials.json.
@@ -1467,6 +1479,16 @@ class Worker:
             batch: list[dict],
             channel_meta: dict,
         ):
+            # PUF-394: a cron-fired turn finished OK → close its run so the
+            # no-overlap guard clears and the job can fire again.
+            if root_id.startswith("cron-"):
+                try:
+                    await scheduler_engine.record_completion(root_id, "ok")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "agent %s: cron run-close failed for %s: %s",
+                        agent_id, root_id, exc,
+                    )
             Worker._clear_api_error_abandoned_if_recoverable(
                 self.runtime, agent_id, root_id, logger,
             )
@@ -1481,6 +1503,38 @@ class Worker:
                 self.runtime.save(agent_id)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    pass
+
+        async def scheduler_loop():
+            # PUF-394: every 30s fire due jobs (catch-up-once on the first
+            # tick), then mirror the job snapshot to the server on change.
+            # Best-effort — a failing tick/sync never wedges the agent.
+            from ..agent import scheduler_ops
+
+            last_synced: str | None = None
+            while not self._stop.is_set():
+                try:
+                    await scheduler_engine.tick()
+                    jobs = await client.scheduler_store.list_jobs()
+                    snapshot = scheduler_ops.server_snapshot(jobs)
+                    payload = json.dumps(snapshot, sort_keys=True)
+                    if payload != last_synced and hasattr(client, "http"):
+                        try:
+                            await client.http.post(
+                                "/agents/me/scheduler", {"jobs": snapshot}
+                            )
+                            last_synced = payload
+                        except Exception as exc:  # noqa: BLE001
+                            logger.debug(
+                                "agent %s: scheduler sync failed: %s", agent_id, exc
+                            )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "agent %s: scheduler tick failed: %s", agent_id, exc
+                    )
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=30.0)
                 except asyncio.TimeoutError:
                     pass
 
@@ -1516,6 +1570,7 @@ class Worker:
 
         hb_task = asyncio.ensure_future(heartbeat())
         status_task = asyncio.ensure_future(reporter.run_heartbeat_loop())
+        scheduler_task = asyncio.ensure_future(scheduler_loop())
         try:
             while not self._stop.is_set():
                 try:
@@ -1550,11 +1605,16 @@ class Worker:
             reporter.stop()
             hb_task.cancel()
             status_task.cancel()
-            for task in (hb_task, status_task):
+            scheduler_task.cancel()
+            for task in (hb_task, status_task, scheduler_task):
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+            try:
+                await client.scheduler_store.close()
+            except Exception:  # noqa: BLE001
+                pass
             self.runtime.status = "stopped"
             self.runtime.save(agent_id)
 

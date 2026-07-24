@@ -39,6 +39,8 @@ from .permission_prompt import format_permission_prompt
 from .events import random_nonce, sign_event
 from .event_kinds import EventKind
 from .message_store import MessageStore
+from . import scheduler_ops
+from .scheduler_store import SchedulerStore
 
 logger = logging.getLogger(__name__)
 
@@ -474,6 +476,7 @@ class PuffoCoreMessageClient:
         image_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
         max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
         catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS,
+        scheduler_store: "SchedulerStore | None" = None,
     ):
         self.slug = slug
         self.device_id = device_id
@@ -505,6 +508,10 @@ class PuffoCoreMessageClient:
         self.keystore = keystore
         self.http = http_client
         self.store = message_store
+        # PUF-394: the daemon-owned per-agent scheduler DB. The Worker's
+        # scheduler engine + this client's cron tools + fire path all share
+        # this one instance (single connection on the daemon loop).
+        self.scheduler_store = scheduler_store
         self._key_cache = DeviceKeyCache(http_client)
         self._ws: Optional[PuffoCoreWsClient] = None
         # Most recent DM sender. ``send_fallback_message(channel_id="")`` means
@@ -2913,6 +2920,115 @@ class PuffoCoreMessageClient:
             "enqueued channel-intro nudge for channel=%s (space=%s)",
             channel_id, space_id,
         )
+
+    # ── PUF-394: persistent scheduler ────────────────────────────────
+
+    async def fire_cron_job(self, job: dict, envelope_id: str) -> None:
+        """Inject a due scheduled job's directive as a synthetic system turn.
+
+        Mirrors ``_enqueue_channel_intro_nudge``: persist the envelope to
+        ``messages.db`` then admit it at ``PRIORITY_SYSTEM``. ``envelope_id``
+        is the ``cron-<job>-<ts>`` id the engine minted (also the thread root,
+        so ``on_turn_success`` can close the run)."""
+        channel_id = job.get("channel_id") or ""
+        now_ms = int(time.time() * 1000)
+        space_id = ""
+        channel_name = channel_id
+        space_name = ""
+        if channel_id:
+            space_id = (await self.store.lookup_channel_space(channel_id)) or ""
+            channel_name = await self._resolve_channel_name(space_id, channel_id)
+            if space_id:
+                space_name = await self._resolve_space_name(space_id)
+
+        prompt_text = (
+            "[puffo-agent system message] Your scheduled job "
+            f"\"{job['name']}\" ({job['cron_expr']}) is now due. Carry out the "
+            "following instruction, then stop — this is a recurring automated "
+            f"run, not a conversation:\n\n{job['prompt']}"
+        )
+        msg_dict = {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "space_id": space_id,
+            "space_name": space_name,
+            "sender_slug": "system",
+            "sender_display_name": "",
+            "sender_email": "",
+            "text": prompt_text,
+            "root_id": "",
+            "is_dm": False,
+            "attachments": [],
+            "sender_is_agent": False,
+            "mentions": [],
+            "envelope_id": envelope_id,
+            "sent_at": now_ms,
+            "is_encrypted": True,
+        }
+        channel_meta = {
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "space_id": space_id,
+            "space_name": space_name,
+            "is_dm": False,
+        }
+        store_payload = {
+            "envelope_id": envelope_id,
+            "envelope_kind": "channel",
+            "sender_slug": "system",
+            "channel_id": channel_id,
+            "space_id": space_id,
+            "content_type": "text/plain",
+            "content": prompt_text,
+            "sent_at": now_ms,
+            "thread_root_id": envelope_id,
+            "reply_to_id": None,
+        }
+        try:
+            await self.store.store(store_payload)
+        except Exception as exc:  # noqa: BLE001 — persistence is best-effort
+            self._log.warning(
+                "cron-fire: failed to persist envelope=%s: %s", envelope_id, exc,
+            )
+        await self._admit_thread_message(
+            root_id=envelope_id,
+            priority=PRIORITY_SYSTEM,
+            msg_dict=msg_dict,
+            channel_meta=channel_meta,
+        )
+        self._log.info(
+            "fired cron job %s (envelope=%s channel=%s)",
+            job.get("id"), envelope_id, channel_id,
+        )
+
+    async def cron_create(
+        self, *, name: str, cron_expr: str, prompt: str, channel_id: str | None
+    ) -> str:
+        return await scheduler_ops.create_op(
+            self.scheduler_store, name=name, cron_expr=cron_expr,
+            prompt=prompt, channel_id=channel_id,
+        )
+
+    async def cron_list(self) -> str:
+        return await scheduler_ops.list_op(self.scheduler_store)
+
+    async def cron_update(
+        self,
+        *,
+        job_id: str,
+        name: str | None = None,
+        cron_expr: str | None = None,
+        prompt: str | None = None,
+        channel_id: str | None = None,
+        enabled: bool | None = None,
+    ) -> str:
+        return await scheduler_ops.update_op(
+            self.scheduler_store, job_id=job_id, name=name, cron_expr=cron_expr,
+            prompt=prompt, channel_id=channel_id, enabled=enabled,
+        )
+
+    async def cron_delete(self, *, job_id: str) -> str:
+        return await scheduler_ops.delete_op(self.scheduler_store, job_id=job_id)
 
     async def _maybe_announce_membership_change(
         self, kind: str, event: dict, payload: dict,

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..agent import scheduler_ops
 from ..crypto.encoding import base64url_decode
 from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
@@ -41,6 +42,8 @@ class HostMcpContext:
     # The worker's live PuffoCoreMessageClient, for tools that drive
     # daemon-side state (leave requests). None until warm().
     message_client: Any = None
+    # PUF-394: the worker's SchedulerStore, for the cron_* RPC handlers.
+    scheduler_store: Any = None
 
 
 # ── filesystem helpers (host & agent .claude.json) ─────────────────
@@ -515,3 +518,66 @@ async def request_command_permission(
         summary=str(summary or ""),
         timeout_s=timeout,
     )
+
+
+# ── PUF-394: cron_* RPC handlers (harness runtimes reach the daemon-owned
+# scheduler store through these; ws-local drives the client directly) ──────
+
+
+def _norm(v):
+    """Coerce an omitted/blank RPC field to None (so update leaves it be)."""
+    return v if v else None
+
+
+async def cron_create(
+    ctx: HostMcpContext,
+    *,
+    name: str,
+    cron_expr: str,
+    prompt: str,
+    channel_id: str,
+) -> str:
+    if ctx.scheduler_store is None:
+        raise RuntimeError("agent isn't fully warm yet — try again in a moment")
+    return await scheduler_ops.create_op(
+        ctx.scheduler_store,
+        name=name or "",
+        cron_expr=cron_expr or "",
+        prompt=prompt or "",
+        channel_id=_norm(channel_id),
+    )
+
+
+async def cron_list(ctx: HostMcpContext) -> str:
+    if ctx.scheduler_store is None:
+        raise RuntimeError("agent isn't fully warm yet — try again in a moment")
+    return await scheduler_ops.list_op(ctx.scheduler_store)
+
+
+async def cron_update(
+    ctx: HostMcpContext,
+    *,
+    job_id: str,
+    name: str,
+    cron_expr: str,
+    prompt: str,
+    channel_id: str,
+    enabled,
+) -> str:
+    if ctx.scheduler_store is None:
+        raise RuntimeError("agent isn't fully warm yet — try again in a moment")
+    return await scheduler_ops.update_op(
+        ctx.scheduler_store,
+        job_id=job_id or "",
+        name=_norm(name),
+        cron_expr=_norm(cron_expr),
+        prompt=_norm(prompt),
+        channel_id=_norm(channel_id),
+        enabled=enabled,
+    )
+
+
+async def cron_delete(ctx: HostMcpContext, *, job_id: str) -> str:
+    if ctx.scheduler_store is None:
+        raise RuntimeError("agent isn't fully warm yet — try again in a moment")
+    return await scheduler_ops.delete_op(ctx.scheduler_store, job_id=job_id or "")

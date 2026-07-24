@@ -1293,3 +1293,81 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             reason=reason,
         )
 
+    _CRON_UNAVAILABLE = (
+        "scheduler unavailable — PUFFO_RPC_URL not set on this MCP "
+        "runtime, so the puffo-agent daemon isn't reachable."
+    )
+
+    @mcp.tool()
+    async def cron_create(
+        name: str, cron_expr: str, prompt: str, channel_id: str = ""
+    ) -> str:
+        """Create a PERSISTENT recurring job. Unlike the built-in Cron*
+        tools (which vanish when your session ends), this survives session
+        end, daemon restart, and worker respawn — the daemon owns it.
+
+        name: a short label (e.g. "daily-report").
+        cron_expr: standard crontab, UTC (e.g. "0 9 * * *" = 09:00 daily,
+            "*/30 * * * *" = every 30 min).
+        prompt: the instruction to carry out each run (e.g. "Post today's
+            status summary to #general using send_message").
+        channel_id: optional target channel the run is scoped to.
+
+        When due, you receive a "[puffo-agent system message]" turn with the
+        prompt; do the work and stop. Returns the job id + next run time.
+        """
+        if cfg.message_client is not None:
+            return await cfg.message_client.cron_create(
+                name=name, cron_expr=cron_expr, prompt=prompt,
+                channel_id=(channel_id or None),
+            )
+        if cfg.rpc_client is None:
+            raise RuntimeError(_CRON_UNAVAILABLE)
+        return await cfg.rpc_client.cron_create(
+            name=name, cron_expr=cron_expr, prompt=prompt, channel_id=channel_id,
+        )
+
+    @mcp.tool()
+    async def cron_list() -> str:
+        """List your persistent recurring jobs (id, name, schedule, next
+        run, last-run status)."""
+        if cfg.message_client is not None:
+            return await cfg.message_client.cron_list()
+        if cfg.rpc_client is None:
+            raise RuntimeError(_CRON_UNAVAILABLE)
+        return await cfg.rpc_client.cron_list()
+
+    @mcp.tool()
+    async def cron_update(
+        job_id: str,
+        name: str = "",
+        cron_expr: str = "",
+        prompt: str = "",
+        channel_id: str = "",
+        enabled: Optional[bool] = None,
+    ) -> str:
+        """Update a recurring job. Only the fields you pass change; omit the
+        rest. Set ``enabled=false`` to pause a job without deleting it."""
+        kw = dict(
+            job_id=job_id,
+            name=(name or None),
+            cron_expr=(cron_expr or None),
+            prompt=(prompt or None),
+            channel_id=(channel_id or None),
+            enabled=enabled,
+        )
+        if cfg.message_client is not None:
+            return await cfg.message_client.cron_update(**kw)
+        if cfg.rpc_client is None:
+            raise RuntimeError(_CRON_UNAVAILABLE)
+        return await cfg.rpc_client.cron_update(**kw)
+
+    @mcp.tool()
+    async def cron_delete(job_id: str) -> str:
+        """Delete a recurring job by id."""
+        if cfg.message_client is not None:
+            return await cfg.message_client.cron_delete(job_id=job_id)
+        if cfg.rpc_client is None:
+            raise RuntimeError(_CRON_UNAVAILABLE)
+        return await cfg.rpc_client.cron_delete(job_id=job_id)
+

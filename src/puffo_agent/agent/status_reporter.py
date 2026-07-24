@@ -22,7 +22,7 @@ DEFAULT_HEARTBEAT_INTERVAL_S = 60.0
 
 # Synthetic local envelopes have no server row; /messages/<id>/processing/*
 # would 404, so skip the HTTP round-trip (the worker still tracks the run).
-_LOCAL_ONLY_ENVELOPE_PREFIXES = ("intro-prompt-",)
+_LOCAL_ONLY_ENVELOPE_PREFIXES = ("intro-prompt-", "cron-")
 
 
 def _is_local_only_envelope(message_id: str) -> bool:

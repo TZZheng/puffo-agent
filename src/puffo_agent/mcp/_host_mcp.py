@@ -112,3 +112,36 @@ class PuffoRpcClient:
                 "reason": reason,
             },
         )
+
+    # ── PUF-394: persistent scheduler ────────────────────────────────
+
+    async def cron_create(
+        self, *, name: str, cron_expr: str, prompt: str, channel_id: str = "",
+    ) -> str:
+        return await self._post(
+            "cron-create",
+            {"name": name, "cron_expr": cron_expr, "prompt": prompt,
+             "channel_id": channel_id},
+        )
+
+    async def cron_list(self) -> str:
+        return await self._post("cron-list", {})
+
+    async def cron_update(
+        self,
+        *,
+        job_id: str,
+        name: Optional[str] = None,
+        cron_expr: Optional[str] = None,
+        prompt: Optional[str] = None,
+        channel_id: Optional[str] = None,
+        enabled: Optional[bool] = None,
+    ) -> str:
+        return await self._post(
+            "cron-update",
+            {"job_id": job_id, "name": name, "cron_expr": cron_expr,
+             "prompt": prompt, "channel_id": channel_id, "enabled": enabled},
+        )
+
+    async def cron_delete(self, *, job_id: str) -> str:
+        return await self._post("cron-delete", {"job_id": job_id})
