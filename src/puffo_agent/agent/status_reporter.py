@@ -128,15 +128,6 @@ class StatusReporter:
             if key in runtime
         }
 
-    def _health_payload(self) -> str | None:
-        if self._runtime_health_provider is None:
-            return None
-        try:
-            return str(self._runtime_health_provider())[:128]
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("runtime_health_provider raised (%s)", exc)
-            return None
-
     async def report_current_status(self) -> None:
         """Best-effort status refresh used after bridge reconnects."""
         await self._send_heartbeat()
@@ -328,9 +319,10 @@ class StatusReporter:
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("runtime_provider raised (%s)", exc)
         if self._runtime_health_provider is not None:
-            health = self._health_payload()
-            if health is not None:
-                body["health"] = health
+            try:
+                body["health"] = self._runtime_health_provider()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("runtime_health_provider raised (%s)", exc)
         try:
             await self._http.post("/agents/me/heartbeat", body)
         except HttpError as exc:
