@@ -108,9 +108,39 @@ class StatusReporter:
                 status,
                 current_message_id=current_message_id,
                 error_text=error_text,
+                runtime=self._runtime_payload(),
+                health=self._health_payload(),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("keyless status emit (%s) failed (%s)", status, exc)
+
+    def _runtime_payload(self) -> dict[str, str] | None:
+        if self._runtime_provider is None:
+            return None
+        try:
+            runtime = self._runtime_provider()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("runtime_provider raised (%s)", exc)
+            return None
+        allowed = ("kind", "provider", "harness", "model", "inference_level")
+        return {
+            key: str(runtime.get(key, ""))[:256]
+            for key in allowed
+            if key in runtime
+        }
+
+    def _health_payload(self) -> str | None:
+        if self._runtime_health_provider is None:
+            return None
+        try:
+            return str(self._runtime_health_provider())[:128]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("runtime_health_provider raised (%s)", exc)
+            return None
+
+    async def report_current_status(self) -> None:
+        """Best-effort status refresh used after bridge reconnects."""
+        await self._send_heartbeat()
 
     async def begin_turn(self, message_id: str) -> str:
         """Returns a ``run_id`` to pass back to ``end_turn``."""
@@ -299,10 +329,9 @@ class StatusReporter:
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("runtime_provider raised (%s)", exc)
         if self._runtime_health_provider is not None:
-            try:
-                body["health"] = self._runtime_health_provider()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("runtime_health_provider raised (%s)", exc)
+            health = self._health_payload()
+            if health is not None:
+                body["health"] = health
         try:
             await self._http.post("/agents/me/heartbeat", body)
         except HttpError as exc:

@@ -263,7 +263,10 @@ def test_chain_non_api_error_swallow_falls_back_to_unhandled_error(
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_carries_both_status_and_health():
+async def test_heartbeat_carries_both_status_and_health(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.store.current_machine_id", lambda: None,
+    )
     from puffo_agent.agent.status_reporter import StatusReporter
     mock_http = AsyncMock()
     mock_http.keyless = False  # AsyncMock auto-truthies attrs; pin native so the heartbeat isn't skipped
@@ -287,7 +290,10 @@ async def test_heartbeat_carries_both_status_and_health():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_without_provider_omits_health_field():
+async def test_heartbeat_without_provider_omits_health_field(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.store.current_machine_id", lambda: None,
+    )
     """Back-compat: when constructed without a provider (no-op /
     tests), heartbeat carries the legacy single-stream shape."""
     from puffo_agent.agent.status_reporter import StatusReporter
@@ -303,7 +309,10 @@ async def test_heartbeat_without_provider_omits_health_field():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_provider_exception_does_not_break_heartbeat():
+async def test_heartbeat_provider_exception_does_not_break_heartbeat(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.store.current_machine_id", lambda: None,
+    )
     from puffo_agent.agent.status_reporter import StatusReporter
     mock_http = AsyncMock()
     mock_http.keyless = False  # AsyncMock auto-truthies attrs; pin native so the heartbeat isn't skipped

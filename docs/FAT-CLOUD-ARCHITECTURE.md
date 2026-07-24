@@ -213,7 +213,24 @@ keys and does crypto locally; fat-cloud holds nothing and lets the server do it.
 > `agent/bridge_client.py`. Net: a large deletion, a small addition — the exact
 > spirit of the cited figure, quantified from what actually exists.
 
-### Observability rides the deleted transport (SWAP-needs-new-frame)
+### Observability crosses the keyless bridge
+
+`StatusReporter` uses signed HTTP for native agents and
+`CloudBridgeClient.send_status` for keyless agents. Both paths report
+`idle` / `busy` / `error`, the current message, bounded error text,
+effective runtime metadata, and runtime health. The bridge sends a fresh
+snapshot after every successful connection or reconnect, on state
+transitions, and on the periodic heartbeat.
+
+The server folds bridge status frames into the same `agent_status` row
+and WebSocket notification used by signed heartbeats. Processing
+start/end updates preserve the latest runtime and health snapshot.
+
+This status path is **[BUILT]**. Full daemon log collection, retention,
+and operator access remain a separate observability feature;
+`error_text` is not a replacement for an audit-log channel.
+
+#### Historical gap (resolved)
 
 One module falsifies the tidy "everything above the seam is unchanged" claim: the
 desktop `StatusReporter` (`src/puffo_agent/agent/status_reporter.py:32`) reports the
@@ -592,13 +609,13 @@ The author ran this checklist against the finished doc:
         missing from the bridge" (`bridge.rs:76`/`:82`, commit `6725d46`), Overview ADD
         bucket, Phase-3 row (re-scoped to token-HTTP), and delta-table rows — **[BUILT:
         server]**.
-      - **G3** (status observability omitted) → "Observability rides the deleted
-        transport" (**SWAP-needs-new-frame**), the lifecycle-diagram observability note,
-        and a delta-table row (`status_reporter.py:32`).
+      - **G3** (status observability omitted) → "Observability crosses the keyless
+        bridge" (**BUILT**), the lifecycle-diagram observability note, and a delta-table
+        row (`status_reporter.py:32`).
       - **G4** (delta-table completeness overclaimed) → completeness claim scoped to the
         message surface + new KEEP/disposition rows + "Capabilities beyond the message
         surface".
-      - **MISSING-GAP #1 status** → G3 (SWAP-needs-new-frame). **#2 OAuth refresh** →
+      - **MISSING-GAP #1 status** → G3 (BUILT). **#2 OAuth refresh** →
         DROP-BY-DESIGN (LiteLLM VK; `claude-code`-OAuth caveat). **#3 local message
         store** → KEEP (`fetch_pending` = cold-start backfill on top of `messages.db`).
         **#4 model catalog** → KEEP-with-reconcile (LiteLLM VK model set). **#5 workspace
