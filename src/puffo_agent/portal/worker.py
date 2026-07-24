@@ -1117,7 +1117,9 @@ class Worker:
         bridge = getattr(client, "_bridge", None)
         reporter = StatusReporter(
             client.http,
-            runtime_health_provider=lambda: self.runtime.health,
+            runtime_health_provider=(
+                None if bridge is not None else lambda: self.runtime.health
+            ),
             runtime_provider=self._runtime_info,
             status_sender=bridge.send_status if bridge is not None else None,
         )
@@ -1490,27 +1492,6 @@ class Worker:
                     asyncio.ensure_future(
                         get_reporter().emit(agent_id, "error", {"error": turn_error})
                     )
-                # AgentAPIError leaves in_progress for next batch's flip.
-                if turn_succeeded:
-                    try:
-                        Worker._resolve_health_on_success(
-                            self.runtime, agent_id, logger,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "agent %s: _resolve_health_on_success failed: %s",
-                            agent_id, exc,
-                        )
-                elif not turn_will_retry:
-                    try:
-                        Worker._fallback_unhandled_error_if_stuck_in_progress(
-                            self.runtime, agent_id, turn_error, logger,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "agent %s: in_progress backstop failed: %s",
-                            agent_id, exc,
-                        )
                 if run_id is not None and first_post_id:
                     # Build the batch payload: first row reuses the
                     # /start run_id (server UPDATEs its row); the
@@ -1533,6 +1514,27 @@ class Worker:
                             "error_text": turn_error,
                         })
                     await reporter.end_turn_batch(runs)
+                # AgentAPIError leaves in_progress for next batch's flip.
+                if turn_succeeded:
+                    try:
+                        Worker._resolve_health_on_success(
+                            self.runtime, agent_id, logger,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "agent %s: _resolve_health_on_success failed: %s",
+                            agent_id, exc,
+                        )
+                elif not turn_will_retry:
+                    try:
+                        Worker._fallback_unhandled_error_if_stuck_in_progress(
+                            self.runtime, agent_id, turn_error, logger,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "agent %s: in_progress backstop failed: %s",
+                            agent_id, exc,
+                        )
                 # Clear turn context so post-turn background work
                 # doesn't inherit a stale channel/root. Hook
                 # fails-open when the file is absent.

@@ -217,18 +217,20 @@ keys and does crypto locally; fat-cloud holds nothing and lets the server do it.
 
 `StatusReporter` uses signed HTTP for native agents and
 `CloudBridgeClient.send_status` for keyless agents. Both paths report
-`idle` / `busy` / `error`, the current message, bounded error text,
-effective runtime metadata, and runtime health. The bridge sends a fresh
+`idle` / `busy` / `error`, the current message, bounded error text, and
+effective runtime metadata. The bridge sends a fresh
 snapshot after every successful connection or reconnect, on state
 transitions, and on the periodic heartbeat.
 
 The server folds bridge status frames into the same `agent_status` row
 and WebSocket notification used by signed heartbeats. Processing
-start/end updates preserve the latest runtime and health snapshot.
+start/end updates preserve the latest runtime snapshot.
 
 This status path is **[BUILT]**. Full daemon log collection, retention,
 and operator access remain a separate observability feature;
 `error_text` is not a replacement for an audit-log channel.
+
+Cloud runtime health remains AIM-owned and does not cross this bridge.
 
 #### Historical gap (resolved)
 

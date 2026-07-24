@@ -565,14 +565,12 @@ class _CaptureSender:
         current_message_id=None,
         error_text=None,
         runtime=None,
-        health=None,
     ):
         self.calls.append({
             "status": status,
             "current_message_id": current_message_id,
             "error_text": error_text,
             "runtime": runtime,
-            "health": health,
         })
         if self._boom:
             raise RuntimeError("bridge ws closed")
@@ -592,7 +590,6 @@ async def test_keyless_begin_turn_emits_busy_over_bridge():
         "current_message_id": "msg_42",
         "error_text": None,
         "runtime": None,
-        "health": None,
     }]
     assert rep._current_status == "busy"
 
@@ -654,7 +651,7 @@ async def test_keyless_report_error_emits_over_bridge():
 
 
 @pytest.mark.asyncio
-async def test_keyless_status_includes_runtime_and_health():
+async def test_keyless_status_includes_runtime():
     http = _ExplodingKeylessHttp()
     sender = _CaptureSender()
     rep = StatusReporter(
@@ -668,7 +665,6 @@ async def test_keyless_status_includes_runtime_and_health():
             "model": "gpt-5",
             "secret": "must-not-cross-the-wire",
         },
-        runtime_health_provider=lambda: "ok",
     )
 
     await rep.report_current_status()
@@ -683,7 +679,6 @@ async def test_keyless_status_includes_runtime_and_health():
             "harness": "codex",
             "model": "gpt-5",
         },
-        "health": "ok",
     }]
 
 
@@ -698,13 +693,11 @@ async def test_keyless_status_survives_telemetry_provider_errors():
         heartbeat_interval_s=999,
         status_sender=sender,
         runtime_provider=broken,
-        runtime_health_provider=broken,
     )
 
     await rep.report_current_status()
 
     assert sender.calls[0]["runtime"] is None
-    assert sender.calls[0]["health"] is None
 
 
 @pytest.mark.asyncio

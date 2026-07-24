@@ -517,7 +517,6 @@ class CloudBridgeClient:
         current_message_id: Optional[str] = None,
         error_text: Optional[str] = None,
         runtime: Optional[dict[str, Any]] = None,
-        health: Optional[str] = None,
     ) -> None:
         """Report runtime status over the bridge — the keyless equivalent of the
         signed ``POST /agents/me/heartbeat`` + processing-run status flips. A
@@ -540,8 +539,6 @@ class CloudBridgeClient:
                 for key in allowed
                 if key in runtime
             }
-        if health is not None:
-            frame["health"] = str(health)[:128]
         await ws.send_json(frame)
 
     def _discard_waiter(

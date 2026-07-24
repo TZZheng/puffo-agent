@@ -109,7 +109,6 @@ class StatusReporter:
                 current_message_id=current_message_id,
                 error_text=error_text,
                 runtime=self._runtime_payload(),
-                health=self._health_payload(),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("keyless status emit (%s) failed (%s)", status, exc)

@@ -202,7 +202,7 @@ async def test_heartbeat_frame_reaches_server(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_status_frame_carries_bounded_runtime_and_health():
+async def test_status_frame_carries_bounded_runtime():
     bridge_app = _MockBridgeApp()
     async with TestClient(TestServer(_build_app(bridge_app))) as client:
         url = str(client.make_url("")).rstrip("/")
@@ -220,7 +220,6 @@ async def test_status_frame_carries_bounded_runtime_and_health():
                     "model": "gpt-5",
                     "secret": "drop-me",
                 },
-                health="in_progress",
             )
             await asyncio.sleep(0)
         finally:
@@ -236,7 +235,6 @@ async def test_status_frame_carries_bounded_runtime_and_health():
         "harness": "codex",
         "model": "gpt-5",
     }
-    assert sent["health"] == "in_progress"
 
 
 @pytest.mark.asyncio
