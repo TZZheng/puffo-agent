@@ -333,7 +333,7 @@ async def _seed_agent_with_note(home: str, agent_id: str) -> None:
         "channel_id": "ch_1",
         "space_id": "sp_1",
         "content_type": "text/plain",
-        "content": "/note\ncolor: #db4cac\nlabel: Waiting\nmessage: do it\nmentions: @bob",
+        "content": "/note \ncolor: #db4cac\nlabel: Waiting\nmessage: do it\nmentions: @bob",
         "sent_at": 1700000002_000,
         "thread_root_id": "msg_root",
     })

@@ -578,7 +578,7 @@ class MessageStore:
             "    ORDER BY m.sent_at DESC, m.envelope_id DESC"
             "  ) AS rn "
             "  FROM messages m "
-            "  WHERE m.channel_id = ? AND m.content LIKE '/note%'"
+            "  WHERE m.channel_id = ? AND m.content LIKE '/note %'"
             ") WHERE rn = 1 "
             "ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"
         )
@@ -602,7 +602,7 @@ class MessageStore:
         sql = (
             "SELECT * FROM messages "
             "WHERE (envelope_id = ? OR thread_root_id = ?) "
-            "AND content LIKE '/note%' "
+            "AND content LIKE '/note %' "
             "ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"
         )
         params = [root_id, root_id, max(1, min(int(limit), 200))]

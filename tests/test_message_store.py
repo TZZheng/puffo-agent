@@ -20,7 +20,7 @@ def _now_ms() -> int:
 
 
 def _note_content(label="Waiting", message="do it", mentions=("bob-0002",)):
-    lines = ["/note", "color: #db4cac", f"label: {label}"]
+    lines = ["/note ", "color: #db4cac", f"label: {label}"]
     if message:
         lines.append(f"message: {message}")
     if mentions:
@@ -550,4 +550,26 @@ async def test_note_on_top_level_message_keys_by_envelope():
     ))
     notes = await store.get_channel_notes("ch_1")
     assert [m.envelope_id for m in notes] == ["note_top"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_note_queries_require_the_marker_space():
+    store = _temp_store()
+    await store.open()
+    await store.store(_channel_payload("env_root", sent_at=1))
+    await store.store({
+        **_channel_payload("env_bare", sent_at=2, thread_root_id="env_root"),
+        "content": "/note\ncolor: #fff\nlabel: Nope",
+    })
+    await store.store({
+        **_channel_payload("env_book", sent_at=3, thread_root_id="env_root"),
+        "content": "/notebook entry",
+    })
+    await store.store({
+        **_channel_payload("env_real", sent_at=4, thread_root_id="env_root"),
+        "content": "/note \ncolor: #fff\nlabel: Real",
+    })
+    notes = await store.get_channel_notes("ch_1")
+    assert [m.envelope_id for m in notes] == ["env_real"]
     await store.close()

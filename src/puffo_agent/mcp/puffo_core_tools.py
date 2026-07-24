@@ -113,7 +113,8 @@ NOTE_LABEL_MAX = 32
 def _format_note(color: str, label: str, message: str, mentions: list[str]) -> str:
     """Build a canonical ``/note`` body — the same wire format the web
     client parses into a pill (parse-note-command.ts)."""
-    lines = ["/note", f"color: {color}", f"label: {label}"]
+    # Marker line is "/note " — the trailing space is load-bearing.
+    lines = ["/note ", f"color: {color}", f"label: {label}"]
     if message:
         lines.append(f"message: {message}")
     if mentions:
@@ -123,18 +124,13 @@ def _format_note(color: str, label: str, message: str, mentions: list[str]) -> s
 
 def _parse_note(content: Any) -> Optional[dict[str, Any]]:
     """Extract label/message/mentions from a ``/note`` body, or None if
-    it isn't a note. ``/note`` must be the first non-blank line."""
-    lines = str(content or "").replace("\r\n", "\n").split("\n")
-    marker = -1
-    for i, ln in enumerate(lines):
-        s = ln.strip()
-        if not s:
-            continue
-        if s.lower() == "/note":
-            marker = i
-        break
-    if marker == -1:
+    it isn't a note. Only a leading ``"/note "`` (with the space) marks
+    a note — bare ``/note`` or ``/notebook...`` don't."""
+    text = str(content or "").replace("\r\n", "\n")
+    if not text.startswith("/note "):
         return None
+    lines = text.split("\n")
+    marker = 0
     fields: dict[str, str] = {}
     mentions: list[str] = []
     for ln in lines[marker + 1:]:

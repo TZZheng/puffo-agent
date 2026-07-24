@@ -1803,7 +1803,7 @@ async def test_resolve_rejects_unknown_level():
 def test_format_and_parse_note_roundtrip():
     color, label = NOTE_PRESETS["waiting"]
     text = _format_note(color, label, "review PR #238", ["bob-0002", "carol-3"])
-    assert text.splitlines()[0] == "/note"
+    assert text.splitlines()[0] == "/note "
     parsed = _parse_note(text)
     assert parsed["label"] == "Waiting"
     assert parsed["message"] == "review PR #238"
@@ -1818,7 +1818,7 @@ def test_parse_note_rejects_non_note():
 
 def test_format_note_omits_empty_message_and_mentions():
     text = _format_note("#c9f748", "Complete", "", [])
-    assert text == "/note\ncolor: #c9f748\nlabel: Complete"
+    assert text == "/note \ncolor: #c9f748\nlabel: Complete"
 
 
 async def _seed_note_root(ms, http):
@@ -1970,7 +1970,7 @@ async def test_get_channel_notes_tool_formats_active_note():
         "envelope_id": "msg_note", "envelope_kind": "channel",
         "sender_slug": "alice-0001", "channel_id": "ch_abc",
         "space_id": "sp_test", "content_type": "text/plain",
-        "content": "/note\ncolor: #db4cac\nlabel: Waiting\nmessage: do it\nmentions: @bob-0002",
+        "content": "/note \ncolor: #db4cac\nlabel: Waiting\nmessage: do it\nmentions: @bob-0002",
         "sent_at": base + 100, "thread_root_id": "msg_root",
     })
     mcp = _build_tools(cfg)
@@ -1995,7 +1995,7 @@ async def test_get_thread_notes_tool_limit_one():
             "envelope_id": f"msg_note_{i}", "envelope_kind": "channel",
             "sender_slug": "alice-0001", "channel_id": "ch_abc",
             "space_id": "sp_test", "content_type": "text/plain",
-            "content": f"/note\ncolor: #db4cac\nlabel: {label}",
+            "content": f"/note \ncolor: #db4cac\nlabel: {label}",
             "sent_at": base + 100 + i, "thread_root_id": "msg_root",
         })
     mcp = _build_tools(cfg)
@@ -2177,3 +2177,9 @@ async def test_send_message_with_attachments_cross_channel_root_rejected(tmp_pat
             "root_id": "msg_elsewhere",
         })
     assert "ch_OTHER" in str(excinfo.value)
+
+
+def test_parse_note_requires_the_marker_space():
+    assert _parse_note("/note" + chr(10) + "color: #fff") is None
+    assert _parse_note("/notebook entry") is None
+    assert _parse_note("/note hello") is not None
