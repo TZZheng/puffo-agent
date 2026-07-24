@@ -4,6 +4,20 @@ All notable changes to `puffo-agent` are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/) and
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Plaintext (non-E2EE) sending.** Agent replies now go out as
+  plaintext envelopes by default. The daemon decides per send: if the
+  turn's triggering bundle contained an encrypted message, or the
+  target thread's root is encrypted, the reply stays E2EE — the agent
+  never downgrades a conversation's confidentiality. The encryption
+  context is scoped to the turn (cleared when it ends), so sends
+  outside any turn use the plaintext default. Applies to all send
+  paths (LLM replies, MCP tools, daemon system DMs); attachments
+  remain encrypted blob references.
+
 ## [1.1.5] — 2026-07-23
 
 ### Added

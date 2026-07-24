@@ -159,6 +159,37 @@ async def test_whoami_includes_display_name():
 
 
 @pytest.mark.asyncio
+async def test_send_message_plaintext_when_daemon_says_unencrypted():
+    cfg, http, ms = _setup()
+    await ms.mark_channel_space("ch_abc", "sp_test")
+    http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
+        "members": [{"slug": "alice-0001", "role": "owner"}],
+    }
+
+    async def _no_encrypt(slug, root):
+        return False
+
+    ms.get_send_encryption = _no_encrypt
+    mcp = _build_tools(cfg)
+    result = await _call(
+        mcp,
+        "send_message",
+        {"channel": "ch_abc", "text": "hello world", "visibility_level": "human"},
+    )
+    assert "posted" in result
+    # No device resolution on the plaintext path.
+    assert not any(
+        p.startswith("/certs/sync") for m, p, _ in http.calls if m == "GET"
+    )
+    post_calls = [(p, b) for m, p, b in http.calls if m == "POST"]
+    assert len(post_calls) == 1
+    path, body = post_calls[0]
+    assert path == "/v2/messages/plaintext"
+    assert body["type"] == "plaintext_message_envelope"
+    assert body["signed_payload"]["payload"]["channel_id"] == "ch_abc"
+
+
+@pytest.mark.asyncio
 async def test_send_message_channel():
     cfg, http, ms = _setup()
     recipient_kem = KemKeyPair.generate()
@@ -1082,6 +1113,12 @@ class _FakeDataClient:
         self.messages: dict[str, object] = {}
         self.exc: Exception | None = None
         self.calls: list[str] = []
+        # Existing tool tests exercise the E2EE branch; plaintext-branch
+        # tests flip this to False.
+        self.send_encryption = True
+
+    async def get_send_encryption(self, slug, thread_root_id):
+        return self.send_encryption
 
     def add(
         self,
