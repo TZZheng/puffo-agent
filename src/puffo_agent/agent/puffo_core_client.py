@@ -1624,6 +1624,9 @@ class PuffoCoreMessageClient:
                 # the slot done in-memory so live arrivals keep
                 # flowing for other threads.
                 continue
+            finally:
+                # Between turns the default (plaintext) applies.
+                send_mode.clear_turn_bundle([getattr(self, "slug", "")])
 
             # Success: persist the cursor so a restart-then-redeliver
             # doesn't re-trigger this thread. ``batch[-1].sent_at`` is

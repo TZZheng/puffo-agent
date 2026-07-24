@@ -201,3 +201,13 @@ async def test_in_process_data_client_delegates_to_send_mode():
     assert await c.get_send_encryption("a-1", "msg_r") is False
     send_mode.note_turn_bundle(["a-1"], True)
     assert await c.get_send_encryption("a-1", None) is True
+
+
+@pytest.mark.asyncio
+async def test_clear_turn_bundle_restores_the_plaintext_default():
+    send_mode.note_turn_bundle(["a-1"], True)
+    assert await send_mode.encryption_required("a-1", _Store(), None) is True
+    send_mode.clear_turn_bundle(["a-1"])
+    assert await send_mode.encryption_required("a-1", _Store(), None) is False
+    # Clearing an unset key is a no-op.
+    send_mode.clear_turn_bundle(["never-set"])

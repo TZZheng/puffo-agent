@@ -10,9 +10,9 @@ from __future__ import annotations
 
 from typing import Any
 
-# Single-slot per agent — the worker serializes turns, so the flag set
-# at batch dispatch governs every send until the next batch. Keyed by
-# both slug and agent_id (callers know one or the other).
+# Single-slot per agent — the worker serializes turns. Set at batch
+# dispatch, cleared when the turn ends, so between-turn sends fall to
+# the plaintext default. Keyed by slug and/or agent_id.
 _turn_bundle_encrypted: dict[str, bool] = {}
 
 
@@ -20,6 +20,11 @@ def note_turn_bundle(keys: list[str], has_encrypted: bool) -> None:
     for key in keys:
         if key:
             _turn_bundle_encrypted[key] = has_encrypted
+
+
+def clear_turn_bundle(keys: list[str]) -> None:
+    for key in keys:
+        _turn_bundle_encrypted.pop(key, None)
 
 
 def turn_bundle_encrypted(key: str) -> bool:
