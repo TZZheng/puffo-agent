@@ -417,6 +417,7 @@ def _msg_to_dict(m: Any) -> dict[str, Any]:
         "received_at": m.received_at,
         "thread_root_id": m.thread_root_id,
         "reply_to_id": m.reply_to_id,
+        "is_encrypted": m.is_encrypted,
     }
 
 
@@ -465,6 +466,23 @@ async def update_profile_cache(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def get_send_encryption(request: web.Request) -> web.Response:
+    """Daemon-level send-mode decision for out-of-process senders (the
+    MCP subprocess). Fail-safe: unknown agent/store answers encrypt."""
+    from ..agent import send_mode
+
+    agent_id = request.match_info["agent_id"]
+    slug = request.query.get("slug", "")
+    root = request.query.get("thread_root_id") or None
+    store = await _store_for(request.app, agent_id)
+    if store is None:
+        return web.json_response({"encrypt": True})
+    encrypt = await send_mode.encryption_required(
+        slug or agent_id, store, root,
+    )
+    return web.json_response({"encrypt": bool(encrypt)})
+
+
 # ── Lifecycle ────────────────────────────────────────────────────
 
 
@@ -502,6 +520,10 @@ def build_app(cfg: DataServiceConfig) -> web.Application:
     app.router.add_get(
         "/v1/data/{agent_id}/messages/{envelope_id}",
         get_message_by_envelope,
+    )
+    app.router.add_get(
+        "/v1/data/{agent_id}/send-encryption",
+        get_send_encryption,
     )
     app.router.add_post(
         "/v1/data/{agent_id}/profile-cache",

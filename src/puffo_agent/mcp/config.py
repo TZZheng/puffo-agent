@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import site
+import os
 import sys
 from pathlib import Path
 
@@ -28,6 +29,15 @@ INFERENCE_LEVELS = ("low", "medium", "high", "xhigh")
 
 # codex model_reasoning_effort values.
 REASONING_EFFORTS = ("minimal", "low", "medium", "high")
+
+
+def supported_inference_levels(harness: str) -> tuple[str, ...]:
+    """Reasoning-effort values a harness accepts; unknown → the union."""
+    if harness == "codex":
+        return REASONING_EFFORTS
+    if harness == "claude-code":
+        return INFERENCE_LEVELS
+    return tuple(dict.fromkeys(INFERENCE_LEVELS + REASONING_EFFORTS))
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -59,6 +69,10 @@ PUFFO_CORE_TOOL_NAMES = (
     "sync_host_mcp",
     "leave_space",
     "leave_channel",
+    "get_dm_allowlists",
+    "get_dm_blocklists",
+    "add_dm_allowlist",
+    "update_dm_blocklist",
     "refresh",
 )
 PUFFO_CORE_TOOL_FQNS = tuple(
@@ -280,6 +294,11 @@ def puffo_core_mcp_env(
         "PUFFO_RPC_URL": rpc_url,
         **_python_user_base_env(runtime_kind),
     }
+    # Forward the daemon's PYTHONPATH so a worktree checkout drives the MCP
+    # subprocess too (unset in prod). Skipped for docker — host path is moot there.
+    pythonpath = os.environ.get("PYTHONPATH")
+    if pythonpath and "docker" not in runtime_kind:
+        env["PYTHONPATH"] = pythonpath
     if agent_id:
         env["PUFFO_AGENT_ID"] = agent_id
     if space_id:
