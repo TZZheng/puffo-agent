@@ -117,6 +117,9 @@ async def test_fire_error_marks_run_and_job(tmp_path):
     got = await store.get_job(job["id"])
     assert got["last_run_status"] == "error"
     assert await store.has_open_run(job["id"]) is False  # run closed on failure
+    # record_fire ran BEFORE the failing fire (crash-safety ordering): a crash
+    # mid-fire must leave next_run_at already advanced so the slot can't re-fire.
+    assert got["next_run_at"] > T0
 
 
 @pytest.mark.asyncio

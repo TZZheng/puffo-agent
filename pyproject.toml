@@ -40,7 +40,8 @@ dependencies = [
     # Relay TLS trust bundle for hosts with an empty OpenSSL cert store.
     "certifi>=2024.2.2",
     # Crontab-expression parsing for the daemon-layer persistent scheduler.
-    "croniter>=2.0",
+    # Upper-bounded: croniter major versions differ on DST/edge-case behavior.
+    "croniter>=2.0,<3.0",
     "cryptography>=43.0",
     "mcp>=1.0",
     # Pillow: dimension-check + downscale inbound image attachments so

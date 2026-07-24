@@ -9,6 +9,11 @@ engine is unit-testable without a live client. openworker-modeled:
   fires once and reschedules to the next future slot, not five times.
 - **no-overlap**: a job with an open run (prior fire still processing) is
   skipped for this occurrence (status ``skipped``) and rescheduled.
+
+The engine tick is driven by the Worker's normal harness ``_run`` loop
+(cli-local / cli-docker / codex — the FB-425 target). ws-local-idle agents get
+the store (CRUD via the MCP tools works) but no tick, so their jobs won't fire
+until they run under the harness path — a documented follow-up, not a bug.
 """
 from __future__ import annotations
 
@@ -68,7 +73,10 @@ class SchedulerEngine:
             envelope_id = f"cron-{job['id']}-{now}"
             await self._store.open_run(job["id"], envelope_id, now)
             # Advance next_run_at BEFORE firing so a crash mid-fire can't
-            # re-fire the same slot on the next tick.
+            # re-fire the same slot on the next tick. Trade-off (intended): a
+            # hard crash (SIGKILL) between here and the fire leaves next_run_at
+            # advanced with an open run that never completes — that occurrence
+            # is skipped, not retried. Preferred over double-firing.
             await self._store.record_fire(job["id"], now, nxt)
             try:
                 await self._fire(job, envelope_id)
