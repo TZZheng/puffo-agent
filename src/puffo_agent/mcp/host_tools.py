@@ -213,10 +213,18 @@ def _list_skills(workspace: Path, home: Path) -> list[tuple[str, str]]:
         for d in sorted(sysroot.iterdir()):
             if d.is_dir() and (d / "SKILL.md").exists():
                 out.append(("system", d.name))
-    agentroot = _workspace_skills_dir(workspace)
-    if agentroot.is_dir():
+    seen: set[str] = set()
+    # Claude mirrors land in .claude/skills, codex mirrors in
+    # .agents/skills — scan both so every harness sees its skills.
+    for agentroot in (
+        _workspace_skills_dir(workspace),
+        workspace / ".agents" / "skills",
+    ):
+        if not agentroot.is_dir():
+            continue
         for d in sorted(agentroot.iterdir()):
-            if d.is_dir() and (d / "SKILL.md").exists():
+            if d.is_dir() and (d / "SKILL.md").exists() and d.name not in seen:
+                seen.add(d.name)
                 out.append(("agent", d.name))
     return out
 

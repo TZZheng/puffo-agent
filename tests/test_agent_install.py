@@ -878,3 +878,20 @@ def test_process_refresh_flags_reload_failure_still_clears_flags(tmp_path, monke
     ))
     assert puffo.system_prompt == "rebuilt"
     assert not agent_flag.exists()
+
+
+def test_list_skills_includes_codex_agents_dir(tmp_path):
+    from puffo_agent.mcp.host_tools import _list_skills
+
+    ws = tmp_path / "ws"
+    codex = ws / ".agents" / "skills" / "use-puffo-notes"
+    codex.mkdir(parents=True)
+    (codex / "SKILL.md").write_text("body", encoding="utf-8")
+    # Same skill mirrored to both dirs must list once.
+    claude = ws / ".claude" / "skills" / "use-puffo-notes"
+    claude.mkdir(parents=True)
+    (claude / "SKILL.md").write_text("body", encoding="utf-8")
+
+    entries = _list_skills(ws, tmp_path / "nohome")
+    assert ("agent", "use-puffo-notes") in entries
+    assert len([n for _, n in entries if n == "use-puffo-notes"]) == 1
