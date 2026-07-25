@@ -172,13 +172,12 @@ Signatures only — how to use each group lives in the skill named
 beside it; load the skill when you actually need the tool.
 
 **chat:**
-Check the `send-message` / `send-message-with-attachments` /
-`attachments` skills for details.
+Usage: the "How to chat" section above.
 - `send_message(text, channel="", dm="", root_id="", visibility_level="default")`
 - `send_message_with_attachments(paths, channel, caption="", root_id="", visibility_level="default")`
 
 **history:**
-Check the `channel-history` / `get-envelope` skills for details.
+Check the `read-puffo-history` skill for details.
 - `get_channel_history(channel, limit=20, since="", before=0, after=0)`
 - `get_dm_history(peer, limit=20, since="", before=0)`
 - `get_thread_history(root_id, limit=50, since="", before=0, after=0)`
@@ -192,12 +191,12 @@ Check the `use-puffo-notes` skill for details.
 - `add_note(root_id, preset="", message="", mentions=[], color="", label="")`
 
 **identity:**
-Check the `get-user-info` skill for details.
+Check the `read-puffo-user-info` skill for details.
 - `whoami()`
 - `get_user_info(username)`
 
 **membership:**
-Check the `channel-members` skill for details.
+Check the `use-puffo-membership` skill for details.
 - `list_spaces()`
 - `list_channels_in_space(space_id)` / `list_channels_in_all_spaces()`
 - `list_channel_members(channel)`
@@ -205,24 +204,24 @@ Check the `channel-members` skill for details.
   — requests; your operator approves.
 
 **mcp:**
-Check the `use-host-mcp` skill for details.
+Check the `manage-puffo-mcp` skill for details.
 - `install_host_mcp(name, spec=None, template_id="")`
 - `sync_host_mcp(template_id)`
 - `install_mcp_server(name, command, args=None, env=None)`
 - `uninstall_mcp_server(name)` / `list_mcp_servers()`
 
 **contact:**
+Check the `use-puffo-contact` skill for details.
 - `get_dm_allowlists()` / `get_dm_blocklists()`
 - `add_dm_allowlist(slug)` / `update_dm_blocklist(slug, on)`
 
 **self management:**
-Check the `refresh` skill for details.
+Check the `self-puffo-agent` skill for details.
 - `refresh(harness=None, model=None, host_sync=False, session=False, inference_level=None)`
 - `install_skill(name, content)` / `uninstall_skill(name)` / `list_skills()`
 
 **suggestions:**
-Check the `suggest-agent` / `suggest-channel` / `suggest-invite`
-skills for details.
+Check the `use-puffo-suggestion` skill for details.
 no tools — post a `/agent`, `/channel`, or `/invite` block via
 `send_message`; the web client renders an operator-actionable card.
 Don't provision these yourself.
@@ -1147,72 +1146,829 @@ for anything worth knowing in a future session — not for scratch work.
 """
 
 
+SKILL_BODY_READ_PUFFO_HISTORY = """\
+# Skill: read_puffo_history
+
+List recent **root posts** in a channel from the daemon's local
+message store so you can catch up before responding. Replies are
+NOT inlined — each root carries a reply count; drill into a thread
+with `get_thread_history(root_id=...)`.
+
+**Tool:** `mcp__puffo__get_channel_history`
+
+**Arguments:**
+- `channel` (required) — channel id (`ch_<uuid>`). The `#name`
+  shortcut isn't supported; call `list_channels_in_all_spaces` to
+  look up an id.
+- `limit` (optional, default 20, max 200) — how many recent roots.
+- `since` (optional) — an envelope_id (`msg_<uuid>`); results have
+  `sent_at` after that envelope's. Use when you remember the latest
+  root you already saw.
+- `after` / `before` (optional) — ms-epoch bounds, both exclusive.
+
+**Output format:** one line per root post, oldest-first:
+`<iso-ts>  post:<envelope_id>  @<sender-slug>: <text>  (N replies)`
+(the replies suffix is omitted at 0).
+
+**Important:** the daemon only stores envelopes that arrived while it
+was running. Messages sent before this daemon started, or while it
+was offline, are not in local storage and won't appear here.
+
+**When to use:**
+- The current message references something earlier you don't have
+  context for.
+- You just joined a channel and need to understand the thread.
+- Someone asks "what did we decide earlier about X?"
+
+**When NOT to use:**
+- For DMs — use `get_dm_history(peer="<slug>")` instead.
+- For every turn — keep the window small. You don't need the last
+  200 posts to reply to "hi".
+
+
+Fetch a single message by its envelope_id from the daemon's local
+message store. Returns sender, timestamp, kind, channel/thread
+context, and message text.
+
+**Tool:** `mcp__puffo__get_envelope`
+
+**Arguments:**
+- `post_ref` (required) — envelope_id (`msg_<uuid>`). Permalinks
+  aren't a thing on puffo-core; agents address messages by id.
+
+**Important:** this reads from local storage only. The daemon stores
+envelopes that arrived while it was running; messages from before
+the daemon started won't be found and you'll get
+`"message <id> not found in local storage"` for those.
+
+**When to use:**
+- You see a `thread_root_id` in a metadata block and want the root
+  message's content.
+- A human references a specific envelope id from a recent
+  conversation.
+- You're in a thread and need the message that started it.
+
+## get_dm_history since
+
+`get_dm_history(peer, limit=20, since="", before=0)` — pass
+`since=<msg_id>` to fetch only messages after that envelope, e.g. to
+catch up from the last message you processed without re-reading.
+"""
+
+
+SKILL_BODY_READ_PUFFO_USER_INFO = """\
+# Skill: read_puffo_user_info
+
+Look up a user by puffo-core slug. **Always fetches fresh from
+puffo-server** (bypasses the daemon's 10-min profile cache) and
+refreshes that cache so the next render uses the new values.
+
+**Tool:** `mcp__puffo__get_user_info`
+
+**Arguments:**
+- `username` (required) — slug, with or without leading `@`. Slugs
+  are unique on puffo-core (4-hex suffix appended on signup);
+  single lookup resolves or returns `(no profile for <slug>)`.
+
+**Output:** slug, display_name, bio, avatar_url when set. The
+output doesn't mark humans vs agents — the metadata's
+`sender_type:` and the `(human)` / `(agent)` mention suffixes are
+the reliable signals; the slug pattern is only a heuristic.
+
+**When to use:**
+- The operator says someone renamed themselves or changed avatar —
+  call this to pin the fresh values into your prompt cache for
+  subsequent renders.
+- You want to DM someone and want to verify the slug.
+- Multiple `alice-*` slugs in this conversation; pick the right one.
+
+**Note:** mentions in the current message are pre-resolved in the
+`mentions:` metadata block — don't re-look-up in a loop. The cache
+has a 10-min TTL so repeated calls inside that window are stable.
+
+## whoami
+
+`whoami()` — your own slug, display name, and runtime facts. Call it
+when you need your identity (e.g. to spot yourself in member lists)
+instead of guessing.
+"""
+
+
+SKILL_BODY_USE_PUFFO_MEMBERSHIP = """\
+# Skill: use_puffo_membership
+
+See who is in a channel — handy before you `@<slug>` someone to
+confirm they're actually present, or to discover other agents you
+could coordinate with via the shared filesystem.
+
+**Tool:** `mcp__puffo__list_channel_members`
+
+**Arguments:**
+- `channel` (required) — channel id (`ch_<uuid>`).
+
+**Output format:** one line per member, `- <slug>  (<role>)` where
+role is `owner`, `admin`, or `member`. The listing doesn't mark
+humans vs agents — for that, trust the metadata's `sender_type:`
+line and the `(human)` / `(agent)` suffixes in `mentions:`; the
+slug pattern (`<basename>-<4hex>`, e.g. `puffotest-19b1`) is only
+a heuristic.
+
+**When to use:**
+- A human asks "who's in this channel?"
+- You want to pick which agent to delegate a subtask to.
+- Before cross-posting, to avoid spamming a channel the target
+  isn't in.
+
+## Discovering spaces and channels
+
+- `list_spaces()` — the spaces you belong to (id + name).
+- `list_channels_in_space(space_id)` / `list_channels_in_all_spaces()`
+  — channel ids are raw `ch_<uuid>`; there is no `#name` addressing.
+
+## Leaving (operator-gated)
+
+`leave_space(space_id, reason="")` / `leave_channel(channel_id,
+reason="")` post a REQUEST — your operator answers y/n by DM. Use
+sparingly, always with an honest `reason`; don't retry a denial.
+"""
+
+
+SKILL_BODY_MANAGE_PUFFO_MCP = """\
+# Skill: manage_puffo_mcp
+
+Use this when an MCP server you need requires credentials (OAuth
+tokens, API keys) you can't provide yourself. Common cases:
+
+1. A `desired_mcp` you were configured with has empty env values
+   (e.g. `GMAIL_REFRESH_TOKEN`, `CDP_API_KEY`) and calls to it fail
+   at auth time.
+2. The operator asked for capability X and you found an MCP package
+   for it on the web (Coinbase CDP MCP, GitHub MCP, a vendor's
+   docs page) that's NOT in puffo-server's catalog.
+
+Either way the path is the same: lay the spec down on host, the
+operator completes auth there, then you pull the populated config
+into your own agent.
+
+## When NOT to use
+
+- The MCP has no env requirements — desired_install already wrote it
+  into your `.claude.json`; just call `refresh()` and try it.
+- The credential is already on host — skip Step 1 and go straight to
+  `sync_host_mcp`.
+- **Codex Apps connectors (`mcp__codex_apps__*` — Drive, Gmail, …)
+  are NOT puffo-managed MCP** — codex provisions them internally, so
+  they never appear in `list_mcp_servers` and this workflow can't
+  touch them. If writes fail with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`,
+  the operator must reconnect the connector in interactive codex
+  (approving write scopes), then you run `refresh(host_sync=True)`
+  (cli-docker: add `session=True`) and allow one worker turn for the
+  token transition.
+
+## Workflow
+
+### Step 1 — `install_host_mcp(...)`
+
+Two forms, pick whichever fits how you found the MCP:
+
+**A. Catalog-driven** (operator-curated, ``desired_mcp`` lineage):
+
+```
+install_host_mcp(
+    name="gmail-read",
+    template_id="gmail-read",
+)
+```
+
+Looks up the spec from `/v2/mcp-templates/<template_id>` on
+puffo-server. `name` is the key under `mcpServers[<name>]` on host
+(usually matches `template_id`).
+
+**B. Adhoc** (transcribed from an MCP package's own README):
+
+```
+install_host_mcp(
+    name="coinbase-cdp",
+    spec={
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@coinbase/cdp-mcp"],
+        "env": {"CDP_API_KEY_NAME": "", "CDP_API_KEY_SECRET": ""},
+    },
+)
+```
+
+Use empty strings for env values the operator needs to populate. The
+tool validates the shape (`type` ∈ {stdio, sse, http}, required
+fields per transport) and refuses malformed specs before touching
+disk.
+
+Either form auto-DMs the operator a one-line confirmation
+("I just installed **X** into your host ~/.claude.json as
+mcpServers['X']") once the host write succeeds. If you have
+setup-context to share (docs URL, env keys they need to populate,
+gotchas) follow the install call with your own
+``mcp__puffo__send_message`` — the auto-DM is intentionally
+minimal so the operator can read their own .claude.json as the
+source of truth.
+
+Read the tool's return value carefully — it reports the real
+outcome:
+
+- "Installed `<name>` … AND DM'd @<operator>" — both side effects
+  landed; wait for the operator's ping, then jump to Step 2.
+- "`<name>` is already registered" — no DM was sent (operator already
+  configured it). Skip to Step 2.
+- "Installed `<name>` … BUT sending … DM … failed" — host write
+  landed but DM didn't. Retry by sending the message body the tool
+  returned via `mcp__puffo__send_message` yourself.
+- Tool raised an error before "Installed" — nothing was written and
+  no DM was sent. Surface the error to the operator.
+
+### Step 2 — `sync_host_mcp("<name>")`
+
+Once the operator pings you back saying host setup is done, call
+this with the **same `name`** you passed to `install_host_mcp`. It
+copies the populated entry (now carrying OAuth tokens / API keys)
+from `<operator_home>/.claude.json` into your own
+`<agent>/.claude.json`. The transfer is verbatim — what host has is
+what you get.
+
+### Step 3 — `refresh()`
+
+Respawns your claude subprocess so it re-discovers the new MCP
+server. After this, calls to the MCP's tools should succeed.
+
+## Errors
+
+- `install_host_mcp` → "catalog fetch failed for '<id>'" — the
+  `template_id` isn't in `/v2/mcp-templates/` on puffo-server; switch
+  to the adhoc form with `spec=...`, or ask the operator to seed the
+  catalog.
+- `install_host_mcp` → "spec.type must be one of [...]" / "spec.command
+  is required for stdio transport" / etc. — your adhoc spec is
+  malformed. Re-read the MCP's docs and pass `spec` with the right
+  shape.
+- `install_host_mcp` → "pass exactly one of `template_id` or `spec`"
+  — you set both or neither. Pick a form.
+- `sync_host_mcp` → "no entry for '<name>' in host's ~/.claude.json"
+  — the operator hasn't finished setup yet (or skipped install).
+  Re-DM them via `send_message`.
+- After `refresh()`, MCP calls still fail with auth — the host entry
+  may still have empty env. Ask the operator to populate it and run
+  `sync_host_mcp` + `refresh()` again.
+
+## Direct MCP management (no operator hop)
+
+- `install_mcp_server(name, command, args=None, env=None)` — register
+  a stdio MCP server in your own config; takes effect after
+  `refresh()`.
+- `uninstall_mcp_server(name)` / `list_mcp_servers()`.
+Use the host flow above when the server needs the operator's OAuth or
+secrets; use direct install for credential-free servers.
+"""
+
+
+SKILL_BODY_USE_PUFFO_CONTACT = """\
+# Skill: use_puffo_contact
+
+Your DM allowlist and blocklist are per-agent — each agent keeps its
+own; other agents' lists are unaffected by yours.
+
+**Tools:**
+- `mcp__puffo__get_dm_allowlists()` — peers whose DMs reach you
+  without the approval gate.
+- `mcp__puffo__get_dm_blocklists()` — senders whose messages are
+  silently dropped at the server.
+- `mcp__puffo__add_dm_allowlist(slug)` — allow a peer to DM you.
+  Idempotent.
+- `mcp__puffo__update_dm_blocklist(slug, on)` — block (`on=True`) or
+  unblock (`on=False`).
+
+## When to use
+
+- Check the lists when a DM you expected never arrived, or before
+  DMing someone new (your first DM to them auto-allowlists them).
+- Blocking is server-enforced and invisible to the sender. Block or
+  unblock **only when your operator explicitly asks** — never on your
+  own judgement.
+
+## When NOT to use
+
+- Don't allowlist strangers proactively; the DM gate exists so your
+  operator decides who reaches you.
+"""
+
+
+SKILL_BODY_SELF_PUFFO_AGENT = """\
+# Skill: self_puffo_agent
+
+Bring your on-disk state (system prompt, skills, MCP registry, CLI
+session, harness+model, inference_level) into your live process. Five
+orthogonal axes; combine them freely.
+
+**Tool:** `mcp__puffo__refresh`
+
+**Arguments:**
+- `harness` (optional) — `"claude-code"` or `"codex"`
+- `model` (optional) — a model id valid for `harness`
+- `host_sync` (optional, bool) — also re-sync operator's host
+  `~/.claude/skills/` + host MCP registrations
+- `session` (optional, bool) — drop CLI session token so next spawn
+  starts a fresh conversation (no `--resume`)
+- `inference_level` (optional) — reasoning effort; per-harness values
+  (codex: minimal/low/medium/high; claude-code: low/medium/high/xhigh).
+  Standalone or alongside a harness+model swap; persists to `agent.yml`
+  + respawns.
+
+`harness` and `model` must be provided together (or both omitted).
+
+**Behaviour matrix:**
+
+| Call | What happens |
+|------|--------------|
+| `refresh()` | Rebuild `CLAUDE.md` + re-sync puffo default skills. Subprocess respawns on next turn, session preserved. |
+| `refresh(host_sync=True)` | Also re-sync host skills + host MCP. cli-local: hot; cli-docker: requires `session=True` too. |
+| `refresh(session=True)` | Also drop CLI session token; next spawn starts a new conversation. |
+| `refresh(harness="codex", model="gpt-5")` | Swap (harness, model), persist to `agent.yml`, full worker respawn. Implicit fresh session. |
+| `refresh(inference_level="medium")` | Set reasoning effort, persist to `agent.yml`, respawn. Standalone or alongside a harness+model swap. |
+
+**When to use:**
+- Edited `CLAUDE.md`, `profile.md`, `memory/*.md` → `refresh()`.
+- Installed a new skill / MCP → `refresh()`.
+- Operator added a new skill to their `~/.claude/skills/` → tell them
+  to call it "host-sync" and use `refresh(host_sync=True[, session=True])`.
+- Conversation feels stuck / context is polluted → `refresh(session=True)`.
+- Operator asked you to try a different model → confirm harness +
+  model with them, then `refresh(harness=..., model=...)`.
+- A task needs more (or less) reasoning effort → `refresh(
+  inference_level="high")` (values are per-harness).
+
+**When NOT to use:**
+- Every turn — worker-scope refresh is cheap (~1s), but the
+  harness+model swap is a full respawn (~5-10s for cli-docker).
+  Batch your edits.
+- To change `runtime.kind` (cli-local ↔ cli-docker) — MCP tool cannot
+  do this; only `puffo-agent agent refresh --kind` or the tray UI.
+
+**Caveat:** the refresh does NOT apply retroactively to the message
+that called it. Expect one "free" message between the call and its
+effect.
+
+## Skills
+
+- `install_skill(name, content)` — add a SKILL.md under your own
+  `.claude/skills/<name>/`; content is the full markdown body.
+- `uninstall_skill(name)` / `list_skills()`.
+Puffo-managed skills are re-mirrored on every worker start — edit
+custom skills only, and `refresh()` after changes.
+"""
+
+
+SKILL_BODY_USE_PUFFO_SUGGESTION = """\
+# Skill: use_puffo_suggestion
+
+a new Puffo agent
+
+You want a human in the current channel to consider creating a new
+agent. Don't try to provision it yourself — instead, post a message
+containing an `/agent` block and the puffo web client renders it as
+an actionable card with an **Add as my agent** button that opens the
+existing create-agent modal pre-filled with your fields.
+
+## When to use
+
+- A conversation surfaces a recurring task that doesn't have a
+  dedicated agent ("we should have someone watching the Sentry
+  stream", "a release-notes drafter would unblock the PM").
+- You want to recommend a specific agent shape (name + role +
+  description) rather than hand-waving "you should add an agent."
+- A human is the right approver — this skill is for *suggesting*,
+  not for taking action.
+
+## Format
+
+Send a single message via `mcp__puffo__send_message` whose text
+contains exactly this block. Any preamble above `/agent` is shown
+above the card as plain text.
+
+```
+<optional preamble — your reasoning, context, prompt for the human>
+
+/agent
+name: <display name>
+role: <short role label, e.g. "QA reviewer" or "release coordinator">
+description: <plain-text purpose, MAX 108 BYTES>
+message: <one-liner the agent should kick off with after it joins>
+```
+
+### Field rules
+
+- **`name`** — what the operator sees in the agent picker (e.g.
+  `Scout`, `Eli the Editor`). Keep it short.
+- **`role`** — a short pill-chip label. Two or three words max
+  ("API reviewer", "support triage").
+- **`description`** — **≤ 108 bytes UTF-8**. ASCII = 1 byte; CJK /
+  emoji = 3–4 bytes. The web parser truncates anything longer and
+  warns the operator. If you need more rationale, put it in the
+  preamble above `/agent`.
+- **`message`** — optional one-line greeting / first prompt the
+  agent uses after the human accepts.
+
+## Example
+
+```
+We've been triaging Sentry alerts manually in #ops for two weeks;
+a dedicated agent would close the loop faster.
+
+/agent
+name: Sentry Triage
+role: Incident watcher
+description: Watches Sentry's high-severity stream and pings the on-call when a new error class appears.
+message: Hi! I'll watch Sentry and surface unknown error classes. Acking the first one now.
+```
+
+## What NOT to do
+
+- Don't omit any of `name` / `role` / `description` — the card
+  renders with placeholders and looks broken.
+- Don't try to create the agent yourself.
+- Don't send the same suggestion twice in quick succession.
+- Don't put markdown inside the `/agent` fields. Strict
+  `key: value` per line.
+
+
+---
+
+a new channel
+
+You want a human in the current space to consider creating a new
+channel. Post a message containing a `/channel` block and the puffo
+web client renders it as an actionable card with a **Create channel**
+button that opens the existing create-channel modal pre-filled with
+your fields.
+
+## When to use
+
+- A subtopic is taking over the parent channel and would benefit
+  from its own room (`#api-design` splitting from `#engineering`).
+- You want to recommend a specific channel name + description
+  rather than just say "let's make a channel for this."
+- A human owns the channel-create decision.
+
+## Format
+
+Send a single message via `mcp__puffo__send_message` whose text
+contains exactly this block. Any preamble above `/channel` is shown
+above the card as plain text.
+
+```
+<optional preamble — reasoning, who should join, what it'll discuss>
+
+/channel
+name: <channel name without the leading #>
+description: <one-line purpose, MAX 108 BYTES>
+message: <optional one-liner shown above the card>
+```
+
+### Field rules
+
+- **`name`** — the channel name as it'll appear in the sidebar.
+  Lowercase ASCII letters / digits / hyphens are safest (matches
+  the server's slug shape); the modal accepts any Unicode.
+- **`description`** — **≤ 108 bytes UTF-8** (same as `suggest-agent`).
+  ASCII = 1 byte; CJK / emoji = 3–4 bytes. The web parser truncates
+  anything longer and warns the human.
+- **`message`** — optional one-liner shown above the card. Good
+  place to suggest who should join and why now.
+
+## Suggested members
+
+The `/channel` block has no `members:` field. List proposed members
+in the preamble; the human adds them in the existing modal's
+picker after accepting.
+
+## Example
+
+```
+We've covered the new ingestion pipeline in #engineering for three
+days running. Splitting it out keeps the parent channel readable.
+Probably want @alice-1234, @bob-9999, @sentry-bot in there to start.
+
+/channel
+name: ingestion-pipeline
+description: Design + rollout of the new ingestion pipeline. Status updates, decisions, blockers.
+message: Spun out of #engineering to keep the parent thread reading-friendly.
+```
+
+## What NOT to do
+
+- Don't try to create the channel yourself via space-events.
+- Don't suggest a channel name that already exists in the active
+  space; the modal rejects duplicates.
+- Don't put markdown inside the `/channel` fields. Strict
+  `key: value` per line.
+- Don't suggest a new channel for every topic that wanders for
+  ten minutes — wait until the conversation is clearly its own.
+
+
+---
+
+inviting a member to a channel
+
+You want a human to invite someone into a channel where they aren't
+currently a member. Post a message containing an `/invite` block and
+the puffo web client renders it as an actionable card with a
+**Send invite** button that opens the existing add-member modal with
+the suggested slug pre-selected.
+
+## When to use
+
+- A member's expertise (or a stakeholder's interest) comes up in
+  conversation and they aren't in the channel yet ("Alice has been
+  working on this exact problem", "let's loop in @bob-9999").
+- You want to recommend a *specific* invite rather than just say
+  "we should bring someone in."
+
+## Format
+
+Send a single message via `mcp__puffo__send_message` whose text
+contains exactly this block. Any preamble above `/invite` is shown
+above the card as plain text.
+
+```
+<optional preamble — why this person should join, what they'd contribute>
+
+/invite
+member: <slug, e.g. alice-1234>
+channel: <target channel — display name OR ch_<uuid>>
+message: <optional one-liner shown alongside the card>
+```
+
+### Field rules
+
+- **`member`** — the **slug** of the person to invite
+  (e.g. `alice-1234`). Slugs only, not display names. Look up the
+  slug from a recent message author or via `get_user_info`.
+- **`channel`** — either the channel display name (without `#`,
+  Unicode OK: `测试0630`, `marketing`, `oauth-rollout`) **or** a raw
+  `ch_<uuid>`. **Prefer `ch_<uuid>` when you have it** — names
+  collide across spaces and Unicode names can render
+  inconsistently in the operator's modal. **Always name the
+  target explicitly** — if omitted, the card defaults to the
+  current channel, which is usually wrong for `/invite`.
+- **`message`** — optional rationale for the human; renders above
+  the card.
+
+## Permissions
+
+The card doesn't enforce channel-admin permissions — the underlying
+add-member modal rejects the invite at submit time if the human
+reviewer isn't allowed to invite. If you know the reviewer isn't an
+admin, suggest someone who is in your preamble.
+
+## Example
+
+```
+@alice-1234 has been shipping the OAuth refactor for a month — she'd
+catch the auth-token race we just hit.
+
+/invite
+member: alice-1234
+channel: oauth-rollout
+message: Alice can sanity-check our token-refresh discussion.
+```
+
+## What NOT to do
+
+- Don't try to send the invite yourself via space-events.
+- Don't use display names in `member` — slugs only.
+- Don't put markdown inside the `/invite` fields. Strict
+  `key: value` per line.
+- Don't suggest an invite for someone already in the target channel.
+  Spot-check with `list_channel_members` first if unsure.
+- Don't fire multiple `/invite` cards in a row for the same person
+  across multiple channels — pick the right one and let the human
+  accept that first.
+"""
+
+
+SKILL_BODY_USE_PUFFO_NOTES = """\
+# Skill: use_puffo_notes
+
+Sticky-notes are lightweight status markers on a thread. Each note is
+a colored pill a human sees at a glance — a label (Waiting /
+Processing / Complete), a short message, and @mentions. A thread has
+one **active** note at a time: the newest wins, like stacking sticky-
+notes on top of each other.
+
+Use notes to make a thread's state legible without a human having to
+read it: "who is this blocked on?", "is anyone working on it?", "is
+it done?".
+
+**Tools:**
+- `mcp__puffo__get_channel_notes(channel, limit=20)` — the active note
+  of every thread in a channel (one per thread), newest-first. Your
+  channel-wide TODO scan.
+- `mcp__puffo__get_thread_notes(root_id, limit=20)` — a thread's note
+  history, newest-first. `limit=1` is the note currently in effect.
+- `mcp__puffo__add_note(root_id, preset, message="", mentions=[],
+  color="", label="")` — put a note on a thread. Posted as a reply in
+  that thread. Pass **either** a preset **or** a custom `color`+`label`
+  (they conflict); with neither, defaults to `waiting`.
+
+## The three presets
+
+A thread is work passing between people; the note tracks who holds
+the ball.
+
+- **waiting** (pink) — the ball is in someone else's court: you're
+  blocked on them, OR your part is done and you're handing off.
+  `mentions=[<slug>, ...]` = who acts next; `message` = what you
+  produced, what they need to know, and what you need them to do.
+  **This is the only preset that takes mentions.**
+- **processing** (yellow) — you hold the ball. Post it proactively so
+  everyone sees where things stand; `message` = a one-line "where I
+  am now". A self-report: the mention is you, and **passing
+  `mentions` is rejected**.
+- **complete** (green) — the WHOLE task is done, not just your part
+  (a finished part is a `waiting` handoff). Posted once, by whoever
+  finishes last; `message` = the wrap-up summary of the entire task.
+  A self-report: the mention is you, and **passing `mentions` is
+  rejected**.
+
+## When a note mentions you
+
+A `waiting` note mentioning you is a handoff: read its message, work
+out your part, and start. Post `processing` if you want the room to
+know you've picked it up.
+
+## Custom color
+
+For a status that doesn't fit a preset, skip `preset` and pass a
+custom `color` (hex, e.g. `#38bdf8`). A custom color **requires a
+`label`** (<=32 chars, e.g. "Blocked", "Review") and **must not** be
+combined with a preset. Custom notes take `mentions` freely, same as
+`waiting`. Presets cover the common cases — reach for custom only when
+none of Waiting / Processing / Complete fits.
+
+## Typical flow
+
+1. A human asks you to do something in a thread → drop a `processing`
+   note so they can see you picked it up:
+   `add_note(root_id=<the ask's root>, preset="processing",
+   message="on it — pulling the logs")`.
+2. You get blocked, or your part is done and someone else takes over
+   → flip to `waiting` and mention them: `add_note(root_id=...,
+   preset="waiting", message="build is green — needs your review to
+   ship", mentions=["alice-1a2b"])`.
+3. The whole ask is delivered → `add_note(root_id=...,
+   preset="complete", message="done — deployed to beta, PR #428")`.
+
+Each `add_note` supersedes the thread's previous note, so the pill a
+human sees always reflects the latest state. You don't delete old
+notes; you post a new one.
+
+## Reading notes
+
+- Landing in a busy channel? `get_channel_notes(channel=<ch_id>)`
+  first — the fastest way to see what's outstanding, and whether
+  anything is `Waiting` on **you**.
+- About to act on a thread? `get_thread_notes(root_id=<root>,
+  limit=1)` tells you the state someone already set, so you don't
+  double-work a thread that's already `Processing` or `Complete`.
+
+`root_id` is always a thread root envelope_id (`msg_<uuid>`) — the
+`thread_root_id` from a message's metadata, or the envelope_id of a
+top-level post. Channel ids are raw `ch_<uuid>` (no `#name`).
+
+**When to use:**
+- You're taking on, progressing, or finishing a piece of work a human
+  is tracking.
+- You need to hand a thread to a specific person and want it to show
+  up in their notes view.
+
+**When NOT to use:**
+- For actual conversation — a note is a status stamp, not a reply.
+  Use `send_message` to talk.
+- For agent-to-agent chatter no human is tracking.
+"""
+
+
+SKILL_BODY_USE_PUFFO_MEMORY = """\
+# Skill: use_puffo_memory
+
+Your `memory/` directory is your long-term memory: every `*.md` in it
+is folded into your system prompt on the next worker restart. Use it
+for anything worth knowing in a future session — not for scratch work.
+
+## What to save
+
+- Operator/user preferences (reply style, language, cadence).
+- Your standing decisions and their WHY ("we chose X because Y").
+- Stable facts about your projects, teammates, and tools.
+- NOT: transcripts, scratch output, anything the platform already
+  shows you (channel history, notes).
+
+## How to save
+
+- One topic per file: `memory/<topic>.md` (`memory/operator.md`,
+  `memory/project-acme.md`). Update the file in place — don't append
+  duplicates; rewrite the stale part.
+- Keep each file short and declarative. Start with a one-line summary,
+  then bullets. Cut anything you wouldn't want in every prompt.
+- Date absolute ("2026-07-24"), never "today"/"yesterday".
+
+## How to retrieve
+
+- Your memory snapshot is ALREADY in this prompt — read it before
+  asking or re-deriving.
+- Mid-session edits don't fold in until the next restart; read the
+  file directly (`memory/<topic>.md`) when you need what you just
+  wrote. `refresh()` rebuilds immediately if it matters now.
+"""
+
+
+SKILL_BODY_PERMISSIONS = """\
+# Skill: permission prompts (cli-local only)
+
+If you are running in `cli-local` mode, any tool invocation your
+operator hasn't pre-approved is routed to them via a puffo-core DM
+for approval. The DM is sent through the same signed-API client
+the rest of the agent uses; the operator sees it in their puffo
+client (CLI, desktop, or web).
+
+**What the operator sees:** a DM that looks like
+
+```
+🔐 agent `<your-slug>` wants to run `Bash`
+- command: `git push origin main`
+reply `y` to approve, `n` to deny (times out in 300s)
+```
+
+**What you see:**
+- On approve: the tool runs normally and you get its output.
+- On deny: a tool error with `owner denied the request`.
+- On timeout: a tool error with `permission request timed out`.
+
+**Guidance:**
+- Batch permission-sensitive work thoughtfully — each request pings
+  the operator. Plan the whole change, then ask once.
+- Explain what you're doing in your reply *before* making the call,
+  so the DM the operator receives has context from your previous
+  message.
+- If the operator denies or times out repeatedly, stop retrying and
+  ask them directly whether the task is still wanted.
+
+This skill does not apply to `sdk-local` or `cli-docker` runtimes:
+SDK agents use an allowlist, and cli-docker agents run in a sandboxed
+container with `--dangerously-skip-permissions` inside.
+"""
+
+
 DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
-    "send-message": (
-        "Reply to a Puffo.ai channel or DM via the puffo MCP toolkit.",
-        DEFAULT_SKILL_SEND_MESSAGE,
+    "read-puffo-history": (
+        'Read channel / DM / thread history and single envelopes from local storage.',
+        SKILL_BODY_READ_PUFFO_HISTORY,
     ),
-    "send-message-with-attachments": (
-        "Send files from your workspace to a Puffo.ai channel or DM.",
-        DEFAULT_SKILL_SEND_MESSAGE_WITH_ATTACHMENTS,
+    "read-puffo-user-info": (
+        'Look up user profiles (get_user_info) and your own identity (whoami).',
+        SKILL_BODY_READ_PUFFO_USER_INFO,
     ),
-    "attachments": (
-        "Read inbound file attachments saved under <workspace>/.puffo/inbox/.",
-        DEFAULT_SKILL_ATTACHMENTS,
+    "use-puffo-membership": (
+        'Discover spaces/channels/members and request to leave them.',
+        SKILL_BODY_USE_PUFFO_MEMBERSHIP,
     ),
-    "permissions": (
-        "Understand cli-local permission prompts (operator y/n "
-        "approval DMs for non-pre-approved tool calls).",
-        DEFAULT_SKILL_PERMISSIONS,
+    "manage-puffo-mcp": (
+        "Install, sync, and list MCP servers — via the operator's host or directly.",
+        SKILL_BODY_MANAGE_PUFFO_MCP,
     ),
-    "channel-history": (
-        "Read recent posts and threads from a Puffo.ai channel.",
-        DEFAULT_SKILL_CHANNEL_HISTORY,
+    "use-puffo-contact": (
+        'Read and manage your DM allowlist / blocklist.',
+        SKILL_BODY_USE_PUFFO_CONTACT,
     ),
-    "channel-members": (
-        "List a channel's member slugs + roles.",
-        DEFAULT_SKILL_CHANNEL_MEMBERS,
+    "self-puffo-agent": (
+        'Rebuild your prompt, swap harness/model, and manage your own skills.',
+        SKILL_BODY_SELF_PUFFO_AGENT,
     ),
-    "get-envelope": (
-        "Fetch one envelope by id from the daemon's local store.",
-        DEFAULT_SKILL_GET_POST,
-    ),
-    "get-user-info": (
-        "Look up a user's slug, display_name, bio, and avatar_url.",
-        DEFAULT_SKILL_GET_USER_INFO,
-    ),
-    "refresh": (
-        "Bring on-disk state (CLAUDE.md, skills, MCP, session, harness+model) into your live process.",
-        DEFAULT_SKILL_REFRESH,
-    ),
-    "use-host-mcp": (
-        "Bring an MCP that needs operator-side OAuth/credentials from "
-        "host into your own agent config.",
-        DEFAULT_SKILL_USE_HOST_MCP,
-    ),
-    "suggest-agent": (
-        "Post a /agent card so a human can spawn a new Puffo agent.",
-        DEFAULT_SKILL_SUGGEST_AGENT,
-    ),
-    "suggest-channel": (
-        "Post a /channel card so a human can spin up a new channel.",
-        DEFAULT_SKILL_SUGGEST_CHANNEL,
-    ),
-    "suggest-invite": (
-        "Post an /invite card so a human can add a member to a channel.",
-        DEFAULT_SKILL_SUGGEST_INVITE,
-    ),
-    "use-puffo-memory": (
-        "Save and retrieve long-term memory files that fold into your "
-        "system prompt.",
-        DEFAULT_SKILL_USE_PUFFO_MEMORY,
+    "use-puffo-suggestion": (
+        'Post /agent, /channel, or /invite cards the operator can act on.',
+        SKILL_BODY_USE_PUFFO_SUGGESTION,
     ),
     "use-puffo-notes": (
-        "Read and post sticky-note status markers (Waiting / Processing "
-        "/ Complete) on Puffo threads.",
-        DEFAULT_SKILL_USE_PUFFO_NOTES,
+        'Read and post sticky-note status markers (Waiting / Processing / Complete) on Puffo threads.',
+        SKILL_BODY_USE_PUFFO_NOTES,
+    ),
+    "use-puffo-memory": (
+        'Save and retrieve long-term memory files that fold into your system prompt.',
+        SKILL_BODY_USE_PUFFO_MEMORY,
+    ),
+    "permissions": (
+        'Understand cli-local permission prompts (operator y/n approval DMs for non-pre-approved tool calls).',
+        SKILL_BODY_PERMISSIONS,
     ),
 }
+
 
 _MANAGED_MARKER = ".puffo-managed"
 _MANAGED_MARKER_BODY = (
