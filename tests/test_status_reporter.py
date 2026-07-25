@@ -159,7 +159,10 @@ async def test_report_error_flips_status_red():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_loop_sends_immediately_then_on_interval():
+async def test_heartbeat_loop_sends_immediately_then_on_interval(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.store.current_machine_id", lambda: None,
+    )
     http = FakeHttp()
     rep = StatusReporter(http, heartbeat_interval_s=10.0)
 
@@ -176,7 +179,10 @@ async def test_heartbeat_loop_sends_immediately_then_on_interval():
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_busy_carries_current_message_id():
+async def test_heartbeat_busy_carries_current_message_id(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.store.current_machine_id", lambda: None,
+    )
     http = FakeHttp()
     rep = StatusReporter(http, heartbeat_interval_s=10.0)
     rep._current_status = "busy"
@@ -546,14 +552,26 @@ async def test_reporter_keyless_defaults_false_without_attr():
 
 
 class _CaptureSender:
-    """Fake bridge status sink; records every (status, mid, err) emitted."""
+    """Fake bridge status sink."""
 
     def __init__(self, *, boom: bool = False) -> None:
-        self.calls: list[tuple[str, str | None, str | None]] = []
+        self.calls: list[dict] = []
         self._boom = boom
 
-    async def __call__(self, status, *, current_message_id=None, error_text=None):
-        self.calls.append((status, current_message_id, error_text))
+    async def __call__(
+        self,
+        status,
+        *,
+        current_message_id=None,
+        error_text=None,
+        runtime=None,
+    ):
+        self.calls.append({
+            "status": status,
+            "current_message_id": current_message_id,
+            "error_text": error_text,
+            "runtime": runtime,
+        })
         if self._boom:
             raise RuntimeError("bridge ws closed")
 
@@ -567,7 +585,12 @@ async def test_keyless_begin_turn_emits_busy_over_bridge():
     run_id = await rep.begin_turn("msg_42")
     assert run_id.startswith("run_")
     assert http.calls == []  # never touched the signed wire
-    assert sender.calls == [("busy", "msg_42", None)]
+    assert sender.calls == [{
+        "status": "busy",
+        "current_message_id": "msg_42",
+        "error_text": None,
+        "runtime": None,
+    }]
     assert rep._current_status == "busy"
 
 
@@ -578,11 +601,13 @@ async def test_keyless_end_turn_emits_idle_and_error_over_bridge():
     rep = StatusReporter(http, heartbeat_interval_s=999, status_sender=sender)
 
     await rep.end_turn("msg_5", "run_x", succeeded=True)
-    assert sender.calls == [("idle", None, None)]
+    assert sender.calls[0]["status"] == "idle"
+    assert sender.calls[0]["current_message_id"] is None
 
     sender.calls.clear()
     await rep.end_turn("msg_6", "run_y", succeeded=False, error_text="boom")
-    assert sender.calls == [("error", None, "boom")]
+    assert sender.calls[0]["status"] == "error"
+    assert sender.calls[0]["error_text"] == "boom"
     assert http.calls == []
 
 
@@ -595,7 +620,7 @@ async def test_keyless_end_turn_batch_emits_over_bridge():
     await rep.end_turn_batch([
         {"run_id": "run_a", "message_id": "msg_a", "succeeded": True},
     ])
-    assert sender.calls == [("idle", None, None)]
+    assert sender.calls[0]["status"] == "idle"
     assert http.calls == []
 
 
@@ -609,7 +634,8 @@ async def test_keyless_send_heartbeat_emits_current_status_over_bridge():
 
     await rep._send_heartbeat()
     assert http.calls == []
-    assert sender.calls == [("busy", "msg_z", None)]
+    assert sender.calls[0]["status"] == "busy"
+    assert sender.calls[0]["current_message_id"] == "msg_z"
 
 
 @pytest.mark.asyncio
@@ -619,8 +645,59 @@ async def test_keyless_report_error_emits_over_bridge():
     rep = StatusReporter(http, heartbeat_interval_s=999, status_sender=sender)
 
     await rep.report_error("fatal")
-    assert sender.calls == [("error", None, "fatal")]
+    assert sender.calls[0]["status"] == "error"
+    assert sender.calls[0]["error_text"] == "fatal"
     assert rep._current_status == "error"
+
+
+@pytest.mark.asyncio
+async def test_keyless_status_includes_runtime():
+    http = _ExplodingKeylessHttp()
+    sender = _CaptureSender()
+    rep = StatusReporter(
+        http,
+        heartbeat_interval_s=999,
+        status_sender=sender,
+        runtime_provider=lambda: {
+            "kind": "cli-local",
+            "provider": "openai",
+            "harness": "codex",
+            "model": "gpt-5",
+            "secret": "must-not-cross-the-wire",
+        },
+    )
+
+    await rep.report_current_status()
+
+    assert sender.calls == [{
+        "status": "idle",
+        "current_message_id": None,
+        "error_text": None,
+        "runtime": {
+            "kind": "cli-local",
+            "provider": "openai",
+            "harness": "codex",
+            "model": "gpt-5",
+        },
+    }]
+
+
+@pytest.mark.asyncio
+async def test_keyless_status_survives_telemetry_provider_errors():
+    def broken():
+        raise RuntimeError("not ready")
+
+    sender = _CaptureSender()
+    rep = StatusReporter(
+        _ExplodingKeylessHttp(),
+        heartbeat_interval_s=999,
+        status_sender=sender,
+        runtime_provider=broken,
+    )
+
+    await rep.report_current_status()
+
+    assert sender.calls[0]["runtime"] is None
 
 
 @pytest.mark.asyncio

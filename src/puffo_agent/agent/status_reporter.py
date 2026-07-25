@@ -108,9 +108,29 @@ class StatusReporter:
                 status,
                 current_message_id=current_message_id,
                 error_text=error_text,
+                runtime=self._runtime_payload(),
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("keyless status emit (%s) failed (%s)", status, exc)
+
+    def _runtime_payload(self) -> dict[str, str] | None:
+        if self._runtime_provider is None:
+            return None
+        try:
+            runtime = self._runtime_provider()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("runtime_provider raised (%s)", exc)
+            return None
+        allowed = ("kind", "provider", "harness", "model", "inference_level")
+        return {
+            key: str(runtime.get(key, ""))[:256]
+            for key in allowed
+            if key in runtime
+        }
+
+    async def report_current_status(self) -> None:
+        """Best-effort status refresh used after bridge reconnects."""
+        await self._send_heartbeat()
 
     async def begin_turn(self, message_id: str) -> str:
         """Returns a ``run_id`` to pass back to ``end_turn``."""

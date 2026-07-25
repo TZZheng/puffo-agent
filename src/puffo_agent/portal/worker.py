@@ -23,9 +23,12 @@ from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError, PuffoAgent
 from ..agent.status_reporter import StatusReporter
 from .runtime_matrix import (
+    HARNESS_PROVIDERS,
     RUNTIME_CLI_DOCKER,
     RUNTIME_CLI_LOCAL,
     RUNTIME_WS_LOCAL,
+    resolve_effective_harness,
+    resolve_effective_provider,
 )
 from .ws_local.hub import AttachPoint
 from ..agent.shared_content import (
@@ -1088,16 +1091,41 @@ class Worker:
         self.runtime.save(self.agent_cfg.id)
 
     def _runtime_info(self) -> dict[str, str]:
-        """Heartbeat payload: the agent's runtime, so the operator's portal can
-        show + pre-select the live model. An edit restarts the worker, so the
-        next instance reports the updated values."""
         rt = self.agent_cfg.runtime
+        kind = rt.kind or "chat-local"
+        if kind == RUNTIME_WS_LOCAL:
+            return {"kind": kind, "provider": "", "harness": "", "model": ""}
+        provider = rt.provider
+        if not provider and kind in (RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER) and rt.harness:
+            supported = HARNESS_PROVIDERS.get(rt.harness, frozenset())
+            if len(supported) == 1:
+                provider = next(iter(supported))
+        if not provider and kind == "chat-local":
+            provider = self.daemon_cfg.default_provider
+        provider = resolve_effective_provider(kind, provider)
+        harness = resolve_effective_harness(kind, provider, rt.harness)
+        provider_cfg = getattr(self.daemon_cfg, provider, None)
+        model = rt.model or getattr(provider_cfg, "model", "")
         return {
-            "kind": rt.kind,
-            "provider": rt.provider,
-            "harness": rt.harness,
-            "model": rt.model,
+            "kind": kind,
+            "provider": provider,
+            "harness": harness,
+            "model": model,
         }
+
+    def _build_status_reporter(self, client) -> StatusReporter:
+        bridge = getattr(client, "_bridge", None)
+        reporter = StatusReporter(
+            client.http,
+            runtime_health_provider=(
+                None if bridge is not None else lambda: self.runtime.health
+            ),
+            runtime_provider=self._runtime_info,
+            status_sender=bridge.send_status if bridge is not None else None,
+        )
+        if bridge is not None:
+            bridge.add_connected_callback(reporter.report_current_status)
+        return reporter
 
     async def _run_ws_local(self) -> None:
         """ws-local agents run no harness consumer. Build the client,
@@ -1113,19 +1141,7 @@ class Worker:
                 self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg,
             )
             self._client = client
-            reporter = StatusReporter(
-                client.http,
-                runtime_health_provider=lambda: self.runtime.health,
-                runtime_provider=self._runtime_info,
-                # Keyless bridge agents can't sign the HTTP status routes — report
-                # status over the (already token-authed) bridge WS instead. None
-                # on native agents, so they keep the signed HTTP path unchanged.
-                status_sender=(
-                    client._bridge.send_status
-                    if getattr(client, "_bridge", None) is not None
-                    else None
-                ),
-            )
+            reporter = self._build_status_reporter(client)
             point = AttachPoint(
                 slug=self.agent_cfg.puffo_core.slug,
                 agent_id=agent_id,
@@ -1663,18 +1679,7 @@ class Worker:
         # back to a no-op when the client has no http client (tests).
         # Lazy provider so each heartbeat reads live runtime.health.
         reporter = (
-            StatusReporter(
-                client.http,
-                runtime_health_provider=lambda: self.runtime.health,
-                runtime_provider=self._runtime_info,
-                # Keyless bridge agents report status over the bridge WS (they
-                # can't sign the HTTP routes); None on native agents.
-                status_sender=(
-                    client._bridge.send_status
-                    if getattr(client, "_bridge", None) is not None
-                    else None
-                ),
-            )
+            self._build_status_reporter(client)
             if hasattr(client, "http")
             else None
         )

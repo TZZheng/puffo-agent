@@ -41,6 +41,7 @@ class _MockBridgeApp:
         self.error_on_send: dict | None = None
         self.recv_send: list[dict] = []
         self.recv_heartbeats: list[dict] = []
+        self.recv_statuses: list[dict] = []
         self.token_seen: str | None = None
         self.heartbeat_received = asyncio.Event()
 
@@ -59,6 +60,8 @@ class _MockBridgeApp:
             if kind == "heartbeat":
                 self.recv_heartbeats.append(frame)
                 self.heartbeat_received.set()
+            elif kind == "status":
+                self.recv_statuses.append(frame)
             elif kind == "send":
                 self.recv_send.append(frame)
                 if self.error_on_send is not None:
@@ -196,6 +199,99 @@ async def test_heartbeat_frame_reaches_server(monkeypatch):
         finally:
             await c.close()
     assert bridge_app.recv_heartbeats[0] == {"type": "heartbeat"}
+
+
+@pytest.mark.asyncio
+async def test_status_frame_carries_bounded_runtime():
+    bridge_app = _MockBridgeApp()
+    async with TestClient(TestServer(_build_app(bridge_app))) as client:
+        url = str(client.make_url("")).rstrip("/")
+        c = CloudBridgeClient(url, "sbx", "slug")
+        await c.connect()
+        try:
+            await c.send_status(
+                "busy",
+                current_message_id="m" * 1100,
+                error_text="e" * 1100,
+                runtime={
+                    "kind": "cli-local",
+                    "provider": "openai",
+                    "harness": "codex",
+                    "model": "gpt-5",
+                    "secret": "drop-me",
+                },
+            )
+            await asyncio.sleep(0)
+        finally:
+            await c.close()
+
+    sent = bridge_app.recv_statuses[0]
+    assert sent["status"] == "busy"
+    assert len(sent["current_message_id"]) == 1024
+    assert len(sent["error_text"]) == 1024
+    assert sent["runtime"] == {
+        "kind": "cli-local",
+        "provider": "openai",
+        "harness": "codex",
+        "model": "gpt-5",
+    }
+
+
+@pytest.mark.asyncio
+async def test_status_rejects_invalid_state_and_clears_non_busy_message_id():
+    bridge_app = _MockBridgeApp()
+    async with TestClient(TestServer(_build_app(bridge_app))) as client:
+        url = str(client.make_url("")).rstrip("/")
+        c = CloudBridgeClient(url, "sbx", "slug")
+        await c.connect()
+        try:
+            with pytest.raises(ValueError, match="invalid agent status"):
+                await c.send_status("starting")
+            await c.send_status("error", current_message_id="must-not-send")
+            await asyncio.sleep(0)
+        finally:
+            await c.close()
+
+    assert "current_message_id" not in bridge_app.recv_statuses[0]
+
+
+@pytest.mark.asyncio
+async def test_connected_callback_runs_after_every_reconnect():
+    bridge_app = _MockBridgeApp()
+    calls = 0
+
+    async def on_connected():
+        nonlocal calls
+        calls += 1
+
+    async with TestClient(TestServer(_build_app(bridge_app))) as client:
+        url = str(client.make_url("")).rstrip("/")
+        c = CloudBridgeClient(url, "sbx", "slug")
+        c.add_connected_callback(on_connected)
+        await c.connect()
+        await c.close()
+        await c.connect()
+        await c.close()
+
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_connected_callback_failure_does_not_break_bridge():
+    bridge_app = _MockBridgeApp()
+
+    async def broken():
+        raise RuntimeError("telemetry unavailable")
+
+    async with TestClient(TestServer(_build_app(bridge_app))) as client:
+        url = str(client.make_url("")).rstrip("/")
+        c = CloudBridgeClient(url, "sbx", "slug")
+        c.add_connected_callback(broken)
+        await c.connect()
+        try:
+            await c.send_fetch_pending()
+        finally:
+            await c.close()
 
 
 @pytest.mark.asyncio

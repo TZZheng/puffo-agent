@@ -20,7 +20,7 @@ import contextlib
 import json
 import logging
 import uuid
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 import aiohttp
 
@@ -75,6 +75,12 @@ class CloudBridgeClient:
         # in the spec — only one in-flight at a time).
         self._ack_result_waiters: asyncio.Queue[asyncio.Future] = asyncio.Queue()
         self._spaces_waiters: asyncio.Queue[asyncio.Future] = asyncio.Queue()
+        self._connected_callbacks: list[Callable[[], Awaitable[None]]] = []
+
+    def add_connected_callback(
+        self, callback: Callable[[], Awaitable[None]],
+    ) -> None:
+        self._connected_callbacks.append(callback)
 
     async def connect(self) -> None:
         self._session = aiohttp.ClientSession(
@@ -122,6 +128,11 @@ class CloudBridgeClient:
         # Start the heartbeat only after a clean handshake so no failure
         # path leaves a live heartbeat task behind.
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        for callback in tuple(self._connected_callbacks):
+            try:
+                await callback()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("cloud bridge: connected callback failed: %s", exc)
 
     async def frames(self) -> AsyncIterator[dict]:
         # Yields message / pending_delivered / uncorrelated error.
@@ -505,6 +516,7 @@ class CloudBridgeClient:
         *,
         current_message_id: Optional[str] = None,
         error_text: Optional[str] = None,
+        runtime: Optional[dict[str, Any]] = None,
     ) -> None:
         """Report runtime status over the bridge — the keyless equivalent of the
         signed ``POST /agents/me/heartbeat`` + processing-run status flips. A
@@ -513,11 +525,20 @@ class CloudBridgeClient:
         WS broadcast, so the operator's status dot + Log are identical.
         Fire-and-forget (no reply frame)."""
         ws = await self._require_ws()
+        if status not in {"idle", "busy", "error"}:
+            raise ValueError(f"invalid agent status: {status}")
         frame: dict[str, Any] = {"type": "status", "status": status}
-        if current_message_id is not None:
-            frame["current_message_id"] = current_message_id
+        if status == "busy" and current_message_id is not None:
+            frame["current_message_id"] = current_message_id[:1024]
         if error_text is not None:
-            frame["error_text"] = error_text
+            frame["error_text"] = error_text[:1024]
+        if runtime is not None:
+            allowed = ("kind", "provider", "harness", "model", "inference_level")
+            frame["runtime"] = {
+                key: str(runtime.get(key, ""))[:256]
+                for key in allowed
+                if key in runtime
+            }
         await ws.send_json(frame)
 
     def _discard_waiter(
