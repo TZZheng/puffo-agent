@@ -1437,7 +1437,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
 
     @mcp.tool()
-    async def sync_host_mcp(template_id: str) -> str:
+    async def sync_host_mcp(name: str) -> str:
         """Copy the operator's ``~/.claude.json#mcpServers[<id>]``
         entry into your own ``<agent>/.claude.json``. Pair with
         ``install_host_mcp`` once the operator finishes OAuth on host,
@@ -1454,7 +1454,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 "on this MCP runtime, so the puffo-agent daemon's "
                 "rpc_service isn't reachable."
             )
-        return await cfg.rpc_client.sync_mcp(template_id=template_id)
+        return await cfg.rpc_client.sync_mcp(name=name)
 
     @mcp.tool()
     async def leave_space(space_id: str, reason: str = "") -> str:

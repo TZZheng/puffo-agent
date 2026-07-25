@@ -210,7 +210,7 @@ Check the `use-puffo-membership` skill for details.
 **mcp:**
 Check the `manage-puffo-mcp` skill for details.
 - `install_host_mcp(name, spec=None, template_id="")`
-- `sync_host_mcp(template_id)`
+- `sync_host_mcp(name)`
 - `install_mcp_server(name, command, args=None, env=None)`
 - `uninstall_mcp_server(name)` / `list_mcp_servers()`
 
@@ -541,7 +541,10 @@ outcome:
 - Tool raised an error before "Installed" - nothing was written and
   no DM was sent. Surface the error to the operator.
 
-### Step 2 - `sync_host_mcp(template_id="<template_id>")`
+### Step 2 - `sync_host_mcp(name="<name>")`
+
+`name` is the entry name under the operator's `mcpServers` (the same
+`name` you passed to `install_host_mcp`) - NOT a catalog template id.
 
 Once the operator pings you back saying host setup is done, call
 this with the **same `name`** you passed to `install_host_mcp`. It
@@ -868,7 +871,7 @@ message: <optional one-liner shown alongside the card>
   (e.g. `alice-1234`). Slugs only, not display names. Look up the
   slug from a recent message author or via `get_user_info`.
 - **`channel`** - either the channel display name (without `#`,
-  Unicode OK: `测试0630`, `marketing`, `oauth-rollout`) **or** a raw
+  Unicode OK: `demo-0630`, `marketing`, `oauth-rollout`) **or** a raw
   `ch_<uuid>`. **Prefer `ch_<uuid>` when you have it** - names
   collide across spaces and Unicode names can render
   inconsistently in the operator's modal. **Always name the
@@ -1097,7 +1100,7 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
         SKILL_BODY_USE_PUFFO_MEMBERSHIP,
     ),
     "manage-puffo-mcp": (
-        "Install, sync, and list MCP servers — via the operator's host or directly.",
+        "Install, sync, and list MCP servers - via the operator's host or directly.",
         SKILL_BODY_MANAGE_PUFFO_MCP,
     ),
     "use-puffo-contact": (
