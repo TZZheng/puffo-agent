@@ -233,16 +233,15 @@ def test_docs_use_msg_envelope_id_format():
         assert "env_" not in body, f"stale env_ id in {skill_id} body"
 
 
-def test_primer_dm_reply_rule_lives_in_how_to_reply():
-    """The DM ``@<slug>`` rule sits inside 'How to reply' (where
-    agents actually read on reply), not only 100+ lines below."""
-    start = DEFAULT_SHARED_CLAUDE_MD.index("## How to reply")
-    end = DEFAULT_SHARED_CLAUDE_MD.index("## Spaces, channels, DMs")
-    how_to_reply = DEFAULT_SHARED_CLAUDE_MD[start:end]
-    assert "@<sender_slug>" in how_to_reply
+def test_primer_dm_rule_lives_in_how_to_chat():
+    """The DM routing rule sits inside 'How to chat' (where agents
+    actually read before replying)."""
+    start = DEFAULT_SHARED_CLAUDE_MD.index("## How to chat")
+    end = DEFAULT_SHARED_CLAUDE_MD.index("## Attachments")
+    how_to_chat = DEFAULT_SHARED_CLAUDE_MD[start:end]
+    assert 'dm="<sender_slug>"' in how_to_chat
     metadata_block = DEFAULT_SHARED_CLAUDE_MD[:start]
-    assert 'channel="@<sender_slug>"' in metadata_block
-
+    assert 'send_message(dm="<slug>", ...)' in metadata_block
 
 def test_primer_metadata_example_matches_builder():
     """The documented metadata block must track what

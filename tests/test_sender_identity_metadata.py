@@ -110,6 +110,6 @@ def test_metadata_block_field_order():
         return next(i for i, ln in enumerate(lines) if ln.startswith(prefix))
 
     assert (
-        idx("- post_id:") < idx("- space_id:") < idx("- channel_id:")
+        idx("- envelope_id:") < idx("- space_id:") < idx("- channel_id:")
         < idx("- thread_root_id:") < idx("- is_encrypted:") < idx("- sender:")
     )

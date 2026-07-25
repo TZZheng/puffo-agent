@@ -27,7 +27,7 @@ def test_allowed_tools_are_the_send_read_and_membership_tools():
         # read / navigation
         "get_user_info",
         "whoami",
-        "get_post",
+        "get_envelope",
         "get_post_segment",
         "get_channel_history",
         "get_dm_history",

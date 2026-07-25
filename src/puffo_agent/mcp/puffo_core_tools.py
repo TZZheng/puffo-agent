@@ -462,8 +462,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
     async def send_message(
-        channel: str,
         text: str,
+        channel: str = "",
+        dm: str = "",
         root_id: str = "",
         visibility_level: str = "default",
     ) -> str:
@@ -496,6 +497,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
               no human is waiting for this reply. Root-level posts
               are still forced visible (can't fold either way).
         """
+        dm_ref = (dm or "").strip().lstrip("@")
+        if dm_ref and channel.strip():
+            raise RuntimeError("pass either channel or dm, not both")
+        if dm_ref:
+            channel = f"@{dm_ref}"
+        if not channel.strip():
+            raise RuntimeError("channel or dm is required")
         return await _send_impl(channel, text, root_id, visibility_level)
 
     async def _send_impl(
@@ -1065,15 +1073,15 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         return "\n".join(lines)
 
     @mcp.tool()
-    async def get_post(post_ref: str) -> str:
+    async def get_envelope(envelope_ref: str) -> str:
         """Fetch one message by its envelope_id from local storage.
 
-        post_ref: an envelope_id (e.g. 'env_...'). Returns sender,
+        envelope_ref: an envelope_id (e.g. 'env_...'). Returns sender,
         timestamp, and message text.
         """
-        envelope_id = (post_ref or "").strip()
+        envelope_id = (envelope_ref or "").strip()
         if not envelope_id:
-            raise RuntimeError("post_ref (envelope_id) is required")
+            raise RuntimeError("envelope_ref (envelope_id) is required")
 
         msg = await cfg.data_client.get_message_by_envelope(envelope_id)
         if msg is None:

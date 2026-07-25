@@ -1061,7 +1061,7 @@ async def test_get_user_info():
 
 
 @pytest.mark.asyncio
-async def test_get_post_from_local():
+async def test_get_envelope_from_local():
     cfg, _, ms = _setup()
     await ms.open()
     await ms.store({
@@ -1071,7 +1071,7 @@ async def test_get_post_from_local():
         "content": "find this message", "sent_at": _now_ms(),
     })
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "get_post", {"post_ref": "env_lookup"})
+    result = await _call(mcp, "get_envelope", {"envelope_ref": "env_lookup"})
     assert "env_lookup" in result
     assert "alice-0001" in result
     assert "find this message" in result
@@ -1079,11 +1079,11 @@ async def test_get_post_from_local():
 
 
 @pytest.mark.asyncio
-async def test_get_post_not_found():
+async def test_get_envelope_not_found():
     cfg, _, ms = _setup()
     await ms.open()
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "get_post", {"post_ref": "env_nonexistent"})
+    result = await _call(mcp, "get_envelope", {"envelope_ref": "env_nonexistent"})
     assert "not found" in result.lower() or "error" in result.lower()
     await ms.close()
 
@@ -1586,7 +1586,7 @@ async def test_core_tools_registered():
         "whoami", "send_message", "get_channel_history",
         "list_spaces", "list_channels_in_all_spaces",
         "list_channels_in_space", "list_channel_members",
-        "get_user_info", "get_post", "send_message_with_attachments",
+        "get_user_info", "get_envelope", "send_message_with_attachments",
     }
     assert expected.issubset(tool_names)
 
@@ -2018,10 +2018,10 @@ async def _store_msg(ms, eid, *, is_encrypted, channel_id="ch_1", thread_root_id
 
 
 @pytest.mark.asyncio
-async def test_get_post_shows_is_encrypted():
+async def test_get_envelope_shows_is_encrypted():
     cfg, _, ms = _setup()
     await _store_msg(ms, "msg_plain", is_encrypted=False)
-    result = await _call(_build_tools(cfg), "get_post", {"post_ref": "msg_plain"})
+    result = await _call(_build_tools(cfg), "get_envelope", {"envelope_ref": "msg_plain"})
     assert "is_encrypted: false" in result
 
 
@@ -2183,3 +2183,47 @@ def test_parse_note_requires_the_marker_space():
     assert _parse_note("/note" + chr(10) + "color: #fff") is None
     assert _parse_note("/notebook entry") is None
     assert _parse_note("/note hello") is not None
+
+
+@pytest.mark.asyncio
+async def test_send_message_dm_param_routes_like_at_slug():
+    cfg, http, ms = _setup()
+
+    async def _no_encrypt(slug, root):
+        return False
+
+    ms.get_send_encryption = _no_encrypt
+    mcp = _build_tools(cfg)
+    result = await _call(
+        mcp,
+        "send_message",
+        {"dm": "@alice-0001", "text": "hi", "visibility_level": "human"},
+    )
+    assert "posted" in result
+    post_calls = [(pth, b) for m, pth, b in http.calls if m == "POST"]
+    assert len(post_calls) == 1
+    _, body = post_calls[0]
+    payload = body["signed_payload"]["payload"]
+    assert payload["envelope_kind"] == "dm"
+    assert payload["recipient_slug"] == "alice-0001"
+
+
+@pytest.mark.asyncio
+async def test_send_message_rejects_channel_plus_dm():
+    cfg, http, ms = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception, match="not both"):
+        await _call(
+            mcp,
+            "send_message",
+            {"channel": "ch_x", "dm": "alice-0001", "text": "hi"},
+        )
+    assert not [c for c in http.calls if c[0] == "POST"]
+
+
+@pytest.mark.asyncio
+async def test_send_message_requires_channel_or_dm():
+    cfg, http, ms = _setup()
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception, match="channel or dm"):
+        await _call(mcp, "send_message", {"text": "hi"})

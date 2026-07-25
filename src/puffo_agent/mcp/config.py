@@ -55,7 +55,7 @@ PUFFO_CORE_TOOL_NAMES = (
     "get_channel_notes",
     "get_thread_notes",
     "add_note",
-    "get_post",
+    "get_envelope",
     "get_post_segment",
     "get_user_info",
     "whoami",

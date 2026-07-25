@@ -25,7 +25,7 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     # read / navigation
     "get_user_info",
     "whoami",
-    "get_post",
+    "get_envelope",
     "get_post_segment",
     "get_channel_history",
     "get_dm_history",

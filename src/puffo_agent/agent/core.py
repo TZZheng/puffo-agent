@@ -465,13 +465,14 @@ class PuffoAgent:
         # is documented to the model in DEFAULT_SHARED_CLAUDE_MD.
         lines: list[str] = []
         if post_id:
-            lines.append(f"- post_id: {post_id}")
+            lines.append(f"- envelope_id: {post_id}")
         if space_name:
             lines.append("- space: " + space_name)
         if space_id:
             lines.append(f"- space_id: {space_id}")
-        lines.append("- channel: " + (channel_name or channel_id))
+        # Both channel lines are absent for DMs (no channel_id).
         if channel_id:
+            lines.append("- channel: " + (channel_name or channel_id))
             lines.append(f"- channel_id: {channel_id}")
         # thread_root_id is the root post id to pass as send_message's
         # root_id. For a top-level post the root is the post itself.
