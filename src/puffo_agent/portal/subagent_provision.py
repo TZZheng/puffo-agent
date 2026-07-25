@@ -119,6 +119,15 @@ def write_subagents(claude_dir: Path, subagents: list[dict]) -> list[dict]:
     agents_dir = claude_dir / "agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     for sa in subagents:
-        (agents_dir / f"{sa['name']}.md").write_text(sa["content"], encoding="utf-8")
-        written.append({"name": sa["name"], "sha256": sha256_hex(sa["content"])})
+        path = agents_dir / f"{sa['name']}.md"
+        # Never write through a pre-existing symlink — a planted link could
+        # escape the workspace. The create path uses a fresh dir so this can't
+        # trigger there, but the helper must not assume its caller does.
+        if path.is_symlink():
+            raise ValueError(f"subagent {sa['name']!r}: refusing to write through a symlink")
+        # write_bytes (not write_text) so the on-disk file is byte-identical to
+        # the sha256 we report — no newline translation on any platform.
+        data = sa["content"].encode("utf-8")
+        path.write_bytes(data)
+        written.append({"name": sa["name"], "sha256": hashlib.sha256(data).hexdigest()})
     return written

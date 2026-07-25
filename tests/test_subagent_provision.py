@@ -131,6 +131,20 @@ def test_validate_bad_name_charset_rejected():
         )
 
 
+def test_validate_lax_frontmatter_with_valid_name_passes():
+    # Intake: "daemon does NOT interpret semantics — harness owns them." A
+    # valid name is the only structural guard; garbage tools/model pass through
+    # and are caught (if at all) at claude-code load time. Source-pin the laxity.
+    content = (
+        "---\nname: loose-agent\ntools: not-a-list-lol\nmodel: 42\n"
+        "description:\n---\n\nbody\n"
+    )
+    got = validate_desired_subagents(
+        [{"name": "loose-agent", "content": content}], harness="claude-code",
+    )
+    assert got == [{"name": "loose-agent", "content": content}]
+
+
 def test_validate_missing_content_rejected():
     with pytest.raises(ValueError, match="content"):
         validate_desired_subagents(
@@ -172,6 +186,28 @@ def test_write_subagents_empty_is_noop(tmp_path):
     claude_dir = tmp_path / ".claude"
     assert write_subagents(claude_dir, []) == []
     assert not (claude_dir / "agents").exists()
+
+
+def test_write_subagents_byte_faithful_across_newlines(tmp_path):
+    # sha256 contract: the on-disk file must be byte-identical to the reported
+    # sha256 regardless of newline style (write_bytes, no translation).
+    content = "---\r\nname: crlf-agent\r\n---\r\n\r\nbody\r\nline2\n"
+    written = write_subagents(tmp_path / ".claude", [{"name": "crlf-agent", "content": content}])
+    on_disk = (tmp_path / ".claude" / "agents" / "crlf-agent.md").read_bytes()
+    assert on_disk == content.encode("utf-8")  # CRLF preserved verbatim
+    assert written[0]["sha256"] == hashlib.sha256(on_disk).hexdigest()
+
+
+def test_write_subagents_refuses_symlink(tmp_path):
+    # Safe-by-construction: a pre-existing symlink at the target is refused,
+    # never followed (would let a planted link escape the workspace).
+    agents_dir = tmp_path / ".claude" / "agents"
+    agents_dir.mkdir(parents=True)
+    outside = tmp_path / "outside.md"
+    (agents_dir / "code-reviewer.md").symlink_to(outside)
+    with pytest.raises(ValueError, match="symlink"):
+        write_subagents(tmp_path / ".claude", [{"name": "code-reviewer", "content": _md("code-reviewer")}])
+    assert not outside.exists()  # nothing written through the link
 
 
 def test_sha256_hex_matches_stdlib():
@@ -224,6 +260,26 @@ def test_write_agent_from_context_lands_subagents(tmp_path, monkeypatch):
     assert result["subagents"] == [
         {"name": "code-reviewer", "sha256": hashlib.sha256(content.encode()).hexdigest()},
     ]
+
+
+def test_write_agent_from_context_prunes_on_subagent_write_failure(tmp_path, monkeypatch):
+    # AC #4 partial-failure path: a disk-write failure AFTER validation prunes
+    # the half-built agent dir (shutil.rmtree) rather than leaving it for the
+    # reconcile loop. The new subagent write is a fresh IO surface; pin it.
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    from puffo_agent.portal import subagent_provision
+    from puffo_agent.portal.api.handlers import _write_agent_from_context
+    from puffo_agent.portal.state import agent_dir
+
+    def _boom(claude_dir, subagents):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(subagent_provision, "write_subagents", _boom)
+    with pytest.raises(OSError):
+        _write_agent_from_context(
+            _ctx("doomed-bot", [{"name": "code-reviewer", "content": _md("code-reviewer")}]),
+        )
+    assert not agent_dir("doomed-bot").exists()  # half-built dir pruned
 
 
 def test_write_agent_from_context_no_subagents(tmp_path, monkeypatch):
