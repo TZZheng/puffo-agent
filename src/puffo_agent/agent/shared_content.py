@@ -543,11 +543,10 @@ outcome:
 
 ### Step 2 - `sync_host_mcp(name="<name>")`
 
-`name` is the entry name under the operator's `mcpServers` (the same
-`name` you passed to `install_host_mcp`) - NOT a catalog template id.
-
 Once the operator pings you back saying host setup is done, call
-this with the **same `name`** you passed to `install_host_mcp`. It
+this with the same `name` you passed to `install_host_mcp` - the
+entry name under the operator's `mcpServers`, NOT a catalog template
+id. It
 copies the populated entry (now carrying OAuth tokens / API keys)
 from `<operator_home>/.claude.json` into your own
 `<agent>/.claude.json`. The transfer is verbatim - what host has is
@@ -693,8 +692,6 @@ tap. You suggest - a human decides. Never provision any of these
 yourself.
 
 ## Suggest a new agent (`/agent`)
-
-a new Puffo agent
 
 You want a human in the current channel to consider creating a new
 agent. Don't try to provision it yourself - instead, post a message
