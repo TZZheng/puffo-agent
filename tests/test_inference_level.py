@@ -359,7 +359,8 @@ async def test_refresh_tool_level_subsumes_host_sync_on_docker(tmp_path):
 
 def test_refresh_skill_documents_inference_level_axis():
     # The skill (in CLAUDE.md) must advertise the axis, not just the docstring.
-    from puffo_agent.agent.shared_content import DEFAULT_SKILL_REFRESH
+    from puffo_agent.agent.shared_content import DEFAULT_SKILLS
+    DEFAULT_SKILL_REFRESH = DEFAULT_SKILLS["self-puffo-agent"][1]
 
     assert "inference_level" in DEFAULT_SKILL_REFRESH
     assert "Four orthogonal" not in DEFAULT_SKILL_REFRESH
