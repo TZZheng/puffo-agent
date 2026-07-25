@@ -299,9 +299,7 @@ an agent to force).
 # ── Default skill markdowns ───────────────────────────────────────────────────
 
 
-# Each entry: skill id → (one-line description, body).
-# The description goes into the YAML frontmatter Claude Code reads
-# for skill discovery; the body is everything below the frontmatter.
+# skill id -> (frontmatter description, body) live in DEFAULT_SKILLS.
 SKILL_BODY_READ_PUFFO_HISTORY = """\
 # Skill: read_puffo_history
 
