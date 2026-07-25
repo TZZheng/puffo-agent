@@ -561,13 +561,8 @@ class MessageStore:
         self, channel_id: str, limit: int = 20,
     ) -> list[StoredMessage]:
         """Active sticky-notes in ``channel_id`` — one per thread (the
-        newest ``/note`` message keyed by thread root), newest-first.
-
-        A note is a ``/note``-prefixed message describing a thread's
-        status; the latest per thread is the one in effect, so this
-        collapses each thread to its head note. Raises ``DataNotFound``
-        for an unknown channel (same rationale as ``get_channel_roots``).
-        """
+        newest ``/note`` keyed by thread root), newest-first. Raises
+        ``DataNotFound`` for an unknown channel."""
         if not await self.channel_exists(channel_id):
             raise DataNotFound(f"channel not found: {channel_id}")
         db = await self._ensure_db()
