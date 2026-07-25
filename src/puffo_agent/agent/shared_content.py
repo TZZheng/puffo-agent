@@ -1040,15 +1040,29 @@ it done?".
 
 ## The three presets
 
-- **waiting** (pink) — the thread is blocked on someone. Pass
-  `mentions=[<slug>, ...]` = who needs to act, and `message` = what
-  they need to do. **This is the only preset that takes mentions.**
-- **processing** (yellow) — you're working on it. A self-report: the
-  mention is you, and **passing `mentions` is rejected**. `message` =
-  the current step.
-- **complete** (green) — the work is done. A self-report: the mention
-  is you, and **passing `mentions` is rejected**. `message` = the
-  delivery summary.
+A thread is work passing between people; the note tracks who holds
+the ball.
+
+- **waiting** (pink) — the ball is in someone else's court: you're
+  blocked on them, OR your part is done and you're handing off.
+  `mentions=[<slug>, ...]` = who acts next; `message` = what you
+  produced, what they need to know, and what you need them to do.
+  **This is the only preset that takes mentions.**
+- **processing** (yellow) — you hold the ball. Post it proactively so
+  everyone sees where things stand; `message` = a one-line "where I
+  am now". A self-report: the mention is you, and **passing
+  `mentions` is rejected**.
+- **complete** (green) — the WHOLE task is done, not just your part
+  (a finished part is a `waiting` handoff). Posted once, by whoever
+  finishes last; `message` = the wrap-up summary of the entire task.
+  A self-report: the mention is you, and **passing `mentions` is
+  rejected**.
+
+## When a note mentions you
+
+A `waiting` note mentioning you is a handoff: read its message, work
+out your part, and start. Post `processing` if you want the room to
+know you've picked it up.
 
 ## Custom color
 
@@ -1065,11 +1079,12 @@ none of Waiting / Processing / Complete fits.
    note so they can see you picked it up:
    `add_note(root_id=<the ask's root>, preset="processing",
    message="on it — pulling the logs")`.
-2. You get blocked on someone else → flip to `waiting` and mention
-   them: `add_note(root_id=..., preset="waiting",
-   message="need the prod token to finish", mentions=["alice-1a2b"])`.
-3. You finish → `add_note(root_id=..., preset="complete",
-   message="done — deployed to beta, PR #428")`.
+2. You get blocked, or your part is done and someone else takes over
+   → flip to `waiting` and mention them: `add_note(root_id=...,
+   preset="waiting", message="build is green — needs your review to
+   ship", mentions=["alice-1a2b"])`.
+3. The whole ask is delivered → `add_note(root_id=...,
+   preset="complete", message="done — deployed to beta, PR #428")`.
 
 Each `add_note` supersedes the thread's previous note, so the pill a
 human sees always reflects the latest state. You don't delete old
