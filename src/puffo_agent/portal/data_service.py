@@ -197,7 +197,10 @@ async def list_dm_history(request: web.Request) -> web.Response:
     if store is None:
         return web.json_response({"error": "agent db not found"}, status=404)
     try:
-        msgs = await store.get_dm_history(peer, limit, before)
+        since = request.query.get("since") or None
+        msgs = await store.get_dm_history(
+            peer, limit, before, since_envelope_id=since,
+        )
     except Exception as exc:
         logger.exception(
             "data-service: get_dm_history failed (agent=%s peer=%s)",

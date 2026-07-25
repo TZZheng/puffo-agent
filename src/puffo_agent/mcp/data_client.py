@@ -153,7 +153,11 @@ class DataClient:
             return []
 
     async def get_dm_history(
-        self, peer_slug: str, limit: int = 20, before: int | None = None,
+        self,
+        peer_slug: str,
+        limit: int = 20,
+        before: int | None = None,
+        since_envelope_id: str | None = None,
     ) -> list[StoredMessageDict]:
         """Recent DM messages exchanged with ``peer_slug``, oldest first.
         ``before`` is an exclusive ms-epoch upper bound for paging."""
@@ -164,6 +168,8 @@ class DataClient:
         params = {"peer": peer_slug, "limit": str(limit)}
         if before is not None:
             params["before"] = str(before)
+        if since_envelope_id:
+            params["since"] = since_envelope_id
         session = await self._get_session()
         try:
             async with session.get(

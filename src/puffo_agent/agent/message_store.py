@@ -358,23 +358,24 @@ class MessageStore:
         peer_slug: str,
         limit: int = 50,
         before: int | None = None,
+        since_envelope_id: str | None = None,
     ) -> list[StoredMessage]:
         db = await self._ensure_db()
+        since_ts = await self._resolve_since_sent_at(since_envelope_id)
+        sql = """SELECT * FROM messages
+                 WHERE envelope_kind = 'dm'
+                   AND (sender_slug = ? OR recipient_slug = ?)"""
+        params: list = [peer_slug, peer_slug]
         if before is not None:
-            sql = """SELECT * FROM messages
-                     WHERE envelope_kind = 'dm'
-                       AND (sender_slug = ? OR recipient_slug = ?)
-                       AND sent_at < ?
-                     ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"""
-            params: tuple = (peer_slug, peer_slug, before, limit)
-        else:
-            sql = """SELECT * FROM messages
-                     WHERE envelope_kind = 'dm'
-                       AND (sender_slug = ? OR recipient_slug = ?)
-                     ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"""
-            params = (peer_slug, peer_slug, limit)
+            sql += " AND sent_at < ?"
+            params.append(before)
+        if since_ts is not None:
+            sql += " AND sent_at > ?"
+            params.append(since_ts)
+        sql += " ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"
+        params.append(limit)
 
-        async with db.execute(sql, params) as cursor:
+        async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
         return [self._row_to_msg(r) for r in reversed(rows)]
 

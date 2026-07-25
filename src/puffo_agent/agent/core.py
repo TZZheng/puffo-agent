@@ -474,6 +474,8 @@ class PuffoAgent:
         if channel_id:
             lines.append("- channel: " + (channel_name or channel_id))
             lines.append(f"- channel_id: {channel_id}")
+        else:
+            lines.append("- direct_message: true")
         # thread_root_id is the root post id to pass as send_message's
         # root_id. For a top-level post the root is the post itself.
         thread_root = root_id or post_id

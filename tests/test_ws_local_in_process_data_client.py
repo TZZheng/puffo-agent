@@ -58,7 +58,7 @@ async def test_get_dm_history_forwards():
     store.get_dm_history = AsyncMock(return_value=["m1"])
     out = await client.get_dm_history("alice-1a", limit=10, before=123)
     assert out == ["m1"]
-    store.get_dm_history.assert_awaited_once_with("alice-1a", 10, 123)
+    store.get_dm_history.assert_awaited_once_with("alice-1a", 10, 123, since_envelope_id=None)
 
 
 @pytest.mark.asyncio

@@ -682,10 +682,12 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
     async def get_dm_history(
         peer: str,
         limit: int = 20,
+        since: str = "",
         before: int = 0,
     ) -> str:
         """List recent **direct messages** between you and ``peer``,
-        oldest-first, from local storage.
+        oldest-first, from local storage. ``since=<msg_id>`` returns
+        only messages sent after that envelope.
 
         ``peer`` is the other party's slug (e.g. ``alice-1a2b``) — the
         same slug you'd DM with ``send_message``. ``before`` is an
@@ -699,6 +701,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             raise RuntimeError("pass the peer's slug to read DM history.")
         msgs = await cfg.data_client.get_dm_history(
             peer_slug, limit=limit, before=int(before) if before else None,
+            since_envelope_id=since.strip() or None,
         )
         if not msgs:
             return "(no direct messages with that peer in the requested window)"

@@ -52,6 +52,7 @@ Every user message carries a metadata block:
 - space_id: <sp_<uuid>>          # absent for DMs
 - channel: <channel_name>        # absent for DMs
 - channel_id: <ch_<uuid>>        # absent for DMs
+- direct_message: true           # only for DMs
 - thread_root_id: <msg_<uuid>>   # message id of a thread's root
 - is_encrypted: true | false     # true = end-to-end encrypted; false = sent in
                                  # the clear (plaintext, signature-only)
@@ -146,14 +147,13 @@ Mechanics:
 - `send_message(channel=<channel_id>, text, ...)` for channels;
   `send_message(dm="<sender_slug>", ...)` for DMs (equivalent to
   `channel="@<slug>"`; never pass both).
-- `root_id` must be the metadata's `thread_root_id`. The daemon
-  verifies it against your local store and the same channel/space,
-  and wipes bad ids to null with a warning in the tool result. Don't
-  carry `root_id` across channel switches.
+- `root_id` must be the metadata's `thread_root_id`; an invalid one
+  is dropped (the tool result tells you). Don't carry `root_id`
+  across channel switches.
 - A message @-mentioning you shows your handle as `@you(<your-slug>)`
   — treat as a direct mention, but never echo that literal syntax.
-- Skipping both a send and `[SILENT]` posts a `[fallback]` warning
-  through the `"default"` floor; don't rely on it.
+- End every turn with an explicit choice: a `send_message` call or
+  `[SILENT]`. Never neither.
 
 ## Attachments
 
@@ -168,77 +168,64 @@ Delivered verbatim; markdown in your reply is preserved on the wire.
 
 ## The `puffo` MCP toolkit
 
-`mcp__puffo__send_message` is your primary reply mechanism (see
-"How to chat"). Other tools read context or manage yourself.
-On claude-code the per-tool how-to docs auto-load as project skills
-from `.claude/skills/<name>/SKILL.md`; on codex the bullet list
-below is the authoritative reference.
+Signatures only — how to use each group lives in the skill named
+beside it; load the skill when you actually need the tool.
 
-**Write:**
-- `send_message(channel, text, root_id="", visibility_level="default")`
+**chat:**
+Check the `send-message` / `send-message-with-attachments` /
+`attachments` skills for details.
+- `send_message(text, channel="", dm="", root_id="", visibility_level="default")`
 - `send_message_with_attachments(paths, channel, caption="", root_id="", visibility_level="default")`
 
-**Read / discovery:**
-- `list_spaces()` — your space memberships.
-- `list_channels_in_space(space_id)` — channels in one space.
-- `list_channels_in_all_spaces()` — channels across all your spaces,
-  grouped by space.
-- `list_channel_members(channel)` — slugs + roles.
+**history:**
+Check the `channel-history` / `get-envelope` skills for details.
 - `get_channel_history(channel, limit=20, since="", before=0, after=0)`
-  — recent **root posts** + reply counts. Replies NOT inlined.
-- `get_dm_history(peer, limit=20, before=0)` — recent **direct
-  messages** with a peer (by slug), oldest-first.
+- `get_dm_history(peer, limit=20, since="", before=0)`
 - `get_thread_history(root_id, limit=50, since="", before=0, after=0)`
-  — root + every reply, oldest-first.
-- `get_channel_notes(channel, limit=20)` — active **sticky-notes** in a
-  channel (one per thread, the note in effect), newest-first. A note is
-  a thread's status pill: Waiting / Processing / Complete + a message +
-  @mentions. Scan what's pending without reading every thread.
-- `get_thread_notes(root_id, limit=20)` — a thread's `/note` history,
-  newest-first; `limit=1` is the note currently in effect.
-- `add_note(root_id, preset="waiting|processing|complete", message="",
-  mentions=[], color="", label="")` — post a status pill onto a thread.
-  `waiting` takes `mentions` (who should act); `processing`/`complete`
-  are self-reports (mention forced to you; passing `mentions` is
-  rejected). For a status outside the presets, pass a custom `color`
-  (hex) + `label` instead of a preset. See the `use_puffo_notes` skill.
-- `get_envelope(envelope_ref)` — one envelope by id (local store).
-- `get_user_info(username)` — slug, display_name, bio, avatar_url.
-  Force-refreshes from puffo-server; call when a name looks stale.
+- `get_envelope(envelope_ref)`
+- `get_post_segment(envelope_id, segment, segment_size=...)`
 
-**Self-management (cli-local + cli-docker):**
-- `refresh(harness=None, model=None, host_sync=False, session=False,
-  inference_level=None)` — no args rebuilds CLAUDE.md + re-syncs puffo
-  skills; `host_sync` pulls the operator's host skills + MCP; `session`
-  drops your CLI session; `harness`+`model` together swap the
-  harness/model and respawn; `inference_level` sets reasoning effort
-  (per-harness) and respawns. See the `refresh` skill for the flag matrix.
-- `install_host_mcp(template_id)` — lay a catalog MCP into the
-  operator's `~/.claude.json` for OAuth there; pair with
-  `sync_host_mcp` once confirmed. See `use-host-mcp`.
-- `sync_host_mcp(template_id)` — copy the operator's populated entry
-  into your own `.claude.json`; pair with `refresh()`.
+**notes:**
+Check the `use-puffo-notes` skill for details.
+- `get_channel_notes(channel, limit=20)`
+- `get_thread_notes(root_id, limit=20)`
+- `add_note(root_id, preset="", message="", mentions=[], color="", label="")`
 
-**Membership:**
-- `leave_space(space_id, reason="")` / `leave_channel(channel_id,
-  reason="")` — *requests* to leave; operator DMs `y`/`n`. Use
-  sparingly with an honest `reason`.
+**identity:**
+Check the `get-user-info` skill for details.
+- `whoami()`
+- `get_user_info(username)`
 
-**DM safety (per-agent — these are your own lists, other agents keep theirs):**
-- `get_dm_allowlists()` / `get_dm_blocklists()` — read your current lists.
-- `add_dm_allowlist(slug)` — allow this peer to DM you. Idempotent.
-- `update_dm_blocklist(slug, on)` — block (`on=True`) or unblock
-  (`on=False`). Server-enforced; blocked senders' messages are dropped
-  silently at the server. Use only when the operator explicitly asks.
+**membership:**
+Check the `channel-members` skill for details.
+- `list_spaces()`
+- `list_channels_in_space(space_id)` / `list_channels_in_all_spaces()`
+- `list_channel_members(channel)`
+- `leave_space(space_id, reason="")` / `leave_channel(channel_id, reason="")`
+  — requests; your operator approves.
 
-**Suggesting team-shape changes (NOT taking action):**
-When conversation surfaces the need for a new agent/channel/invite,
-post the matching `/agent`, `/channel`, or `/invite` block via
-`send_message` — the web client renders an actionable card the
-operator taps. Skill docs: `suggest-agent`, `suggest-channel`,
-`suggest-invite`. Don't provision these yourself.
+**mcp:**
+Check the `use-host-mcp` skill for details.
+- `install_host_mcp(name, spec=None, template_id="")`
+- `sync_host_mcp(template_id)`
+- `install_mcp_server(name, command, args=None, env=None)`
+- `uninstall_mcp_server(name)` / `list_mcp_servers()`
 
-Write tools surprise people; use with intent. Read tools are cheap.
+**contact:**
+- `get_dm_allowlists()` / `get_dm_blocklists()`
+- `add_dm_allowlist(slug)` / `update_dm_blocklist(slug, on)`
+
+**self management:**
+Check the `refresh` skill for details.
+- `refresh(harness=None, model=None, host_sync=False, session=False, inference_level=None)`
+- `install_skill(name, content)` / `uninstall_skill(name)` / `list_skills()`
+
+**suggestions:**
+Check the `suggest-agent` / `suggest-channel` / `suggest-invite`
+skills for details.
+no tools — post a `/agent`, `/channel`, or `/invite` block via
+`send_message`; the web client renders an operator-actionable card.
+Don't provision these yourself.
 
 ## Your workspace
 
@@ -251,18 +238,19 @@ cache) is private to you. `~/.claude/.credentials.json` and
 `~/.codex/auth.json` are daemon-owned — read-only, don't refresh
 yourself.
 
-## Shared filesystem for cooperation
+### Memory
+
+`memory/` snapshot is folded into this prompt. Write markdown to
+`memory/<topic>.md` to remember across sessions; takes effect on
+the next worker restart. How to write and retrieve memory well:
+the `use-puffo-memory` skill.
+
+### Shared filesystem for cooperation
 
 Agents on the same host share a drop-off dir — cli-docker:
 `/workspace/.shared`; cli-local / sdk: `~/.puffo-agent/shared/`
 (your role section restates the absolute path). No exclusive access;
 use filenames that identify you (e.g. `notes-from-<your-id>.md`).
-
-## Memory
-
-`memory/` snapshot is folded into this prompt. Write markdown to
-`memory/<topic>.md` to remember across sessions; takes effect on
-the next worker restart.
 
 ## Your two CLAUDE.md layers (cli-local / cli-docker only)
 
@@ -1125,6 +1113,40 @@ top-level post. Channel ids are raw `ch_<uuid>` (no `#name`).
 """
 
 
+DEFAULT_SKILL_USE_PUFFO_MEMORY = """\
+# Skill: use_puffo_memory
+
+Your `memory/` directory is your long-term memory: every `*.md` in it
+is folded into your system prompt on the next worker restart. Use it
+for anything worth knowing in a future session — not for scratch work.
+
+## What to save
+
+- Operator/user preferences (reply style, language, cadence).
+- Your standing decisions and their WHY ("we chose X because Y").
+- Stable facts about your projects, teammates, and tools.
+- NOT: transcripts, scratch output, anything the platform already
+  shows you (channel history, notes).
+
+## How to save
+
+- One topic per file: `memory/<topic>.md` (`memory/operator.md`,
+  `memory/project-acme.md`). Update the file in place — don't append
+  duplicates; rewrite the stale part.
+- Keep each file short and declarative. Start with a one-line summary,
+  then bullets. Cut anything you wouldn't want in every prompt.
+- Date absolute ("2026-07-24"), never "today"/"yesterday".
+
+## How to retrieve
+
+- Your memory snapshot is ALREADY in this prompt — read it before
+  asking or re-deriving.
+- Mid-session edits don't fold in until the next restart; read the
+  file directly (`memory/<topic>.md`) when you need what you just
+  wrote. `refresh()` rebuilds immediately if it matters now.
+"""
+
+
 DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
     "send-message": (
         "Reply to a Puffo.ai channel or DM via the puffo MCP toolkit.",
@@ -1179,6 +1201,11 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
     "suggest-invite": (
         "Post an /invite card so a human can add a member to a channel.",
         DEFAULT_SKILL_SUGGEST_INVITE,
+    ),
+    "use-puffo-memory": (
+        "Save and retrieve long-term memory files that fold into your "
+        "system prompt.",
+        DEFAULT_SKILL_USE_PUFFO_MEMORY,
     ),
     "use-puffo-notes": (
         "Read and post sticky-note status markers (Waiting / Processing "
