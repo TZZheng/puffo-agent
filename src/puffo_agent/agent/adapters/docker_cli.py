@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 
 from ...mcp.config import (
+    INFERENCE_LEVELS,
     write_cli_mcp_config,
 )
 from .hermes_helpers import (
@@ -148,6 +149,7 @@ class DockerCLIAdapter(Adapter):
         agent_home_dir: str,
         shared_fs_dir: str,
         owner_username: str = "",
+        inference_level: str = "",
         harness=None,
         google_api_key: str = "",
         memory_limit: str = "",
@@ -174,6 +176,7 @@ class DockerCLIAdapter(Adapter):
         # isolation.
         self.shared_fs_dir = Path(shared_fs_dir)
         self.owner_username = owner_username
+        self.inference_level = inference_level
         # Only used when harness is gemini-cli (passed via
         # ``docker exec -e GEMINI_API_KEY=...``).
         self.google_api_key = google_api_key
@@ -713,6 +716,16 @@ class DockerCLIAdapter(Adapter):
         ])
         if self.model:
             cmd.extend(["--model", self.model])
+        if self.inference_level:
+            if self.inference_level in INFERENCE_LEVELS:
+                cmd.extend(["--effort", self.inference_level])
+            else:
+                logger.warning(
+                    "agent %s: ignoring inference_level %r for claude-code "
+                    "(expected one of %s)",
+                    self.agent_id, self.inference_level,
+                    ", ".join(INFERENCE_LEVELS),
+                )
         cmd.extend(extra_args)
         return cmd
 
@@ -856,10 +869,10 @@ class DockerCLIAdapter(Adapter):
                 )
             for name, cmd in unreachable:
                 logger.warning(
-                    "agent %s: host MCP %r command %r looks host-local and "
-                    "won't resolve inside the container. Install the "
-                    "binary in the image or bind-mount it explicitly, "
-                    "otherwise this MCP will fail on first use.",
+                    "agent %s: host MCP %r has host-local path %r that won't "
+                    "resolve inside the container — SKIPPED (not injected). "
+                    "Install the binary in the image or bind-mount it, then "
+                    "re-sync, to make this MCP available.",
                     self.agent_id, name, cmd,
                 )
             # Plugins: the actual plugin tree is bind-mounted read-
@@ -913,10 +926,10 @@ class DockerCLIAdapter(Adapter):
                 )
             for name, cmd in gemini_unreachable:
                 logger.warning(
-                    "agent %s: host gemini MCP %r command %r looks "
-                    "host-local and won't resolve inside the container. "
-                    "Install the binary in the image or bind-mount it, "
-                    "otherwise the MCP will fail on first use.",
+                    "agent %s: host gemini MCP %r has host-local path %r "
+                    "that won't resolve inside the container — SKIPPED. "
+                    "Install the binary in the image or bind-mount it, then "
+                    "re-sync, to make this MCP available.",
                     self.agent_id, name, cmd,
                 )
 

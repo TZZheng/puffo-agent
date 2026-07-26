@@ -117,22 +117,17 @@ def encrypt_message(
     return envelope
 
 
-def encrypt_message_with_content_key(
+def _build_signed_payload(
     inp: EncryptInput,
     signing_key: Ed25519KeyPair,
-    *,
-    now_ms: int | None = None,
-) -> tuple[dict, bytes]:
-    """Like ``encrypt_message`` but exposes ``content_key`` so the
-    caller can supplement later via ``build_supplementation_envelope``."""
-    if not inp.recipients:
-        raise ValueError("no recipients")
-
+    now_ms: int | None,
+) -> tuple[str, int, dict]:
+    """Shared by the E2EE and plaintext producers so the payload shape
+    and signature input can't drift between the two send modes."""
     # EnvelopeId MUST be ``msg_<UUID>`` — server's prefix validator
     # rejects anything else before crypto runs.
     envelope_id = f"msg_{uuid.uuid4()}"
     message_nonce = base64url_encode(os.urandom(16))
-
     if now_ms is None:
         now_ms = _now_ms()
 
@@ -154,15 +149,45 @@ def encrypt_message_with_content_key(
         content=inp.content,
         is_visible_to_human=inp.is_visible_to_human,
     )
-
     payload_dict = payload.to_payload_dict()
     canonical = canonicalize_for_signing(payload_dict)
     sig = signing_key.sign(canonical)
-
     signed = {
         "payload": payload_dict,
         "signature": base64url_encode(sig),
     }
+    return envelope_id, now_ms, signed
+
+
+def build_plaintext_message(
+    inp: EncryptInput,
+    signing_key: Ed25519KeyPair,
+    *,
+    now_ms: int | None = None,
+) -> dict:
+    """Non-E2EE producer: the signed payload rides in the clear; no
+    recipient devices involved. ``inp.recipients`` is ignored."""
+    envelope_id, _, signed = _build_signed_payload(inp, signing_key, now_ms)
+    return {
+        "type": "plaintext_message_envelope",
+        "version": 1,
+        "envelope_id": envelope_id,
+        "signed_payload": signed,
+    }
+
+
+def encrypt_message_with_content_key(
+    inp: EncryptInput,
+    signing_key: Ed25519KeyPair,
+    *,
+    now_ms: int | None = None,
+) -> tuple[dict, bytes]:
+    """Like ``encrypt_message`` but exposes ``content_key`` so the
+    caller can supplement later via ``build_supplementation_envelope``."""
+    if not inp.recipients:
+        raise ValueError("no recipients")
+
+    envelope_id, now_ms, signed = _build_signed_payload(inp, signing_key, now_ms)
     plaintext = json.dumps(signed, separators=(",", ":")).encode()
 
     content_key = generate_content_key()
@@ -299,6 +324,32 @@ def decrypt_message(
     if payload_dict.get("sender_slug") != envelope["sender_slug"]:
         raise ValueError("sender_slug mismatch")
 
+    return _message_payload_from_dict(payload_dict, envelope_id)
+
+
+def read_plaintext_message(
+    envelope: dict,
+    sender_public_key: bytes,
+) -> MessagePayload:
+    """Verify a non-E2EE ``plaintext_message_envelope`` and return its payload.
+
+    No HPKE/AEAD — the signature covers the canonicalized ``payload`` as in
+    the E2EE path. There's no outer envelope, so the payload's own
+    ``sender_slug`` is authoritative (no cross-check).
+    """
+    envelope_id = envelope["envelope_id"]
+    signed = envelope["signed_payload"]
+    payload_dict = signed["payload"]
+    sig_bytes = base64url_decode(signed["signature"])
+
+    canonical = canonicalize_for_signing(payload_dict)
+    if not ed25519_verify(sender_public_key, canonical, sig_bytes):
+        raise ValueError("signature verification failed")
+
+    return _message_payload_from_dict(payload_dict, envelope_id)
+
+
+def _message_payload_from_dict(payload_dict: dict, envelope_id: str) -> MessagePayload:
     return MessagePayload(
         payload_type=payload_dict["type"],
         version=payload_dict["version"],

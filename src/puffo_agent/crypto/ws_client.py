@@ -57,6 +57,8 @@ class PuffoCoreWsClient:
         self.on_message: MessageHandler | None = None
         self.on_event: EventHandler | None = None
         self.on_cert_update: CertHandler | None = None
+        # Fires after every (re)connect handshake, before catch-up.
+        self.on_connect: Callable[[], Coroutine[Any, Any, None]] | None = None
 
     def _build_connect_frame(self) -> str:
         sess = self.keystore.load_session(self.slug)
@@ -103,21 +105,38 @@ class PuffoCoreWsClient:
             )
             if not messages:
                 return
+            # HTTP, not WS-frame (no pong until the listen loop → WS dies
+            # mid-catch-up); chunked so progress survives a death.
             envelope_ids = []
             for item in messages:
                 envelope = item.get("envelope", item)
+                skip_ack = False
                 if self.on_message:
                     try:
-                        await self.on_message(envelope)
+                        # False = hold un-acked until the operator decides.
+                        skip_ack = await self.on_message(envelope) is False
                     except Exception:
                         logger.exception("on_message callback failed during catch-up")
                 eid = envelope.get("envelope_id")
-                if eid:
+                if eid and not skip_ack:
                     envelope_ids.append(eid)
-            if envelope_ids and self._ws:
-                await self._send_ack(envelope_ids)
+                if len(envelope_ids) >= 25:
+                    await self._ack_http(envelope_ids)
+                    envelope_ids = []
+            if envelope_ids:
+                await self._ack_http(envelope_ids)
         except Exception:
             logger.exception("Catch-up failed")
+
+    async def _ack_http(self, envelope_ids: list[str]) -> None:
+        try:
+            await self.http_client.post(
+                "/messages/ack", {"envelope_ids": list(envelope_ids)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "catch-up HTTP ack failed (%d ids): %s", len(envelope_ids), exc,
+            )
 
     async def _send_ack(self, envelope_ids: list[str]) -> None:
         if self._ws:
@@ -135,13 +154,15 @@ class PuffoCoreWsClient:
 
         elif msg_type == "message":
             envelope = msg.get("envelope", {})
+            skip_ack = False
             if self.on_message:
                 try:
-                    await self.on_message(envelope)
+                    # False = hold un-acked (gated foreign DM stays pending).
+                    skip_ack = await self.on_message(envelope) is False
                 except Exception:
                     logger.exception("on_message callback failed")
             eid = envelope.get("envelope_id")
-            if eid:
+            if eid and not skip_ack:
                 await self._send_ack([eid])
 
         elif msg_type == "cert_update":
@@ -168,6 +189,11 @@ class PuffoCoreWsClient:
             self._ws = ws
             self.session_id = await self._handshake(ws)
             logger.info("[%s] WS connected, session=%s", self.slug, self.session_id)
+            if self.on_connect:
+                try:
+                    await self.on_connect()
+                except Exception:
+                    logger.exception("on_connect callback failed")
             await self._catchup()
             await self._listen_loop()
 
