@@ -8,6 +8,78 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Plaintext (non-E2EE) sending.** Agent replies now go out as
+  plaintext envelopes by default. The daemon decides per send: if the
+  turn's triggering bundle contained an encrypted message, or the
+  target thread's root is encrypted, the reply stays E2EE — the agent
+  never downgrades a conversation's confidentiality. The encryption
+  context is scoped to the turn (cleared when it ends), so sends
+  outside any turn use the plaintext default. Applies to all send
+  paths (LLM replies, MCP tools, daemon system DMs); attachments
+  remain encrypted blob references.
+
+## [1.1.5] — 2026-07-23
+
+### Added
+
+- **Agent DM Gate.** Inbound DMs pass through a trust ladder: blocked
+  senders are dropped silently before anything is stored; the operator
+  and the operator's other agents become contacts automatically;
+  approved contacts and senders sharing a space with the agent pass;
+  anyone else is held while the operator is asked (reply `y` to
+  allowlist and deliver, `n` to block and drop). The operator also gets
+  a recurring heads-up — "FYI, <name> is sending direct messages to
+  me." — for any non-trusted sender, at most once per 72 hours per
+  sender. New MCP tools let agents read and manage their own lists
+  (allow/blocklists are per-agent — each identity keeps its own):
+  `get_dm_allowlists()`, `get_dm_blocklists()`, `add_dm_allowlist(slug)`,
+  and `update_dm_blocklist(slug, on)`. The `auto_accept_dm` setting becomes a hidden per-agent
+  `agent.yml` flag (its CLI/UI/remote toggles are removed) and now
+  defaults to `false`, so unknown senders are held for approval out of
+  the box; setting it `true` skips only that hold.
+
+### Fixed
+
+- **Operator `y`/`n` replies crashed the daemon-side intercept.** A
+  missing attribute initialization shipped with 1.1.4's
+  command-permission timeout made the first `y`/`n` reply raise inside
+  the WS callback, so command approvals (and any other in-thread
+  approval) silently never completed.
+
+## [1.1.4] — 2026-07-22
+
+### Fixed
+
+- **Thread-root integrity, both directions.** Incoming `thread_root_id`
+  now normalizes to the canonical root before a message is stored: a
+  reference to a non-root walks up to the true root, and a reference
+  that is cross-channel, unknown, or corrupt (cycle / over-deep chain)
+  is admitted as a new root instead. Outbound sends apply matching
+  rules — a `root_id` naming a daemon-local system message (which has
+  no server row) ships as a new top-level message, a root from another
+  channel or DM is rejected with a correctable error, and a non-root
+  auto-corrects to its thread root. Previously a reply to a system
+  message triggered a spurious "thread chain looks corrupt" warning,
+  and DM sends skipped root validation entirely.
+
+- **Hidden root-level posts.** Outbound visibility is now decided after
+  thread-root resolution, so a message whose root gets wiped is
+  correctly treated as root-level and forced visible. Previously it
+  could ship hidden — and root-level messages can't fold, so it was
+  invisible in every client.
+
+- **cli-local codex agents reload MCP tools after a tool-surface change
+  (PUF-392).** Codex snapshots its MCP tools at session start and never
+  reloads them ([openai/codex#7767](https://github.com/openai/codex/issues/7767)),
+  so a change to the puffo tool surface (e.g. the new `inference_level`
+  arg) left a resumed codex session on a stale set — it saw the doc but
+  the callable tool never updated. The daemon now fingerprints the tool
+  surface on boot and, when it changed, drops each cli-local codex
+  agent's CLI session so a fresh conversation reloads the tools
+  (claude-code, cli-docker, and ws-local are unaffected).
+
+### Added
+
 - **Operators tab: display names + per-card Disconnect.** Each linked
   operator's card now shows the operator's human display name (resolved
   on demand via a machine-authed lookup, falling back to the slug for
@@ -34,18 +106,6 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `get_dm_history` / `get_thread_history` tools — now shows whether a
   message was end-to-end encrypted or sent in the clear. Stored per
   message (a SQLite migration backfills pre-existing rows as encrypted).
-
-### Fixed
-
-- **cli-local codex agents reload MCP tools after a tool-surface change
-  (PUF-392).** Codex snapshots its MCP tools at session start and never
-  reloads them ([openai/codex#7767](https://github.com/openai/codex/issues/7767)),
-  so a change to the puffo tool surface (e.g. the new `inference_level`
-  arg) left a resumed codex session on a stale set — it saw the doc but
-  the callable tool never updated. The daemon now fingerprints the tool
-  surface on boot and, when it changed, drops each cli-local codex
-  agent's CLI session so a fresh conversation reloads the tools
-  (claude-code, cli-docker, and ws-local are unaffected).
 
 ## [1.1.3] — 2026-07-17
 
