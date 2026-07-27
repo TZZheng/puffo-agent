@@ -21,6 +21,7 @@ import os
 import shutil
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ...macos.keychain import is_macos
@@ -44,6 +45,12 @@ from ...portal.state import (
 )
 from ..cli_bin import resolve_claude_bin, resolve_codex_bin, resolve_hermes_bin
 from .base import Adapter, TurnContext, TurnResult
+from ..context_controller import (
+    ContextCapabilities,
+    ContextSnapshot,
+    ProviderAdmissionEvent,
+    normalize_context_snapshot,
+)
 from .cli_session import AuditLog, ClaudeSession
 from .codex_session import CodexSession
 from .desired_install import run_spawn_install
@@ -216,6 +223,7 @@ class LocalCLIAdapter(Adapter):
         self._hermes_home: Path | None = None
         self._hermes_mcp_registered = False
         self._hermes_audit: AuditLog | None = None
+        self._one_shot_provider_session_id: str | None = None
 
     async def run_turn(self, ctx: TurnContext) -> TurnResult:
         self._verify()
@@ -329,6 +337,67 @@ class LocalCLIAdapter(Adapter):
         if self._codex_session is not None:
             return await self._codex_session.health_probe()
         return True
+
+    def _context_delegate(self):
+        if self.harness.name() == "codex":
+            return self._ensure_codex_session()
+        if self.harness.name() == "claude-code":
+            return self._ensure_session()
+        return None
+
+    async def get_context_snapshot(self) -> ContextSnapshot:
+        delegate = self._context_delegate()
+        if delegate is not None:
+            return await delegate.get_context_snapshot()
+        return normalize_context_snapshot(
+            used_tokens=0,
+            estimated_source="hermes_unsupported_fallback_200000",
+        )
+
+    def get_context_capabilities(self) -> ContextCapabilities:
+        delegate = self._context_delegate()
+        if delegate is not None:
+            return delegate.get_context_capabilities()
+        return ContextCapabilities(
+            diagnostic="one-shot Hermes context control unsupported",
+        )
+
+    async def compact_context(self):
+        delegate = self._context_delegate()
+        return (
+            await delegate.compact_context()
+            if delegate is not None else await super().compact_context()
+        )
+
+    async def rollover_context(self):
+        delegate = self._context_delegate()
+        return (
+            await delegate.rollover_context()
+            if delegate is not None else await super().rollover_context()
+        )
+
+    def get_provider_session_id(self) -> str | None:
+        delegate = self._context_delegate()
+        if delegate is not None:
+            return delegate.get_provider_session_id()
+        if self._one_shot_provider_session_id:
+            return self._one_shot_provider_session_id
+        try:
+            persisted = json.loads(self.session_file.read_text(encoding="utf-8"))
+            return str(persisted.get("session_id") or "") or None
+        except (OSError, ValueError):
+            return None
+
+    def register_admission_callback(
+        self, callback, planning_cycle_key: str = "",
+    ) -> None:
+        delegate = self._context_delegate()
+        if delegate is not None:
+            delegate.register_admission_callback(callback, planning_cycle_key)
+        else:
+            super().register_admission_callback(callback, planning_cycle_key)
+
+    register_provider_admission_callback = register_admission_callback
 
     def _ensure_codex_session(self) -> CodexSession:
         if self._codex_session is not None:
@@ -653,6 +722,15 @@ class LocalCLIAdapter(Adapter):
             })
 
         reply, session_id, tool_calls = parse_hermes_reply(stdout_text)
+        self._one_shot_provider_session_id = session_id or None
+        if reply or session_id or tool_calls:
+            await self._fire_admission_callback(ProviderAdmissionEvent(
+                planning_cycle_key=getattr(
+                    self, "_context_admission_planning_cycle_key", "",
+                ),
+                provider_session_id=self.get_provider_session_id(),
+                admitted_at=datetime.now(timezone.utc),
+            ))
         if tool_calls:
             logger.info(
                 "agent %s: hermes turn invoked %d tool(s): %s",

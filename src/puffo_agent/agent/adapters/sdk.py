@@ -14,12 +14,19 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from ...mcp.config import (
     PUFFO_CORE_TOOL_FQNS,
 )
 from .base import Adapter, TurnContext, TurnResult, format_history_as_prompt
+from ..context_controller import (
+    ContextCapabilities,
+    ContextSnapshot,
+    ProviderAdmissionEvent,
+    normalize_context_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,10 +112,20 @@ class SDKAdapter(Adapter):
         # The SDK requires streaming-mode input (AsyncIterable) when
         # can_use_tool is set — a plain string prompt raises
         # "can_use_tool callback requires streaming mode".
+        admitted = False
         async for msg in self._query(
             prompt=_prompt_stream(format_history_as_prompt(ctx.messages)),
             options=options,
         ):
+            if not admitted:
+                admitted = True
+                await self._fire_admission_callback(ProviderAdmissionEvent(
+                    planning_cycle_key=getattr(
+                        self, "_context_admission_planning_cycle_key", "",
+                    ),
+                    provider_session_id=None,
+                    admitted_at=datetime.now(timezone.utc),
+                ))
             if isinstance(msg, self._AssistantMessage):
                 for block in msg.content:
                     if isinstance(block, self._TextBlock):
@@ -142,6 +159,17 @@ class SDKAdapter(Adapter):
                 "send_message_targets": send_message_targets,
                 "assistant_text_parts": list(reply_parts),
             },
+        )
+
+    async def get_context_snapshot(self) -> ContextSnapshot:
+        return normalize_context_snapshot(
+            used_tokens=0,
+            estimated_source="sdk_stateless_fallback_200000",
+        )
+
+    def get_context_capabilities(self) -> ContextCapabilities:
+        return ContextCapabilities(
+            diagnostic="SDK adapter is stateless; context control unsupported",
         )
 
     async def _gate(self, tool_name: str, tool_input: dict, context: Any) -> dict:
