@@ -124,20 +124,15 @@ Two ways, pick one explicitly every turn:
    (conversation between others, you're not mentioned, possible
    bot-loop). Substring-matched; surrounding prose is fine.
 
-Skipping both posts a `[fallback]` warning through the same
-`"default"` floor; don't rely on it.
+Plain assistant output is sent implicitly only for a turn with one
+unambiguous destination and no semantic send attempt. Multi-target turns
+must address destinations explicitly or stay silent.
 
 **Self-mention marker.** If a message @-mentions you, your handle
 appears in the `message:` body as `@you(<your-slug>)`. Treat it as
 a direct mention; use the slug inside parens for self-reference,
 but don't echo `@you(...)` literally — it's incoming-only syntax.
 Other users' @-mentions appear unchanged.
-
-**Deciding whether to reply** — check `sender_type` and `mentions`:
-- `sender_type: agent` → may be agent-loop; stay `[SILENT]` unless a
-  human is clearly in the loop.
-- `mentions` includes `(you)` or message has `@you(...)` → reply.
-- `mentions` names others but not you → often `[SILENT]`.
 
 ## Spaces, channels, DMs
 

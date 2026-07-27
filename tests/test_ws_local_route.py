@@ -93,6 +93,9 @@ class FakeCfg:
     def resolve_profile_path(self):
         return "/nonexistent/profile.md"  # OSError → empty profile_md branch
 
+    def resolve_workspace_dir(self):
+        return "/tmp/puffo-ws-local-test"
+
 
 @pytest.mark.asyncio
 async def test_full_attach_flow(monkeypatch):
@@ -155,3 +158,132 @@ async def test_unservable_slug_rejected(monkeypatch):
     await serve_attached(t, hub)
     errors = t.by_type("error")
     assert errors and "not a ws-local agent" in errors[0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_v2_receipt_to_global_bundle_admitted_end_and_owned_runtime_cleanup(
+    monkeypatch, tmp_path,
+):
+    from puffo_agent.agent.message_store import (
+        MessageStore,
+        ProcessingState,
+        ReceiptDisposition,
+    )
+    import puffo_agent.agent.send_coordinator as coordinator_mod
+
+    store = MessageStore(tmp_path / "messages.db")
+    await store.open()
+
+    class Coordinator:
+        def __init__(self, **kwargs):
+            self.provider_session_id = None
+            self.held_recovery_source = kwargs["held_recovery_source"]
+
+        async def send(self, *_args, **_kwargs):
+            return {"state": "failed"}
+
+    monkeypatch.setattr(coordinator_mod, "SendCoordinator", Coordinator)
+    monkeypatch.setattr(route_mod, "_build_tool_dispatch", lambda _point: {})
+
+    class V2Client:
+        def __init__(self):
+            self.slug = "puffotest"
+            self.device_id = "dev"
+            self.keystore = object()
+            self.http = object()
+            self.store = store
+            self.space_id = None
+            self.workspace = str(tmp_path)
+            self.global_runtime = None
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def listen(self, _on_message):
+            await self.store.store_receipt(
+                {
+                    "envelope_id": "global-one",
+                    "envelope_kind": "channel",
+                    "sender_slug": "alice",
+                    "space_id": "sp",
+                    "channel_id": "ch",
+                    "content": "hello",
+                    "content_type": "text/plain",
+                    "sent_at": 1,
+                },
+                server_seq=1,
+                disposition=ReceiptDisposition.ELIGIBLE,
+                reason="test receipt",
+            )
+            self.global_runtime.notify()
+            self.started.set()
+            await self.release.wait()
+
+        def set_profile(self, *_args, **_kwargs):
+            return None
+
+    class V2Cfg(FakeCfg):
+        def resolve_workspace_dir(self):
+            return tmp_path
+
+    client = V2Client()
+    reporter = FakeReporter()
+    hub = WsLocalHub()
+    hub.register(AttachPoint(
+        slug="puffotest",
+        agent_id="puffotest-1",
+        agent_cfg=V2Cfg(),
+        client=client,
+        reporter=reporter,
+        ack_timeout_s=180,
+        ping_interval_s=30,
+    ))
+    monkeypatch.setattr(
+        route_mod,
+        "authenticate_bundle",
+        lambda _blob, _pw: AuthedAgent(
+            "puffotest-1", "puffotest", "Puffo Test",
+        ),
+    )
+    transport = FakeTransport()
+    transport.feed({
+        "type": "connect",
+        "bundle": "Yg==",
+        "password": "pw",
+        "capabilities": ["multi-target-v2", "explicit-admission-v2"],
+    })
+    served = asyncio.create_task(serve_attached(transport, hub))
+    await asyncio.wait_for(client.started.wait(), 1)
+    for _ in range(30):
+        bundles = transport.by_type("bundle")
+        if bundles:
+            break
+        await asyncio.sleep(0.02)
+    bundle = transport.by_type("bundle")[0]
+    assert bundle["turn_id"]
+    transport.feed({"type": "ack", "bundle_id": bundle["bundle_id"]})
+    await asyncio.sleep(0)
+    assert [row.envelope_id for row in await store.get_pending()] == ["global-one"]
+    transport.feed({
+        "type": "admitted",
+        "version": 2,
+        "bundle_id": bundle["bundle_id"],
+        "turn_id": bundle["turn_id"],
+    })
+    for _ in range(20):
+        run = await store.get_turn_run(bundle["turn_id"])
+        if run is not None and run.state == ProcessingState.IN_TURN.value:
+            break
+        await asyncio.sleep(0.01)
+    assert run.state == ProcessingState.IN_TURN.value
+    transport.feed({"type": "end", "bundle_id": bundle["bundle_id"]})
+    for _ in range(20):
+        run = await store.get_turn_run(bundle["turn_id"])
+        if run.state == ProcessingState.PROCESSED.value:
+            break
+        await asyncio.sleep(0.01)
+    assert run.state == ProcessingState.PROCESSED.value
+    transport._inbound.put_nowait(None)
+    await served
+    assert client.global_runtime is None
+    assert not hasattr(client, "_ws_local_owned_runtime")
+    await store.close()

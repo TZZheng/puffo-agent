@@ -437,3 +437,32 @@ async def test_send_fallback_message_drops_when_channel_space_unknown():
     # No HTTP at all — the FakeHttp ``raise`` ensures it.
     assert http.calls == []
     await ms.close()
+
+
+def test_worker_build_and_listener_use_global_runtime_contract():
+    import inspect
+
+    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+
+    constructor_params = inspect.signature(PuffoCoreMessageClient).parameters
+    listener_params = inspect.signature(PuffoCoreMessageClient.listen).parameters
+
+    assert tuple(listener_params) == ("self", "on_message")
+    assert tuple(constructor_params) == (
+        "slug",
+        "device_id",
+        "space_id",
+        "keystore",
+        "http_client",
+        "message_store",
+        "operator_slug",
+        "auto_accept_space_invitations",
+        "auto_accept_dm",
+        "workspace",
+        "max_inline_chars",
+        "segment_chars",
+        "agent_created_at",
+        "image_edge_px",
+        "catchup_stale_hours",
+        "bridge_client",
+    )

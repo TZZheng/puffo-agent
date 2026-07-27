@@ -34,6 +34,15 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .base import STATUS_PREVIEW_CHARS, TurnResult, is_silent
+from ..context_controller import (
+    AdmissionCallback,
+    CompactionResult,
+    ContextCapabilities,
+    ContextSnapshot,
+    ProviderAdmissionEvent,
+    RolloverResult,
+    normalize_context_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +236,10 @@ class ClaudeSession:
         # fallback needs to be sent because claude-code has no
         # transcript to resume.
         self._last_spawn_resumed: bool = False
+        self._context_used_tokens: int = 0
+        self._context_measured_at: datetime | None = None
+        self._admission_callback: AdmissionCallback | None = None
+        self._admission_planning_cycle_key: str = ""
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -403,6 +416,65 @@ class ClaudeSession:
         async with self._lock:
             await self._kill_proc()
 
+    async def get_context_snapshot(self) -> ContextSnapshot:
+        return normalize_context_snapshot(
+            used_tokens=self._context_used_tokens,
+            measured_at=self._context_measured_at,
+            estimated_source="claude_usage_fallback_200000",
+        )
+
+    def get_context_capabilities(self) -> ContextCapabilities:
+        return ContextCapabilities(
+            native_measurement=bool(self._context_measured_at),
+            rollover=True,
+            diagnostic="Claude reports usage; native compaction unsupported",
+        )
+
+    async def compact_context(self) -> CompactionResult:
+        return CompactionResult(
+            completed=False,
+            provider_session_id=self.get_provider_session_id(),
+            diagnostic="native Claude compaction unsupported; no text frame sent",
+        )
+
+    async def rollover_context(self) -> RolloverResult:
+        previous = self.get_provider_session_id()
+        async with self._lock:
+            self._clear_session_id()
+            await self._kill_proc()
+            self._context_used_tokens = 0
+            self._context_measured_at = None
+        return RolloverResult(
+            completed=True,
+            previous_provider_session_id=previous,
+            diagnostic="Claude session and cached occupancy cleared",
+        )
+
+    def get_provider_session_id(self) -> str | None:
+        return self._session_id or None
+
+    def register_admission_callback(
+        self,
+        callback: AdmissionCallback | None,
+        planning_cycle_key: str = "",
+    ) -> None:
+        self._admission_callback = callback
+        self._admission_planning_cycle_key = planning_cycle_key
+
+    register_provider_admission_callback = register_admission_callback
+
+    async def _fire_admission(self) -> None:
+        callback = self._admission_callback
+        key = self._admission_planning_cycle_key
+        self._admission_callback = None
+        self._admission_planning_cycle_key = ""
+        if callback is not None:
+            await callback(ProviderAdmissionEvent(
+                planning_cycle_key=key,
+                provider_session_id=self.get_provider_session_id(),
+                admitted_at=datetime.now(timezone.utc),
+            ))
+
     # ── Session id persistence ────────────────────────────────────────────────
 
     def _load_session_id(self) -> str:
@@ -457,6 +529,8 @@ class ClaudeSession:
                 self.agent_id, exc,
             )
             self._clear_session_id()
+            self._context_used_tokens = 0
+            self._context_measured_at = None
             await self._spawn(system_prompt)
             self._last_spawn_resumed = False
 
@@ -545,7 +619,7 @@ class ClaudeSession:
                     + (f"; stderr: {stderr_tail}" if stderr_tail else "")
                 )
             event = _parse_event(line)
-            if event is None:
+            if not isinstance(event, dict):
                 continue
             if event.get("type") == "system" and event.get("subtype") == "init":
                 return (event.get("session_id") or "").strip()
@@ -614,6 +688,8 @@ class ClaudeSession:
             )
         self._clear_session_id()
         await self._kill_proc()
+        self._context_used_tokens = 0
+        self._context_measured_at = None
 
     async def _kill_proc(self) -> None:
         if self._proc is None:
@@ -776,8 +852,12 @@ class ClaudeSession:
                 await self._handle_stream_failure("eof_mid_turn", f"rc={rc}")
                 return TurnResult(reply="", metadata={"stream_error": "eof_mid_turn"})
             event = _parse_event(line)
-            if event is None:
+            if not isinstance(event, dict):
                 continue
+            event_session_id = str(event.get("session_id") or "").strip()
+            if event_session_id and event_session_id != self._session_id:
+                self._save_session_id(event_session_id)
+            await self._fire_admission()
             event_types_seen.append(
                 f"{event.get('type')}/{event.get('subtype', '-')}"
             )
@@ -840,6 +920,10 @@ class ClaudeSession:
                 input_tokens = int(usage.get("input_tokens", 0) or 0) + int(
                     usage.get("cache_creation_input_tokens", 0) or 0
                 )
+                self._context_used_tokens = input_tokens + int(
+                    usage.get("cache_read_input_tokens", 0) or 0
+                )
+                self._context_measured_at = datetime.now(timezone.utc)
                 output_tokens = int(usage.get("output_tokens", 0) or 0)
                 # Fallback for CLI versions where the assembled text
                 # reply only appears on ``result.result``.

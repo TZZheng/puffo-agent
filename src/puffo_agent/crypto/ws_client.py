@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Callable, Coroutine
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Awaitable, Callable, Coroutine, Mapping, TypedDict
 
 import websockets
 import websockets.exceptions  # websockets>=16 lazy-loads submodules; bare `import websockets` doesn't bind `.exceptions`
@@ -33,7 +35,24 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-MessageHandler = Callable[[dict], Coroutine[Any, Any, None]]
+class ServerDelivery(TypedDict):
+    seq: int
+    envelope: dict[str, Any]
+
+
+class TransportOutcome(str, Enum):
+    ACK = "ack"
+    HOLD = "hold"
+
+
+@dataclass(frozen=True)
+class DeliveryResult:
+    outcome: TransportOutcome
+    envelope_id: str | None
+    reason: str
+
+
+MessageHandler = Callable[[ServerDelivery], Awaitable[TransportOutcome]]
 EventHandler = Callable[[str, dict], Coroutine[Any, Any, None]]
 CertHandler = Callable[[dict], Coroutine[Any, Any, None]]
 
@@ -109,17 +128,9 @@ class PuffoCoreWsClient:
             # mid-catch-up); chunked so progress survives a death.
             envelope_ids = []
             for item in messages:
-                envelope = item.get("envelope", item)
-                skip_ack = False
-                if self.on_message:
-                    try:
-                        # False = hold un-acked until the operator decides.
-                        skip_ack = await self.on_message(envelope) is False
-                    except Exception:
-                        logger.exception("on_message callback failed during catch-up")
-                eid = envelope.get("envelope_id")
-                if eid and not skip_ack:
-                    envelope_ids.append(eid)
+                result = await self.dispatch_delivery(item)
+                if result.outcome is TransportOutcome.ACK and result.envelope_id:
+                    envelope_ids.append(result.envelope_id)
                 if len(envelope_ids) >= 25:
                     await self._ack_http(envelope_ids)
                     envelope_ids = []
@@ -145,25 +156,53 @@ class PuffoCoreWsClient:
                 "envelope_ids": envelope_ids,
             }))
 
+    async def dispatch_delivery(self, item: Mapping[str, Any]) -> DeliveryResult:
+        """Validate and classify one Server delivery without sending an ACK.
+
+        Both HTTP catch-up and live WebSocket delivery use this seam.  Callers
+        may also reuse it for another durable delivery source.
+        """
+        if not isinstance(item, Mapping):
+            return DeliveryResult(TransportOutcome.HOLD, None, "delivery is not a mapping")
+        seq = item.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
+            return DeliveryResult(TransportOutcome.HOLD, None, "invalid server sequence")
+        raw_envelope = item.get("envelope")
+        if not isinstance(raw_envelope, Mapping):
+            return DeliveryResult(TransportOutcome.HOLD, None, "invalid envelope")
+        envelope = dict(raw_envelope)
+        envelope_id = envelope.get("envelope_id")
+        if not isinstance(envelope_id, str) or not envelope_id.strip():
+            return DeliveryResult(TransportOutcome.HOLD, None, "invalid envelope id")
+        if self.on_message is None:
+            return DeliveryResult(TransportOutcome.HOLD, envelope_id, "no message handler")
+
+        delivery: ServerDelivery = {"seq": seq, "envelope": envelope}
+        try:
+            outcome = await self.on_message(delivery)
+        except Exception:
+            logger.exception("on_message callback failed")
+            return DeliveryResult(TransportOutcome.HOLD, envelope_id, "handler exception")
+        if outcome is TransportOutcome.ACK:
+            return DeliveryResult(TransportOutcome.ACK, envelope_id, "handler committed")
+        if outcome is TransportOutcome.HOLD:
+            return DeliveryResult(TransportOutcome.HOLD, envelope_id, "handler held")
+        return DeliveryResult(TransportOutcome.HOLD, envelope_id, "unexpected handler result")
+
     async def _handle_frame(self, raw: str) -> None:
         msg = json.loads(raw)
+        if not isinstance(msg, Mapping):
+            logger.warning("ignoring malformed WebSocket frame")
+            return
         msg_type = msg.get("type")
 
         if msg_type == "ping":
             await self._ws.send(json.dumps({"type": "pong"}))
 
         elif msg_type == "message":
-            envelope = msg.get("envelope", {})
-            skip_ack = False
-            if self.on_message:
-                try:
-                    # False = hold un-acked (gated foreign DM stays pending).
-                    skip_ack = await self.on_message(envelope) is False
-                except Exception:
-                    logger.exception("on_message callback failed")
-            eid = envelope.get("envelope_id")
-            if eid and not skip_ack:
-                await self._send_ack([eid])
+            result = await self.dispatch_delivery(msg)
+            if result.outcome is TransportOutcome.ACK and result.envelope_id:
+                await self._send_ack([result.envelope_id])
 
         elif msg_type == "cert_update":
             if self.on_cert_update:

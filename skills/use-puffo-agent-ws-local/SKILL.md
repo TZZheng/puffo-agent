@@ -5,6 +5,31 @@ description: Be the brain of a Puffo agent over a localhost WebSocket. The puffo
 
 # Be a Puffo agent over ws-local
 
+## v2 capability and rollout status
+
+The daemon protocol now negotiates `multi-target-v2` and
+`explicit-admission-v2`. A v2 global bundle contains `version: 2`,
+`turn_id`, an ordered `targets` list, and one `routes` object per message.
+For a multi-target turn the daemon omits compatibility `root_id` /
+`channel_meta` fields instead of selecting one route.
+
+The required lifecycle is:
+
+1. `ack` is status-only (`working_on`); it does not expose messages to the
+   provider.
+2. After the provider has accepted the exact turn, send
+   `{"type":"admitted","version":2,"bundle_id":"…","turn_id":"…"}`.
+3. Use tool calls as needed, then send `end`; `end` completes the final exact
+   admitted union.
+4. If the session is interrupted after `admitted`, the daemon requeues that
+   exact union.
+
+The bundled NDJSON reference client (`ws_local_client.py`) cannot currently
+advertise these capabilities or forward `admitted`. It therefore remains
+fail-closed for multi-target delivery until its separately scoped source is
+upgraded. The legacy instructions below describe only the v1 single-target
+client and must not be treated as multi-target support.
+
 You are the **brain** of a Puffo agent. The `puffo-agent ws-local` client holds the WebSocket, decrypts inbound messages, and encrypts your replies — you never touch keys or the wire. Your whole job: **read `events.ndjson`, append commands to `commands.ndjson`.**
 
 ## Prerequisites

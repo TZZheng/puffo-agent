@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from ...mcp.config import (
@@ -25,6 +26,12 @@ from .base import (
     TurnResult,
     anthropic_base_url_env,
     format_history_as_prompt,
+)
+from ..context_controller import (
+    ContextCapabilities,
+    ContextSnapshot,
+    ProviderAdmissionEvent,
+    normalize_context_snapshot,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,7 +98,7 @@ class SDKAdapter(Adapter):
         # Vendor endpoint unless base_url is set; ANTHROPIC_BASE_URL then
         # routes the SDK's model calls through the proxy (LiteLLM VK).
         env = {"ANTHROPIC_API_KEY": self.api_key} if self.api_key else {}
-        env.update(anthropic_base_url_env(self.base_url))
+        env.update(anthropic_base_url_env(getattr(self, "base_url", "")))
 
         options = self._Options(
             system_prompt=ctx.system_prompt,
@@ -121,10 +128,20 @@ class SDKAdapter(Adapter):
         # The SDK requires streaming-mode input (AsyncIterable) when
         # can_use_tool is set — a plain string prompt raises
         # "can_use_tool callback requires streaming mode".
+        admitted = False
         async for msg in self._query(
             prompt=_prompt_stream(format_history_as_prompt(ctx.messages)),
             options=options,
         ):
+            if not admitted:
+                admitted = True
+                await self._fire_admission_callback(ProviderAdmissionEvent(
+                    planning_cycle_key=getattr(
+                        self, "_context_admission_planning_cycle_key", "",
+                    ),
+                    provider_session_id=None,
+                    admitted_at=datetime.now(timezone.utc),
+                ))
             if isinstance(msg, self._AssistantMessage):
                 for block in msg.content:
                     if isinstance(block, self._TextBlock):
@@ -158,6 +175,17 @@ class SDKAdapter(Adapter):
                 "send_message_targets": send_message_targets,
                 "assistant_text_parts": list(reply_parts),
             },
+        )
+
+    async def get_context_snapshot(self) -> ContextSnapshot:
+        return normalize_context_snapshot(
+            used_tokens=0,
+            estimated_source="sdk_stateless_fallback_200000",
+        )
+
+    def get_context_capabilities(self) -> ContextCapabilities:
+        return ContextCapabilities(
+            diagnostic="SDK adapter is stateless; context control unsupported",
         )
 
     async def _gate(self, tool_name: str, tool_input: dict, context: Any) -> dict:

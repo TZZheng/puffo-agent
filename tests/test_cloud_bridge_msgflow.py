@@ -30,9 +30,11 @@ import logging
 import pytest
 
 import puffo_agent.agent.puffo_core_client as pcc_mod
+import puffo_agent.agent.send_coordinator as sc_mod
 import puffo_agent.mcp.puffo_core_tools as pct_mod
 from puffo_agent.agent.message_store import MessageStore
 from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+from puffo_agent.agent.send_coordinator import SendCoordinator
 from puffo_agent.crypto.encoding import base64url_encode
 from puffo_agent.crypto.http_client import PuffoCoreHttpClient
 from puffo_agent.crypto.keystore import (
@@ -244,6 +246,7 @@ def _bridge_client(
         http_client=http,
         message_store=store,
         workspace=workspace or "",
+        catchup_stale_hours=0,
         bridge_client=bridge,
     )
 
@@ -291,6 +294,16 @@ def _tools_cfg(tmp_path, *, bridge, data_client, http=None, slug="bot-0001"):
         space_id="sp_home",
         workspace=str(tmp_path),
         bridge_client=bridge,
+    )
+
+
+def _install_native_send_coordinator(cfg: PuffoCoreToolsConfig) -> None:
+    cfg.send_coordinator = SendCoordinator(
+        slug=cfg.slug,
+        keystore=cfg.keystore,
+        http_client=cfg.http_client,
+        data_client=cfg.data_client,
+        workspace=cfg.workspace,
     )
 
 
@@ -352,25 +365,6 @@ async def test_a_inbound_stores_like_native_without_decrypt(tmp_path, monkeypatc
         "sent_at": SENT_AT,
         "plaintext": CONTENT,
     }
-    # The decrypted-equivalent of the same logical message — what the
-    # native decrypt_message would yield. Feeding this straight through
-    # the shared tail gives the reference store row to compare against.
-    ref_payload = MessagePayload(
-        payload_type="puffo.message",
-        version=1,
-        envelope_id=ENV_ID,
-        envelope_kind="channel",
-        sender_slug=SENDER,
-        sender_subkey_id="",
-        sent_at=SENT_AT,
-        message_nonce="",
-        content_type="text/plain",
-        content=CONTENT,
-        is_visible_to_human=True,
-        space_id=SPACE,
-        channel_id=CHANNEL,
-    )
-
     # --- bridge path ---
     bridge = FakeBridge(scripted=[frame])
     client = _bridge_client(tmp_path, bridge, db="bridge.db")
@@ -383,34 +377,20 @@ async def test_a_inbound_stores_like_native_without_decrypt(tmp_path, monkeypatc
 
     await _drive_listen_until(client, on_message=on_message, done=done)
 
-    # --- native reference path (post-decrypt shared tail) ---
-    ref = _bridge_client(tmp_path, FakeBridge(), db="native_ref.db")
-    ref._queue = asyncio.PriorityQueue()
-    ref._queue_seq = 0
-    ref._thread_state = {}
-    await ref.store.open()
-    await ref._handle_plaintext_payload(ref_payload)
-
     bridge_row = await client.store.get_message_by_envelope(ENV_ID)
-    ref_row = await ref.store.get_message_by_envelope(ENV_ID)
     assert bridge_row is not None, "bridge inbound frame was not persisted"
-    assert ref_row is not None
 
-    persisted_fields = (
-        "envelope_id", "sender_slug", "channel_id", "space_id",
-        "recipient_slug", "content_type", "content", "sent_at",
-        "envelope_kind",
-    )
-    for f in persisted_fields:
-        assert getattr(bridge_row, f) == getattr(ref_row, f), (
-            f"bridge/native persisted field {f!r} diverged: "
-            f"{getattr(bridge_row, f)!r} != {getattr(ref_row, f)!r}"
-        )
-    # Concrete spot-checks so the equivalence isn't vacuously true.
-    assert bridge_row.content == CONTENT
+    assert bridge_row.envelope_id == ENV_ID
+    assert bridge_row.channel_id == CHANNEL
+    assert bridge_row.space_id == SPACE
+    assert bridge_row.recipient_slug is None
+    assert bridge_row.sent_at == SENT_AT
+    assert bridge_row.content["text"] == CONTENT
     assert bridge_row.sender_slug == SENDER
     assert bridge_row.envelope_kind == "channel"
     assert bridge_row.content_type == "text/plain"
+    assert bridge_row.server_seq is None
+    assert bridge_row.local_ordinal == 1
 
     # decrypt never ran, and the message surfaced to the agent.
     assert decrypt_calls == []
@@ -488,7 +468,8 @@ async def test_b_send_message_dm_uses_bridge_no_encrypt(tmp_path, monkeypatch):
     assert body["recipient_slug"] == "alice-0001"
     assert "space_id" not in body and "channel_id" not in body
     assert bridge.sent == []
-    assert "msg_bridgeack" in result
+    assert result["envelope_id"] == "msg_bridgeack"
+    assert result["state"] == "sent"
     assert enc_calls == []
 
 
@@ -519,7 +500,8 @@ async def test_b_send_message_channel_uses_bridge_no_encrypt(tmp_path, monkeypat
     assert body["channel_id"] == "ch_xyz"
     assert "recipient_slug" not in body
     assert bridge.sent == []
-    assert "msg_bridgeack" in result
+    assert result["envelope_id"] == "msg_bridgeack"
+    assert result["state"] == "sent"
     assert enc_calls == []
 
 
@@ -564,9 +546,9 @@ async def test_b_send_message_channel_threads_on_bridge(tmp_path):
     assert body["channel_id"] == "ch_xyz"
     assert bridge.sent == []
     # No stale "top-level" / "not wired" note — threading is live now.
-    assert "top-level" not in result.lower()
-    assert "not wired" not in result.lower()
-    assert "msg_bridgeack" in result
+    assert "top-level" not in result.get("note", "").lower()
+    assert "not wired" not in result.get("note", "").lower()
+    assert result["envelope_id"] == "msg_bridgeack"
 
 
 @pytest.mark.asyncio
@@ -598,7 +580,7 @@ async def test_b_send_message_dm_threads_on_bridge(tmp_path):
     assert body["thread_root_id"] == "dm_root"
     assert body["reply_to_id"] == "dm_root"
     assert bridge.sent == []
-    assert "msg_bridgeack" in result
+    assert result["envelope_id"] == "msg_bridgeack"
 
 
 @pytest.mark.asyncio
@@ -891,7 +873,7 @@ async def test_d_native_send_message_still_encrypts_and_posts(tmp_path, monkeypa
         enc_calls.append(1)
         return ({"envelope_id": "msg_native", "type": "message_envelope"}, b"ck")
 
-    monkeypatch.setattr(pct_mod, "encrypt_message_with_content_key", _enc_spy)
+    monkeypatch.setattr(sc_mod, "encrypt_message_with_content_key", _enc_spy)
 
     ks = _native_keystore(tmp_path)
     http = FakeHttp()
@@ -919,6 +901,7 @@ async def test_d_native_send_message_still_encrypts_and_posts(tmp_path, monkeypa
         space_id="sp_home",
         bridge_client=None,  # native
     )
+    _install_native_send_coordinator(cfg)
     tools = build_dispatch(cfg)
 
     result = await tools["send_message"](channel="@alice-0001", text="hi native")
@@ -927,7 +910,8 @@ async def test_d_native_send_message_still_encrypts_and_posts(tmp_path, monkeypa
     assert any(p == "/messages" for m, p, _ in http.calls if m == "POST"), (
         f"native send must POST via http_client; calls={http.calls}"
     )
-    assert "posted" in result
+    assert result["state"] == "sent"
+    assert "posted" in result["note"]
 
 
 class _RecordingWs:
@@ -985,6 +969,7 @@ async def test_d_native_inbound_still_decrypts_before_storing(tmp_path, monkeypa
         keystore=ks,
         http_client=http,
         message_store=store,
+        catchup_stale_hours=0,
     )  # no bridge → native
 
     async def _empty_get(path, *a, **k):
@@ -1008,14 +993,17 @@ async def test_d_native_inbound_still_decrypts_before_storing(tmp_path, monkeypa
     assert handle_envelope is not None
 
     await handle_envelope({
-        "envelope_id": "env_native_in",
-        "sender_slug": "alice-0001",
+        "seq": 1,
+        "envelope": {
+            "envelope_id": "env_native_in",
+            "sender_slug": "alice-0001",
+        },
     })
 
     assert decrypt_calls, "native inbound must call decrypt_message"
     row = await client.store.get_message_by_envelope("env_native_in")
     assert row is not None
-    assert row.content == "decrypted body"
+    assert row.content["text"] == "decrypted body"
 
 
 # --------------------------------------------------------------------------
@@ -1081,7 +1069,8 @@ async def test_e_attachments_uploaded_keyless_and_reffed_on_bridge(
     assert not any(
         p in ("/blobs/upload", "/messages") for _, p, _ in http.calls
     ), http.calls
-    assert "msg_bridgeack" in result
+    assert result["state"] == "sent"
+    assert result["envelope_id"] == "msg_bridgeack"
 
 
 @pytest.mark.asyncio
@@ -1314,8 +1303,8 @@ async def test_e_native_attachments_still_encrypt_and_signed_http(
         enc_msg_calls.append(1)
         return ({"envelope_id": "msg_native_att", "type": "message_envelope"}, b"ck")
 
-    monkeypatch.setattr(pct_mod, "encrypt_attachment", _enc_att_spy)
-    monkeypatch.setattr(pct_mod, "encrypt_message_with_content_key", _enc_msg_spy)
+    monkeypatch.setattr(sc_mod, "encrypt_attachment", _enc_att_spy)
+    monkeypatch.setattr(sc_mod, "encrypt_message_with_content_key", _enc_msg_spy)
 
     ks = _native_keystore(tmp_path)
     http = FakeHttp()
@@ -1345,6 +1334,7 @@ async def test_e_native_attachments_still_encrypt_and_signed_http(
         workspace=str(tmp_path),
         bridge_client=None,  # native
     )
+    _install_native_send_coordinator(cfg)
     tools = build_dispatch(cfg)
 
     (tmp_path / "note.txt").write_bytes(b"native file bytes")
@@ -1360,7 +1350,8 @@ async def test_e_native_attachments_still_encrypt_and_signed_http(
     assert any(
         m == "POST" and p == "/messages" for m, p, _ in http.calls
     ), f"native must POST the envelope; calls={http.calls}"
-    assert "uploaded 1 file" in result
+    assert result["state"] == "sent"
+    assert "uploaded" in result["note"]
 
 
 # --------------------------------------------------------------------------
@@ -1436,16 +1427,16 @@ async def test_f1_ack_over_full_listen_loop(tmp_path):
 @pytest.mark.asyncio
 async def test_f1_failing_message_handling_skips_ack(tmp_path):
     """A frame whose handling raises is NOT acked — the ack sits inside
-    the handling ``try`` after a clean ``_handle_plaintext_payload``, so a
+    the handling ``try`` after a clean ``_store_bridge_payload``, so a
     raise skips it and the server redelivers."""
     ENV_ID = "env_ack_fail"
     bridge = FakeBridge()
     client = await _open_dispatch_client(tmp_path, bridge, db="ack_fail.db")
 
-    async def _boom(payload):
+    async def _boom(payload, **_kwargs):
         raise RuntimeError("handling blew up")
 
-    client._handle_plaintext_payload = _boom  # type: ignore[method-assign]
+    client._store_bridge_payload = _boom  # type: ignore[method-assign]
 
     # _dispatch_bridge_frame swallows the handling exception (logs it).
     await client._dispatch_bridge_frame(_bridge_message_frame(ENV_ID))

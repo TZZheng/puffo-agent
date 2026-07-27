@@ -145,6 +145,67 @@ async def test_install_unexpected_exception_500(app_client_factory, monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hidden", [
+    {"context_baseline_seq": 1},
+    {"seen_seq": 1},
+    {"unexpected": True},
+])
+async def test_send_message_hidden_or_unknown_rejected_before_resolver(
+    app_client_factory, hidden,
+):
+    resolver_calls = []
+    rpc_service.set_rpc_resolver(lambda aid: resolver_calls.append(aid))
+    client = await app_client_factory()
+    response = await client.post(
+        "/v1/rpc/agent_a/send-message",
+        json={"channel": "ch_a", "text": "x", **hidden},
+    )
+    assert response.status == 400
+    assert resolver_calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_message_structured_round_trip(app_client_factory):
+    class Coordinator:
+        def __init__(self):
+            self.calls = []
+
+        async def send(self, request):
+            self.calls.append(request)
+            return {"state": "held", "attempted": True, "latest_seq": 9}
+
+    coordinator = Coordinator()
+    ctx = _stub_ctx()
+    ctx.send_coordinator = coordinator
+    rpc_service.set_rpc_resolver(lambda _aid: ctx)
+    client = await app_client_factory()
+    response = await client.post(
+        "/v1/rpc/agent_a/send-message",
+        json={"channel": "ch_a", "text": "x", "send_anyway": True},
+    )
+    assert response.status == 200
+    assert await response.json() == {
+        "state": "held", "attempted": True, "latest_seq": 9,
+    }
+    assert coordinator.calls[0].destination == "ch_a"
+    assert coordinator.calls[0].send_anyway is True
+
+
+@pytest.mark.asyncio
+async def test_send_message_unavailable_is_structured(app_client_factory):
+    rpc_service.set_rpc_resolver(lambda _aid: _stub_ctx())
+    client = await app_client_factory()
+    response = await client.post(
+        "/v1/rpc/agent_a/send-message",
+        json={"channel": "ch_a", "text": "x"},
+    )
+    assert response.status == 200
+    body = await response.json()
+    assert body["state"] == "failed"
+    assert body["attempted"] is True
+
+
+@pytest.mark.asyncio
 async def test_install_rejects_non_json_body(app_client_factory):
     rpc_service.set_rpc_resolver(lambda aid: _stub_ctx(aid))
     app_client = await app_client_factory()

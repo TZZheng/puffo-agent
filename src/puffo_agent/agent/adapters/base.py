@@ -13,6 +13,16 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
+from ..context_controller import (
+    AdmissionCallback,
+    CompactionResult,
+    ContextCapabilities,
+    ContextSnapshot,
+    ProviderAdmissionEvent,
+    RolloverResult,
+    normalize_context_snapshot,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +145,61 @@ class Adapter(ABC):
         ``auth_failed`` if the round-trip still fails. Default-True;
         only the Codex override does a real subprocess/thread probe."""
         return True
+
+    async def get_context_snapshot(self) -> ContextSnapshot:
+        """Best available context estimate.
+
+        The compatible default is explicitly estimated and uses the package's
+        labeled fallback; it does not pretend that a provider measured it.
+        """
+        return normalize_context_snapshot(
+            used_tokens=0,
+            estimated_source="adapter_estimated_fallback_200000",
+        )
+
+    def get_context_capabilities(self) -> ContextCapabilities:
+        return ContextCapabilities(
+            diagnostic="adapter has no native context measurement or control",
+        )
+
+    async def compact_context(self) -> CompactionResult:
+        return CompactionResult(
+            completed=False,
+            provider_session_id=self.get_provider_session_id(),
+            diagnostic="native compaction unsupported",
+        )
+
+    async def rollover_context(self) -> RolloverResult:
+        return RolloverResult(
+            completed=False,
+            previous_provider_session_id=self.get_provider_session_id(),
+            diagnostic="session rollover unsupported",
+        )
+
+    def get_provider_session_id(self) -> str | None:
+        return None
+
+    def register_admission_callback(
+        self,
+        callback: AdmissionCallback | None,
+        planning_cycle_key: str = "",
+    ) -> None:
+        """Register a one-shot callback for the next provider admission."""
+        self._context_admission_callback = callback
+        self._context_admission_planning_cycle_key = planning_cycle_key
+
+    # More explicit alias used by some integration call sites.
+    register_provider_admission_callback = register_admission_callback
+
+    async def _fire_admission_callback(
+        self, event: ProviderAdmissionEvent,
+    ) -> None:
+        # Consume before awaiting: duplicate events and callback failures cannot
+        # invoke the same callback twice.
+        callback = getattr(self, "_context_admission_callback", None)
+        self._context_admission_callback = None
+        if callback is not None:
+            await callback(event)
 
 
 def format_history_as_prompt(messages: list[dict]) -> str:

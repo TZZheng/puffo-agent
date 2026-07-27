@@ -36,6 +36,11 @@ from ..crypto.message import (
 )
 from ..crypto.primitives import Ed25519KeyPair
 from ..limits import MESSAGE_SEGMENT_CHARS
+from ..agent.send_coordinator import (
+    SemanticSendRequest,
+    SendCoordinator,
+    failed_result,
+)
 from .data_client import DataClient, DataNotFound
 from ._host_mcp import PuffoRpcClient
 
@@ -98,6 +103,11 @@ def _ts_to_iso(ms: int) -> str:
     if not ms:
         return ""
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat(timespec="seconds")
+
+
+def _enc_tag(m: Any) -> str:
+    """`[encrypted]`/`[plaintext]` tag; legacy rows default to encrypted."""
+    return "[encrypted]" if getattr(m, "is_encrypted", True) else "[plaintext]"
 
 
 # ── transport seam ─────────────────────────────────────────────────
@@ -164,11 +174,6 @@ async def _upload_blob_keyless(cfg: Any, data: bytes) -> dict:
     ) or {}
 
 
-def _enc_tag(m: Any) -> str:
-    """`[encrypted]`/`[plaintext]` tag; legacy rows default to encrypted."""
-    return "[encrypted]" if getattr(m, "is_encrypted", True) else "[plaintext]"
-
-
 @dataclass
 class PuffoCoreToolsConfig:
     slug: str
@@ -187,23 +192,64 @@ class PuffoCoreToolsConfig:
     # Set only on the in-process (ws-local) path, where tools run inside
     # the daemon and drive the message client directly instead of via RPC.
     message_client: Any = None
+    # Package 4 wires the worker's one persistent instance. Optional keeps
+    # older constructors source-compatible; sends fail closed while absent.
+    send_coordinator: Any = None
     # T23 keyless bridge transport (``CloudBridgeClient``). Populated only
     # at the in-process ws-local site (from ``client._bridge``); the
-    # subprocess/RPC MCP path leaves it None → native encrypt+signed POST.
-    # When set, both ``send_message`` and ``send_message_with_attachments``
-    # send plaintext via the bridge: attachment bytes are uploaded keyless
-    # (``bridge_client.upload_blob``) and referenced by ``blob_id`` in the
-    # frame's top-level ``attachments`` — no encrypt, no signed POST.
+    # subprocess/RPC MCP path leaves it None.
     bridge_client: Any = None
 
     @property
     def keyless(self) -> bool:
-        """True on the T23 bridge transport: outbound reads/sends go over
-        the unsigned ``/v2/cloud-agents/*`` routes (egress-injected
-        ``x-sandbox-token``) instead of the signed keystore path. Reads
-        ``http_client.keyless``; test fakes without the attribute default
-        to native, so existing native tests keep passing untouched."""
+        """Whether reads and sends use the keyless cloud-agent routes."""
         return getattr(self.http_client, "keyless", False)
+
+
+async def _dispatch_semantic_send(
+    cfg: "PuffoCoreToolsConfig", request: SemanticSendRequest,
+) -> dict[str, Any]:
+    coordinator = getattr(cfg, "send_coordinator", None)
+    if coordinator is not None:
+        try:
+            if hasattr(coordinator, "workspace"):
+                coordinator.workspace = cfg.workspace
+            result = await coordinator.send(request)
+        except Exception as exc:
+            return failed_result(
+                f"persistent send coordinator failed: {exc}",
+                kind="coordinator",
+            )
+        if isinstance(result, dict):
+            result.setdefault("attempted", True)
+            return result
+        return failed_result(
+            "persistent send coordinator returned a malformed result",
+            kind="protocol",
+        )
+    if cfg.keyless:
+        coordinator = SendCoordinator(
+            slug=cfg.slug,
+            keystore=cfg.keystore,
+            http_client=cfg.http_client,
+            data_client=cfg.data_client,
+            workspace=cfg.workspace,
+        )
+        return await coordinator.send(request)
+    rpc = getattr(cfg, "rpc_client", None)
+    if rpc is not None:
+        try:
+            result = await rpc.send_message(**request.to_rpc_dict())
+        except Exception as exc:
+            return failed_result(f"send RPC unavailable: {exc}", kind="rpc_unavailable")
+        if isinstance(result, dict):
+            result.setdefault("attempted", True)
+            return result
+        return failed_result("send RPC returned a malformed result", kind="protocol")
+    return failed_result(
+        "persistent send coordinator is unavailable",
+        kind="coordinator_unavailable",
+    )
 
 
 def _note_contact(
@@ -511,7 +557,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         text: str,
         root_id: str = "",
         visibility_level: str = "default",
-    ) -> str:
+        send_anyway: bool = False,
+    ) -> dict[str, Any]:
         """Post a message to a Puffo.ai channel or DM a user.
 
         channel: '@<slug>' for a DM (e.g. '@alice-1234'), or a raw
@@ -541,6 +588,20 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
               no human is waiting for this reply. Root-level posts
               are still forced visible (can't fold either way).
         """
+        return await _dispatch_semantic_send(
+            cfg,
+            SemanticSendRequest(
+                destination=channel,
+                text=text,
+                root_id=root_id,
+                visibility_level=visibility_level,
+                send_anyway=send_anyway,
+            ),
+        )
+
+        # Retained temporarily as unreachable reference code for the other
+        # read-oriented helpers in this module; the semantic return above is
+        # the only model-authored send path.
         channel_ref = channel.strip()
         if not channel_ref:
             raise RuntimeError("channel is required")
@@ -1126,7 +1187,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         caption: str = "",
         root_id: str = "",
         visibility_level: str = "default",
-    ) -> str:
+        send_anyway: bool = False,
+    ) -> dict[str, Any]:
         """Send a message carrying one or more workspace files to a
         channel or DM.
 
@@ -1144,6 +1206,18 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             ``"human"`` | ``"default"`` | ``"agent_only"``, default
             ``"default"``. The @-mention floor keys off ``caption``.
         """
+        return await _dispatch_semantic_send(
+            cfg,
+            SemanticSendRequest(
+                destination=channel,
+                attachment_paths=tuple(paths) if isinstance(paths, list) else (),
+                caption=caption,
+                root_id=root_id,
+                visibility_level=visibility_level,
+                send_anyway=send_anyway,
+            ),
+        )
+
         import mimetypes
         from pathlib import Path
 
@@ -1580,16 +1654,6 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             reason=reason,
         )
 
-    # Bridge-only sandbox-lifecycle tools (schedule_wake / cancel_wake /
-    # get_scheduled_wake / get_runtime_status / keep_alive). Gated on
-    # ``bridge_client`` — set ONLY at the in-process ws-local site — so a
-    # native/subprocess agent never registers them (and never exposes the
-    # keyless ``x-sandbox-token`` lifecycle surface). Imported lazily so
-    # the native path doesn't pay for a module it will never use.
-    if cfg.bridge_client is not None:
-        from .lifecycle_tools import register_lifecycle_tools
-        register_lifecycle_tools(mcp, cfg)
-
     @mcp.tool()
     async def get_dm_allowlists() -> str:
         """List your DM allowlist (peers whose DMs skip the approval
@@ -1660,3 +1724,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
         _note_contact(cfg, target, blocked=False)
         return f"unblocked {target}"
+
+    # Bridge-only sandbox-lifecycle tools (schedule_wake / cancel_wake /
+    # get_scheduled_wake / get_runtime_status / keep_alive). Gated on
+    # ``bridge_client`` — set ONLY at the in-process ws-local site — so a
+    # native/subprocess agent never registers them (and never exposes the
+    # keyless ``x-sandbox-token`` lifecycle surface). Imported lazily so
+    # the native path doesn't pay for a module it will never use.
+    if cfg.bridge_client is not None:
+        from .lifecycle_tools import register_lifecycle_tools
+        register_lifecycle_tools(mcp, cfg)

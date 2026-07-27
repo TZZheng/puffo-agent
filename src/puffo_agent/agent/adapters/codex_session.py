@@ -45,11 +45,21 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .base import STATUS_PREVIEW_CHARS, TurnResult, is_silent
 from .cli_session import AuditLog
+from ..context_controller import (
+    AdmissionCallback,
+    CompactionResult,
+    ContextCapabilities,
+    ContextSnapshot,
+    ProviderAdmissionEvent,
+    RolloverResult,
+    normalize_context_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +82,7 @@ METHOD_NEW_CONVERSATION = "thread/start"
 METHOD_SEND_USER_TURN = "turn/start"
 METHOD_RESUME_CONVERSATION = "thread/resume"
 METHOD_INTERRUPT_TURN = "turn/interrupt"
+METHOD_COMPACT_CONTEXT = "thread/compact/start"
 
 # Request-ACK timeout; first thread/start after spawn is slow (cold model load).
 REQUEST_TIMEOUT_SECONDS = 60.0
@@ -79,6 +90,7 @@ REQUEST_TIMEOUT_SECONDS = 60.0
 # Default per-turn wall-clock budget; defensive against an App Server
 # that ACKs but never streams.
 TURN_TIMEOUT_SECONDS = 600.0
+COMPACT_TIMEOUT_SECONDS = 60.0
 
 # Reacts fast in a small fleet, absorbs single transient hiccups.
 CODEX_THREAD_WEDGED_THRESHOLD = 2
@@ -192,6 +204,17 @@ class _PendingTurn:
     completed: asyncio.Future = field(default_factory=asyncio.Future)
     # Optional progress callback for in-turn UI updates.
     on_progress: Optional[Callable[[str], Any]] = None
+    # Set only by the correlated provider ``turn/started`` notification.
+    provider_turn_id: str | None = None
+
+
+@dataclass
+class _PendingCompact:
+    thread_id: str
+    before: ContextSnapshot
+    completed: asyncio.Future
+    turn_id: str | None = None
+    item_id: str | None = None
 
 
 class CodexSession:
@@ -268,6 +291,16 @@ class CodexSession:
         # Resets on next success; hits THRESHOLD → rotate (drop the
         # persisted conversation id; next _ensure_running starts fresh).
         self._consecutive_thread_failures: int = 0
+        self._latest_usage_last: dict[str, Any] = {}
+        self._latest_usage_total: dict[str, Any] = {}
+        self._context_used_tokens: int = 0
+        self._context_window: int | None = None
+        self._context_measured_at: datetime | None = None
+        self._pending_compact: _PendingCompact | None = None
+        self._admission_callback: AdmissionCallback | None = None
+        self._admission_planning_cycle_key: str = ""
+        self._admission_is_continuation: bool = False
+        self._admission_turn_id: str | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -455,6 +488,127 @@ class CodexSession:
 
     def has_persisted_session(self) -> bool:
         return bool(self._conversation_id)
+
+    async def get_context_snapshot(self) -> ContextSnapshot:
+        return normalize_context_snapshot(
+            used_tokens=self._context_used_tokens,
+            provider_context_window=self._context_window,
+            measured_at=self._context_measured_at,
+            estimated_source="codex_usage_fallback_200000",
+        )
+
+    def get_context_capabilities(self) -> ContextCapabilities:
+        return ContextCapabilities(
+            native_compaction=True,
+            rollover=True,
+            native_measurement=bool(self._context_measured_at),
+            diagnostic="Codex token usage, native compact, and rollover supported",
+        )
+
+    def get_provider_session_id(self) -> str | None:
+        return self._conversation_id or None
+
+    def register_admission_callback(
+        self,
+        callback: AdmissionCallback | None,
+        planning_cycle_key: str = "",
+    ) -> None:
+        self._admission_callback = callback
+        self._admission_planning_cycle_key = planning_cycle_key
+        # Registration during an already-running turn represents acceptance of
+        # a newly supplied tool result, not the initial user-input boundary.
+        self._admission_is_continuation = callback is not None and self._active_turn is not None
+        self._admission_turn_id = (
+            self._active_turn.provider_turn_id
+            if self._admission_is_continuation and self._active_turn is not None
+            else None
+        )
+
+    register_provider_admission_callback = register_admission_callback
+
+    async def _fire_admission(self, provider_turn_id: str | None) -> None:
+        callback = self._admission_callback
+        key = self._admission_planning_cycle_key
+        self._admission_callback = None
+        self._admission_planning_cycle_key = ""
+        self._admission_is_continuation = False
+        self._admission_turn_id = None
+        if callback is not None:
+            await callback(ProviderAdmissionEvent(
+                planning_cycle_key=key,
+                provider_session_id=self.get_provider_session_id(),
+                provider_turn_id=provider_turn_id,
+                admitted_at=datetime.now(timezone.utc),
+            ))
+
+    async def compact_context(self) -> CompactionResult:
+        before = await self.get_context_snapshot()
+        thread_id = self._conversation_id
+        if not thread_id:
+            return CompactionResult(
+                completed=False,
+                before=before,
+                diagnostic="no active Codex thread",
+            )
+        pending = _PendingCompact(
+            thread_id=thread_id,
+            before=before,
+            completed=asyncio.get_running_loop().create_future(),
+        )
+        # Register state before the request so early notifications cannot race.
+        self._pending_compact = pending
+        try:
+            await self._send_raw_request(
+                self._reserve_id(),
+                METHOD_COMPACT_CONTEXT,
+                {"threadId": thread_id},
+            )
+            await asyncio.wait_for(
+                asyncio.shield(pending.completed),
+                timeout=COMPACT_TIMEOUT_SECONDS,
+            )
+            after = await self.get_context_snapshot()
+            return CompactionResult(
+                completed=True,
+                before=before,
+                after=after,
+                provider_session_id=thread_id,
+                diagnostic="matching contextCompaction item completed",
+            )
+        except asyncio.TimeoutError:
+            return CompactionResult(
+                completed=False,
+                before=before,
+                after=await self.get_context_snapshot(),
+                provider_session_id=thread_id,
+                diagnostic="Codex compaction completion timed out",
+            )
+        except Exception as exc:
+            return CompactionResult(
+                completed=False,
+                before=before,
+                after=await self.get_context_snapshot(),
+                provider_session_id=thread_id,
+                diagnostic=f"Codex compaction failed: {exc}",
+            )
+        finally:
+            if self._pending_compact is pending:
+                self._pending_compact = None
+
+    async def rollover_context(self) -> RolloverResult:
+        previous = self.get_provider_session_id()
+        async with self._lock:
+            self._reset_conversation()
+            self._context_used_tokens = 0
+            self._context_window = None
+            self._context_measured_at = None
+            self._latest_usage_last = {}
+            self._latest_usage_total = {}
+        return RolloverResult(
+            completed=True,
+            previous_provider_session_id=previous,
+            diagnostic="Codex thread memory and persistence cleared",
+        )
 
     async def health_probe(self) -> bool:
         """Post-respawn round-trip check: ``_ensure_running`` spawns the
@@ -1069,12 +1223,26 @@ class CodexSession:
             get_reporter().record_codex_rate_limits((params or {}).get("rateLimits"))
             return
 
-        if m.startswith("thread/tokenusage/updated") and turn is not None:
+        if m.startswith("thread/tokenusage/updated"):
             # codex reports per-turn tokens here (not turn/completed); ``last``
             # refreshes during the turn, final value stands at turn/completed.
             tu = (params or {}).get("tokenUsage") or {}
             last = tu.get("last") or {}
             total = tu.get("total") or {}
+            self._latest_usage_last = dict(last)
+            self._latest_usage_total = dict(total)
+            try:
+                if last.get("totalTokens") is not None:
+                    self._context_used_tokens = max(
+                        0, int(last["totalTokens"]),
+                    )
+                if tu.get("modelContextWindow") is not None:
+                    self._context_window = int(tu["modelContextWindow"])
+                self._context_measured_at = datetime.now(timezone.utc)
+            except (TypeError, ValueError):
+                pass
+            if turn is None:
+                return
             try:
                 # ``last`` is a single request; sum the whole turn via the
                 # thread total's delta. Input excludes the re-sent cached read.
@@ -1090,10 +1258,67 @@ class CodexSession:
                 pass
             return
 
+        if m.startswith("turn/started"):
+            thread_id = str((params or {}).get("threadId") or "")
+            turn_obj = (params or {}).get("turn") or {}
+            turn_id = str(turn_obj.get("id") or (params or {}).get("turnId") or "")
+            compact = self._pending_compact
+            # An active user turn owns its correlated start notification. This
+            # prevents a concurrent compact tracker from stealing user events.
+            if (
+                turn is not None
+                and thread_id == self._conversation_id
+                and turn_id
+                and (turn.provider_turn_id is None or turn.provider_turn_id == turn_id)
+            ):
+                turn.provider_turn_id = turn_id
+                if self._admission_callback is not None and not self._admission_is_continuation:
+                    await self._fire_admission(turn_id)
+                return
+            if (
+                compact is not None
+                and thread_id == compact.thread_id
+                and turn_id
+                and compact.turn_id is None
+            ):
+                compact.turn_id = turn_id
+            return
+
+        compact = self._pending_compact
+        if m.startswith("item/") and compact is not None:
+            thread_id = str((params or {}).get("threadId") or "")
+            item = (params or {}).get("item") or {}
+            kind = str(item.get("type") or "")
+            turn_id = str((params or {}).get("turnId") or "")
+            item_id = str(item.get("id") or (params or {}).get("itemId") or "")
+            started_matches = (
+                thread_id == compact.thread_id
+                and bool(compact.turn_id)
+                and turn_id == compact.turn_id
+                and kind == "contextCompaction"
+                and bool(item_id)
+            )
+            if started_matches and m.endswith("/started") and compact.item_id is None:
+                compact.item_id = item_id
+                return
+            completed_matches = (
+                started_matches
+                and bool(compact.item_id)
+                and item_id == compact.item_id
+            )
+            if completed_matches and m.endswith("/completed"):
+                if not compact.completed.done():
+                    compact.completed.set_result(None)
+                return
+
         if m.startswith("item/") and turn is not None:
+            if self._continuation_item_admits(m, params, turn):
+                await self._fire_admission(turn.provider_turn_id)
             await self._handle_item_event(m, params, turn)
             return
         if m.startswith("turn/completed") and turn is not None:
+            if self._continuation_terminal_admits(params, turn):
+                await self._fire_admission(turn.provider_turn_id)
             self._absorb_turn_usage(turn, params)
             if not turn.completed.done():
                 turn.completed.set_result(None)
@@ -1110,6 +1335,43 @@ class CodexSession:
                     RuntimeError(f"codex turn failed: {err_text}"),
                 )
             return
+
+    def _continuation_item_admits(
+        self, method: str, params: dict, turn: _PendingTurn,
+    ) -> bool:
+        if (
+            self._admission_callback is None
+            or not self._admission_is_continuation
+            or not method.endswith("/completed")
+        ):
+            return False
+        item = (params or {}).get("item") or {}
+        kind = str(item.get("type") or "")
+        thread_id = str((params or {}).get("threadId") or "")
+        turn_id = str((params or {}).get("turnId") or "")
+        expected_turn = self._admission_turn_id or turn.provider_turn_id
+        return (
+            thread_id == self._conversation_id
+            and bool(expected_turn)
+            and turn_id == expected_turn
+            and kind.lower() != "contextcompaction"
+            and bool(kind)
+        )
+
+    def _continuation_terminal_admits(
+        self, params: dict, turn: _PendingTurn,
+    ) -> bool:
+        if self._admission_callback is None or not self._admission_is_continuation:
+            return False
+        thread_id = str((params or {}).get("threadId") or "")
+        turn_obj = (params or {}).get("turn") or {}
+        turn_id = str(turn_obj.get("id") or (params or {}).get("turnId") or "")
+        expected_turn = self._admission_turn_id or turn.provider_turn_id
+        return (
+            thread_id == self._conversation_id
+            and bool(expected_turn)
+            and turn_id == expected_turn
+        )
 
     async def _handle_item_event(
         self, normalised_method: str, params: dict, turn: _PendingTurn,

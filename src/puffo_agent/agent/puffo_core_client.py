@@ -34,18 +34,27 @@ from ..crypto.message import (
 )
 from . import send_mode
 from ..crypto.primitives import Ed25519KeyPair, KemKeyPair
-from ..crypto.ws_client import INITIAL_BACKOFF, MAX_BACKOFF, PuffoCoreWsClient
+from ..crypto.ws_client import (
+    INITIAL_BACKOFF,
+    MAX_BACKOFF,
+    PuffoCoreWsClient,
+    ServerDelivery,
+    TransportOutcome,
+)
 
 if TYPE_CHECKING:
     from .bridge_client import CloudBridgeClient
 from . import disk_cache
 from ._invite_strings import format_invite_error, format_leave_error
 from .contact_cache import ContactCache
-from .core import AgentAPIError
 from .permission_prompt import format_permission_prompt
 from .events import random_nonce, sign_event
 from .event_kinds import EventKind
-from .message_store import MessageStore
+from .message_store import (
+    MessageStore,
+    ReceiptDisposition,
+    ReceiptWriteStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,13 +74,6 @@ _MENTION_RE = re.compile(
 )
 
 
-# Lower number = higher priority — drained first by the consumer loop.
-PRIORITY_MENTIONED_HUMAN = 1
-PRIORITY_MENTIONED_BOT = 2
-PRIORITY_HUMAN = 3
-PRIORITY_BOT = 4
-PRIORITY_SYSTEM = 5
-
 # Per-slug profile cache TTL — keeps display_name + avatar_url
 # fresh enough that a rename / avatar change on puffo-server
 # propagates within ~10 min on the next render, without paying
@@ -80,16 +82,26 @@ PRIORITY_SYSTEM = 5
 # tool which force-refreshes regardless of TTL.
 _PROFILE_CACHE_TTL_SECONDS = 10 * 60
 
+# Compatibility-only queue definitions retained for the bridge's legacy unit
+# fixtures. Production receive paths are scheduled by GlobalInboxRuntime.
+PRIORITY_MENTIONED_HUMAN = 1
+PRIORITY_MENTIONED_BOT = 2
+PRIORITY_HUMAN = 3
+PRIORITY_BOT = 4
+
+
+@dataclass
+class _ThreadEntry:
+    current_priority: int
+    current_seq: int
+    messages: list[dict] = field(default_factory=list)
+    in_queue: bool = True
+    channel_meta: dict = field(default_factory=dict)
+    dispatching_ids: set[str] = field(default_factory=set)
+
 # Healthy data resolves in one hop (a root's own thread_root_id is NULL);
 # deeper chains are corrupt and the reply is admitted as its own root.
 _INCOMING_ROOT_MAX_DEPTH = 8
-
-# Mirrors ``adapters/cli_session.MAX_USER_MESSAGE_BYTES``; a test pins them.
-DEFAULT_MAX_INPUT_BYTES = 180 * 1000
-
-# Deliberately over-counts the ``_format_user_block`` metadata header so a
-# near-boundary split lands one turn early, never over the cap.
-_BLOCK_METADATA_OVERHEAD_BYTES = 2048
 
 # Auto-reply to a foreign sender whose first DM is held pending approval.
 _DM_GATE_SENDER_ACK = (
@@ -100,53 +112,6 @@ _DM_GATE_SENDER_ACK = (
 # Stored in place of a blocked account's channel-message body: keeps the
 # thread/seq metadata intact for history reads without the content.
 _BLOCKED_MESSAGE_PLACEHOLDER = "[message from a blocked account was dropped]"
-
-
-@dataclass
-class _ThreadEntry:
-    """Per-thread queue state.
-
-    The PriorityQueue itself stores ``(priority, seq, root_id)``
-    tuples so the heap can order by priority and break ties on
-    monotonic seq (dicts aren't orderable). The real per-thread
-    state lives here, keyed by ``root_id``:
-
-    - ``messages`` holds every decoded message dict for this
-      thread that has been enqueued but not yet dispatched. The
-      consumer drains the whole list in a single ``on_message_batch``
-      call, so messages that arrived between the first enqueue and
-      the eventual pop all reach the agent as one turn.
-    - ``current_priority`` / ``current_seq`` are the priority and
-      seq currently active in the queue. When a new arrival on the
-      same root bumps priority, we DON'T remove the stale heap
-      entry (``asyncio.PriorityQueue`` doesn't support that); we
-      push a fresh tuple and let the consumer drop the old one when
-      it pops and notices ``seq`` no longer matches the entry's
-      ``current_seq``.
-    - ``in_queue`` flips False between successful dispatch and the
-      next arrival on this root, so a later message reopens the
-      entry cleanly instead of stacking into a stale batch.
-    - ``channel_meta`` is captured on the first enqueue and reused
-      on dispatch; the thread/channel/space context is invariant
-      for a given root.
-    - ``dispatching_ids`` is the set of envelope_ids currently being
-      sent to the agent (the batch the consumer just claimed but
-      hasn't finished). A duplicate WS delivery that lands during
-      that window can't be caught by the handle_envelope cursor
-      (cursor advances only after dispatch succeeds) or by the
-      in-memory dedup (the consumer just emptied ``messages`` to
-      claim the batch), so the reopen branch of
-      ``_admit_thread_message`` would otherwise put the duplicate
-      into a fresh batch — causing the agent to see the same post
-      across two turns. This set is checked at admit time and
-      cleared on successful cursor advance.
-    """
-    current_priority: int
-    current_seq: int
-    messages: list[dict] = field(default_factory=list)
-    in_queue: bool = True
-    channel_meta: dict = field(default_factory=dict)
-    dispatching_ids: set[str] = field(default_factory=set)
 
 
 async def _fetch_blob_with_retry(
@@ -250,15 +215,12 @@ def _parse_operator_pubkey(identity_cert_json: Optional[str]) -> Optional[bytes]
     return op_pk
 
 
-def _compute_priority(direct: bool, sender_is_agent: bool) -> int:
-    """Map (direct, sender_is_agent) to one of the PRIORITY_* bands.
-    PRIORITY_SYSTEM is reserved for a future service-message envelope.
-    """
-    if direct and not sender_is_agent:
+def _compute_priority(direct: bool, sender_is_bot: bool) -> int:
+    if direct and not sender_is_bot:
         return PRIORITY_MENTIONED_HUMAN
-    if direct and sender_is_agent:
+    if direct and sender_is_bot:
         return PRIORITY_MENTIONED_BOT
-    if not sender_is_agent:
+    if not sender_is_bot:
         return PRIORITY_HUMAN
     return PRIORITY_BOT
 
@@ -494,10 +456,9 @@ class PuffoCoreMessageClient:
         segment_chars: int = MESSAGE_SEGMENT_CHARS,
         agent_created_at: int = 0,
         image_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
+        catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS,
         *,
         bridge_client: "CloudBridgeClient | None" = None,
-        max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
-        catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS,
     ):
         self.slug = slug
         self.device_id = device_id
@@ -521,7 +482,6 @@ class PuffoCoreMessageClient:
         # 200k-context model with a verbose system prompt.
         self._max_inline_chars = max(1, int(max_inline_chars))
         self._segment_chars = max(1, int(segment_chars))
-        self._max_input_bytes = max(1, int(max_input_bytes))
         # Catch-up older than this skips the LLM (still stored); <= 0 disables.
         self._catchup_stale_ms = (
             int(catchup_stale_hours * 3600 * 1000) if catchup_stale_hours > 0 else 0
@@ -545,6 +505,8 @@ class PuffoCoreMessageClient:
         # "reply to whoever just DMed me". Single-slot is fine since
         # the worker handles one envelope at a time; concurrent DM
         # handlers would need a per-turn lookup keyed by envelope_id.
+        self.global_runtime: Any | None = None
+        self._legacy_dm_peer: str = ""
         self._last_dm_sender: str = ""
 
         # Operator root pubkey from our identity_cert (cached at
@@ -677,54 +639,20 @@ class PuffoCoreMessageClient:
 
     async def listen(
         self,
-        on_message: Callable[..., Coroutine[Any, Any, Any]],
-        on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-        on_api_error_abandon: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-        on_turn_success: Callable[..., Coroutine[Any, Any, Any]] | None = None,
+        on_message: Callable[..., Any] | None = None,
     ) -> None:
-        """``on_message`` is the thread-batch callback. Despite the
-        legacy parameter name kept for caller compatibility, it's
-        invoked as ``on_message(root_id, batch, channel_meta)`` —
-        the consumer collapses every arrival on the same thread
-        into a single dispatch (see ``_consume_queue``).
+        """Listen for durable receipts.
 
-        ``on_api_error_retry`` is the kick-retry callback invoked
-        after the consumer catches an ``AgentAPIError``. Same
-        signature, but the implementation is expected to nudge
-        claude-code via ``--resume`` rather than re-sending the
-        ``batch`` payload (so the agent's transcript doesn't pick up
-        a duplicate of the original user input on every retry). When
-        omitted, the consumer abandons the batch on first failure.
-
-        PUF-252: ``on_api_error_abandon`` is the state-honesty
-        hook fired exactly once when kick-retries have all failed
-        and the batch is being abandoned. The worker uses this to
-        flip ``runtime.health`` + ``runtime.error`` so the
-        discoverable-action affordances on Nova's lane (FB-197
-        status dot + FB-198 restart lever, both in the Operator
-        Action Panel cluster) have a signal to surface — Sam's
-        "agent went silent without warning" symptom stops being
-        invisible. Invoked as ``on_api_error_abandon(root_id,
-        batch, channel_meta, attempts)``. When omitted, the
-        abandon stays silent (pre-PUF-252 behaviour).
-
-        ``on_turn_success`` is the recovery-side matched-pair
-        for ``on_api_error_abandon``. Fires on every successful
-        turn exit (fresh dispatch AND kick-retry recovery).
-        Invoked as ``on_turn_success(root_id, batch, channel_meta)``.
+        ``on_message`` is an unused optional positional argument retained for
+        the frozen ws-local route. Provider work is scheduled exclusively by
+        ``GlobalInboxRuntime``.
         """
-        if self._bridge is not None:
-            # T23 phase 2: keyless bridge transport. No identity file to
-            # load; inbound plaintext frames flow through the same store
-            # + thread-queue tail native uses (the consumer runs). The
-            # invite-poll / member-warm tasks stay skipped — they drive
-            # signed HTTP endpoints that can't work keyless.
-            await self._listen_bridge(
-                on_message,
-                on_api_error_retry,
-                on_api_error_abandon,
-                on_turn_success,
-            )
+        if getattr(self, "_bridge", None) is not None:
+            # Keyless bridge frames have no signed identity or native WS
+            # sequence today. They still enter the durable global inbox as
+            # explicitly unsequenced receipts; provider work remains owned
+            # by GlobalInboxRuntime.
+            await self._listen_bridge()
             return
 
         identity = self.keystore.load_identity(self.slug)
@@ -740,7 +668,9 @@ class PuffoCoreMessageClient:
             identity.identity_cert_json,
         )
 
-        async def handle_envelope(envelope: dict) -> None:
+        async def handle_envelope(delivery: ServerDelivery) -> TransportOutcome:
+            server_seq = delivery["seq"]
+            envelope = delivery["envelope"]
             # Self-envelopes are NOT dropped at the door anymore (Han
             # 2026-05-13). The server fans out every recipient device
             # in ``envelope.recipients``, which always includes the
@@ -770,7 +700,7 @@ class PuffoCoreMessageClient:
                     "could not fetch signing keys for %s — skipping (%s)",
                     sender_slug, e,
                 )
-                return
+                return TransportOutcome.HOLD
 
             def _open(pk: bytes) -> MessagePayload:
                 if is_plaintext:
@@ -806,7 +736,7 @@ class PuffoCoreMessageClient:
                     "decryption failed for %s (%d sender keys tried) — skipping",
                     envelope.get("envelope_id"), len(sender_pks),
                 )
-                return
+                return TransportOutcome.HOLD
 
             # Incoming thread linkage normalizes before storage:
             # thread_root_id resolves to the canonical same-scope root
@@ -817,44 +747,7 @@ class PuffoCoreMessageClient:
             validated_reply_to_id = await self._validate_incoming_parent_id(
                 payload.reply_to_id, payload.channel_id, payload.space_id,
             )
-            # Blocked sender's DM: ack-and-drop before persistence.
-            if (
-                payload.envelope_kind == "dm"
-                and payload.sender_slug != self.slug
-                and await self._contacts.is_blocked(payload.sender_slug)
-            ):
-                self._log.info(
-                    "dm_gate: dropped DM from blocked %s", payload.sender_slug,
-                )
-                return
-
-            # Blocked sender's CHANNEL message: the server only filters DMs,
-            # so drop here — redacted placeholder keeps thread metadata.
-            if (
-                payload.envelope_kind != "dm"
-                and payload.sender_slug != self.slug
-                and await self._contacts.is_blocked(payload.sender_slug)
-            ):
-                await self.store.store({
-                    "envelope_id": payload.envelope_id,
-                    "envelope_kind": payload.envelope_kind,
-                    "sender_slug": payload.sender_slug,
-                    "channel_id": payload.channel_id,
-                    "space_id": payload.space_id,
-                    "recipient_slug": payload.recipient_slug,
-                    "content_type": "text/plain",
-                    "content": _BLOCKED_MESSAGE_PLACEHOLDER,
-                    "sent_at": payload.sent_at,
-                    "thread_root_id": validated_thread_root_id,
-                    "reply_to_id": validated_reply_to_id,
-                })
-                self._log.info(
-                    "contact: dropped channel message from blocked %s "
-                    "(redacted placeholder stored)",
-                    payload.sender_slug,
-                )
-                return
-            await self.store.store({
+            stored_payload = {
                 "envelope_id": payload.envelope_id,
                 "envelope_kind": payload.envelope_kind,
                 "sender_slug": payload.sender_slug,
@@ -867,7 +760,84 @@ class PuffoCoreMessageClient:
                 "thread_root_id": validated_thread_root_id,
                 "reply_to_id": validated_reply_to_id,
                 "is_encrypted": not is_plaintext,
-            })
+            }
+
+            async def commit(
+                disposition: ReceiptDisposition,
+                reason: str,
+                *,
+                content: Any | None = None,
+            ) -> TransportOutcome:
+                row = dict(stored_payload)
+                if content is not None:
+                    row["content"] = content
+                    row["content_type"] = "text/plain"
+                result = None
+                if disposition is ReceiptDisposition.ELIGIBLE:
+                    promoted = await self.store.promote_gated_receipt(
+                        payload.envelope_id, server_seq, reason=reason,
+                    )
+                    if promoted.status is not ReceiptWriteStatus.CONFLICT:
+                        result = promoted
+                if result is None:
+                    result = await self.store.store_receipt(
+                        row, server_seq=server_seq,
+                        disposition=disposition, reason=reason,
+                    )
+                if result.status is ReceiptWriteStatus.CONFLICT:
+                    return TransportOutcome.HOLD
+                runtime = getattr(self, "global_runtime", None)
+                if runtime is not None:
+                    if (
+                        payload.envelope_kind == "channel"
+                        and result.status
+                        in (
+                            ReceiptWriteStatus.COMMITTED,
+                            ReceiptWriteStatus.IDEMPOTENT,
+                        )
+                    ):
+                        runtime.notify_delivery()
+                    if (
+                        result.disposition is ReceiptDisposition.ELIGIBLE
+                        and result.status is ReceiptWriteStatus.COMMITTED
+                    ):
+                        runtime.notify()
+                return (
+                    TransportOutcome.ACK
+                    if result.acknowledge else TransportOutcome.HOLD
+                )
+            # Blocked sender's DM: ack-and-drop before persistence.
+            if (
+                payload.envelope_kind == "dm"
+                and payload.sender_slug != self.slug
+                and await self._contacts.is_blocked(payload.sender_slug)
+            ):
+                self._log.info(
+                    "dm_gate: dropped DM from blocked %s", payload.sender_slug,
+                )
+                return await commit(
+                    ReceiptDisposition.TERMINAL,
+                    "blocked dm tombstone",
+                    content=_BLOCKED_MESSAGE_PLACEHOLDER,
+                )
+
+            # Blocked sender's CHANNEL message: the server only filters DMs,
+            # so drop here — redacted placeholder keeps thread metadata.
+            if (
+                payload.envelope_kind != "dm"
+                and payload.sender_slug != self.slug
+                and await self._contacts.is_blocked(payload.sender_slug)
+            ):
+                self._log.info(
+                    "contact: dropped channel message from blocked %s "
+                    "(redacted placeholder stored)",
+                    payload.sender_slug,
+                )
+                return await commit(
+                    ReceiptDisposition.TERMINAL,
+                    "blocked channel tombstone",
+                    content=_BLOCKED_MESSAGE_PLACEHOLDER,
+                )
             # Rebind for downstream code (root_id resolution at the
             # batch-coalesce step, channel_meta construction, etc.) so
             # admit-time wipes propagate through the agent prompt.
@@ -886,7 +856,7 @@ class PuffoCoreMessageClient:
                 # them so their reply isn't gated.
                 if payload.envelope_kind == "dm":
                     await self._maybe_allowlist_outbound_dm(payload.recipient_slug)
-                return
+                return await commit(ReceiptDisposition.TERMINAL, "self echo")
 
             # Daemon-side intercept: ``y``/``n`` from the operator on an
             # outstanding invite-DM accepts/rejects without waking the
@@ -906,33 +876,37 @@ class PuffoCoreMessageClient:
                 )
                 if handled_labels:
                     # Handled inline — don't queue for the LLM.
-                    self._last_dm_sender = payload.sender_slug
                     if is_direct:
                         await self._send_invite_bulk_summary(
                             handled_labels, text_raw, payload_thread_root_id or "",
                         )
-                    return
+                    return await commit(
+                        ReceiptDisposition.TERMINAL, "handled invite reply"
+                    )
                 # Same gate for agent-initiated leave requests, but
                 # threaded-only — each leave is confirmed in its own
                 # thread (no direct/bulk path).
                 if await self._maybe_handle_leave_reply(
                     thread_root_id=payload_thread_root_id or "", text=text_raw,
                 ):
-                    self._last_dm_sender = payload.sender_slug
-                    return
+                    return await commit(
+                        ReceiptDisposition.TERMINAL, "handled leave reply"
+                    )
                 # Same gate for cli-local command-permission prompts.
                 if await self._maybe_handle_permission_reply(
                     thread_root_id=payload_thread_root_id or "", text=text_raw,
                 ):
-                    self._last_dm_sender = payload.sender_slug
-                    return
+                    return await commit(
+                        ReceiptDisposition.TERMINAL, "handled permission reply"
+                    )
                 # Operator's y/n reply to a foreign-DM approval prompt.
                 if await self._maybe_handle_dm_approval_reply(
                     thread_root_id=payload_thread_root_id or "",
                     text=text_raw,
                 ):
-                    self._last_dm_sender = payload.sender_slug
-                    return
+                    return await commit(
+                        ReceiptDisposition.TERMINAL, "handled dm approval reply"
+                    )
 
             # Stale catch-up backlog: stored above, skips the LLM and the gate.
             if self._is_stale_for_catchup(payload.sent_at):
@@ -944,7 +918,9 @@ class PuffoCoreMessageClient:
                     payload_thread_root_id or payload.envelope_id,
                 )
                 self._report_stale_processed(payload.envelope_id)
-                return
+                return await commit(
+                    ReceiptDisposition.TERMINAL, "stale catch-up"
+                )
 
             channel_id = payload.channel_id or ""
             is_dm = payload.envelope_kind == "dm"
@@ -983,14 +959,12 @@ class PuffoCoreMessageClient:
                             text=raw_text,
                         )
                         if gated:
-                            return False
+                            return await commit(
+                                ReceiptDisposition.FOREIGN_DM_GATED,
+                                "foreign dm awaiting approval",
+                            )
 
-            # Stash the sender so `send_fallback_message("")` can route replies.
-            # Always overwrite — first-write would pin replies to a
-            # stale peer when a different person DMs us.
-            if is_dm:
-                self._last_dm_sender = payload.sender_slug
-            elif payload.channel_id and payload.space_id:
+            if not is_dm and payload.channel_id and payload.space_id:
                 # Remember which space owns this channel so replies
                 # resolve members in the right space (cross-space
                 # invites would otherwise fail).
@@ -1045,35 +1019,6 @@ class PuffoCoreMessageClient:
             else:
                 channel_name = channel_id
 
-            # Thread-batched queue: every message coalesces under
-            # its ``root_id`` (the envelope's ``thread_root_id``, or
-            # the message itself when it's a top-level post). The
-            # PriorityQueue holds one slot per root; new arrivals on
-            # the same thread either join the existing batch
-            # (priority same or lower) or bump the slot to the new
-            # higher priority. The agent processes one whole thread
-            # at a time in ``on_message_batch``.
-            # PUF-227-A: route on the VALIDATED thread_root_id. If
-            # admit-time validation wiped it (parent not in cache or
-            # cross-channel), the message gets a fresh per-envelope
-            # root_id and lands in its own batch — never inheriting a
-            # stale channel_meta from an unrelated thread.
-            root_id = payload_thread_root_id or payload.envelope_id
-
-            # Cross-restart dedup: after a daemon restart the server
-            # redelivers anything in /messages/pending. If we already
-            # dispatched a batch that covers ``payload.sent_at``,
-            # skip — the agent has seen this.
-            last_processed = await self.store.get_last_processed_sent_at(root_id)
-            if payload.sent_at <= last_processed:
-                self._log.info(
-                    "handle_envelope: cursor-rejected duplicate envelope=%s "
-                    "(sent_at=%d <= last_processed=%d, root=%s)",
-                    payload.envelope_id, payload.sent_at,
-                    last_processed, root_id,
-                )
-                return
-
             # Per-session display-name cache turns this into ~1 HTTP
             # call per distinct sender per session; same helper the
             # invite-DM flow already uses. Empty string on miss.
@@ -1089,11 +1034,7 @@ class PuffoCoreMessageClient:
                 and payload.sender_slug == self.operator_slug
             )
 
-            # ``owner_slug`` is agent-only — the is-agent signal the
-            # priority bands were designed around.
-            direct = is_dm or is_mention
             sender_is_agent = bool(sender_owner_slug)
-            priority = _compute_priority(direct, sender_is_agent)
 
             # Long-message redaction. Operators paste big chunks of
             # code or transcripts that, combined with the agent's
@@ -1113,53 +1054,22 @@ class PuffoCoreMessageClient:
                 agent_slug=self.slug,
             )
 
-            msg_dict = {
-                "channel_id": channel_id,
-                "channel_name": channel_name,
-                "space_id": space_id,
-                "space_name": space_name,
-                "sender_slug": payload.sender_slug,
+            stored_payload["content"] = {
+                "text": llm_text,
+                "attachment_paths": attachment_paths,
+                "mentions": mentions,
                 "sender_display_name": sender_display_name,
                 "sender_owner_slug": sender_owner_slug,
                 "is_from_operator": is_from_operator,
-                "sender_email": "",
-                "text": llm_text,
-                "root_id": payload_thread_root_id or "",
-                "is_dm": is_dm,
-                "attachments": attachment_paths,
                 "sender_is_agent": sender_is_agent,
-                "mentions": mentions,
-                "envelope_id": payload.envelope_id,
-                "sent_at": payload.sent_at,
                 "is_visible_to_human": payload.is_visible_to_human,
-                "is_encrypted": not is_plaintext,
-            }
-            channel_meta = {
-                "channel_id": channel_id,
                 "channel_name": channel_name,
-                "space_id": space_id,
                 "space_name": space_name,
-                "is_dm": is_dm,
             }
-
-            await self._admit_thread_message(
-                root_id=root_id,
-                priority=priority,
-                msg_dict=msg_dict,
-                channel_meta=channel_meta,
+            return await commit(
+                ReceiptDisposition.ELIGIBLE, "eligible message"
             )
 
-        # Per-listen() queue. A reconnect drops any envelopes not yet
-        # drained; the server redelivers via /messages/pending on the
-        # next subscribe, and the sqlite ``thread_processing_state``
-        # cursor keeps the agent from re-running on threads it already
-        # handled before the restart.
-        self._queue = asyncio.PriorityQueue()
-        self._queue_seq = 0
-        self._thread_state: dict[str, _ThreadEntry] = {}
-        consumer_task = asyncio.ensure_future(
-            self._consume_queue(on_message, on_api_error_retry, on_api_error_abandon, on_turn_success),
-        )
         invite_poll_task = asyncio.ensure_future(self._invite_poll_loop())
         self._ws = PuffoCoreWsClient(
             server_url=self.keystore.load_identity(self.slug).server_url,
@@ -1175,11 +1085,10 @@ class PuffoCoreMessageClient:
         try:
             await self._ws.run()
         finally:
-            consumer_task.cancel()
             invite_poll_task.cancel()
             if self._warm_task is not None:
                 self._warm_task.cancel()
-            for task in (consumer_task, invite_poll_task, self._warm_task):
+            for task in (invite_poll_task, self._warm_task):
                 if task is None:
                     continue
                 try:
@@ -1188,11 +1097,7 @@ class PuffoCoreMessageClient:
                     pass
 
     async def _listen_bridge(
-        self,
-        on_message: Callable[..., Coroutine[Any, Any, Any]],
-        on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-        on_api_error_abandon: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-        on_turn_success: Callable[..., Coroutine[Any, Any, Any]] | None = None,
+        self, legacy_test_callback: Callable[..., Any] | None = None,
     ) -> None:
         """Bridge-transport lifecycle loop: connect → fetch_pending →
         drain frames → reconnect, with the same backoff schedule as the
@@ -1200,14 +1105,9 @@ class PuffoCoreMessageClient:
         double on failure, cap at MAX_BACKOFF, reset on successful
         connect).
 
-        Inbound plaintext ``message`` frames map to a ``MessagePayload``
-        and flow through the same ``_handle_plaintext_payload`` tail the
-        native decrypt path uses — so a bridge-transport agent stores +
-        surfaces DMs / channel posts exactly like native, minus the
-        crypto. A fresh ``connect()`` drives ``send_fetch_pending()``
-        once so a cold sandbox drains its server-side queue;
-        ``pending_delivered`` marks that backfill complete (the loop
-        keeps running for live delivery).
+        Each successfully decoded message is persisted before its bridge ACK
+        is scheduled. A fresh ``connect()`` drives ``send_fetch_pending()``
+        once so a cold sandbox drains its server-side queue.
 
         Deliberately does NOT start ``_invite_poll_loop`` /
         ``_warm_member_caches`` — they drive signed HTTP endpoints that
@@ -1216,53 +1116,36 @@ class PuffoCoreMessageClient:
         bridge = self._bridge
         assert bridge is not None  # guarded by listen()
 
-        # Per-listen() queue + thread state, mirrored from native
-        # listen(): a reconnect drops any envelopes not yet drained;
-        # the server redelivers them on the next fetch_pending, and the
-        # sqlite cursor keeps the agent from re-running handled threads.
-        self._queue = asyncio.PriorityQueue()
-        self._queue_seq = 0
-        self._thread_state = {}
         await self.store.open()
-        consumer_task = asyncio.ensure_future(
-            self._consume_queue(
-                on_message, on_api_error_retry,
-                on_api_error_abandon, on_turn_success,
-            ),
-        )
         backoff = INITIAL_BACKOFF
-        try:
-            while True:
-                try:
-                    try:
-                        await bridge.connect()
-                        backoff = INITIAL_BACKOFF
-                        # Cold-start IN backfill: one fetch_pending per
-                        # successful connect drains the server queue.
-                        # Idempotent (server redelivers on redelivery),
-                        # so a reconnect re-fetches for free.
-                        await bridge.send_fetch_pending()
-                        async for frame in bridge.frames():
-                            await self._dispatch_bridge_frame(frame)
-                    finally:
-                        await bridge.close()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self._log.warning(
-                        "bridge WS disconnected (%s: %s), reconnecting in %ds",
-                        type(exc).__name__, exc, backoff,
-                    )
-                    await asyncio.sleep(backoff)
-                    backoff = min(backoff * 2, MAX_BACKOFF)
-        finally:
-            consumer_task.cancel()
+        while True:
             try:
-                await consumer_task
-            except (asyncio.CancelledError, Exception):
-                pass
+                try:
+                    await bridge.connect()
+                    backoff = INITIAL_BACKOFF
+                    await bridge.send_fetch_pending()
+                    async for frame in bridge.frames():
+                        await self._dispatch_bridge_frame(
+                            frame, legacy_test_callback=legacy_test_callback,
+                        )
+                finally:
+                    await bridge.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._log.warning(
+                    "bridge WS disconnected (%s: %s), reconnecting in %ds",
+                    type(exc).__name__, exc, backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
 
-    async def _dispatch_bridge_frame(self, frame: dict) -> None:
+    async def _dispatch_bridge_frame(
+        self,
+        frame: dict,
+        *,
+        legacy_test_callback: Callable[..., Any] | None = None,
+    ) -> None:
         """Route one inbound bridge frame off ``frames()``.
 
         ``message`` handling is wrapped so one poison frame logs and is
@@ -1287,7 +1170,9 @@ class PuffoCoreMessageClient:
                     # before. Native frames never carry this, so their
                     # path is untouched.
                     self._preseed_frame_display_name(frame, payload)
-                    await self._handle_plaintext_payload(payload)
+                    await self._store_bridge_payload(
+                        payload, legacy_test_callback=legacy_test_callback,
+                    )
                     # F1: ack the delivered envelope now that it handled
                     # cleanly. A handling exception above skips this (still
                     # inside the try), so the server redelivers. Scheduled
@@ -1369,11 +1254,197 @@ class PuffoCoreMessageClient:
             avatar_url = frame.get("avatar_url") or ""
             avatar_url = avatar_url.strip() if isinstance(avatar_url, str) else ""
             self.set_profile(slug, name, avatar_url)
+            owner_slug = frame.get("sender_owner_slug") or frame.get("owner_slug") or ""
+            owner_slug = owner_slug.strip() if isinstance(owner_slug, str) else ""
+            self._owner_slug_cache[slug] = (owner_slug, time.monotonic())
         except Exception:
             self._log.debug(
                 "bridge display-name pre-seed skipped (envelope_id=%s)",
                 frame.get("envelope_id"), exc_info=True,
             )
+
+    async def _store_bridge_payload(
+        self,
+        payload: MessagePayload,
+        *,
+        legacy_test_callback: Callable[..., Any] | None = None,
+    ) -> None:
+        """Persist one keyless bridge message into the global durable inbox.
+
+        The current bridge wire does not carry the native delivery ``seq``.
+        Such messages therefore use the explicit local-ordinal lane instead
+        of inventing a freshness boundary. Once the bridge exposes a trusted
+        server sequence this path can use ``store_receipt`` directly.
+        """
+        existing = await self.store.get_message_by_envelope(payload.envelope_id)
+        if existing is not None:
+            return
+
+        thread_root_id = await self._resolve_incoming_thread_root(
+            payload.thread_root_id, payload.channel_id, payload.space_id,
+        )
+        reply_to_id = await self._validate_incoming_parent_id(
+            payload.reply_to_id, payload.channel_id, payload.space_id,
+        )
+        row: dict[str, Any] = {
+            "envelope_id": payload.envelope_id,
+            "envelope_kind": payload.envelope_kind,
+            "sender_slug": payload.sender_slug,
+            "channel_id": payload.channel_id,
+            "space_id": payload.space_id,
+            "recipient_slug": payload.recipient_slug,
+            "content_type": payload.content_type,
+            "content": payload.content,
+            "sent_at": payload.sent_at,
+            "thread_root_id": thread_root_id,
+            "reply_to_id": reply_to_id,
+            "is_encrypted": False,
+        }
+
+        # Self echoes and stale backfill remain queryable history but must not
+        # create provider work.
+        if payload.sender_slug == self.slug:
+            await self.store.store(row)
+            return
+        if self._is_stale_for_catchup(payload.sent_at):
+            await self.store.store(row)
+            return
+
+        channel_id = payload.channel_id or ""
+        space_id = payload.space_id or ""
+        is_dm = payload.envelope_kind == "dm"
+        attachment_paths: list[str] = []
+        if payload.content_type == "puffo/message+attachments/v1" and isinstance(
+            payload.content, dict,
+        ):
+            raw_text = str(payload.content.get("text") or "")
+            metas_raw = payload.content.get("attachments") or []
+            if isinstance(metas_raw, list):
+                attachment_paths = await self._save_inbound_attachments(
+                    envelope_id=payload.envelope_id,
+                    metas_raw=metas_raw,
+                )
+        else:
+            raw_text = str(payload.content) if payload.content else ""
+        if isinstance(payload.attachments, list) and payload.attachments:
+            attachment_paths.extend(
+                await self._save_inbound_bridge_attachments(
+                    envelope_id=payload.envelope_id,
+                    refs=payload.attachments,
+                )
+            )
+
+        if is_dm:
+            self._legacy_dm_peer = payload.sender_slug
+            self._last_dm_sender = payload.sender_slug
+        elif channel_id and space_id:
+            self._channel_space[channel_id] = space_id
+
+        self_slug_lower = self.slug.lower()
+        seen: set[str] = set()
+        parsed: list[str] = []
+        for match in _MENTION_RE.finditer(raw_text):
+            slug = match.group(1).lower()
+            if slug not in seen:
+                seen.add(slug)
+                parsed.append(slug)
+        is_mention = self_slug_lower in seen
+        space_members = (
+            await self._get_space_members(space_id) if space_id else {}
+        )
+        mentions: list[dict[str, Any]] = []
+        for slug in parsed:
+            if slug == self_slug_lower:
+                mentions.append(
+                    {"username": self.slug, "is_agent": True, "is_self": True}
+                )
+                continue
+            if space_members and slug not in space_members:
+                continue
+            mentions.append(
+                {
+                    "username": slug,
+                    "is_agent": space_members.get(slug) == "agent",
+                    "is_self": False,
+                }
+            )
+
+        clean_text = (
+            raw_text.replace(f"@{self.slug}", f"@you({self.slug})").strip()
+            if is_mention else raw_text
+        )
+        space_name = await self._resolve_space_name(space_id) if space_id else ""
+        if is_dm:
+            channel_name = "Direct message"
+        elif channel_id:
+            channel_name = await self._resolve_channel_name(space_id, channel_id)
+        else:
+            channel_name = ""
+        sender_display_name = await self._fetch_display_name(payload.sender_slug)
+        sender_owner_slug = await self._fetch_owner_slug(payload.sender_slug)
+        llm_text = _maybe_redact_long_text(
+            clean_text,
+            envelope_id=payload.envelope_id,
+            sender_slug=payload.sender_slug,
+            sender_display_name=sender_display_name,
+            max_inline_chars=self._max_inline_chars,
+            segment_chars=self._segment_chars,
+            agent_slug=self.slug,
+        )
+        row["content"] = {
+            "text": llm_text,
+            "attachment_paths": attachment_paths,
+            "mentions": mentions,
+            "sender_display_name": sender_display_name,
+            "sender_owner_slug": sender_owner_slug,
+            "is_from_operator": bool(
+                self.operator_slug and payload.sender_slug == self.operator_slug
+            ),
+            "sender_is_agent": bool(sender_owner_slug),
+            "is_visible_to_human": payload.is_visible_to_human,
+            "channel_name": channel_name,
+            "space_name": space_name,
+        }
+        await self.store.store_local_event(
+            row, reason="keyless bridge delivery without server sequence",
+        )
+        runtime = getattr(self, "global_runtime", None)
+        if runtime is not None:
+            runtime.notify()
+        elif legacy_test_callback is not None:
+            content = row["content"]
+            root_id = thread_root_id or payload.envelope_id
+            message = {
+                "channel_id": channel_id,
+                "channel_name": channel_name,
+                "space_id": space_id,
+                "space_name": space_name,
+                "sender_slug": payload.sender_slug,
+                "sender_display_name": sender_display_name,
+                "sender_email": "",
+                "text": llm_text,
+                "root_id": thread_root_id or "",
+                "is_dm": is_dm,
+                "attachments": content["attachment_paths"],
+                "sender_is_bot": bool(sender_owner_slug),
+                "mentions": mentions,
+                "envelope_id": payload.envelope_id,
+                "sent_at": payload.sent_at,
+                "is_visible_to_human": payload.is_visible_to_human,
+            }
+            result = legacy_test_callback(
+                root_id,
+                [message],
+                {
+                    "channel_id": channel_id,
+                    "channel_name": channel_name,
+                    "space_id": space_id,
+                    "space_name": space_name,
+                    "is_dm": is_dm,
+                },
+            )
+            if asyncio.iscoroutine(result):
+                await result
 
     async def _handle_plaintext_payload(self, payload: MessagePayload) -> None:
         """Persist + surface a decoded message payload to the agent.
@@ -1997,30 +2068,6 @@ class PuffoCoreMessageClient:
                 root_id,
             )
 
-    def _message_block_bytes(self, msg: dict) -> int:
-        """Conservative byte estimate of one formatted block — over-counts
-        so greedy-fill never lets an over-cap block through."""
-        n = len((msg.get("text") or "").encode("utf-8"))
-        for att in (msg.get("attachments") or []):
-            n += len(str(att).encode("utf-8")) + 16
-        for mention in (msg.get("mentions") or []):
-            n += len(str(mention).encode("utf-8")) + 8
-        return n + _BLOCK_METADATA_OVERHEAD_BYTES
-
-    def _greedy_fit_prefix(self, messages: list[dict]) -> int:
-        """Largest K where ``messages[:K]`` fits ``_max_input_bytes``.
-        Always >= 1 — a lone over-budget message dispatches alone (the
-        adapter cap is the backstop) instead of stalling the thread."""
-        budget = self._max_input_bytes
-        total = 0
-        for i, msg in enumerate(messages):
-            size = self._message_block_bytes(msg)
-            sep = 2 if i > 0 else 0  # blocks join with a blank line "\n\n"
-            if i > 0 and total + sep + size > budget:
-                return i
-            total += sep + size
-        return len(messages)
-
     async def _consume_queue(
         self,
         on_message_batch: Callable[..., Coroutine[Any, Any, Any]],
@@ -2061,16 +2108,26 @@ class PuffoCoreMessageClient:
             # arriving mid-dispatch can be rejected at admit time
             # (the durable cursor hasn't advanced yet, so it can't
             # catch it).
-            all_msgs = entry.messages
+            batch = entry.messages
             channel_meta = entry.channel_meta
+            entry.messages = []
+            entry.in_queue = False
+            entry.dispatching_ids = {
+                m.get("envelope_id") for m in batch if m.get("envelope_id")
+            }
 
-            # Paranoid in-batch dedup (before the split, so byte accounting
-            # sees the real set). Admit-time dedup should make this a no-op;
-            # the warning exposes any upstream race that slips one through.
+            # Safety net: paranoid in-batch dedup right before
+            # dispatch. ``_admit_thread_message``'s in-queue dedup
+            # plus ``dispatching_ids`` should already guarantee
+            # ``batch`` is duplicate-free, but if some upstream race
+            # we haven't characterised slips a duplicate envelope_id
+            # past both, we must NOT hand the same envelope to the
+            # agent twice in one turn. The warning log lets us spot
+            # the offending path if it ever fires.
             seen_ids: set[str] = set()
             deduped: list[dict] = []
             dropped: list[str] = []
-            for m in all_msgs:
+            for m in batch:
                 mid = m.get("envelope_id", "")
                 if mid and mid in seen_ids:
                     dropped.append(mid)
@@ -2084,35 +2141,7 @@ class PuffoCoreMessageClient:
                     "for thread %s before dispatch: %s",
                     len(dropped), root_id, dropped,
                 )
-
-            # Greedy-fill: dispatch the FIFO prefix that fits the byte
-            # budget; the remainder stays queued.
-            split = self._greedy_fit_prefix(deduped)
-            batch = deduped[:split]
-            deferred = deduped[split:]
-            entry.dispatching_ids = {
-                m.get("envelope_id") for m in batch if m.get("envelope_id")
-            }
-            if deferred:
-                # Slot stays OPEN so a mid-dispatch arrival appends after the
-                # deferred tail instead of overwriting via the reopen branch;
-                # the cursor covers only ``batch``, so deferred survive restart.
-                entry.messages = deferred
-                entry.in_queue = True
-                self._queue_seq += 1
-                entry.current_seq = self._queue_seq
-                await self._queue.put(
-                    (entry.current_priority, entry.current_seq, root_id)
-                )
-                self._log.info(
-                    "greedy-fill: thread %s dispatching %d/%d msgs, "
-                    "deferring %d to next turn (budget=%d bytes)",
-                    root_id, len(batch), len(deduped), len(deferred),
-                    self._max_input_bytes,
-                )
-            else:
-                entry.messages = []
-                entry.in_queue = False
+                batch = deduped
 
             # Pre-dispatch jitter. When several agents on the same
             # host get activated by the same message (e.g. a channel
@@ -2127,11 +2156,6 @@ class PuffoCoreMessageClient:
             except asyncio.CancelledError:
                 raise
 
-            # Missing key counts as encrypted — never downgrade on doubt.
-            send_mode.note_turn_bundle(
-                [getattr(self, "slug", "")],
-                any(m.get("is_encrypted", True) for m in batch),
-            )
             try:
                 await on_message_batch(root_id, batch, channel_meta)
             except AgentAPIError as exc:
@@ -2177,9 +2201,6 @@ class PuffoCoreMessageClient:
                 # the slot done in-memory so live arrivals keep
                 # flowing for other threads.
                 continue
-            finally:
-                # Between turns the default (plaintext) applies.
-                send_mode.clear_turn_bundle([getattr(self, "slug", "")])
 
             # Success: persist the cursor so a restart-then-redeliver
             # doesn't re-trigger this thread. ``batch[-1].sent_at`` is
@@ -2206,7 +2227,6 @@ class PuffoCoreMessageClient:
                 batch=batch,
                 channel_meta=channel_meta,
             )
-
     async def _invite_poll_loop(self) -> None:
         """Poll ``/invites`` to catch invites the WS can't reach (the
         server only fans events to existing space members, which the
@@ -3544,7 +3564,7 @@ class PuffoCoreMessageClient:
         channel_name = await self._resolve_channel_name(space_id, channel_id)
 
         now_ms = int(__import__("time").time() * 1000)
-        envelope_id = f"intro-prompt-{channel_id}-{now_ms}"
+        envelope_id = f"intro-prompt-{channel_id}"
         # The prefix is documented in the agent's CLAUDE.md primer as
         # a recognised control-message marker (see 0.7.3 notes); the
         # agent treats it as a directive rather than user chatter.
@@ -3558,37 +3578,6 @@ class PuffoCoreMessageClient:
             "Don't include a thread root_id — this should be a new "
             "top-level post in the channel."
         )
-
-        msg_dict = {
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "space_id": space_id,
-            "space_name": space_name,
-            "sender_slug": "system",
-            "sender_display_name": "",
-            "sender_email": "",
-            "text": prompt_text,
-            "root_id": "",
-            "is_dm": False,
-            "attachments": [],
-            "sender_is_agent": False,
-            "mentions": [],
-            "envelope_id": envelope_id,
-            "sent_at": now_ms,
-            "is_encrypted": True,
-        }
-        channel_meta = {
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "space_id": space_id,
-            "space_name": space_name,
-            "is_dm": False,
-        }
-
-        # Mark prompted BEFORE admitting so a crash between admit and
-        # commit can't leave us re-prompting on restart. Worst case
-        # the agent doesn't get the nudge — preferable to spamming.
-        await self.store.mark_channel_intro_prompted(channel_id)
 
         # Persist the synthetic envelope to ``messages.db`` so the
         # agent can resolve it through its normal data-service paths
@@ -3614,23 +3603,20 @@ class PuffoCoreMessageClient:
             "reply_to_id": None,
         }
         try:
-            await self.store.store(store_payload)
+            await self.store.store_local_event(
+                store_payload,
+                reason="channel introduction",
+                intro_channel_id=channel_id,
+            )
         except Exception as exc:  # noqa: BLE001
-            # Persistence is best-effort — the in-memory queue still
-            # delivers the prompt even if sqlite fails (disk full,
-            # permission, etc.). Log loud so the operator can spot
-            # the inconsistency between prompt + history.
             self._log.warning(
                 "intro-nudge: failed to persist envelope=%s to messages.db: %s",
                 envelope_id, exc,
             )
-
-        await self._admit_thread_message(
-            root_id=envelope_id,
-            priority=PRIORITY_SYSTEM,
-            msg_dict=msg_dict,
-            channel_meta=channel_meta,
-        )
+            return
+        runtime = getattr(self, "global_runtime", None)
+        if runtime is not None:
+            runtime.notify()
         self._log.info(
             "enqueued channel-intro nudge for channel=%s (space=%s)",
             channel_id, space_id,
@@ -3900,32 +3886,6 @@ class PuffoCoreMessageClient:
             f"{body} This is an announcement, for your context."
         )
 
-        msg_dict = {
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "space_id": space_id,
-            "space_name": space_name,
-            "sender_slug": "system",
-            "sender_display_name": "",
-            "sender_email": "",
-            "text": prompt_text,
-            "root_id": "",
-            "is_dm": False,
-            "attachments": [],
-            "sender_is_agent": False,
-            "mentions": [],
-            "envelope_id": envelope_id,
-            "sent_at": now_ms,
-            "is_encrypted": True,
-        }
-        channel_meta = {
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "space_id": space_id,
-            "space_name": space_name,
-            "is_dm": False,
-        }
-
         store_payload = {
             "envelope_id": envelope_id,
             "envelope_kind": "channel",
@@ -3939,7 +3899,10 @@ class PuffoCoreMessageClient:
             "reply_to_id": None,
         }
         try:
-            await self.store.store(store_payload)
+            await self.store.store_local_event(
+                store_payload,
+                reason="membership system message",
+            )
         except Exception as exc:  # noqa: BLE001
             self._log.warning(
                 "membership system-message: failed to persist "
@@ -3947,12 +3910,10 @@ class PuffoCoreMessageClient:
                 envelope_id, exc,
             )
 
-        await self._admit_thread_message(
-            root_id=envelope_id,
-            priority=PRIORITY_SYSTEM,
-            msg_dict=msg_dict,
-            channel_meta=channel_meta,
-        )
+            return
+        runtime = getattr(self, "global_runtime", None)
+        if runtime is not None:
+            runtime.notify()
         self._log.info(
             "enqueued membership system-message channel=%s "
             "actor=%s action=%s",
@@ -4522,15 +4483,14 @@ class PuffoCoreMessageClient:
         messages = data.get("messages", []) if isinstance(data, dict) else []
         acked: list[str] = []
         for item in messages:
-            envelope = item.get("envelope", item)
             try:
-                result = await self._ws.on_message(envelope)
+                result = await self._ws.dispatch_delivery(item)
             except Exception:
                 self._log.exception("auto_accept_dm: drain handle failed")
                 continue
+            envelope = item.get("envelope", item)
             eid = envelope.get("envelope_id")
-            # False would mean still-gated (not expected post-allowlist).
-            if eid and result is not False:
+            if eid and result.outcome is TransportOutcome.ACK:
                 acked.append(eid)
         if acked:
             try:
@@ -5003,7 +4963,7 @@ class PuffoCoreMessageClient:
         self, recipient_slug: str, text: str, root_id: str,
     ) -> dict | None:
         """Send a DM to a specific slug (rather than to
-        ``_last_dm_sender`` like ``send_fallback_message`` does). Returns the
+        the retired implicit DM peer like the legacy fallback did. Returns the
         encrypted envelope on success (caller can read its
         envelope_id), or ``None`` when the recipient has no
         resolvable devices.
@@ -5098,7 +5058,7 @@ class PuffoCoreMessageClient:
         self, channel_id: str, text: str, root_id: str = "",
     ) -> None:
         """Post a reply. Empty ``channel_id`` ⇒ DM back to
-        ``_last_dm_sender``.
+        the retired implicit DM peer.
 
         Non-empty ``channel_id``: channel reply; recipients are the
         channel members resolved via /spaces/.../members + /certs/sync.
@@ -5208,7 +5168,7 @@ class PuffoCoreMessageClient:
             send_channel_id: Optional[str] = channel_id
         else:
             # DM reply — route to whoever just DMed us.
-            recipient = self._last_dm_sender
+            recipient = self._legacy_dm_peer
             if not recipient:
                 self._log.warning(
                     "send_fallback_message called with empty channel_id but no DM "

@@ -113,6 +113,87 @@ async def permission_request_route(request: web.Request) -> web.Response:
     )
 
 
+_SEND_BODY_KEYS = frozenset({
+    "channel", "text", "paths", "caption", "root_id",
+    "visibility_level", "send_anyway",
+})
+
+
+async def send_message_route(request: web.Request) -> web.Response:
+    """Strict structured semantic send RPC.
+
+    Unknown fields are rejected before resolver lookup, which prevents hidden
+    freshness inputs from reaching (or even invoking) the coordinator.
+    """
+    agent_id = request.match_info["agent_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be a JSON object"}, status=400,
+        )
+    unknown = set(body) - _SEND_BODY_KEYS
+    if unknown:
+        return web.json_response(
+            {"error": f"unknown send field(s): {', '.join(sorted(unknown))}"},
+            status=400,
+        )
+    if not isinstance(body.get("channel"), str) or not body.get("channel", "").strip():
+        return web.json_response({"error": "channel is required"}, status=400)
+    for key in ("text", "caption", "root_id", "visibility_level"):
+        if key in body and not isinstance(body[key], str):
+            return web.json_response(
+                {"error": f"{key} must be a string"}, status=400,
+            )
+    if "paths" in body and (
+        not isinstance(body["paths"], list)
+        or not all(isinstance(item, str) for item in body["paths"])
+    ):
+        return web.json_response(
+            {"error": "paths must be a list of strings"}, status=400,
+        )
+    if "send_anyway" in body and not isinstance(body["send_anyway"], bool):
+        return web.json_response(
+            {"error": "send_anyway must be a boolean"}, status=400,
+        )
+    if "paths" in body and "text" in body:
+        return web.json_response(
+            {"error": "send body must contain text or paths, not both"}, status=400,
+        )
+
+    resolver = _RPC_RESOLVER
+    if resolver is None:
+        return web.json_response({"error": "rpc resolver not wired"}, status=503)
+    ctx = resolver(agent_id)
+    if ctx is None:
+        return web.json_response(
+            {"error": f"no warm worker for agent_id {agent_id!r}"}, status=404,
+        )
+    kwargs = {
+        "channel": body["channel"],
+        "text": body.get("text", ""),
+        "paths": body.get("paths"),
+        "caption": body.get("caption", ""),
+        "root_id": body.get("root_id", ""),
+        "visibility_level": body.get("visibility_level", "default"),
+        "send_anyway": body.get("send_anyway", False),
+    }
+    try:
+        result = await host_mcp_handler.send_message(ctx, **kwargs)
+    except Exception as exc:
+        logger.exception("rpc-service: structured send raised for agent=%s", agent_id)
+        return web.json_response(
+            {"error": f"handler raised: {exc}"}, status=500,
+        )
+    if not isinstance(result, dict):
+        return web.json_response(
+            {"error": "send handler returned a non-object result"}, status=500,
+        )
+    return web.json_response(result)
+
+
 def build_app(cfg: RpcServiceConfig) -> web.Application:
     app = web.Application()
     app.router.add_post(
@@ -130,6 +211,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/permission-request",
         permission_request_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/send-message",
+        send_message_route,
     )
     return app
 
