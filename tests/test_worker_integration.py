@@ -347,7 +347,14 @@ async def test_puffo_core_client_send_fallback_message_encrypts():
     # cache from inbound envelopes + membership events; the smoke
     # test seeds it directly.
     client._channel_space["ch_abc"] = "sp_test"
-    await client.send_fallback_message("ch_abc", "hello world", root_id="")
+    # E2EE branch: mark the turn's bundle as encrypted (plaintext is
+    # the default otherwise — covered in test_plaintext_send).
+    from puffo_agent.agent import send_mode
+    send_mode.note_turn_bundle(["bot-0001"], True)
+    try:
+        await client.send_fallback_message("ch_abc", "hello world", root_id="")
+    finally:
+        send_mode.note_turn_bundle(["bot-0001"], False)
 
     # Channel resolution: members endpoint -> /certs/sync.
     assert any(

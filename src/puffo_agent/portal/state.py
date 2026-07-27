@@ -32,6 +32,12 @@ from typing import Any
 import psutil
 import yaml
 
+from ..limits import (
+    DEFAULT_CATCHUP_STALE_HOURS,
+    MAX_INLINE_MESSAGE_CHARS,
+    MESSAGE_SEGMENT_CHARS,
+)
+
 
 # Where daemon.yml, agents/, etc. live.
 def home_dir() -> Path:
@@ -93,13 +99,9 @@ def shared_fs_dir() -> Path:
     return home_dir() / "shared"
 
 
-# Files copied from the operator's $HOME into a per-agent virtual
-# $HOME on first use. Lift OAuth-essential files only.
-# Note: ``.claude.json`` is a sibling of the ``.claude/`` dir; Claude
-# CLI reads it from ``$HOME/.claude.json`` so we mirror that layout.
-# ``.credentials.json`` is intentionally excluded — set up separately
-# via ``sync_host_claude_code_auth_view`` so every agent tracks live OAuth
-# state (matches cli-docker's bind-mount model).
+# OAuth-essential files seeded into the per-agent virtual $HOME.
+# ``.claude.json`` is a sibling of ``.claude/``. ``.credentials.json``
+# excluded; sync_host_claude_code_auth_view owns live OAuth state.
 _CLAUDE_HOME_SEED_PATHS = (
     ".claude/settings.json",
     ".claude.json",
@@ -141,6 +143,14 @@ def _sync_credentials_from_keychain(host_home: Path) -> bool:
     """
     import platform
     if platform.system() != "Darwin":
+        return False
+    # The login Keychain belongs to the current macOS user. Never project
+    # its credential into an arbitrary caller-supplied home (including
+    # test fixtures, mounted homes, or another user's directory).
+    try:
+        if host_home.expanduser().resolve() != Path.home().resolve():
+            return False
+    except OSError:
         return False
     try:
         from ..macos.keychain import read_keychain_blob
@@ -426,8 +436,17 @@ def sync_host_gemini_skills(host_home: Path, project_dir: Path) -> int:
 
 
 # Path prefixes that won't resolve inside the runtime container.
-# ``/home/agent/`` is handled separately because it IS valid inside.
-_HOST_LOCAL_COMMAND_PREFIXES = ("/Users/", "/tmp/", "/var/folders/")
+# ``/home/agent/`` is handled separately because it IS valid inside;
+# ``/opt/puffoagent-pkg`` stays resolvable (prefixes are more specific).
+_HOST_LOCAL_COMMAND_PREFIXES = (
+    "/Users/",
+    "/tmp/",
+    "/var/folders/",
+    "/opt/homebrew/",
+    "/opt/local/",
+    "/Volumes/",
+    "/private/",
+)
 
 
 def _looks_host_local_command(command: str) -> bool:
@@ -442,6 +461,27 @@ def _looks_host_local_command(command: str) -> bool:
     if command.startswith("/home/") and not command.startswith("/home/agent/"):
         return True
     return any(command.startswith(p) for p in _HOST_LOCAL_COMMAND_PREFIXES)
+
+
+def _host_local_token(cfg: dict) -> str | None:
+    """First token in an MCP server cfg that points at a host-only path,
+    or ``None`` when everything resolves inside the container. Scans
+    ``args`` too — a bare ``npx`` / ``uvx`` command often hides the host
+    path in an argument."""
+    if not isinstance(cfg, dict):
+        return None
+    cmd = cfg.get("command") or ""
+    if isinstance(cmd, str) and _looks_host_local_command(cmd):
+        return cmd
+    for arg in cfg.get("args") or []:
+        # /tmp exists in the container: a /tmp arg is a valid output path.
+        if (
+            isinstance(arg, str)
+            and not arg.startswith("/tmp/")
+            and _looks_host_local_command(arg)
+        ):
+            return arg
+    return None
 
 
 def sync_host_mcp_servers(
@@ -478,12 +518,14 @@ def sync_host_mcp_servers(
 
     agent_servers = dict(agent_data.get("mcpServers") or {})
     unreachable: list[tuple[str, str]] = []
+    merged = 0
     for name, cfg in host_servers.items():
+        token = _host_local_token(cfg)
+        if token is not None:
+            unreachable.append((name, token))
+            continue
         agent_servers[name] = cfg
-        if isinstance(cfg, dict):
-            cmd = cfg.get("command") or ""
-            if isinstance(cmd, str) and _looks_host_local_command(cmd):
-                unreachable.append((name, cmd))
+        merged += 1
     agent_data["mcpServers"] = agent_servers
 
     try:
@@ -493,7 +535,7 @@ def sync_host_mcp_servers(
         os.replace(tmp, agent_path)
     except OSError:
         return 0, []
-    return len(host_servers), unreachable
+    return merged, unreachable
 
 
 def sync_host_plugins(host_home: Path, agent_home: Path) -> str:
@@ -590,10 +632,7 @@ def sync_host_enabled_plugins(host_home: Path, agent_home: Path) -> int:
     except (OSError, ValueError):
         return 0
     enabled = host_data.get("enabledPlugins")
-    # Claude Code has used both shapes historically — dict
-    # (``{name: true}``) on newer versions, list (``[name, ...]``)
-    # on older. Pass either through unchanged so we don't reshape
-    # something Claude is about to read.
+    # Claude Code has shipped both shapes (dict + list); pass through unchanged.
     if not isinstance(enabled, (list, dict)) or not enabled:
         return 0
 
@@ -658,12 +697,14 @@ def sync_host_gemini_mcp_servers(
 
     merged_servers = dict(agent_data.get("mcpServers") or {})
     unreachable: list[tuple[str, str]] = []
+    merged = 0
     for name, cfg in host_servers.items():
+        token = _host_local_token(cfg)
+        if token is not None:
+            unreachable.append((name, token))
+            continue
         merged_servers[name] = cfg
-        if isinstance(cfg, dict):
-            cmd = cfg.get("command") or ""
-            if isinstance(cmd, str) and _looks_host_local_command(cmd):
-                unreachable.append((name, cmd))
+        merged += 1
 
     if extra_servers:
         for name, cfg in extra_servers.items():
@@ -678,7 +719,7 @@ def sync_host_gemini_mcp_servers(
         os.replace(tmp, agent_path)
     except OSError:
         return 0, []
-    return len(host_servers), unreachable
+    return merged, unreachable
 
 
 def daemon_yml_path() -> Path:
@@ -828,26 +869,18 @@ class DaemonConfig:
     skills_dir: str = ""  # absolute path; empty = no shared skills
     reconcile_interval_seconds: float = 2.0
     runtime_heartbeat_seconds: float = 5.0
-    # cli-docker memory caps. Defaults bound each container so one
-    # runaway claude can't poison the VM (vm.overcommit_memory=1 +
-    # uncapped containers can drain swap and surface ENOMEM on
-    # unrelated reads). Operators can opt out with empty strings;
-    # per-agent overrides live on ``runtime``.
+    # cli-docker memory caps: one runaway claude must not drain the VM's
+    # swap. Empty string = opt out; per-agent overrides on ``runtime``.
     docker_memory_limit: str = "1.5g"
     docker_memory_reservation: str = "500m"
-    # Inbound message redaction. When an envelope's text exceeds
-    # ``max_inline_message_chars`` the daemon replaces the body the
-    # LLM sees with a system-message placeholder (carrying
-    # envelope_id, total length, segment count, and a preview), and
-    # the agent fetches the full content one chunk at a time via
-    # the ``get_post_segment`` MCP tool. The original envelope is
-    # stored unmodified in ``messages.db`` — only the prompt-budget
-    # view is redacted. Tuned for Claude's 200k window minus a
-    # generous system-prompt + history headroom; defaults pinned at
-    # 4000/2000 so a single 8-segment paste fits comfortably even
-    # with a verbose primer.
-    max_inline_message_chars: int = 4000
-    segment_chars: int = 2000
+    # Inbound redaction: over-limit envelope bodies become a placeholder
+    # (id, length, segments, preview); the agent pages via get_post_segment.
+    # Only the prompt view is redacted, messages.db keeps the original.
+    # Guards session-lifetime growth; 16000 inlines typical code/log pastes.
+    max_inline_message_chars: int = MAX_INLINE_MESSAGE_CHARS
+    segment_chars: int = MESSAGE_SEGMENT_CHARS
+    # Catch-up older than this is stored but skips the LLM; <= 0 disables.
+    catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     data_service: "DataServiceConfig" = field(
         default_factory=lambda: DataServiceConfig(),
@@ -872,8 +905,13 @@ class DaemonConfig:
             runtime_heartbeat_seconds=float(raw.get("runtime_heartbeat_seconds", 5.0)),
             docker_memory_limit=raw.get("docker_memory_limit", "1.5g"),
             docker_memory_reservation=raw.get("docker_memory_reservation", "500m"),
-            max_inline_message_chars=int(raw.get("max_inline_message_chars", 4000)),
-            segment_chars=int(raw.get("segment_chars", 2000)),
+            max_inline_message_chars=int(
+                raw.get("max_inline_message_chars", MAX_INLINE_MESSAGE_CHARS)
+            ),
+            segment_chars=int(raw.get("segment_chars", MESSAGE_SEGMENT_CHARS)),
+            catchup_stale_hours=float(
+                raw.get("catchup_stale_hours", DEFAULT_CATCHUP_STALE_HOURS)
+            ),
         )
         for name in ("anthropic", "openai", "google"):
             p = raw.get(name) or {}
@@ -918,6 +956,7 @@ class DaemonConfig:
             "docker_memory_reservation": self.docker_memory_reservation,
             "max_inline_message_chars": self.max_inline_message_chars,
             "segment_chars": self.segment_chars,
+            "catchup_stale_hours": self.catchup_stale_hours,
             "anthropic": asdict(self.anthropic),
             "openai": asdict(self.openai),
             "google": asdict(self.google),
@@ -934,10 +973,8 @@ class TriggerRules:
     on_dm: bool = True
 
 
-## Default puffo-core server. Override per-agent via
-## ``puffo_core.server_url`` for self-hosted relays or local dev.
-## ``api.puffo.ai`` is platform-internal only; client traffic goes
-## through the public ``chat.puffo.ai/relay`` edge.
+## Default puffo-core server; per-agent override via puffo_core.server_url.
+## api.puffo.ai is platform-internal; clients use chat.puffo.ai/relay.
 DEFAULT_PUFFO_SERVER_URL = "https://chat.puffo.ai/relay"
 
 
@@ -962,6 +999,10 @@ class PuffoCoreConfig:
     # Hidden knob (no UI, agent.yml only): when true, space invites from
     # non-operators are auto-accepted, then the operator is DM'd a report.
     auto_accept_space_invitations: bool = False
+    # Hidden yaml-only flag (no CLI/UI/control-op surface). False
+    # (default) = the DM-gate ladder holds unknown senders for operator
+    # approval; True bypasses only that hold — block/FYI still apply.
+    auto_accept_dm: bool = False
     # One of VALID_TRANSPORTS. ``bridge`` (experimental) talks plaintext
     # WS to ``server_url``'s /v2/cloud-agents/subscribe endpoint using
     # ``sandbox_token`` instead of local key files. Absent from saved
@@ -1011,15 +1052,15 @@ class RuntimeConfig:
     # codex (cli-local) sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
-    # Agent engine (CLI kinds only):
-    #   - ``claude-code``: ``claude`` CLI with our stream-json session
-    #     protocol, --resume, --model, and the puffo MCP tool suite.
-    #   - ``hermes``: ``hermes chat -q`` one-shot per turn against
-    #     Anthropic, using Claude Code's credential store.
-    #   - ``gemini-cli``: declared, not yet implemented.
-    # Hermes + anthropic billing note: third-party OAuth clients route
-    # to Anthropic's ``extra_usage`` pool, NOT a Claude subscription.
-    # Same token, different ledger.
+    # "" = harness default; codex → config.toml, claude-code → --effort
+    inference_level: str = ""
+    # codex (cli-local) per-turn wall-clock budget in seconds; raise for
+    # agents running long reasoning/complex tasks.
+    task_timeout_seconds: float = 600.0
+    # Agent engine (CLI kinds only): ``claude-code`` (stream-json + resume +
+    # puffo MCP), ``hermes`` (one-shot ``hermes chat -q``), ``gemini-cli``
+    # (declared, unimplemented). Hermes OAuth bills to Anthropic
+    # extra_usage, not a Claude subscription.
     harness: str = "claude-code"  # claude-code | hermes
     # sdk only: cap on agentic-loop iterations per turn. 10 is fine
     # for short Q&A; multi-step work often needs 30-50. CLI kinds
@@ -1039,13 +1080,9 @@ class AgentConfig:
     display_name: str = ""
     # Cached chat avatar URL; server is source of truth.
     avatar_url: str = ""
-    # ``role`` is the long-form (<=140 chars) "what does this agent do"
-    # string; ``role_short`` is the chip label rendered by clients in
-    # member lists. Mirror of the server-side identity profile fields
-    # added in puffo-server's identity_role migration. On every edit
-    # the daemon syncs both up to ``PATCH /identities/self``; the
-    # server derives ``role_short`` from ``role`` when the client
-    # omits it.
+    # role = long-form (<=140 chars); role_short = client chip label.
+    # Synced to PATCH /identities/self on edit; server derives role_short
+    # when omitted.
     role: str = ""
     role_short: str = ""
     puffo_core: PuffoCoreConfig = field(default_factory=PuffoCoreConfig)
@@ -1122,6 +1159,7 @@ class AgentConfig:
                 auto_accept_space_invitations=bool(
                     pc.get("auto_accept_space_invitations", False)
                 ),
+                auto_accept_dm=bool(pc.get("auto_accept_dm", False)),
                 transport=transport,
                 sandbox_token=sandbox_token,
             ),
@@ -1137,6 +1175,8 @@ class AgentConfig:
                 docker_memory_reservation=rt.get("docker_memory_reservation", ""),
                 permission_mode=rt.get("permission_mode", "bypassPermissions"),
                 sandbox=rt.get("sandbox", "danger-full-access"),
+                inference_level=rt.get("inference_level", ""),
+                task_timeout_seconds=float(rt.get("task_timeout_seconds", 600.0)),
                 harness=harness,
                 max_turns=int(rt.get("max_turns", 10)),
             ),
@@ -1213,35 +1253,17 @@ class RuntimeState:
     msg_count: int = 0
     last_event_at: int = 0
     error: str = ""
-    # Worker-side health, independent of ``status``. Values:
-    #   "ok"                  — refresh-ping passed, a turn cleared a
-    #                           prior abandon, or a credential refresh
-    #                           cleared a prior auth_failed
-    #   "in_progress"         — turn mid-flight; overrides any sticky
-    #                           red so the UI reads alive
-    #   "auth_failed"         — adapter saw 401 / authentication_error
-    #                           (set in worker._handle_suppressed_reply);
-    #                           cleared by the CredentialRefresher's
-    #                           refresh-success callback (PUF-258 wired
-    #                           the clear; PUF-221 owns the set lane)
-    #   "api_error_abandoned" — kick-retry exhausted, batch silently
-    #                           abandoned; cleared on next successful turn
-    #                           (PUF-255's on_turn_success lane)
-    #   "refresh_broken"      — daemon saw N consecutive non-success
-    #                           refresh outcomes; cleared by next
-    #                           REFRESHED. Does not overwrite the two
-    #                           stronger downstream signals above.
-    #   "unhandled_error"     — non-AgentAPIError raised in the turn and
-    #                           no category red was set; cleared by
-    #                           next successful turn
-    #   "codex_thread_wedged" — codex thread rotated after N consecutive
-    #                           turn timeouts/failures OR the verbatim
-    #                           "agent thread limit reached" error.
-    #                           Auto-recovers on next inbound message;
-    #                           cleared on next successful turn. Does
-    #                           NOT overwrite the stronger downstream
-    #                           signals above.
-    #   "unknown"             — no probe yet
+    # Worker-side health, independent of ``status``:
+    #   "ok"                  - clean turn / cleared red
+    #   "in_progress"         - turn mid-flight; overrides sticky reds
+    #   "auth_failed"         - adapter saw 401; cleared by refresh success
+    #   "api_error_abandoned" - kick-retry exhausted; cleared on next good turn
+    #   "refresh_broken"      - N consecutive refresh failures; cleared by next
+    #                           REFRESHED; never overwrites the reds above
+    #   "unhandled_error"     - uncategorised turn raise; cleared on next good turn
+    #   "codex_thread_wedged" - thread rotated (timeouts/failures/thread-limit);
+    #                           auto-recovers; never overwrites stronger reds
+    #   "unknown"             - no probe yet
     health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | refresh_broken | unhandled_error | codex_thread_wedged | unknown
 
     @classmethod

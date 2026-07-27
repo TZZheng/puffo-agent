@@ -68,6 +68,28 @@ def _agent_view(agent: Path) -> Path:
     return agent / ".claude" / ".credentials.json"
 
 
+def test_non_operator_home_does_not_read_login_keychain(tmp_path, monkeypatch):
+    import platform
+    from puffo_agent.macos import keychain
+
+    host = tmp_path / "host"
+    agent = tmp_path / "agent"
+    _write_host(host)
+    calls = []
+
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(
+        keychain,
+        "read_keychain_blob",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    assert sync_host_claude_code_auth_view(host, agent) == "view"
+    assert calls == []
+    data = json.loads(_agent_view(agent).read_text(encoding="utf-8"))
+    assert data["claudeAiOauth"]["accessToken"] == "at-123"
+
+
 # ── sanitizer ─────────────────────────────────────────────────
 
 
