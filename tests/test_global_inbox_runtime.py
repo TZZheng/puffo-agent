@@ -30,6 +30,8 @@ from puffo_agent.agent.message_store import (
     MessageStore,
     ProcessingState,
     ReceiptDisposition,
+    ReceiptResult,
+    ReceiptWriteStatus,
 )
 from puffo_agent.crypto.message import MessagePayload
 from puffo_agent.crypto.ws_client import TransportOutcome
@@ -117,6 +119,7 @@ async def listen_delivery(
     seq: int,
     blocked: bool = False,
     gate_foreign_dm: bool = False,
+    setup=None,
 ):
     """Drive the production listen callback with a complete wrapper."""
     import puffo_agent.agent.puffo_core_client as client_mod
@@ -171,8 +174,9 @@ async def listen_delivery(
 
         async def run(self):
             outcome = await self.on_message(delivery)
-            # The callback may only release ACK/HOLD after the durable write.
-            assert "committed" in events
+            # The callback may only release ACK/HOLD after the durable write
+            # decision (commit, idempotency, or conflict).
+            assert events
             events.append(outcome.value)
 
         async def dispatch_delivery(self, item):
@@ -198,7 +202,10 @@ async def listen_delivery(
     client._max_inline_chars = 100_000
     client._segment_chars = 10_000
     client._pending_dm_approvals = {}
-    client.global_runtime = SimpleNamespace(notify=lambda: events.append("wake"))
+    client.global_runtime = SimpleNamespace(
+        notify=lambda: events.append("work-wake"),
+        notify_delivery=lambda: events.append("delivery-wake"),
+    )
     client._processed_invite_ids = set()
     client._processed_membership_event_ids = set()
 
@@ -247,8 +254,11 @@ async def listen_delivery(
     monkeypatch.setattr(
         client_mod.KemKeyPair, "from_secret_bytes", lambda _value: object(),
     )
+    setup_result = await setup(client, store, events, delivery) if setup else None
     await client.listen(lambda *_args: asyncio.sleep(0))
-    return client, store, events, delivery
+    if setup is None:
+        return client, store, events, delivery
+    return client, store, events, delivery, setup_result
 
 
 def payload_for(
@@ -294,7 +304,12 @@ async def test_receipt_listen_eligible_commit_before_ack_and_scheduler_wake(
     _client, store, events, _delivery = await listen_delivery(
         monkeypatch, tmp_path, payload=payload_for("eligible"), seq=11,
     )
-    assert events == ["committed", "wake", TransportOutcome.ACK.value]
+    assert events == [
+        "committed",
+        "delivery-wake",
+        "work-wake",
+        TransportOutcome.ACK.value,
+    ]
     row = (await store.get_pending())[0]
     assert row.envelope_id == "eligible"
     assert row.model_visible_at is None
@@ -313,11 +328,178 @@ async def test_receipt_listen_blocked_tombstone_never_persists_plaintext(
         seq=12,
         blocked=True,
     )
-    assert events == ["committed", TransportOutcome.ACK.value]
+    assert events == [
+        "committed",
+        "delivery-wake",
+        TransportOutcome.ACK.value,
+    ]
     raw = (tmp_path / "messages.db").read_bytes()
     assert secret.encode() not in raw
     assert await store.get_pending() == ()
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_channel_delivery_wake_releases_exact_watermark_waiter(
+    monkeypatch, tmp_path,
+):
+    async def setup(client, store, _events, _delivery):
+        runtime = GlobalInboxRuntime(
+            store=store,
+            adapter=Adapter(),
+            run_turn=lambda _planned: None,
+            workspace=tmp_path,
+        )
+        runtime.held_recovery_source.wait_timeout_s = 0.5
+        client.global_runtime = runtime
+        return asyncio.create_task(
+            runtime.held_recovery_source.wait_for_held_delivery(
+                "sp-1", "ch-1", 14, "terminal"
+            )
+        )
+
+    _client, store, events, _delivery, waiter = await listen_delivery(
+        monkeypatch,
+        tmp_path,
+        payload=payload_for("terminal", content="secret"),
+        seq=14,
+        blocked=True,
+        setup=setup,
+    )
+    assert await waiter
+    assert "delivery-wake" not in events  # real runtime wake, not the event spy
+    assert await store.get_pending() == ()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_idempotent_terminal_channel_delivery_wake_releases_waiter(
+    monkeypatch, tmp_path,
+):
+    async def setup(client, store, events, _delivery):
+        runtime = GlobalInboxRuntime(
+            store=store,
+            adapter=Adapter(),
+            run_turn=lambda _planned: None,
+            workspace=tmp_path,
+        )
+        runtime.held_recovery_source.wait_timeout_s = 0.5
+        client.global_runtime = runtime
+        waiter = asyncio.create_task(
+            runtime.held_recovery_source.wait_for_held_delivery(
+                "sp-1", "ch-1", 15, "idempotent-terminal"
+            )
+        )
+        await asyncio.sleep(0)
+        await store.store_receipt(
+            {
+                "envelope_id": "idempotent-terminal",
+                "envelope_kind": "channel",
+                "sender_slug": "agent",
+                "channel_id": "ch-1",
+                "space_id": "sp-1",
+                "recipient_slug": None,
+                "content_type": "text/plain",
+                "content": "hello",
+                "sent_at": 1,
+                "thread_root_id": None,
+                "reply_to_id": None,
+                "is_encrypted": True,
+            },
+            server_seq=15,
+            disposition=ReceiptDisposition.TERMINAL,
+            reason="self echo",
+        )
+        events.clear()
+        assert not waiter.done()
+        return waiter
+
+    _client, store, events, _delivery, waiter = await listen_delivery(
+        monkeypatch,
+        tmp_path,
+        payload=payload_for(
+            "idempotent-terminal", sender="agent", content="hello"
+        ),
+        seq=15,
+        setup=setup,
+    )
+    assert await waiter
+    assert events == ["committed", TransportOutcome.ACK.value]
+    assert await store.get_pending() == ()
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "expected_events"),
+    [
+        (
+            "eligible_dm",
+            ["committed", "work-wake", TransportOutcome.ACK.value],
+        ),
+        (
+            "conflict",
+            ["write-conflict", TransportOutcome.HOLD.value],
+        ),
+    ],
+)
+async def test_notification_matrix_dm_and_conflict(
+    monkeypatch, tmp_path, kind, expected_events,
+):
+    async def setup(_client, store, events, _delivery):
+        if kind == "conflict":
+            async def conflict(*_args, **_kwargs):
+                events.append("write-conflict")
+                return ReceiptResult(
+                    ReceiptWriteStatus.CONFLICT,
+                    ReceiptDisposition.ELIGIBLE,
+                    "conflict",
+                    False,
+                )
+
+            store.store_receipt = conflict
+
+    payload = payload_for(
+        f"matrix-{kind}",
+        kind="dm" if kind == "eligible_dm" else "channel",
+    )
+    _client, store, events, _delivery, _setup = await listen_delivery(
+        monkeypatch,
+        tmp_path,
+        payload=payload,
+        seq=16,
+        setup=setup,
+    )
+    assert events == expected_events
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_notification_matrix_raised_write_wakes_neither(
+    monkeypatch, tmp_path,
+):
+    captured = {}
+
+    async def setup(_client, store, events, _delivery):
+        captured["store"] = store
+        captured["events"] = events
+
+        async def fail(*_args, **_kwargs):
+            events.append("write-raised")
+            raise OSError("disk full")
+
+        store.store_receipt = fail
+
+    with pytest.raises(OSError, match="disk full"):
+        await listen_delivery(
+            monkeypatch,
+            tmp_path,
+            payload=payload_for("matrix-raised"),
+            seq=17,
+            setup=setup,
+        )
+    assert captured["events"] == ["write-raised"]
+    await captured["store"].close()
 
 
 @pytest.mark.asyncio
@@ -726,6 +908,273 @@ async def test_crash_join_mismatched_or_stateless_session_requeues(tmp_path):
     )
     assert not await runtime.recover_current_turn()
     assert [m.envelope_id for m in await store.get_pending()] == ["m1"]
+    assert not path.exists()
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "invalid_version",
+        "id_mismatch",
+        "route_mismatch",
+        "target_mismatch",
+        "stateless",
+        "session_mismatch",
+    ],
+)
+async def test_crash_join_invalid_exact_union_metadata_requeues(tmp_path, case):
+    store = await make_store(tmp_path)
+    await receipt(store, "first", 1, sender="alice")
+    await receipt(store, "second", 2, sender="bob")
+    adapter = Adapter()
+    seed = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    planned = await seed.plan_pending()
+    assert planned is not None
+    seed._write_current_turn(planned)
+    session = None if case == "stateless" else adapter.session
+    await store.admit_messages(
+        planned.message_ids,
+        turn_id=planned.turn_id,
+        provider_session_id=session,
+    )
+    raw = json.loads(seed.current_turn_path.read_text())
+    if case == "invalid_version":
+        raw["version"] = 999
+    elif case == "id_mismatch":
+        raw["message_ids"] = ["first"]
+    elif case == "route_mismatch":
+        raw["routes"][0]["channel_id"] = "wrong-channel"
+    elif case == "target_mismatch":
+        raw["targets"] = [["channel", "wrong-space", "wrong-channel"]]
+    elif case == "session_mismatch":
+        adapter.session = "different-provider-session"
+    seed.current_turn_path.write_text(json.dumps(raw))
+
+    coordinator = SimpleNamespace(provider_session_id="stale")
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+        coordinator=coordinator,
+    )
+    assert not await runtime.recover_current_turn()
+    assert [row.envelope_id for row in await store.get_pending()] == [
+        "first",
+        "second",
+    ]
+    assert not runtime.current_turn_path.exists()
+    assert runtime.active.turn_id == ""
+    assert coordinator.provider_session_id is None
+    assert adapter.callback is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["invalid_shape", "no_run", "stale_run"])
+async def test_crash_join_invalid_or_stale_file_is_removed(tmp_path, case):
+    store = await make_store(tmp_path)
+    await receipt(store, "message", 1)
+    adapter = Adapter()
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.current_turn_path.parent.mkdir(parents=True)
+    if case == "invalid_shape":
+        runtime.current_turn_path.write_text(json.dumps(["not", "a", "join"]))
+    elif case == "no_run":
+        runtime.current_turn_path.write_text(json.dumps({
+            "version": 2,
+            "turn_id": "missing-turn",
+            "message_ids": ["message"],
+            "routes": [],
+            "targets": [],
+        }))
+    else:
+        planned = await runtime.plan_pending()
+        assert planned is not None
+        runtime._write_current_turn(planned)
+        await store.admit_messages(
+            planned.message_ids,
+            turn_id=planned.turn_id,
+            provider_session_id=adapter.session,
+        )
+        await store.mark_processed(planned.message_ids, turn_id=planned.turn_id)
+
+    assert not await runtime.recover_current_turn()
+    assert not runtime.current_turn_path.exists()
+    if case == "stale_run":
+        assert await store.get_pending() == ()
+    else:
+        assert [row.envelope_id for row in await store.get_pending()] == ["message"]
+    assert runtime.active.turn_id == ""
+    assert adapter.callback is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_resumes_exact_crash_join_before_planning(tmp_path):
+    store = await make_store(tmp_path)
+    await receipt(store, "first", 1, sender="alice")
+    await receipt(store, "second", 2, sender="bob")
+    seed_adapter = Adapter()
+    seed_runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=seed_adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    planned = await seed_runtime.plan_pending()
+    assert planned is not None
+    seed_runtime._write_current_turn(planned)
+    await store.admit_messages(
+        planned.message_ids,
+        turn_id=planned.turn_id,
+        provider_session_id=seed_adapter.session,
+    )
+
+    retry_seen = asyncio.Event()
+
+    class Runner:
+        initial_calls = 0
+        retry_calls = 0
+        recovered = None
+
+        async def __call__(self, _planned):
+            self.initial_calls += 1
+            raise AssertionError("startup recovery must not invoke initial turn")
+
+        async def handle_global_inbox_retry(self, recovered):
+            self.retry_calls += 1
+            self.recovered = recovered
+            retry_seen.set()
+
+    class NoPlanner:
+        def plan(self, *_args, **_kwargs):
+            raise AssertionError("startup recovery must not call the planner")
+
+    runner = Runner()
+    adapter = Adapter()
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=runner,
+        workspace=tmp_path,
+        planner=NoPlanner(),
+    )
+    task = asyncio.create_task(runtime.run())
+    await asyncio.wait_for(retry_seen.wait(), timeout=1)
+    for _ in range(20):
+        if not runtime.current_turn_path.exists():
+            break
+        await asyncio.sleep(0)
+    runtime.stop()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert runner.initial_calls == 0
+    assert runner.retry_calls == 1
+    assert runner.recovered.message_ids == planned.message_ids
+    assert runner.recovered.routes == planned.routes
+    assert runner.recovered.targets == planned.targets
+    assert runner.recovered.provider_input == planned.provider_input
+    assert await store.get_pending() == ()
+    assert not runtime.current_turn_path.exists()
+    assert runtime.active.turn_id == ""
+    assert adapter.callback is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "health_state", "diagnostic", "expected_retry_calls"),
+    [
+        ("unavailable", "degraded", "retry unavailable", 0),
+        ("auth", "auth_failed", "auth failure", 1),
+        ("unsafe", "degraded", "unsafe failure", 1),
+        ("exhausted", "api_error_abandoned", "budget exhausted", 3),
+    ],
+)
+async def test_resume_failure_requeues_exact_union_and_cleans_identity(
+    tmp_path, failure, health_state, diagnostic, expected_retry_calls,
+):
+    store = await make_store(tmp_path)
+    await receipt(store, "first", 1)
+    await receipt(store, "second", 2)
+    adapter = Adapter()
+    seed = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    planned = await seed.plan_pending()
+    assert planned is not None
+    seed._write_current_turn(planned)
+    await store.admit_messages(
+        planned.message_ids,
+        turn_id=planned.turn_id,
+        provider_session_id=adapter.session,
+    )
+
+    class Runner:
+        initial_calls = 0
+        retry_calls = 0
+
+        async def __call__(self, _planned):
+            self.initial_calls += 1
+            raise AssertionError("failed resume must not enter initial delivery")
+
+        async def handle_global_inbox_retry(self, _planned):
+            self.retry_calls += 1
+            if failure == "auth":
+                raise AgentAPIError("auth", is_auth=True)
+            if failure == "unsafe":
+                raise RuntimeError("unsafe")
+            raise AgentAPIError("rate limited", is_auth=False)
+
+    runner = Runner()
+    if failure == "unavailable":
+        del Runner.handle_global_inbox_retry
+    coordinator = SimpleNamespace(provider_session_id="stale")
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=runner,
+        workspace=tmp_path,
+        coordinator=coordinator,
+        max_api_retries=2,
+        retry_sleep=lambda _delay: asyncio.sleep(0),
+    )
+    task = asyncio.create_task(runtime.run())
+    for _ in range(100):
+        if not runtime.current_turn_path.exists():
+            break
+        await asyncio.sleep(0)
+    assert not runtime.current_turn_path.exists()
+    runtime.stop()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert runner.initial_calls == 0
+    assert runner.retry_calls == expected_retry_calls
+    assert [row.envelope_id for row in await store.get_pending()] == [
+        "first",
+        "second",
+    ]
+    assert runtime.health.state == health_state
+    assert diagnostic in runtime.health.diagnostic
+    assert runtime.active.turn_id == ""
+    assert coordinator.provider_session_id is None
+    assert adapter.callback is None
     await store.close()
 
 

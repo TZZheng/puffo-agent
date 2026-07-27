@@ -505,6 +505,7 @@ class GlobalInboxRuntime:
         self._boundary = asyncio.Lock()
         self._stopping = False
         self._degraded = False
+        self._defer_requeued_resume = False
         self.max_context_decisions = max_context_decisions
         self.max_api_retries = max_api_retries
         self.retry_sleep = retry_sleep
@@ -517,11 +518,18 @@ class GlobalInboxRuntime:
 
     def notify(self) -> None:
         self._degraded = False
-        self.held_recovery_source.notify_delivery()
         self.coalescer.notify()
 
+    def notify_delivery(self) -> None:
+        self.held_recovery_source.notify_delivery()
+
     async def run(self) -> None:
-        if await self.store.get_pending(limit=1):
+        await self.recover_current_turn()
+        if self._defer_requeued_resume:
+            # Consume the recovery wake without immediately feeding the same
+            # failed durable union through the initial-turn path.
+            await self.coalescer.wait_for_burst()
+        elif await self.store.get_pending(limit=1):
             self.notify()
         while not self._stopping:
             await self.coalescer.wait_for_burst()
@@ -823,34 +831,187 @@ class GlobalInboxRuntime:
             raise RuntimeError("global runtime retry is unavailable")
         return await retry(planned)
 
+    def _clear_terminal_turn(self) -> None:
+        self.adapter.register_admission_callback(None, "")
+        self.active.clear()
+        if self.coordinator is not None:
+            self.coordinator.provider_session_id = None
+        try:
+            self.current_turn_path.unlink()
+        except OSError:
+            pass
+
+    def _reconstruct_exact_turn(
+        self,
+        *,
+        turn_id: str,
+        rows: tuple[StoredMessage, ...],
+    ) -> PlannedTurn:
+        blocks = tuple(self.formatter(row) for row in rows)
+        routes = tuple(route_for(row) for row in rows)
+        targets: list[tuple[str, ...]] = []
+        for route in routes:
+            if route.target not in targets:
+                targets.append(route.target)
+        target_tuple = tuple(targets)
+        summary = self._target_summary(target_tuple, len(rows))
+        prefix = f"<global_inbox_turn>\n{summary}\n"
+        suffix = "\n</global_inbox_turn>"
+        return PlannedTurn(
+            turn_id=turn_id,
+            planning_cycle_key=f"recovery_{turn_id}",
+            message_ids=tuple(row.envelope_id for row in rows),
+            items=rows,
+            routes=routes,
+            targets=target_tuple,
+            target_summary=summary,
+            formatted_blocks=blocks,
+            provider_input=prefix + "\n".join(blocks) + suffix,
+            formatted_tokens=sum(self.estimator(block) for block in blocks),
+            wrapper_overhead_tokens=self.estimator(prefix + suffix),
+            formatted_bytes=sum(len(block.encode("utf-8")) for block in blocks),
+            wrapper_overhead_bytes=len((prefix + suffix).encode("utf-8")),
+        )
+
     async def recover_current_turn(self) -> bool:
-        """Resume only an exact, stateful crash join; otherwise requeue it."""
+        """Finish or unwind a durable crash join before normal planning."""
+        raw: Any = None
         try:
             raw = json.loads(self.current_turn_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False
         except (OSError, ValueError):
+            self.health = RuntimeHealth("degraded", "invalid crash join")
+            self._clear_terminal_turn()
             return False
-        if not isinstance(raw, dict) or raw.get("version") != CURRENT_TURN_VERSION:
+
+        turn_id = raw.get("turn_id") if isinstance(raw, dict) else None
+        run = (
+            await self.store.get_turn_run(turn_id)
+            if isinstance(turn_id, str) and turn_id
+            else None
+        )
+        durable_ids = (
+            tuple(run.message_ids)
+            if run is not None and run.state == ProcessingState.IN_TURN.value
+            else ()
+        )
+
+        async def unwind(
+            diagnostic: str,
+            state: str = "degraded",
+            *,
+            defer_requeued_resume: bool = False,
+        ) -> bool:
+            requeued = False
+            if run is not None and durable_ids:
+                exact_ids = (
+                    tuple(self.active.message_ids)
+                    if self.active.turn_id == run.turn_id
+                    else durable_ids
+                )
+                await self.store.requeue_messages(exact_ids, turn_id=run.turn_id)
+                requeued = True
+            self.health = RuntimeHealth(state, diagnostic)
+            self._defer_requeued_resume = defer_requeued_resume and requeued
+            self._clear_terminal_turn()
+            if requeued:
+                self.notify()
             return False
-        turn_id = raw.get("turn_id")
-        ids = tuple(raw.get("message_ids") or ())
-        if not isinstance(turn_id, str) or not turn_id or not ids:
-            return False
-        run = await self.store.get_turn_run(turn_id)
-        if run is None or run.state != ProcessingState.IN_TURN.value:
-            return False
+
+        if (
+            not isinstance(raw, dict)
+            or raw.get("version") != CURRENT_TURN_VERSION
+            or run is None
+            or run.state != ProcessingState.IN_TURN.value
+            or not durable_ids
+        ):
+            return await unwind("invalid or stale crash join")
+
+        session = run.provider_session_id
+        rows = (
+            await self.store.get_in_turn_messages(turn_id, session)
+            if session
+            else ()
+        )
+        planned = self._reconstruct_exact_turn(turn_id=turn_id, rows=rows) if rows else None
+        expected_routes = (
+            [asdict(route) for route in planned.routes] if planned is not None else []
+        )
+        expected_targets = (
+            [list(target) for target in planned.targets] if planned is not None else []
+        )
+        raw_ids = raw.get("message_ids")
+        raw_routes = raw.get("routes")
+        raw_targets = raw.get("targets")
         current_session = self.adapter.get_provider_session_id()
         if (
-            run.provider_session_id
-            and current_session == run.provider_session_id
-            and tuple(run.message_ids) == ids
-            and await self.store.get_in_turn_messages(turn_id, current_session)
+            session is None
+            or current_session != session
+            or planned is None
+            or planned.message_ids != durable_ids
+            or not isinstance(raw_ids, list)
+            or tuple(raw_ids) != durable_ids
+            or raw_routes != expected_routes
+            or raw_targets != expected_targets
         ):
-            self.active.turn_id = turn_id
-            self.active.message_ids[:] = list(ids)
-            self.active.provider_session_id = current_session
-            if self.coordinator is not None:
-                self.coordinator.provider_session_id = current_session
+            return await unwind("crash join identity, route, or target mismatch")
+
+        self.active.turn_id = turn_id
+        self.active.message_ids[:] = list(durable_ids)
+        self.active.provider_session_id = session
+        if self.coordinator is not None:
+            self.coordinator.provider_session_id = session
+        self.attempts.reset()
+        self.health = RuntimeHealth("in_progress", "resuming durable crash join")
+        if not hasattr(self.run_turn, "handle_global_inbox_retry"):
+            return await unwind(
+                "crash resume retry unavailable", defer_requeued_resume=True
+            )
+        try:
+            retries = 0
+            while True:
+                try:
+                    await self._run_retry(planned)
+                    break
+                except Exception as exc:
+                    from .core import AgentAPIError
+
+                    if isinstance(exc, AgentAPIError) and exc.is_auth:
+                        return await unwind(
+                            "crash resume auth failure",
+                            "auth_failed",
+                            defer_requeued_resume=True,
+                        )
+                    if not isinstance(exc, AgentAPIError):
+                        return await unwind(
+                            f"crash resume unsafe failure: {type(exc).__name__}",
+                            defer_requeued_resume=True,
+                        )
+                    if retries >= self.max_api_retries:
+                        return await unwind(
+                            "crash resume retry budget exhausted",
+                            "api_error_abandoned",
+                            defer_requeued_resume=True,
+                        )
+                    retries += 1
+                    await self.retry_sleep(min(2 ** (retries - 1), 4))
+            await self.store.mark_processed(
+                tuple(self.active.message_ids), turn_id=turn_id
+            )
+            self.health = RuntimeHealth()
+            self._clear_terminal_turn()
             return True
-        await self.store.requeue_messages(run.message_ids, turn_id=turn_id)
-        self.notify()
-        return False
+        except asyncio.CancelledError:
+            await self.store.requeue_messages(
+                tuple(self.active.message_ids), turn_id=turn_id
+            )
+            self.health = RuntimeHealth("degraded", "crash resume cancelled and requeued")
+            self._clear_terminal_turn()
+            self.notify()
+            raise
+        except Exception as exc:
+            return await unwind(
+                f"crash resume terminal failure: {type(exc).__name__}",
+                defer_requeued_resume=True,
+            )
