@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 import tempfile
@@ -9,9 +10,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.message_store import (
     ChannelRoot,
+    LifecycleConflict,
     MessageStore,
+    ProcessingState,
+    ReceiptDisposition,
+    ReceiptWriteStatus,
     StoredMessage,
 )
+from puffo_agent.crypto.ws_client import PuffoCoreWsClient, TransportOutcome
 
 
 def _now_ms() -> int:
@@ -426,4 +432,570 @@ async def test_has_dm_from():
     assert await store.has_dm_from("alice-1")
     assert not await store.has_dm_from("")
 
+    await store.close()
+
+
+# ── Agent-wide Inbox receipts, ordering, and lifecycle ───────────
+
+
+@pytest.mark.asyncio
+async def test_schema_migration_is_idempotent_and_checks_new_columns():
+    import sqlite3
+
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "messages.db")
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE messages (envelope_id TEXT PRIMARY KEY, envelope_kind TEXT NOT NULL, "
+        "sender_slug TEXT NOT NULL, channel_id TEXT, space_id TEXT, recipient_slug TEXT, "
+        "content_type TEXT NOT NULL DEFAULT 'text/plain', content TEXT NOT NULL, "
+        "sent_at INTEGER NOT NULL, received_at INTEGER NOT NULL, thread_root_id TEXT, reply_to_id TEXT)"
+    )
+    con.execute(
+        "INSERT INTO messages VALUES "
+        "('legacy','channel','alice','ch','sp',NULL,'text/plain','old',1,1,NULL,NULL)"
+    )
+    con.commit()
+    con.close()
+
+    store = MessageStore(path)
+    await store.open()
+    await store.close()
+    await store.open()
+    db = await store._ensure_db()
+    async with db.execute("SELECT * FROM messages WHERE envelope_id = 'legacy'") as cur:
+        row = await cur.fetchone()
+    assert row["is_encrypted"] == 1
+    for column in (
+        "server_seq", "receipt_disposition", "receipt_reason", "processing_state",
+        "processing_turn_id", "model_visible_at", "processed_at", "local_ordinal",
+        "after_server_seq",
+    ):
+        assert row[column] is None
+    with pytest.raises(Exception):
+        await db.execute(
+            "UPDATE messages SET receipt_disposition = 'invalid' WHERE envelope_id = 'legacy'"
+        )
+    await db.rollback()
+    with pytest.raises(Exception):
+        await db.execute(
+            "UPDATE messages SET processing_state = 'invalid' WHERE envelope_id = 'legacy'"
+        )
+    await db.rollback()
+    async with db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_processing_state'"
+    ) as cur:
+        assert await cur.fetchone() is not None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_exact_baseline_schema_migration_keeps_inbox_fields_null():
+    import sqlite3
+
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "messages.db")
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE messages (envelope_id TEXT PRIMARY KEY, envelope_kind TEXT NOT NULL, "
+        "sender_slug TEXT NOT NULL, channel_id TEXT, space_id TEXT, recipient_slug TEXT, "
+        "content_type TEXT NOT NULL DEFAULT 'text/plain', content TEXT NOT NULL, "
+        "sent_at INTEGER NOT NULL, received_at INTEGER NOT NULL, thread_root_id TEXT, "
+        "reply_to_id TEXT, is_encrypted INTEGER NOT NULL DEFAULT 1)"
+    )
+    con.execute(
+        "INSERT INTO messages VALUES "
+        "('baseline','channel','alice','ch','sp',NULL,'text/plain','old',1,1,NULL,NULL,0)"
+    )
+    con.commit()
+    con.close()
+    store = MessageStore(path)
+    await store.open()
+    msg = await store.get_message_by_envelope("baseline")
+    assert msg is not None and msg.is_encrypted is False
+    assert msg.server_seq is None
+    assert msg.receipt_disposition is None
+    assert msg.processing_state is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_receipt_ack_mapping_idempotency_conflicts_and_gated_promotion():
+    store = _temp_store()
+    eligible = await store.store_receipt(
+        _channel_payload("eligible"),
+        server_seq=1,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="accepted",
+    )
+    terminal = await store.store_receipt(
+        _channel_payload("terminal"),
+        server_seq=2,
+        disposition=ReceiptDisposition.TERMINAL,
+        reason="redacted",
+    )
+    gated = await store.store_receipt(
+        _dm_payload("gated", "foreign", "agent"),
+        server_seq=3,
+        disposition=ReceiptDisposition.FOREIGN_DM_GATED,
+        reason="approval required",
+    )
+    assert eligible.acknowledge and terminal.acknowledge
+    assert not gated.acknowledge
+    repeated = await store.store_receipt(
+        _channel_payload("eligible", content="ignored"),
+        server_seq=1,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="ignored",
+    )
+    assert repeated.status is ReceiptWriteStatus.IDEMPOTENT
+    assert repeated.acknowledge
+
+    by_id = await store.store_receipt(
+        _channel_payload("eligible"),
+        server_seq=99,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="conflict",
+    )
+    by_seq = await store.store_receipt(
+        _channel_payload("different"),
+        server_seq=1,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="conflict",
+    )
+    assert by_id.status is ReceiptWriteStatus.CONFLICT and not by_id.acknowledge
+    assert by_seq.status is ReceiptWriteStatus.CONFLICT and not by_seq.acknowledge
+
+    promoted = await store.promote_gated_receipt("gated", 3, reason="approved")
+    promoted_again = await store.promote_gated_receipt("gated", 3, reason="approved")
+    assert promoted.status is ReceiptWriteStatus.COMMITTED and promoted.acknowledge
+    assert promoted_again.status is ReceiptWriteStatus.IDEMPOTENT and promoted_again.acknowledge
+    assert [m.envelope_id for m in await store.get_pending()] == ["eligible", "gated"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_receipt_handler_seam_maps_durable_acknowledge_to_transport_outcome():
+    store = _temp_store()
+    client = object.__new__(PuffoCoreWsClient)
+
+    async def handler(delivery):
+        envelope = delivery["envelope"]
+        disposition = ReceiptDisposition(envelope.pop("_disposition"))
+        result = await store.store_receipt(
+            envelope,
+            server_seq=delivery["seq"],
+            disposition=disposition,
+            reason="classified",
+        )
+        return (
+            TransportOutcome.ACK
+            if result.acknowledge
+            else TransportOutcome.HOLD
+        )
+
+    client.on_message = handler
+    eligible = _channel_payload("transport-eligible")
+    eligible["_disposition"] = ReceiptDisposition.ELIGIBLE.value
+    gated = _dm_payload("transport-gated", "foreign", "agent")
+    gated["_disposition"] = ReceiptDisposition.FOREIGN_DM_GATED.value
+    assert (
+        await client.dispatch_delivery({"seq": 20, "envelope": eligible})
+    ).outcome is TransportOutcome.ACK
+    assert (
+        await client.dispatch_delivery({"seq": 21, "envelope": gated})
+    ).outcome is TransportOutcome.HOLD
+
+    conflict = _channel_payload("other-id")
+    conflict["_disposition"] = ReceiptDisposition.ELIGIBLE.value
+    assert (
+        await client.dispatch_delivery({"seq": 20, "envelope": conflict})
+    ).outcome is TransportOutcome.HOLD
+
+    async def failing_handler(_delivery):
+        raise RuntimeError("injected commit failure")
+
+    client.on_message = failing_handler
+    assert (
+        await client.dispatch_delivery({
+            "seq": 22,
+            "envelope": _channel_payload("commit-failure"),
+        })
+    ).outcome is TransportOutcome.HOLD
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_sequence_backfill_does_not_activate_history_row():
+    store = _temp_store()
+    await store.store(_channel_payload("legacy"))
+    result = await store.store_receipt(
+        _channel_payload("legacy"),
+        server_seq=8,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="real delivery",
+    )
+    assert result.status is ReceiptWriteStatus.COMMITTED and result.acknowledge
+    msg = await store.get_message_by_envelope("legacy")
+    assert msg is not None
+    assert msg.server_seq == 8
+    assert msg.receipt_disposition is None and msg.processing_state is None
+    assert await store.get_pending() == ()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_local_pending_fifo_frontier_ordinal_and_channel_page_survive_reopen():
+    store = _temp_store()
+    await store.store_receipt(
+        _channel_payload("s1"), server_seq=1,
+        disposition=ReceiptDisposition.ELIGIBLE, reason="ok",
+    )
+    await store.store_local_event(_channel_payload("l1"), reason="runtime")
+    await store.store_local_event(_channel_payload("l2"), reason="runtime")
+    await store.store_receipt(
+        _channel_payload("s2"), server_seq=2,
+        disposition=ReceiptDisposition.ELIGIBLE, reason="ok",
+    )
+    await store.close()
+    await store.open()
+    pending = await store.get_pending()
+    assert [m.envelope_id for m in pending] == ["s1", "l1", "l2", "s2"]
+    assert [m.server_seq for m in pending] == [1, None, None, 2]
+    assert pending[1].after_server_seq == pending[2].after_server_seq == 1
+    assert pending[1].local_ordinal < pending[2].local_ordinal
+    page = await store.get_channel_pending("sp_1", "ch_1", limit=3)
+    assert [m.envelope_id for m in page.items] == ["s1", "l1", "l2"]
+    assert page.through_seq == 1 and page.more_available
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_introduction_local_marker_commit_and_replay_are_atomic():
+    store = _temp_store()
+    payload = _channel_payload("intro")
+    first = await store.store_local_event(
+        payload, reason="introduction", intro_channel_id="ch_1"
+    )
+    replay = await store.store_local_event(
+        payload, reason="introduction", intro_channel_id="ch_1"
+    )
+    assert first.envelope_id == replay.envelope_id == "intro"
+    assert [m.envelope_id for m in await store.get_pending()] == ["intro"]
+    assert await store.has_channel_intro_been_prompted("ch_1")
+    with pytest.raises(LifecycleConflict):
+        await store.store_local_event(
+            _channel_payload("other"), reason="introduction", intro_channel_id="ch_1"
+        )
+    assert not await store.has_message("other")
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_introduction_marker_rolls_back_when_local_insert_fails():
+    store = _temp_store()
+    await store.store(_channel_payload("duplicate"))
+    with pytest.raises(Exception):
+        await store.store_local_event(
+            _channel_payload("duplicate"),
+            reason="introduction",
+            intro_channel_id="new-channel",
+        )
+    assert not await store.has_channel_intro_been_prompted("new-channel")
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_sequence_less_server_receipt_is_never_pending_work():
+    store = _temp_store()
+    db = await store._ensure_db()
+    values = store._payload_values(_channel_payload("missing-sequence"), None)
+    await db.execute(
+        """INSERT INTO messages
+           (envelope_id, envelope_kind, sender_slug, channel_id, space_id,
+            recipient_slug, content_type, content, sent_at, received_at,
+            thread_root_id, reply_to_id, is_encrypted, receipt_disposition,
+            receipt_reason, processing_state)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        values + (
+            ReceiptDisposition.ELIGIBLE.value,
+            "malformed legacy data",
+            ProcessingState.PENDING.value,
+        ),
+    )
+    await db.commit()
+    assert await store.get_pending() == ()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_lifecycle_turn_recovery_baseline_through_and_cleanup():
+    store = _temp_store()
+    old = _now_ms() - 100 * 86_400_000
+    for seq in (1, 2):
+        await store.store_receipt(
+            _channel_payload(f"s{seq}"),
+            server_seq=seq,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="ok",
+            received_at=old,
+        )
+    before = await store.get_pending()
+    with pytest.raises(LifecycleConflict):
+        await store.admit_messages(
+            ["s1", "missing"], turn_id="bad", provider_session_id="provider"
+        )
+    assert await store.get_pending() == before
+
+    run = await store.admit_messages(
+        ["s1", "s2"], turn_id="turn", provider_session_id="provider",
+        model_visible_at=123,
+    )
+    assert run.message_ids == ("s1", "s2")
+    assert [m.envelope_id for m in await store.get_in_turn_messages("turn", "provider")] == [
+        "s1", "s2",
+    ]
+    assert await store.get_model_visible_through_seq("turn", "sp_1", "ch_1") == 2
+    await store.set_context_baseline("sp_1", "ch_1", 5)
+    await store.set_context_baseline("sp_1", "ch_2", 9)
+    assert await store.get_context_baseline("sp_1", "ch_1") == 5
+    assert await store.get_context_baseline("sp_1", "ch_2") == 9
+    assert await store.cleanup(90) == 0
+
+    await store.close()
+    await store.open()
+    reopened = await store.get_turn_run("turn")
+    assert reopened is not None and reopened.provider_session_id == "provider"
+    requeued = await store.requeue_messages(["s2", "s1"], turn_id="turn")
+    assert requeued.state == "requeued"
+    assert await store.get_model_visible_through_seq("turn", "sp_1", "ch_1") is None
+    completed_admission = await store.admit_messages(
+        ["s1", "s2"], turn_id="turn2", provider_session_id="provider2"
+    )
+    assert completed_admission.state == ProcessingState.IN_TURN.value
+    completed = await store.mark_processed(["s2", "s1"], turn_id="turn2")
+    assert completed.state == ProcessingState.PROCESSED.value
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_active_turn_append_uses_stable_union_for_complete_and_requeue():
+    store = _temp_store()
+    for seq in range(1, 7):
+        await store.store_receipt(
+            _channel_payload(f"s{seq}"),
+            server_seq=seq,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="ok",
+        )
+
+    initial = await store.admit_messages(
+        ["s1"], turn_id="append-complete", provider_session_id="durable"
+    )
+    assert initial.message_ids == ("s1",)
+    appended = await store.admit_messages(
+        ["s2", "s3"], turn_id="append-complete", provider_session_id="durable"
+    )
+    assert appended.message_ids == ("s1", "s2", "s3")
+    with pytest.raises(LifecycleConflict):
+        await store.admit_messages(
+            ["s4"], turn_id="append-complete", provider_session_id="other"
+        )
+    with pytest.raises(LifecycleConflict):
+        await store.admit_messages(
+            ["s2"], turn_id="append-complete", provider_session_id="durable"
+        )
+    with pytest.raises(LifecycleConflict):
+        await store.admit_messages(
+            ["s4", "missing"],
+            turn_id="append-complete",
+            provider_session_id="durable",
+        )
+    assert (await store.get_turn_run("append-complete")).message_ids == (
+        "s1", "s2", "s3",
+    )
+    completed = await store.mark_processed(
+        ["s3", "s1", "s2"], turn_id="append-complete"
+    )
+    assert completed.state == ProcessingState.PROCESSED.value
+    with pytest.raises(LifecycleConflict):
+        await store.admit_messages(
+            ["s4"], turn_id="append-complete", provider_session_id="durable"
+        )
+
+    await store.admit_messages(
+        ["s4"], turn_id="append-requeue", provider_session_id="durable-2"
+    )
+    appended_requeue = await store.admit_messages(
+        ["s5", "s6"], turn_id="append-requeue", provider_session_id="durable-2"
+    )
+    assert appended_requeue.message_ids == ("s4", "s5", "s6")
+    requeued = await store.requeue_messages(
+        ["s6", "s4", "s5"], turn_id="append-requeue"
+    )
+    assert requeued.state == "requeued"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_nullable_provider_session_is_non_resumable_and_requeue_only():
+    store = _temp_store()
+    for seq in (1, 2):
+        await store.store_receipt(
+            _channel_payload(f"stateless-{seq}"),
+            server_seq=seq,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="ok",
+        )
+    run = await store.admit_messages(
+        ["stateless-1"], turn_id="stateless-complete", provider_session_id=None
+    )
+    assert run.provider_session_id is None
+    completed = await store.mark_processed(
+        ["stateless-1"], turn_id="stateless-complete"
+    )
+    assert completed.state == ProcessingState.PROCESSED.value
+
+    await store.admit_messages(
+        ["stateless-2"], turn_id="stateless-interrupted", provider_session_id=None
+    )
+    db = await store._ensure_db()
+    async with db.execute("PRAGMA table_info(turn_runs)") as cursor:
+        columns = {row["name"]: row for row in await cursor.fetchall()}
+    assert columns["provider_session_id"]["notnull"] == 0
+    await store.close()
+    await store.open()
+    reopened = await store.get_turn_run("stateless-interrupted")
+    assert reopened is not None and reopened.provider_session_id is None
+    assert await store.get_in_turn_messages("stateless-interrupted", None) == ()
+    requeued = await store.requeue_messages(
+        ["stateless-2"], turn_id="stateless-interrupted"
+    )
+    assert requeued.state == "requeued"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_nonnullable_provider_session_schema_migration_preserves_turn():
+    import sqlite3
+
+    store = _temp_store()
+    await store.open()
+    await store.close()
+    connection = sqlite3.connect(store.db_path)
+    connection.executescript(
+        """
+        DROP TABLE turn_run_messages;
+        DROP TABLE turn_runs;
+        CREATE TABLE turn_runs (
+            turn_id TEXT PRIMARY KEY,
+            provider_session_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            started_at INTEGER NOT NULL,
+            completed_at INTEGER
+        );
+        CREATE TABLE turn_run_messages (
+            turn_id TEXT NOT NULL,
+            envelope_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            PRIMARY KEY (turn_id, envelope_id),
+            UNIQUE (turn_id, ordinal),
+            FOREIGN KEY (turn_id) REFERENCES turn_runs(turn_id)
+        );
+        INSERT INTO turn_runs VALUES ('legacy-turn', 'durable', 'in_turn', 123, NULL);
+        INSERT INTO turn_run_messages VALUES ('legacy-turn', 'legacy-message', 0);
+        """
+    )
+    connection.close()
+
+    await store.open()
+    db = await store._ensure_db()
+    async with db.execute("PRAGMA table_info(turn_runs)") as cursor:
+        columns = {row["name"]: row for row in await cursor.fetchall()}
+    assert columns["provider_session_id"]["notnull"] == 0
+    run = await store.get_turn_run("legacy-turn")
+    assert run is not None
+    assert run.provider_session_id == "durable"
+    assert run.message_ids == ("legacy-message",)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_inbox_receipt_local_and_lifecycle_operations_serialize():
+    store = _temp_store()
+    await store.open()
+    await store.store_receipt(
+        _channel_payload("admit-me"),
+        server_seq=1,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="ok",
+    )
+    receipt, local, admitted = await asyncio.gather(
+        store.store_receipt(
+            _channel_payload("concurrent-receipt"),
+            server_seq=2,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="ok",
+        ),
+        store.store_local_event(_channel_payload("concurrent-local"), reason="runtime"),
+        store.admit_messages(
+            ["admit-me"], turn_id="concurrent-turn", provider_session_id="durable"
+        ),
+    )
+    assert receipt.acknowledge
+    assert local.processing_state is ProcessingState.PENDING
+    assert admitted.message_ids == ("admit-me",)
+    completed, pending = await asyncio.gather(
+        store.mark_processed(["admit-me"], turn_id="concurrent-turn"),
+        store.get_pending(),
+    )
+    assert completed.state == ProcessingState.PROCESSED.value
+    assert {item.envelope_id for item in pending} == {
+        "concurrent-receipt", "concurrent-local",
+    }
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_writer_waits_for_active_inbox_transaction(monkeypatch):
+    store = _temp_store()
+    await store.open()
+    transaction_started = asyncio.Event()
+    release_transaction = asyncio.Event()
+    original = store._store_receipt_unlocked
+
+    async def paused_receipt(*args, **kwargs):
+        db = await store._ensure_db()
+        await db.execute("BEGIN IMMEDIATE")
+        transaction_started.set()
+        await release_transaction.wait()
+        await db.rollback()
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_store_receipt_unlocked", paused_receipt)
+    receipt_task = asyncio.create_task(
+        store.store_receipt(
+            _channel_payload("locked-receipt"),
+            server_seq=1,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="ok",
+        )
+    )
+    await transaction_started.wait()
+    legacy_task = asyncio.create_task(store.store(_channel_payload("legacy-write")))
+    await asyncio.sleep(0)
+    assert not legacy_task.done()
+
+    db = await store._ensure_db()
+    async with db.execute(
+        "SELECT 1 FROM messages WHERE envelope_id = 'legacy-write'"
+    ) as cursor:
+        assert await cursor.fetchone() is None
+
+    release_transaction.set()
+    receipt = await receipt_task
+    await legacy_task
+    assert receipt.acknowledge
+    assert await store.has_message("locked-receipt")
+    assert await store.has_message("legacy-write")
     await store.close()
