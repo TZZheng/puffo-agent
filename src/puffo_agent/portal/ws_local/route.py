@@ -93,6 +93,11 @@ def _build_tool_dispatch(point: AttachPoint):
         workspace=getattr(client, "workspace", None),
         message_client=client,
         send_coordinator=send_coordinator,
+        # T23: the daemon owns the single per-agent bridge WS, so only
+        # the in-process ws-local tools can drive it. None on native
+        # agents → send_message keeps the signed-crypto path. The
+        # subprocess/RPC MCP site can't own this WS, so it stays None.
+        bridge_client=getattr(client, "_bridge", None),
     )
     return _build_dispatch(cfg)
 

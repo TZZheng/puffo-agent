@@ -60,12 +60,17 @@ def _rebuild_managed_system_prompt(
     profile_path: str,
     memory_path: str,
     workspace_path: str,
+    display_name: str = "",
+    role: str = "",
+    role_short: str = "",
 ) -> str:
     """Dispatch wrapper: write the right system-prompt file(s) for the
     agent's harness. Codex agents get ``$CODEX_HOME/AGENTS.md``; every
     other harness goes through the legacy claude-code path (which also
     writes GEMINI.md for the gemini-cli harness sharing the same body).
-    Returns the assembled prompt body either way.
+    Returns the assembled prompt body either way. The identity fields
+    feed the managed ``memory/briefing/profile.md`` re-sync inside the
+    rebuild.
     """
     if harness_name == "codex":
         return rebuild_agent_codex_md(
@@ -74,6 +79,10 @@ def _rebuild_managed_system_prompt(
             memory_dir=Path(memory_path),
             workspace_dir=Path(workspace_path),
             codex_user_dir=agent_codex_user_dir(agent_id),
+            agent_id=agent_id,
+            display_name=display_name,
+            role=role,
+            role_short=role_short,
         )
     return rebuild_agent_claude_md(
         shared_dir=shared_path,
@@ -82,6 +91,10 @@ def _rebuild_managed_system_prompt(
         workspace_dir=Path(workspace_path),
         claude_user_dir=agent_claude_user_dir(agent_id),
         gemini_user_dir=agent_home_dir(agent_id) / ".gemini",
+        agent_id=agent_id,
+        display_name=display_name,
+        role=role,
+        role_short=role_short,
     )
 
 logger = logging.getLogger(__name__)
@@ -115,6 +128,9 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             agent_id=agent_cfg.id,
             workspace_dir=str(agent_cfg.resolve_workspace_dir()),
             max_turns=agent_cfg.runtime.max_turns,
+            # Empty = vendor endpoint (unchanged); set = route the SDK's
+            # model calls through the proxy via ANTHROPIC_BASE_URL.
+            base_url=agent_cfg.runtime.llm_base_url,
         )
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_stdio_sdk_config, default_python_executable
@@ -128,6 +144,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
                 workspace=str(agent_cfg.resolve_workspace_dir()),
                 agent_id=agent_cfg.id,
+                memory_dir=str(agent_cfg.resolve_memory_dir()),
             )
         return adapter
 
@@ -209,6 +226,10 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 rpc_url=f"http://host.docker.internal:{daemon_cfg.rpc_service.port}",
                 runtime_kind="cli-docker",
                 harness=agent_cfg.runtime.harness,
+                # MCP runs in-container; the agent dir is bind-mounted
+                # at /home/agent/.puffo-agent-state (docker_cli also
+                # pins this at its env-override sites).
+                memory_dir="/home/agent/.puffo-agent-state/memory",
             )
         return adapter
 
@@ -243,6 +264,13 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             puffo_core_server_url=agent_cfg.puffo_core.server_url,
             puffo_core_slug=agent_cfg.puffo_core.slug,
             puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
+            # Empty base URL → no env override (claude keeps its OAuth /
+            # ~/.claude credential path). Set → ANTHROPIC_BASE_URL routes
+            # the CLI's model calls through the proxy; the VK rides on
+            # runtime.api_key (injected as ANTHROPIC_API_KEY only when
+            # the base URL is also set — see LocalCLIAdapter._llm_env).
+            llm_base_url=agent_cfg.runtime.llm_base_url,
+            llm_api_key=agent_cfg.runtime.api_key,
         )
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
@@ -259,6 +287,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 rpc_url=f"http://127.0.0.1:{daemon_cfg.rpc_service.port}",
                 runtime_kind="cli-local",
                 harness=agent_cfg.runtime.harness,
+                memory_dir=str(agent_cfg.resolve_memory_dir()),
             )
         return adapter
 
@@ -272,6 +301,9 @@ def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
     """Anthropic/OpenAI message-completion provider for the
     chat-local adapter. Per-agent fields override daemon defaults."""
     provider_name = runtime.provider or daemon_cfg.default_provider
+    # Empty base URL → None → vendor endpoint (today's behavior, byte-for-
+    # byte unchanged). Set → route completions through the proxy (VK).
+    base_url = runtime.llm_base_url or None
 
     if provider_name == "anthropic":
         from ..agent.providers.anthropic_provider import AnthropicProvider
@@ -281,7 +313,7 @@ def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
             raise RuntimeError(
                 "anthropic api_key is not set in daemon.yml or agent.yml"
             )
-        return AnthropicProvider(api_key=api_key, model=model)
+        return AnthropicProvider(api_key=api_key, model=model, base_url=base_url)
 
     if provider_name == "openai":
         from ..agent.providers.openai_provider import OpenAIProvider
@@ -291,7 +323,7 @@ def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
             raise RuntimeError(
                 "openai api_key is not set in daemon.yml or agent.yml"
             )
-        return OpenAIProvider(api_key=api_key, model=model)
+        return OpenAIProvider(api_key=api_key, model=model, base_url=base_url)
 
     raise RuntimeError(f"unknown provider {provider_name!r}")
 
@@ -363,10 +395,26 @@ def _build_puffo_core_client(
     from ..crypto.keystore import KeyStore
 
     pc = agent_cfg.puffo_core
-    _ensure_agent_identity_imported(agent_id, pc.slug)
+    bridge = None
+    if pc.transport == "bridge":
+        # T23 keyless transport: no identity file exists to import;
+        # the bridge authenticates with the sandbox token instead.
+        # Keystore/http below are still constructed (both lazy — they
+        # never touch disk/network in __init__); phase 2 replaces
+        # their call sites.
+        from ..agent.bridge_client import CloudBridgeClient
+
+        bridge = CloudBridgeClient(pc.server_url, pc.sandbox_token, pc.slug)
+    else:
+        _ensure_agent_identity_imported(agent_id, pc.slug)
     ks_dir = str(agent_dir(agent_id) / "keys")
     ks = KeyStore(ks_dir)
-    http = PuffoCoreHttpClient(pc.server_url, ks, pc.slug)
+    # Bridge agents dispatch outbound tool work keyless over the unsigned
+    # ``/v2/cloud-agents/*`` routes; ``route.py`` reuses ``client.http``, so
+    # the in-process ws-local cfg's ``keyless`` accessor reads True here.
+    http = PuffoCoreHttpClient(
+        pc.server_url, ks, pc.slug, keyless=(pc.transport == "bridge"),
+    )
     ms = MessageStore(str(agent_dir(agent_id) / "messages.db"))
 
     max_inline = (
@@ -405,6 +453,7 @@ def _build_puffo_core_client(
         agent_created_at=agent_cfg.created_at,
         image_edge_px=max_image_edge_px(model),
         catchup_stale_hours=catchup_stale_hours,
+        bridge_client=bridge,
     )
 
 
@@ -860,6 +909,80 @@ class Worker:
         # Signalled when warm() finishes (success, failure, or skipped).
         # Daemon awaits this to serialise heavy startup across workers.
         self._warm_done = asyncio.Event()
+        # Proactive (between-turns) profile reload state. The refresh
+        # watcher (see ``_run``) and the turn-start ``_process_refresh_flags``
+        # call share this lock so a flag is consumed exactly once —
+        # whichever path wins takes it; the loser hits the early-return
+        # when the flags are already gone. ``_turn_active`` gates the
+        # watcher so it never applies mid-generation (deferred to the
+        # turn-start path). ``_refresh_now`` is a signal-driven wake so
+        # SIGHUP can beat the 250 ms idle poll.
+        self._reload_lock = asyncio.Lock()
+        self._turn_active = False
+        self._refresh_now = asyncio.Event()
+
+    def notify_refresh(self) -> None:
+        """Wake the proactive refresh watcher now (sub-poll latency).
+        Called from the daemon's SIGHUP handler, which runs on the loop
+        thread. No-op safe: setting an already-set Event is idempotent,
+        and if the worker has no watcher yet (pre-``_run``) the flag is
+        simply observed on the first watcher tick."""
+        self._refresh_now.set()
+
+    async def _proactive_refresh_tick(self, flag_paths, apply) -> bool:
+        """One proactive-watcher iteration's decision + apply. Skips when
+        a turn owns flag consumption (``_turn_active``) or no flag in
+        ``flag_paths`` is pending; otherwise takes ``_reload_lock`` (the
+        same lock the turn-start path holds → consume-once), re-checks
+        ``_turn_active``, and awaits ``apply`` (the bound
+        ``_process_refresh_flags`` call). Returns whether ``apply`` ran.
+        Exceptions from ``apply`` are swallowed so the watcher never
+        kills the worker — the turn-start path is the backstop."""
+        if self._turn_active:
+            # A turn owns flag consumption; never apply mid-turn.
+            return False
+        if not any(p.exists() for p in flag_paths):
+            # Cheap exists() check before taking the lock.
+            return False
+        async with self._reload_lock:
+            if self._turn_active:
+                # A turn started between the check and the lock; defer to
+                # the turn-start path.
+                return False
+            try:
+                await apply()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "agent %s: proactive refresh failed: %s",
+                    self.agent_cfg.id, exc,
+                )
+            return True
+
+    async def _refresh_watcher_loop(
+        self, flag_paths, apply, *, interval: float = 0.25,
+    ) -> None:
+        """Proactive between-turns profile reload loop. Polls
+        ``flag_paths`` every ``interval`` s (waking immediately when
+        ``notify_refresh()`` fires) so a ``profile.md`` / host-sync /
+        session edit takes effect while the agent is IDLE — instead of
+        only lazily at the next turn. Each pending flag is funneled into
+        ``apply``, the bound turn-start ``_process_refresh_flags`` /
+        ``adapter.reload`` primitive (adapter-only reload: the bridge WS
+        on ``self._client`` and the worker are untouched). No-op unless a
+        flag is present, so native/desktop runtimes see no behavioral
+        change beyond applying an already-written flag sooner. Runs as a
+        sibling task of ``heartbeat``; ends when ``_stop`` is set."""
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._refresh_now.wait(), timeout=interval,
+                )
+            except asyncio.TimeoutError:
+                pass
+            self._refresh_now.clear()
+            if self._stop.is_set():
+                break
+            await self._proactive_refresh_tick(flag_paths, apply)
 
     def start(self) -> asyncio.Task:
         if self._task is not None and not self._task.done():
@@ -1048,7 +1171,6 @@ class Worker:
             memory_path = str(self.agent_cfg.resolve_memory_dir())
             workspace_path = str(self.agent_cfg.resolve_workspace_dir())
             claude_path = str(self.agent_cfg.resolve_claude_dir())
-            Path(memory_path).mkdir(parents=True, exist_ok=True)
             Path(workspace_path).mkdir(parents=True, exist_ok=True)
             _seed_claude_dir(Path(claude_path))
 
@@ -1063,6 +1185,9 @@ class Worker:
                 profile_path=profile_path,
                 memory_path=memory_path,
                 workspace_path=workspace_path,
+                display_name=self.agent_cfg.display_name,
+                role=self.agent_cfg.role,
+                role_short=self.agent_cfg.role_short,
             )
 
             # One-time migration: remove an older project-level
@@ -1165,40 +1290,58 @@ class Worker:
         global_runtime: GlobalInboxRuntime
 
         async def run_global_turn(planned):
-            await _process_refresh_flags(
-                agent_id=agent_id,
-                harness_name=(self.agent_cfg.runtime.harness or "").strip(),
-                shared_path=shared_path,
-                profile_path=profile_path,
-                memory_path=memory_path,
-                workspace_path=workspace_path,
-                puffo=puffo,
-                adapter=self._adapter,
-                refresh_agent_flag=refresh_agent_flag_path,
-                refresh_host_sync_flag=refresh_host_sync_flag_path,
-                refresh_session_flag=refresh_session_flag_path,
-            )
-            self._maybe_wake_refresher_if_auth_failed(agent_id)
-            if (
-                self._ensure_fresh_token is not None
-                and self.agent_cfg.runtime.kind in (
-                    RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER,
-                )
-                and not await self._ensure_fresh_token()
-            ):
-                self._enter_auth_failed(agent_id)
-                raise AgentAPIError(
-                    "credential refresh failed before delivery", is_auth=True
-                )
-            Worker._flip_health_in_progress(self.runtime, agent_id, logger)
+            async def execute_provider_turn():
+                self._turn_active = True
+                try:
+                    async with self._reload_lock:
+                        await _process_refresh_flags(
+                            agent_id=agent_id,
+                            harness_name=(
+                                self.agent_cfg.runtime.harness or ""
+                            ).strip(),
+                            shared_path=shared_path,
+                            profile_path=profile_path,
+                            memory_path=memory_path,
+                            workspace_path=workspace_path,
+                            display_name=self.agent_cfg.display_name,
+                            role=self.agent_cfg.role,
+                            role_short=self.agent_cfg.role_short,
+                            puffo=puffo,
+                            adapter=self._adapter,
+                            refresh_agent_flag=refresh_agent_flag_path,
+                            refresh_host_sync_flag=refresh_host_sync_flag_path,
+                            refresh_session_flag=refresh_session_flag_path,
+                        )
+                    self._maybe_wake_refresher_if_auth_failed(agent_id)
+                    if (
+                        self._ensure_fresh_token is not None
+                        and self.agent_cfg.runtime.kind in (
+                            RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER,
+                        )
+                        and not await self._ensure_fresh_token()
+                    ):
+                        self._enter_auth_failed(agent_id)
+                        raise AgentAPIError(
+                            "credential refresh failed before delivery",
+                            is_auth=True,
+                        )
+                    Worker._flip_health_in_progress(
+                        self.runtime, agent_id, logger
+                    )
+                    return await puffo.handle_global_inbox_turn(planned)
+                finally:
+                    self._turn_active = False
+
             try:
-                reply = await puffo.handle_global_inbox_turn(planned)
+                reply = await execute_provider_turn()
             except AgentAPIError as exc:
                 if exc.is_auth:
                     self._enter_auth_failed(agent_id)
                 raise
             else:
-                Worker._resolve_health_on_success(self.runtime, agent_id, logger)
+                Worker._resolve_health_on_success(
+                    self.runtime, agent_id, logger
+                )
             self.runtime.msg_count += 1
             self.runtime.last_event_at = int(time.time())
             if not reply:
@@ -1226,8 +1369,12 @@ class Worker:
             ))
 
         async def retry_global_turn(planned):
+            self._turn_active = True
             try:
-                reply = await puffo.handle_global_inbox_retry(planned)
+                try:
+                    reply = await puffo.handle_global_inbox_retry(planned)
+                finally:
+                    self._turn_active = False
             except AgentAPIError as exc:
                 if exc.is_auth:
                     self._enter_auth_failed(agent_id)
@@ -1290,8 +1437,37 @@ class Worker:
                 except asyncio.TimeoutError:
                     pass
 
-        # Per-agent credential_refresh coroutine retired; CredentialRefresher
-        # owns the loop daemon-wide (single writer, no rotation race).
+        # Proactive between-turns reload: bind the turn-start
+        # ``_process_refresh_flags`` primitive over this run's locals so
+        # the watcher applies the SAME reload the turn-start path does.
+        refresh_flag_paths = (
+            refresh_agent_flag_path,
+            refresh_host_sync_flag_path,
+            refresh_session_flag_path,
+        )
+
+        async def apply_refresh() -> None:
+            await _process_refresh_flags(
+                agent_id=agent_id,
+                harness_name=(self.agent_cfg.runtime.harness or "").strip(),
+                shared_path=shared_path,
+                profile_path=profile_path,
+                memory_path=memory_path,
+                workspace_path=workspace_path,
+                display_name=self.agent_cfg.display_name,
+                role=self.agent_cfg.role,
+                role_short=self.agent_cfg.role_short,
+                puffo=puffo,
+                adapter=self._adapter,
+                refresh_agent_flag=refresh_agent_flag_path,
+                refresh_host_sync_flag=refresh_host_sync_flag_path,
+                refresh_session_flag=refresh_session_flag_path,
+            )
+
+        # PUF-221: per-agent credential_refresh coroutine retired —
+        # CredentialRefresher in portal/credential_refresh.py owns the
+        # refresh loop daemon-wide. Single writer = no multi-process
+        # rotation race on Anthropic's single-use refresh tokens.
 
         # Status reporter: heartbeat task + inline begin/end_turn; no-op
         # without an http client (tests). Lazy provider reads live runtime.health.
@@ -1322,6 +1498,9 @@ class Worker:
 
         hb_task = asyncio.ensure_future(heartbeat())
         status_task = asyncio.ensure_future(reporter.run_heartbeat_loop())
+        watch_task = asyncio.ensure_future(
+            self._refresh_watcher_loop(refresh_flag_paths, apply_refresh)
+        )
         try:
             while not self._stop.is_set():
                 try:
@@ -1357,7 +1536,8 @@ class Worker:
             reporter.stop()
             hb_task.cancel()
             status_task.cancel()
-            for task in (hb_task, status_task):
+            watch_task.cancel()
+            for task in (hb_task, status_task, watch_task):
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
@@ -1379,6 +1559,9 @@ async def _process_refresh_flags(
     refresh_agent_flag: Path,
     refresh_host_sync_flag: Path,
     refresh_session_flag: Path,
+    display_name: str = "",
+    role: str = "",
+    role_short: str = "",
 ) -> None:
     """Consume any worker-scope refresh flags into a single
     ``adapter.reload(prompt, with_session=…)`` call at turn start.
@@ -1422,6 +1605,9 @@ async def _process_refresh_flags(
                 profile_path=profile_path,
                 memory_path=memory_path,
                 workspace_path=workspace_path,
+                display_name=display_name,
+                role=role,
+                role_short=role_short,
             )
             from ..agent.shared_content import MEMORY_SECTION_HEADER
 

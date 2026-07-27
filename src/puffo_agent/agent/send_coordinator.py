@@ -209,6 +209,8 @@ class SendCoordinator:
                 "'#<name>' channel addressing isn't supported; use a channel id",
                 kind="validation",
             )
+        if getattr(self.http_client, "keyless", False):
+            return await self._send_keyless(request, destination)
         if destination.startswith("@"):
             return await self._send_dm(request, destination[1:])
 
@@ -230,6 +232,131 @@ class SendCoordinator:
             if recovered:
                 result["recovered_messages"] = recovered
         return result
+
+    async def _send_keyless(
+        self, request: SemanticSendRequest, destination: str,
+    ) -> dict[str, Any]:
+        """Preserve the CloudBridge transport behind the semantic facade.
+
+        The experimental keyless endpoint does not yet implement the native
+        freshness/hold contract. It therefore sends through its existing
+        cloud-agent route and returns a normalized semantic result.
+        """
+        from ..mcp.puffo_core_tools import (
+            _resolve_channel_space,
+            _resolve_outgoing_root,
+        )
+
+        dm_peer: str | None
+        channel_id: str | None
+        space_id: str | None
+        if destination.startswith("@"):
+            dm_peer = destination[1:]
+            if not dm_peer:
+                return failed_result(
+                    "DM recipient slug is required after '@'", kind="validation",
+                )
+            channel_id = None
+            space_id = None
+        else:
+            dm_peer = None
+            channel_id = destination
+            try:
+                space_id = await _resolve_channel_space(
+                    _CoordinatorConfig(self), destination,
+                )
+            except Exception as exc:
+                return failed_result(str(exc), kind="routing")
+
+        try:
+            root_id, root_note = await _resolve_outgoing_root(
+                request.root_id,
+                self.data_client,
+                self_slug=self.slug,
+                channel_id=channel_id,
+                space_id=space_id,
+                dm_peer=dm_peer,
+            )
+            body: dict[str, Any] = {
+                "plaintext": (
+                    request.caption if request.attachment_paths else request.text
+                ),
+            }
+            if dm_peer is not None:
+                body["recipient_slug"] = dm_peer
+            else:
+                body["space_id"] = space_id
+                body["channel_id"] = channel_id
+            if root_id:
+                body["thread_root_id"] = root_id
+                if request.root_id:
+                    body["reply_to_id"] = request.root_id
+
+            targets = self._validate_attachment_targets(request)
+            total_bytes = 0
+            refs: list[dict[str, Any]] = []
+            prepared: list[tuple[Path, bytes, str]] = []
+            for target in targets:
+                plaintext = target.read_bytes()
+                mime_type = (
+                    mimetypes.guess_type(target.name)[0]
+                    or "application/octet-stream"
+                )
+                prepared.append((target, plaintext, mime_type))
+                total_bytes += len(plaintext)
+            for target, plaintext, mime_type in prepared:
+                upload = await self.http_client.post_bytes_unsigned(
+                    "/v2/cloud-agents/blobs/upload", plaintext,
+                )
+                blob_id = (
+                    upload.get("blob_id")
+                    if isinstance(upload, Mapping) else None
+                )
+                if not blob_id:
+                    raise RuntimeError(
+                        f"keyless upload returned no blob_id for {target.name!r}"
+                    )
+                refs.append({
+                    "blob_id": blob_id,
+                    "filename": target.name,
+                    "mime_type": mime_type,
+                    "size_bytes": len(plaintext),
+                })
+            if refs:
+                body["attachments"] = refs
+
+            raw = await self.http_client.post_unsigned(
+                "/v2/cloud-agents/messages", body,
+            ) or {}
+            envelope_id = (
+                raw.get("envelope_id") if isinstance(raw, Mapping) else None
+            )
+            if not envelope_id:
+                return failed_result(
+                    "keyless message send returned no envelope_id",
+                    kind="protocol",
+                )
+            attachment_note = (
+                f"\nuploaded {len(refs)} file(s) ({total_bytes} bytes total)"
+                if refs else ""
+            )
+            return SendResult(
+                state="sent",
+                envelope_id=str(envelope_id),
+                note=(
+                    f"{'uploaded' if refs else 'posted'} {envelope_id} "
+                    f"to {destination}{root_note}{attachment_note}"
+                ),
+            ).to_dict()
+        except HttpError as exc:
+            return SendResult(
+                state="failed",
+                error=_http_error_detail(exc.body),
+                error_kind="http",
+                status=exc.status,
+            ).to_dict()
+        except Exception as exc:
+            return failed_result(str(exc), kind="validation")
 
     async def _baseline(self, space_id: str, channel_id: str) -> Any:
         return await _call_first(
