@@ -16,6 +16,7 @@ from ..crypto.encoding import base64url_decode
 from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
 from ..agent import send_mode
+from ..agent.send_coordinator import SemanticSendRequest, failed_result
 from ..crypto.message import (
     EncryptInput,
     RecipientDevice,
@@ -47,6 +48,9 @@ class HostMcpContext:
     # The worker's live PuffoCoreMessageClient, for tools that drive
     # daemon-side state (leave requests). None until warm().
     message_client: Any = None
+    # The worker's single persistent semantic send coordinator. Package 4
+    # supplies it; optional preserves existing context constructors.
+    send_coordinator: Any = None
 
 
 # ── filesystem helpers (host & agent .claude.json) ─────────────────
@@ -501,6 +505,43 @@ async def request_leave(
         channel_id=channel_id,
         reason=reason or "",
     )
+
+
+async def send_message(
+    ctx: HostMcpContext,
+    *,
+    channel: str,
+    text: str = "",
+    paths: list[str] | None = None,
+    caption: str = "",
+    root_id: str = "",
+    visibility_level: str = "default",
+    send_anyway: bool = False,
+) -> dict[str, Any]:
+    """Dispatch a semantic model send through the worker-owned coordinator."""
+    coordinator = ctx.send_coordinator
+    if coordinator is None:
+        return failed_result(
+            "persistent send coordinator is unavailable",
+            kind="coordinator_unavailable",
+        )
+    request = SemanticSendRequest(
+        destination=str(channel or ""),
+        text=str(text or ""),
+        attachment_paths=tuple(paths or ()),
+        caption=str(caption or ""),
+        root_id=str(root_id or ""),
+        visibility_level=str(visibility_level or "default"),
+        send_anyway=send_anyway is True,
+    )
+    result = await coordinator.send(request)
+    if not isinstance(result, dict):
+        return failed_result(
+            "persistent send coordinator returned a malformed result",
+            kind="protocol",
+        )
+    result.setdefault("attempted", True)
+    return result
 
 
 async def request_command_permission(

@@ -36,6 +36,10 @@ from ..crypto.message import (
 )
 from ..crypto.primitives import Ed25519KeyPair
 from ..limits import MESSAGE_SEGMENT_CHARS
+from ..agent.send_coordinator import (
+    SemanticSendRequest,
+    failed_result,
+)
 from .data_client import DataClient, DataNotFound
 from ._host_mcp import PuffoRpcClient
 
@@ -123,6 +127,46 @@ class PuffoCoreToolsConfig:
     # Set only on the in-process (ws-local) path, where tools run inside
     # the daemon and drive the message client directly instead of via RPC.
     message_client: Any = None
+    # Package 4 wires the worker's one persistent instance. Optional keeps
+    # older constructors source-compatible; sends fail closed while absent.
+    send_coordinator: Any = None
+
+
+async def _dispatch_semantic_send(
+    cfg: "PuffoCoreToolsConfig", request: SemanticSendRequest,
+) -> dict[str, Any]:
+    coordinator = getattr(cfg, "send_coordinator", None)
+    if coordinator is not None:
+        try:
+            if hasattr(coordinator, "workspace"):
+                coordinator.workspace = cfg.workspace
+            result = await coordinator.send(request)
+        except Exception as exc:
+            return failed_result(
+                f"persistent send coordinator failed: {exc}",
+                kind="coordinator",
+            )
+        if isinstance(result, dict):
+            result.setdefault("attempted", True)
+            return result
+        return failed_result(
+            "persistent send coordinator returned a malformed result",
+            kind="protocol",
+        )
+    rpc = getattr(cfg, "rpc_client", None)
+    if rpc is not None:
+        try:
+            result = await rpc.send_message(**request.to_rpc_dict())
+        except Exception as exc:
+            return failed_result(f"send RPC unavailable: {exc}", kind="rpc_unavailable")
+        if isinstance(result, dict):
+            result.setdefault("attempted", True)
+            return result
+        return failed_result("send RPC returned a malformed result", kind="protocol")
+    return failed_result(
+        "persistent send coordinator is unavailable",
+        kind="coordinator_unavailable",
+    )
 
 
 def _note_contact(
@@ -400,7 +444,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         text: str,
         root_id: str = "",
         visibility_level: str = "default",
-    ) -> str:
+        send_anyway: bool = False,
+    ) -> dict[str, Any]:
         """Post a message to a Puffo.ai channel or DM a user.
 
         channel: '@<slug>' for a DM (e.g. '@alice-1234'), or a raw
@@ -430,6 +475,20 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
               no human is waiting for this reply. Root-level posts
               are still forced visible (can't fold either way).
         """
+        return await _dispatch_semantic_send(
+            cfg,
+            SemanticSendRequest(
+                destination=channel,
+                text=text,
+                root_id=root_id,
+                visibility_level=visibility_level,
+                send_anyway=send_anyway,
+            ),
+        )
+
+        # Retained temporarily as unreachable reference code for the other
+        # read-oriented helpers in this module; the semantic return above is
+        # the only model-authored send path.
         channel_ref = channel.strip()
         if not channel_ref:
             raise RuntimeError("channel is required")
@@ -958,7 +1017,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         caption: str = "",
         root_id: str = "",
         visibility_level: str = "default",
-    ) -> str:
+        send_anyway: bool = False,
+    ) -> dict[str, Any]:
         """Send a message carrying one or more workspace files to a
         channel or DM.
 
@@ -976,6 +1036,18 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             ``"human"`` | ``"default"`` | ``"agent_only"``, default
             ``"default"``. The @-mention floor keys off ``caption``.
         """
+        return await _dispatch_semantic_send(
+            cfg,
+            SemanticSendRequest(
+                destination=channel,
+                attachment_paths=tuple(paths) if isinstance(paths, list) else (),
+                caption=caption,
+                root_id=root_id,
+                visibility_level=visibility_level,
+                send_anyway=send_anyway,
+            ),
+        )
+
         import mimetypes
         from pathlib import Path
 
@@ -1367,4 +1439,3 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
         _note_contact(cfg, target, blocked=False)
         return f"unblocked {target}"
-
