@@ -13,6 +13,7 @@ from puffo_agent.crypto.encoding import base64url_encode
 from puffo_agent.crypto.keystore import KeyStore, Session, StoredIdentity, encode_secret
 from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
 from puffo_agent.agent._visibility import resolve_visibility
+from puffo_agent.agent.send_coordinator import SendCoordinator
 from puffo_agent.mcp.puffo_core_tools import (
     PuffoCoreToolsConfig,
     _resolve_outgoing_root,
@@ -33,6 +34,7 @@ class FakeHttpClient:
     def __init__(self):
         self.calls: list[tuple[str, str, dict | None]] = []
         self.responses: dict[str, dict] = {}
+        self._seq = 100
 
     def _match(self, path: str) -> dict:
         if path in self.responses:
@@ -64,6 +66,21 @@ class FakeHttpClient:
         self.calls.append(("POST", path, body))
         if path in self.responses:
             return self.responses[path]
+        if path == "/v2/agent-runtime/messages:send":
+            self._seq += 1
+            freshness = body["freshness"]
+            return {
+                "state": "sent",
+                "envelope_id": body["envelope"]["envelope_id"],
+                "seq": self._seq,
+                "replay": False,
+                "missing_devices": [],
+                "freshness": {
+                    "mode": freshness["mode"],
+                    "seen_seq": freshness["seen_seq"],
+                    "latest_seq_before_send": freshness["seen_seq"],
+                },
+            }
         return {"ok": True}
 
     async def post_bytes(self, path, headers=None, data=None):
@@ -117,6 +134,26 @@ def _setup():
         data_client=ms,
         space_id="sp_test",
     )
+    class _Freshness:
+        async def get_context_baseline_seq(self, _space_id, _channel_id):
+            return 0
+
+        async def get_active_turn_through_seq(self, _space_id, _channel_id):
+            return None
+
+        async def advance_active_turn_through_seq(self, *_args):
+            return None
+
+    freshness = _Freshness()
+    cfg.send_coordinator = SendCoordinator(
+        slug=cfg.slug,
+        keystore=cfg.keystore,
+        http_client=cfg.http_client,
+        data_client=cfg.data_client,
+        workspace=cfg.workspace,
+        baseline_source=freshness,
+        active_turn_source=freshness,
+    )
     return cfg, http, ms
 
 
@@ -129,6 +166,13 @@ def _build_tools(cfg):
 
 async def _call(mcp, name, args=None):
     result = await mcp.call_tool(name, args or {})
+    if (
+        isinstance(result, tuple)
+        and len(result) > 1
+        and isinstance(result[1], dict)
+        and result[1].get("state") == "failed"
+    ):
+        raise RuntimeError(json.dumps(result[1]))
     if isinstance(result, list):
         return "".join(
             getattr(item, "text", str(item)) for item in result
@@ -159,6 +203,76 @@ async def test_whoami_includes_display_name():
 
 
 @pytest.mark.asyncio
+async def test_hidden_schema_semantic_send_fields_only():
+    cfg, _, _ = _setup()
+    tools = {tool.name: tool for tool in await _build_tools(cfg).list_tools()}
+    for name in ("send_message", "send_message_with_attachments"):
+        schema = tools[name].inputSchema
+        properties = schema["properties"]
+        assert "send_anyway" in properties
+        assert "context_baseline_seq" not in properties
+        assert "seen_seq" not in properties
+
+
+@pytest.mark.asyncio
+async def test_semantic_rpc_unavailable_returns_structured_failure():
+    cfg, http, _ = _setup()
+    cfg.send_coordinator = None
+    cfg.rpc_client = None
+    result = await _build_tools(cfg).call_tool(
+        "send_message", {"channel": "ch_a", "text": "do not post"},
+    )
+    structured = result[1]
+    assert structured["state"] == "failed"
+    assert structured["attempted"] is True
+    assert not [call for call in http.calls if call[0] == "POST"]
+
+
+@pytest.mark.asyncio
+async def test_semantic_in_process_uses_injected_persistent_coordinator():
+    cfg, _, _ = _setup()
+    calls = []
+
+    class Stub:
+        async def send(self, request):
+            calls.append(request)
+            return {"state": "held", "attempted": True}
+
+    cfg.send_coordinator = Stub()
+    result = await _build_tools(cfg).call_tool(
+        "send_message",
+        {"channel": "ch_a", "text": "x", "send_anyway": True},
+    )
+    assert result[1] == {"state": "held", "attempted": True}
+    assert calls[0].send_anyway is True
+
+
+@pytest.mark.asyncio
+async def test_semantic_out_of_process_uses_structured_rpc_client():
+    cfg, _, _ = _setup()
+    bodies = []
+
+    class Rpc:
+        async def send_message(self, **body):
+            bodies.append(body)
+            return {"state": "sent", "attempted": True, "seq": 3}
+
+    cfg.send_coordinator = None
+    cfg.rpc_client = Rpc()
+    result = await _build_tools(cfg).call_tool(
+        "send_message", {"channel": "ch_a", "text": "x", "send_anyway": True},
+    )
+    assert result[1]["state"] == "sent"
+    assert bodies == [{
+        "channel": "ch_a",
+        "root_id": "",
+        "visibility_level": "default",
+        "send_anyway": True,
+        "text": "x",
+    }]
+
+
+@pytest.mark.asyncio
 async def test_send_message_plaintext_when_daemon_says_unencrypted():
     cfg, http, ms = _setup()
     await ms.mark_channel_space("ch_abc", "sp_test")
@@ -171,22 +285,13 @@ async def test_send_message_plaintext_when_daemon_says_unencrypted():
 
     ms.get_send_encryption = _no_encrypt
     mcp = _build_tools(cfg)
-    result = await _call(
-        mcp,
-        "send_message",
-        {"channel": "ch_abc", "text": "hello world", "visibility_level": "human"},
-    )
-    assert "posted" in result
-    # No device resolution on the plaintext path.
-    assert not any(
-        p.startswith("/certs/sync") for m, p, _ in http.calls if m == "GET"
-    )
-    post_calls = [(p, b) for m, p, b in http.calls if m == "POST"]
-    assert len(post_calls) == 1
-    path, body = post_calls[0]
-    assert path == "/v2/messages/plaintext"
-    assert body["type"] == "plaintext_message_envelope"
-    assert body["signed_payload"]["payload"]["channel_id"] == "ch_abc"
+    with pytest.raises(RuntimeError, match="plaintext channel"):
+        await _call(
+            mcp,
+            "send_message",
+            {"channel": "ch_abc", "text": "hello world", "visibility_level": "human"},
+        )
+    assert not any(m.startswith("POST") for m, _, _ in http.calls)
 
 
 @pytest.mark.asyncio
@@ -230,9 +335,9 @@ async def test_send_message_channel():
     post_calls = [(p, b) for m, p, b in http.calls if m == "POST"]
     assert len(post_calls) == 1
     path, body = post_calls[0]
-    assert path == "/messages"
-    # Body IS the envelope; no ``{"envelope": ...}`` wrapper.
-    envelope = body
+    assert path == "/v2/agent-runtime/messages:send"
+    assert set(body) == {"envelope", "freshness"}
+    envelope = body["envelope"]
     assert envelope["type"] == "message_envelope"
     assert envelope["version"] == 1
     assert envelope["envelope_kind"] == "channel"
@@ -1355,6 +1460,7 @@ def _spy_encrypt_input(monkeypatch):
     thread_root_id. Patches both encrypt entrypoints — send paths
     use the with_content_key variant."""
     import puffo_agent.mcp.puffo_core_tools as pct
+    import puffo_agent.agent.send_coordinator as coordinator_module
     captured: dict = {}
     real = pct.encrypt_message
     real_with_key = pct.encrypt_message_with_content_key
@@ -1369,6 +1475,9 @@ def _spy_encrypt_input(monkeypatch):
 
     monkeypatch.setattr(pct, "encrypt_message", spy)
     monkeypatch.setattr(pct, "encrypt_message_with_content_key", spy_with_key)
+    monkeypatch.setattr(
+        coordinator_module, "encrypt_message_with_content_key", spy_with_key,
+    )
     return captured
 
 
@@ -1570,7 +1679,7 @@ async def test_send_message_with_attachments_auto_corrects_reply_as_root_id(
     assert "uploaded" in result
     assert "auto-corrected" in result
     # Display string reflects the *resolved* thread, not the wrong id.
-    assert "in thread msg_root" in result
+    assert "auto-corrected to msg_root" in result
     assert captured["inp"].thread_root_id == "msg_root"
 
 
