@@ -199,6 +199,64 @@ class PuffoAgent:
             on_progress=on_progress,
         )
 
+    async def handle_global_inbox_turn(
+        self,
+        planned,
+        on_progress=None,
+    ) -> str | None:
+        """Run one exact durable global batch without trigger-route inference."""
+        if not planned.message_ids:
+            return None
+        self.log.append({"role": "user", "content": planned.provider_input})
+        self._truncate_log()
+        return await self._run_turn_and_route(
+            channel_name="global inbox",
+            sender="multiple" if len(planned.targets) > 1 else "",
+            on_progress=on_progress,
+        )
+
+    async def handle_global_inbox_retry(
+        self,
+        planned,
+        on_progress=None,
+    ) -> str | None:
+        """Resume an admitted global turn without appending its input again."""
+        kick_text = (
+            "[puffo-agent system message] session errored on rate "
+            "limiting, please resume processing."
+        )
+        ctx = TurnContext(
+            system_prompt=self.system_prompt,
+            messages=list(self.log),
+            workspace_dir=self.workspace_dir,
+            claude_dir=self.claude_dir,
+            memory_dir=self.memory_dir,
+            on_progress=on_progress,
+        )
+        result = await self.adapter.run_retry_turn(
+            kick_text, planned.provider_input, ctx,
+        )
+        send_message_called = bool(result.metadata.get("send_message_targets"))
+        text_parts: list[str] = result.metadata.get("assistant_text_parts") or []
+        if send_message_called:
+            if result.reply:
+                self._append_assistant("global inbox", result.reply)
+            return None
+        joined = "\n".join(text_parts) if text_parts else (result.reply or "")
+        if is_silent(joined):
+            return None
+        if "API Error" in joined:
+            is_auth = looks_like_auth_error(joined)
+            raise AgentAPIError(
+                "agent adapter output contained 'API Error' on global retry",
+                is_auth=is_auth,
+            )
+        if not text_parts and not result.reply:
+            return None
+        fallback = _format_assistant_fallback(text_parts, result.reply)
+        self._append_assistant("global inbox", fallback)
+        return fallback
+
     async def handle_api_error_retry(
         self,
         root_id: str,

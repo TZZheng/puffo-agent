@@ -7,7 +7,6 @@ into runtime.json so the CLI can read live stats without IPC.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import random
@@ -15,7 +14,6 @@ import re
 import shutil
 import sys
 import time
-import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
@@ -360,11 +358,7 @@ def _build_puffo_core_client(
     the dataclass defaults.
     """
     from ..agent.message_store import MessageStore
-    from ..agent.puffo_core_client import (
-        DEFAULT_MAX_INPUT_BYTES,
-        PuffoCoreMessageClient,
-        max_image_edge_px,
-    )
+    from ..agent.puffo_core_client import PuffoCoreMessageClient, max_image_edge_px
     from ..crypto.http_client import PuffoCoreHttpClient
     from ..crypto.keystore import KeyStore
 
@@ -395,9 +389,6 @@ def _build_puffo_core_client(
     else:
         model = agent_cfg.runtime.model or (daemon_cfg.anthropic.model if daemon_cfg else "")
 
-    # Codex has no adapter input cap; its ceiling is a runaway safety net.
-    max_input_bytes = 4_000_000 if is_codex else DEFAULT_MAX_INPUT_BYTES
-
     return PuffoCoreMessageClient(
         slug=pc.slug,
         device_id=pc.device_id,
@@ -413,7 +404,6 @@ def _build_puffo_core_client(
         segment_chars=segment_chars,
         agent_created_at=agent_cfg.created_at,
         image_edge_px=max_image_edge_px(model),
-        max_input_bytes=max_input_bytes,
         catchup_stale_hours=catchup_stale_hours,
     )
 
@@ -917,6 +907,7 @@ class Worker:
             keystore=client.keystore,
             http_client=client.http,
             message_client=client,
+            send_coordinator=getattr(client, "send_delegate", None),
         )
 
     async def stop(self) -> None:
@@ -1160,43 +1151,20 @@ class Worker:
         refresh_agent_flag_path = pa_dir / "refresh_agent.flag"
         refresh_host_sync_flag_path = pa_dir / "refresh_host_sync.flag"
         refresh_session_flag_path = pa_dir / "refresh_session.flag"
-        # Per-turn context for the cli-local permission hook. The hook
-        # is a separate subprocess and reads this file to learn which
-        # channel + root to reply to.
-        current_turn_path = Path(workspace_path) / ".puffo-agent" / "current_turn.json"
+        # One durable global scheduler and one persistent semantic coordinator
+        # own every provider turn.
+        from ..agent.global_inbox_runtime import (
+            ActiveBoundaryAdapter,
+            BaselineAdapter,
+            GlobalInboxRuntime,
+            TrackingSendDelegate,
+        )
+        from ..agent.send_coordinator import SemanticSendRequest, SendCoordinator
+        from .ws_local.in_process_data_client import InProcessDataClient
 
-        async def on_message_batch(
-            root_id: str,
-            batch: list[dict],
-            channel_meta: dict,
-        ):
-            """One agent turn per thread batch. The puffo-core client
-            collapses every arrival on the same ``root_id`` into a
-            single list and hands it here in arrival order. The agent
-            sees every message in one turn and decides whom (and how
-            many times) to reply on its own.
+        global_runtime: GlobalInboxRuntime
 
-            Server-side processing-run telemetry is keyed on the
-            triggering post id; we use the LAST envelope in the batch
-            as that anchor since it's the most recent thing the agent
-            is reasoning about. The reply, if any, posts back to
-            ``root_id`` as a thread reply (or to the channel root for
-            a top-level batch).
-            """
-            if not batch:
-                return
-            # Duplicate tracer: same envelope_id in two lines within seconds =
-            # cursor or dispatching_ids miss.
-            batch_ids = [m.get("envelope_id", "") for m in batch]
-            logger.info(
-                "agent %s: on_message_batch root=%s size=%d envelopes=%s",
-                agent_id, root_id, len(batch), batch_ids,
-            )
-            # Per-batch telemetry: first message gets /processing/start (yellow
-            # dot); the rest flip white->green via /processing/end:batch.
-            first_post_id = batch[0].get("envelope_id", "")
-            channel_id = channel_meta.get("channel_id", "")
-
+        async def run_global_turn(planned):
             await _process_refresh_flags(
                 agent_id=agent_id,
                 harness_name=(self.agent_cfg.runtime.harness or "").strip(),
@@ -1210,271 +1178,108 @@ class Worker:
                 refresh_host_sync_flag=refresh_host_sync_flag_path,
                 refresh_session_flag=refresh_session_flag_path,
             )
-            try:
-                current_turn_path.parent.mkdir(parents=True, exist_ok=True)
-                current_turn_path.write_text(
-                    json.dumps({
-                        "channel_id": channel_id,
-                        "root_id": root_id,
-                        "triggering_post_id": first_post_id,
-                    }),
-                    encoding="utf-8",
-                )
-            except OSError as exc:
-                logger.warning(
-                    "agent %s: could not write current_turn.json: %s "
-                    "(permission hook will fail-open)", agent_id, exc,
-                )
-            # New batch while auth_failed: wake the refresher to check
-            # for a re-login now (the flip below would mask auth_failed).
             self._maybe_wake_refresher_if_auth_failed(agent_id)
-            # Pre-delivery credential gate. The single-use refresh_token race is
-            # OS-agnostic: N agents refreshing in parallel lose N-1 with
-            # invalid_grant. Skipped for non-claude runtimes (ws-local, api-puffo).
             if (
                 self._ensure_fresh_token is not None
                 and self.agent_cfg.runtime.kind in (
                     RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER,
                 )
+                and not await self._ensure_fresh_token()
             ):
-                ok = await self._ensure_fresh_token()
-                if not ok:
-                    # Token stuck: _enter_auth_failed flips health + DMs the operator once
-                    # per episode; raise pushes the batch into the consumer retry path so
-                    # it redelivers on recovery.
-                    logger.warning(
-                        "agent %s: pre-delivery token refresh failed; "
-                        "flagging auth_failed and deferring batch",
-                        agent_id,
-                    )
-                    self._enter_auth_failed(agent_id)
-                    raise AgentAPIError(
-                        "credential refresh failed before delivery",
-                    )
-            try:
-                Worker._flip_health_in_progress(self.runtime, agent_id, logger)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "agent %s: _flip_health_in_progress failed: %s",
-                    agent_id, exc,
+                self._enter_auth_failed(agent_id)
+                raise AgentAPIError(
+                    "credential refresh failed before delivery", is_auth=True
                 )
-            # Server-side processing-run + status transitions.
-            # Reporter swallows network errors so a flaky status push
-            # never blocks the actual reply.
-            run_id = (
-                await reporter.begin_turn(first_post_id)
-                if first_post_id
-                else None
-            )
-            turn_succeeded = True
-            turn_will_retry = False
-            turn_error: str | None = None
+            Worker._flip_health_in_progress(self.runtime, agent_id, logger)
             try:
-                reply = await puffo.handle_message_batch(
-                    root_id=root_id,
-                    batch=batch,
-                    channel_meta=channel_meta,
-                )
+                reply = await puffo.handle_global_inbox_turn(planned)
             except AgentAPIError as exc:
-                # Adapter surfaced an "API Error" string. Mark turn
-                # errored and re-raise; the consumer loop re-enqueues
-                # the batch with cursor preserved and backs off.
-                if getattr(exc, "is_auth", False):
-                    # Auth: skip the pointless kick-retries — flag
-                    # auth_failed + DM now; consumer abandons (redelivers).
-                    logger.warning(
-                        "agent %s: adapter auth error — flagging auth_failed, "
-                        "no kick-retry", agent_id,
-                    )
+                if exc.is_auth:
                     self._enter_auth_failed(agent_id)
-                    turn_error = "auth error"
-                else:
-                    logger.warning("agent %s: api-error retry: %s", agent_id, exc)
-                    turn_error = "API Error"
-                reply = None
-                turn_succeeded = False
-                turn_will_retry = True
                 raise
-            except Exception as exc:
-                logger.error(
-                    "agent %s: handle_message_batch error: %s",
-                    agent_id, exc, exc_info=True,
-                )
-                reply = None
-                turn_succeeded = False
-                turn_error = f"{type(exc).__name__}: {exc}"
-            finally:
-                if turn_error:
-                    from .control.reporter import get_reporter
-
-                    asyncio.ensure_future(
-                        get_reporter().emit(agent_id, "error", {"error": turn_error})
-                    )
-                if run_id is not None and first_post_id:
-                    # First row reuses the /start run_id (server UPDATE); the rest get
-                    # fresh run_ids (server UPSERT, started_at = ended_at = now).
-                    runs: list[dict] = [{
-                        "run_id": run_id,
-                        "message_id": first_post_id,
-                        "succeeded": turn_succeeded,
-                        "error_text": turn_error,
-                    }]
-                    for msg in batch[1:]:
-                        mid = msg.get("envelope_id", "")
-                        if not mid:
-                            continue
-                        runs.append({
-                            "run_id": f"run_{uuid.uuid4().hex}",
-                            "message_id": mid,
-                            "succeeded": turn_succeeded,
-                            "error_text": turn_error,
-                        })
-                    await reporter.end_turn_batch(runs)
-                # AgentAPIError leaves in_progress for next batch's flip.
-                if turn_succeeded:
-                    try:
-                        Worker._resolve_health_on_success(
-                            self.runtime, agent_id, logger,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "agent %s: _resolve_health_on_success failed: %s",
-                            agent_id, exc,
-                        )
-                elif not turn_will_retry:
-                    try:
-                        Worker._fallback_unhandled_error_if_stuck_in_progress(
-                            self.runtime, agent_id, turn_error, logger,
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "agent %s: in_progress backstop failed: %s",
-                            agent_id, exc,
-                        )
-                # Clear turn context so post-turn background work
-                # doesn't inherit a stale channel/root. Hook
-                # fails-open when the file is absent.
-                try:
-                    current_turn_path.unlink()
-                except OSError:
-                    pass
-            # One batch = one "message" for the runtime counter; the
-            # display still reads as "N messages processed."
+            else:
+                Worker._resolve_health_on_success(self.runtime, agent_id, logger)
             self.runtime.msg_count += 1
             self.runtime.last_event_at = int(time.time())
-            if reply:
-                suppressed, backoff = _handle_suppressed_reply(
-                    reply,
-                    self.runtime,
-                    agent_id,
-                    scope="fallback",
-                    on_auth_failure=self._notify_refresh_needed,
-                    on_auth_failed_enter=self._on_auth_failed_enter,
+            if not reply:
+                return
+            # Plain output has exactly one legal implicit route. Every explicit,
+            # failed, attachment, or held attempt suppresses it.
+            if len(planned.targets) != 1 or global_runtime.attempts.attempts:
+                logger.warning(
+                    "agent %s: suppressed ambiguous global plain output "
+                    "(targets=%d attempts=%d)",
+                    agent_id, len(planned.targets), global_runtime.attempts.attempts,
                 )
-                if suppressed:
-                    await asyncio.sleep(backoff)
-                else:
-                    # Fallback reply when the agent skipped both
-                    # send_message and [SILENT].
-                    await client.send_fallback_message(
-                        channel_id, reply, root_id=root_id,
-                    )
-
-        async def on_api_error_retry(
-            root_id: str,
-            batch: list[dict],
-            channel_meta: dict,
-        ):
-            """Kick-retry path after an ``AgentAPIError``. Calls the
-            agent's retry method, which sends a small "session
-            errored on rate limiting, please resume processing"
-            kick to claude-code over ``--resume`` instead of
-            re-appending the original batch. If ``--resume`` is no
-            longer valid, the adapter falls back to the full
-            ``batch`` payload on its own.
-
-            Raises ``AgentAPIError`` again if the kick also surfaces
-            the rate limit, so the consumer's outer retry loop can
-            apply another backoff or give up after the cap.
-            """
-            channel_id = channel_meta.get("channel_id", "")
-            reply = await puffo.handle_api_error_retry(
+                return
+            target = planned.targets[0]
+            if target[0] == "dm":
+                destination = f"@{target[1]}"
+                root_id = ""
+            else:
+                destination = target[2]
+                root_id = target[3] if target[0] == "thread" else ""
+            await global_runtime.send_delegate.send(SemanticSendRequest(
+                destination=destination,
+                text=reply,
                 root_id=root_id,
-                channel_meta=channel_meta,
-                fallback_batch=batch,
-            )
-            self.runtime.msg_count += 1
-            self.runtime.last_event_at = int(time.time())
-            if reply:
-                suppressed, backoff = _handle_suppressed_reply(
-                    reply,
-                    self.runtime,
-                    agent_id,
-                    scope="api-error-retry",
-                    on_auth_failure=self._notify_refresh_needed,
-                    on_auth_failed_enter=self._on_auth_failed_enter,
+            ))
+
+        async def retry_global_turn(planned):
+            try:
+                reply = await puffo.handle_global_inbox_retry(planned)
+            except AgentAPIError as exc:
+                if exc.is_auth:
+                    self._enter_auth_failed(agent_id)
+                raise
+            else:
+                Worker._resolve_health_on_success(self.runtime, agent_id, logger)
+            if not reply:
+                return
+            if len(planned.targets) != 1 or global_runtime.attempts.attempts:
+                logger.warning(
+                    "agent %s: suppressed ambiguous global retry output "
+                    "(targets=%d attempts=%d)",
+                    agent_id, len(planned.targets), global_runtime.attempts.attempts,
                 )
-                if suppressed:
-                    # Hottest leak site (FB-88 / FB-159 case-studies).
-                    # Backoff samples instead of hammering when the
-                    # underlying limit / outage is still active.
-                    await asyncio.sleep(backoff)
-                else:
-                    await client.send_fallback_message(
-                        channel_id, reply, root_id=root_id,
-                    )
+                return
+            target = planned.targets[0]
+            destination = f"@{target[1]}" if target[0] == "dm" else target[2]
+            root_id = target[3] if target[0] == "thread" else ""
+            await global_runtime.send_delegate.send(SemanticSendRequest(
+                destination=destination,
+                text=reply,
+                root_id=root_id,
+            ))
 
-        async def on_api_error_abandon(
-            root_id: str,
-            batch: list[dict],
-            channel_meta: dict,
-            attempts: int,
-        ):
-            """PUF-252: surface the abandoned-batch state on
-            ``runtime`` so the discoverable-action affordance has a
-            signal to render. Pre-PUF-252 the abandon was silent and
-            Sam's Scout appeared ``state=running`` even though the
-            consumer had given up on the pending DM. Now
-            ``runtime.health`` flips to ``api_error_abandoned`` +
-            ``runtime.error`` carries a human-readable summary.
+        run_global_turn.handle_global_inbox_retry = retry_global_turn
 
-            UI consumers live in Nova's lane: **FB-197**
-            (agent-state status dot) + **FB-198** (restart lever),
-            both folded into the Operator Action Panel cluster
-            alongside FB-67 / PUF-220 / PUF-248 / PUF-250 / FB-179.
-            Deliberately NO auto-recovery here -- per the
-            ``feedback_dedup_triage_policy.md`` revision at PUF-249
-            closure, platform doesn't substitute for user-action
-            when user-action exists. Auto-recovery is storage-
-            shaped-defense-with-time-delay; same rejection criterion
-            as throttling. FB-198's restart lever is the right
-            recovery surface; this hook just feeds it honest data.
-            """
-            self.runtime.health = "api_error_abandoned"
-            self.runtime.error = (
-                f"Worker abandoned a batch on thread {root_id} after "
-                f"{attempts} rate-limit kick-retries. The agent has "
-                "gone silent on this thread until a new message "
-                "arrives OR the agent is refreshed/restarted."
-            )
-            self.runtime.save(agent_id)
-            logger.warning(
-                "agent %s: api-error-abandon on thread %s (attempts=%d)",
-                agent_id, root_id, attempts,
-            )
-
-        async def on_turn_success(
-            root_id: str,
-            batch: list[dict],
-            channel_meta: dict,
-        ):
-            Worker._clear_api_error_abandoned_if_recoverable(
-                self.runtime, agent_id, root_id, logger,
-            )
-            # retry-success path bypasses on_message_batch's finally.
-            Worker._resolve_health_on_success(
-                self.runtime, agent_id, logger,
-            )
+        global_runtime = GlobalInboxRuntime(
+            store=client.store,
+            adapter=self._adapter,
+            run_turn=run_global_turn,
+            workspace=workspace_path,
+        )
+        coordinator = SendCoordinator(
+            slug=client.slug,
+            keystore=client.keystore,
+            http_client=client.http,
+            data_client=InProcessDataClient(client.store, client),
+            workspace=workspace_path,
+            baseline_source=BaselineAdapter(client.store),
+            active_turn_source=ActiveBoundaryAdapter(
+                client.store, global_runtime.active
+            ),
+            held_recovery_source=global_runtime.held_recovery_source,
+        )
+        global_runtime.coordinator = coordinator
+        global_runtime.send_delegate = TrackingSendDelegate(
+            coordinator, global_runtime.attempts
+        )
+        client.global_runtime = global_runtime
+        client.send_coordinator = coordinator
+        client.send_delegate = global_runtime.send_delegate
+        global_runtime_task = asyncio.ensure_future(global_runtime.run())
 
         async def heartbeat():
             interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)
@@ -1520,12 +1325,7 @@ class Worker:
         try:
             while not self._stop.is_set():
                 try:
-                    await client.listen(
-                        on_message=on_message_batch,
-                        on_api_error_retry=on_api_error_retry,
-                        on_api_error_abandon=on_api_error_abandon,
-                        on_turn_success=on_turn_success,
-                    )
+                    await client.listen()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -1548,6 +1348,12 @@ class Worker:
                 except asyncio.TimeoutError:
                     pass
         finally:
+            global_runtime.stop()
+            global_runtime_task.cancel()
+            try:
+                await global_runtime_task
+            except (asyncio.CancelledError, Exception):
+                pass
             reporter.stop()
             hb_task.cancel()
             status_task.cancel()

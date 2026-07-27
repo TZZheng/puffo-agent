@@ -65,11 +65,10 @@ def test_gate_wired_into_listen_before_admit():
     assert "_is_stale_for_catchup(payload.sent_at)" in src
     assert "staleness-gate-skipped" in src
     gate = src.index("_is_stale_for_catchup(payload.sent_at)")
-    admit = src.index("_admit_thread_message(")
-    assert gate < admit, "staleness gate must precede _admit_thread_message"
-    # A skipped envelope is still persisted — the store precedes the gate.
-    store = src.index("self.store.store(")
-    assert store < gate, "store.store must precede the staleness gate"
+    admit = src.index("ReceiptDisposition.ELIGIBLE", gate)
+    assert gate < admit, "staleness gate must precede eligible commit"
+    # Classification is persisted by the common durable commit seam.
+    assert "store_receipt(" in src
     # Self-echo + operator intercepts run regardless of age.
     self_echo = src.index("payload.sender_slug == self.slug")
     leave = src.index("_maybe_handle_leave_reply")
