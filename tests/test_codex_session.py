@@ -320,6 +320,255 @@ while True:
     assert result.output_tokens == 21
 
 
+def test_context_snapshot_retained_without_active_turn(tmp_path):
+    cs = CodexSession(
+        "context-test", tmp_path / "session.json", ["true"],
+    )
+
+    async def drive():
+        await cs._handle_notification("thread/tokenUsage/updated", {
+            "threadId": "c1",
+            "turnId": "t1",
+            "tokenUsage": {
+                "last": {
+                    "totalTokens": 143262,
+                    "inputTokens": 10,
+                    "outputTokens": 2,
+                },
+                "total": {"inputTokens": 99, "outputTokens": 22},
+                "modelContextWindow": 258400,
+            },
+        })
+        return await cs.get_context_snapshot()
+
+    snap = asyncio.run(drive())
+    assert snap.used_tokens == 143262
+    assert snap.context_window == 258400
+    assert snap.source == "provider"
+    assert cs._latest_usage_total == {"inputTokens": 99, "outputTokens": 22}
+
+
+def test_compact_waits_for_matching_context_compaction_completion(tmp_path):
+    cs = CodexSession("compact-test", tmp_path / "session.json", ["true"])
+    cs._conversation_id = "thread-current"
+    request_seen = asyncio.Event()
+
+    async def fake_send(request_id, method, params):
+        assert method == "thread/compact/start"
+        assert params == {"threadId": "thread-current"}
+        request_seen.set()
+        return {}
+
+    cs._send_raw_request = fake_send
+
+    async def drive():
+        task = asyncio.create_task(cs.compact_context())
+        await request_seen.wait()
+        await asyncio.sleep(0)
+        assert not task.done()  # JSON-RPC acceptance is not completion.
+        # Completion cannot establish its own identity.
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current",
+            "turnId": "compact-turn",
+            "item": {"id": "compact-item", "type": "contextCompaction"},
+        })
+        assert not task.done()
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current",
+            "turn": {"id": "compact-turn"},
+        })
+        # Missing identity and wrong turn/item/type remain pending.
+        for event in (
+            {"threadId": "thread-current", "turnId": "", "item": {
+                "id": "compact-item", "type": "contextCompaction",
+            }},
+            {"threadId": "thread-current", "turnId": "user-turn", "item": {
+                "id": "compact-item", "type": "contextCompaction",
+            }},
+            {"threadId": "thread-current", "turnId": "compact-turn", "item": {
+                "id": "wrong-type", "type": "agentMessage",
+            }},
+        ):
+            await cs._handle_notification("item/started", event)
+            assert not task.done()
+        await cs._handle_notification("item/started", {
+            "threadId": "thread-current",
+            "turnId": "compact-turn",
+            "item": {"id": "compact-item", "type": "contextCompaction"},
+        })
+        await cs._handle_notification("item/completed", {
+            "threadId": "wrong",
+            "turnId": "compact-turn",
+            "item": {"id": "compact-item", "type": "contextCompaction"},
+        })
+        assert not task.done()
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current",
+            "turnId": "compact-turn",
+            "item": {"id": "wrong-item", "type": "contextCompaction"},
+        })
+        assert not task.done()
+        await cs._handle_notification("thread/compacted", {
+            "threadId": "thread-current",
+            "turnId": "compact-turn",
+        })
+        assert not task.done()
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current",
+            "turnId": "compact-turn",
+            "item": {"id": "compact-item", "type": "contextCompaction"},
+        })
+        return await task
+
+    result = asyncio.run(drive())
+    assert result.completed is True
+    assert result.provider_session_id == "thread-current"
+    assert result.before is not None and result.after is not None
+
+
+def test_compact_timeout_cleans_state_without_rotation(tmp_path, monkeypatch):
+    import puffo_agent.agent.adapters.codex_session as codex_module
+
+    monkeypatch.setattr(codex_module, "COMPACT_TIMEOUT_SECONDS", 0.001)
+    cs = CodexSession("compact-timeout", tmp_path / "session.json", ["true"])
+    cs._conversation_id = "thread-still-valid"
+
+    async def fake_send(request_id, method, params):
+        return {}  # accepted, but no contextCompaction completion follows
+
+    cs._send_raw_request = fake_send
+    result = asyncio.run(cs.compact_context())
+    assert result.completed is False
+    assert "timed out" in result.diagnostic
+    assert cs._pending_compact is None
+    assert cs.get_provider_session_id() == "thread-still-valid"
+    assert cs._consecutive_thread_failures == 0
+
+
+def test_admission_fires_only_on_correlated_user_turn_started(tmp_path):
+    from puffo_agent.agent.adapters.codex_session import _PendingTurn
+
+    async def drive():
+        cs = CodexSession("admission-test", tmp_path / "session.json", ["true"])
+        cs._conversation_id = "thread-current"
+        events = []
+
+        async def admitted(event):
+            events.append(event)
+
+        cs.register_admission_callback(admitted, "cycle-c")
+        cs._active_turn = _PendingTurn(1, time.time())
+        assert events == []  # registration / request ACK does not admit.
+        # A JSON-RPC ACK is handled outside notification dispatch and therefore
+        # cannot consume provider admission.
+        assert cs._admission_callback is admitted
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current",
+            "turnId": "other",
+            "item": {"id": "i", "type": "agentMessage"},
+        })
+        await cs._handle_notification("turn/completed", {
+            "threadId": "wrong",
+            "turn": {"id": "wrong-turn"},
+        })
+        assert events == []
+        await cs._handle_notification("turn/started", {
+            "threadId": "wrong",
+            "turn": {"id": "wrong-turn"},
+        })
+        assert events == []
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current",
+            "turn": {"id": "user-turn"},
+        })
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current",
+            "turn": {"id": "user-turn"},
+        })
+        assert len(events) == 1
+        assert events[0].provider_turn_id == "user-turn"
+
+    asyncio.run(drive())
+
+
+def test_initial_admission_ignores_compact_and_continuation_is_distinct(tmp_path):
+    from puffo_agent.agent.adapters.codex_session import _PendingCompact, _PendingTurn
+
+    async def drive():
+        cs = CodexSession("continuation-test", tmp_path / "session.json", ["true"])
+        cs._conversation_id = "thread-current"
+        events = []
+
+        async def admitted(event):
+            events.append(event)
+
+        # Compact notifications with no active user turn do not consume the
+        # independently registered initial callback.
+        cs.register_admission_callback(admitted, "initial")
+        cs._pending_compact = _PendingCompact(
+            "thread-current",
+            await cs.get_context_snapshot(),
+            asyncio.get_running_loop().create_future(),
+        )
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current", "turn": {"id": "compact-turn"},
+        })
+        await cs._handle_notification("item/started", {
+            "threadId": "thread-current", "turnId": "compact-turn",
+            "item": {"id": "compact-item", "type": "contextCompaction"},
+        })
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current", "turnId": "compact-turn",
+            "item": {"id": "compact-item", "type": "contextCompaction"},
+        })
+        assert events == []
+        cs._pending_compact = None
+
+        user_turn = _PendingTurn(2, time.time())
+        cs._active_turn = user_turn
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current", "turn": {"id": "user-turn"},
+        })
+        assert [event.planning_cycle_key for event in events] == ["initial"]
+
+        # Registration after turn start is continuation admission.
+        cs.register_admission_callback(admitted, "continuation")
+        for params in (
+            {"threadId": "wrong", "turnId": "user-turn",
+             "item": {"id": "m1", "type": "mcpToolCall"}},
+            {"threadId": "thread-current", "turnId": "wrong-turn",
+             "item": {"id": "m2", "type": "mcpToolCall"}},
+            {"threadId": "thread-current", "turnId": "user-turn",
+             "item": {"id": "c1", "type": "contextCompaction"}},
+        ):
+            await cs._handle_notification("item/completed", params)
+        assert len(events) == 1
+        accepted = {
+            "threadId": "thread-current", "turnId": "user-turn",
+            "item": {"id": "m3", "type": "mcpToolCall", "status": "completed"},
+        }
+        await cs._handle_notification("item/completed", accepted)
+        await cs._handle_notification("item/completed", accepted)
+        assert [event.planning_cycle_key for event in events] == [
+            "initial", "continuation",
+        ]
+        assert events[-1].provider_turn_id == "user-turn"
+
+        cs.register_admission_callback(admitted, "continuation-terminal")
+        await cs._handle_notification("turn/completed", {
+            "threadId": "wrong", "turn": {"id": "user-turn"},
+        })
+        assert len(events) == 2
+        await cs._handle_notification("turn/completed", {
+            "threadId": "thread-current", "turn": {"id": "user-turn"},
+        })
+        assert [event.planning_cycle_key for event in events] == [
+            "initial", "continuation", "continuation-terminal",
+        ]
+
+    asyncio.run(drive())
+
+
 def test_token_usage_sums_multi_request_turn(tmp_path):
     """A turn with several model requests reports the whole turn's usage (the
     thread total's delta), not just the last request."""

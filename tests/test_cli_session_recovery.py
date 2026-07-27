@@ -202,6 +202,127 @@ def test_input_tokens_include_cache_creation(tmp_path):
     out = asyncio.run(drive())
     assert out.input_tokens == 3 + 331  # cache read (142928) excluded
     assert out.output_tokens == 26
+    snap = asyncio.run(session.get_context_snapshot())
+    assert snap.used_tokens == 3 + 331 + 142928
+    assert snap.context_window == 200_000
+    assert "fallback" in snap.source
+
+
+def test_admission_waits_for_first_valid_post_write_provider_event(tmp_path):
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess-admitted",
+        "usage": {"input_tokens": 1},
+    }
+    lines = [
+        b"not json\n",
+        b"[1, 2, 3]\n",
+        (json.dumps(result) + "\n").encode(),
+    ]
+    session = _make_session(tmp_path, audit=False)
+    events = []
+
+    async def admitted(event):
+        assert session._proc.stdin.buffer
+        events.append(event)
+
+    async def drive():
+        session.register_admission_callback(admitted, "cycle-a")
+        session._proc = _FakeProc(
+            pre_turn_lines=[b'{"type":"stale"}\n'],
+            stdout_lines=lines,
+        )
+        return await session._one_turn("hello")
+
+    out = asyncio.run(drive())
+    assert out.input_tokens == 1
+    assert len(events) == 1
+    assert events[0].planning_cycle_key == "cycle-a"
+    assert events[0].provider_session_id == "sess-admitted"
+
+
+def test_compact_unsupported_without_text_frame_and_rollover_clears(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    session._save_session_id("sess-roll")
+    session._context_used_tokens = 123
+    captured_proc = None
+
+    class LiveFakeProc(_FakeProc):
+        def __init__(self):
+            super().__init__()
+            self._wait_calls = 0
+
+        async def wait(self):
+            self._wait_calls += 1
+            if not self._terminated:
+                raise asyncio.TimeoutError
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            super().terminate()
+
+    async def install_live_proc():
+        nonlocal captured_proc
+        captured_proc = LiveFakeProc()
+        session._proc = captured_proc
+
+    asyncio.run(install_live_proc())
+
+    compact = asyncio.run(session.compact_context())
+    assert compact.completed is False
+    assert session._proc is captured_proc
+    assert bytes(captured_proc.stdin.buffer) == b""
+
+    rolled = asyncio.run(session.rollover_context())
+    assert rolled.completed is True
+    assert rolled.previous_provider_session_id == "sess-roll"
+    assert session.get_provider_session_id() is None
+    assert asyncio.run(session.get_context_snapshot()).used_tokens == 0
+    assert not session.session_file.exists()
+    assert captured_proc._terminated is True
+    assert bytes(captured_proc.stdin.buffer) == b""
+    assert b"/compact" not in captured_proc.stdin.buffer
+
+
+def test_valid_stream_event_admits_before_later_stream_failure(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    events = []
+
+    async def admitted(event):
+        events.append(event)
+
+    class ValidThenFailure:
+        def __init__(self):
+            self.triggered = False
+            self.emitted = False
+
+        async def readline(self):
+            if not self.triggered:
+                await asyncio.Future()
+            if not self.emitted:
+                self.emitted = True
+                return b'{"type":"assistant","message":{"content":[]}}\n'
+            raise ConnectionResetError("later failure")
+
+    async def drive():
+        session.register_admission_callback(admitted, "failed-after-admit")
+        proc = _FakeProc()
+        reader = ValidThenFailure()
+        proc.stdout = reader
+        proc.stdin = _FakeStdin(on_write=lambda: setattr(reader, "triggered", True))
+        session._proc = proc
+        result = await session._one_turn("hello")
+        return result, proc
+
+    result, proc = asyncio.run(drive())
+    assert result.metadata["stream_error"] == "readline_pipe"
+    assert len(events) == 1
+    assert events[0].planning_cycle_key == "failed-after-admit"
+    submitted = bytes(proc.stdin.buffer)
+    assert b'"type": "user"' in submitted
+    assert b"/compact" not in submitted
 
 
 # ── Test 2: stream overflow recovery ─────────────────────────────────────────

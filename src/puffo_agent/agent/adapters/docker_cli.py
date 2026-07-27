@@ -34,6 +34,7 @@ import json
 import logging
 import shutil
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ...mcp.config import (
@@ -55,6 +56,12 @@ from ...portal.state import (
     sync_host_skills,
 )
 from .base import Adapter, TurnContext, TurnResult
+from ..context_controller import (
+    ContextCapabilities,
+    ContextSnapshot,
+    ProviderAdmissionEvent,
+    normalize_context_snapshot,
+)
 from .cli_session import AuditLog, ClaudeSession
 
 
@@ -207,6 +214,7 @@ class DockerCLIAdapter(Adapter):
         # (remove + add) so a flag mismatch is safe. The gemini path
         # writes MCP config upfront via ``_ensure_started`` instead.
         self._hermes_mcp_registered = False
+        self._one_shot_provider_session_id: str | None = None
         # Set post-construction by worker.py. When non-None, claude-
         # code is routed at ``puffo_core_server``. Values must be
         # CONTAINER-local paths since the MCP subprocess runs inside
@@ -437,6 +445,15 @@ class DockerCLIAdapter(Adapter):
             })
 
         reply, session_id, tool_calls = parse_hermes_reply(stdout_text)
+        self._one_shot_provider_session_id = session_id or None
+        if reply or session_id or tool_calls:
+            await self._fire_admission_callback(ProviderAdmissionEvent(
+                planning_cycle_key=getattr(
+                    self, "_context_admission_planning_cycle_key", "",
+                ),
+                provider_session_id=self.get_provider_session_id(),
+                admitted_at=datetime.now(timezone.utc),
+            ))
         if tool_calls:
             logger.info(
                 "agent %s: hermes turn invoked %d tool(s): %s",
@@ -581,6 +598,15 @@ class DockerCLIAdapter(Adapter):
             })
 
         reply, session_id, err = _parse_gemini_reply(stdout_text)
+        self._one_shot_provider_session_id = session_id or None
+        if reply or session_id or err:
+            await self._fire_admission_callback(ProviderAdmissionEvent(
+                planning_cycle_key=getattr(
+                    self, "_context_admission_planning_cycle_key", "",
+                ),
+                provider_session_id=self.get_provider_session_id(),
+                admitted_at=datetime.now(timezone.utc),
+            ))
         if err:
             logger.warning(
                 "agent %s: gemini rc=0 but returned JSON error: %s",
@@ -663,6 +689,54 @@ class DockerCLIAdapter(Adapter):
                     "agent %s: couldn't unlink session file %s: %s",
                     self.agent_id, self.session_file, exc,
                 )
+
+    async def get_context_snapshot(self) -> ContextSnapshot:
+        if self.harness.name() == "claude-code":
+            return await self._ensure_session().get_context_snapshot()
+        return normalize_context_snapshot(
+            used_tokens=0,
+            estimated_source=f"{self.harness.name()}_unsupported_fallback_200000",
+        )
+
+    def get_context_capabilities(self) -> ContextCapabilities:
+        if self.harness.name() == "claude-code":
+            return self._ensure_session().get_context_capabilities()
+        return ContextCapabilities(
+            diagnostic=f"one-shot {self.harness.name()} context control unsupported",
+        )
+
+    async def compact_context(self):
+        if self.harness.name() == "claude-code":
+            return await self._ensure_session().compact_context()
+        return await super().compact_context()
+
+    async def rollover_context(self):
+        if self.harness.name() == "claude-code":
+            return await self._ensure_session().rollover_context()
+        return await super().rollover_context()
+
+    def get_provider_session_id(self) -> str | None:
+        if self.harness.name() == "claude-code":
+            return self._ensure_session().get_provider_session_id()
+        if self._one_shot_provider_session_id:
+            return self._one_shot_provider_session_id
+        try:
+            persisted = json.loads(self.session_file.read_text(encoding="utf-8"))
+            return str(persisted.get("session_id") or "") or None
+        except (OSError, ValueError):
+            return None
+
+    def register_admission_callback(
+        self, callback, planning_cycle_key: str = "",
+    ) -> None:
+        if self.harness.name() == "claude-code":
+            self._ensure_session().register_admission_callback(
+                callback, planning_cycle_key,
+            )
+        else:
+            super().register_admission_callback(callback, planning_cycle_key)
+
+    register_provider_admission_callback = register_admission_callback
 
     async def aclose(self) -> None:
         if self._session is not None:

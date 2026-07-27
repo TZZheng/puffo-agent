@@ -549,3 +549,48 @@ def test_run_turn_thread_limit_rotates_via_wiring(env_home):
     rs = RuntimeState.load(aid)
     assert rs.health == "codex_thread_wedged"
     assert "thread-limit verbatim" in rs.error
+
+
+def test_neutral_session_accessor_and_explicit_rollover(tmp_path):
+    cs = _make_session(tmp_path)
+    cs._save_conversation_id("thread-old")
+    cs._conversation_id = "thread-old"
+    cs._context_used_tokens = 42
+    assert cs.get_provider_session_id() == "thread-old"
+
+    result = asyncio.run(cs.rollover_context())
+    assert result.completed is True
+    assert result.previous_provider_session_id == "thread-old"
+    assert cs.get_provider_session_id() is None
+    assert cs._context_used_tokens == 0
+    persisted = cs._load_conversation_id()
+    assert persisted == ""
+
+
+def test_explicit_rollover_next_start_establishes_fresh_thread(tmp_path):
+    fake = _write_fake(tmp_path, '''\
+absorb_initialize()
+msg = r()
+assert msg["method"] == "thread/start"
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"id": "thread-fresh"}}})
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+''')
+    cs = _wiring_session(tmp_path, fake, "codex-rollover-fresh")
+    cs._save_conversation_id("thread-old")
+    cs._conversation_id = "thread-old"
+
+    async def drive():
+        rolled = await cs.rollover_context()
+        await cs.warm("system")
+        new_id = cs.get_provider_session_id()
+        await cs.aclose()
+        return rolled, new_id
+
+    rolled, new_id = asyncio.run(drive())
+    assert rolled.previous_provider_session_id == "thread-old"
+    assert new_id == "thread-fresh"
+    assert cs._load_conversation_id() == "thread-fresh"
