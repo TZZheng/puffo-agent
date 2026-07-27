@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 import aiosqlite
 
 from ..portal.state import home_dir
 
-_SCHEMA = """
+_BASE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     envelope_id TEXT PRIMARY KEY,
     envelope_kind TEXT NOT NULL,
@@ -26,18 +28,6 @@ CREATE TABLE IF NOT EXISTS messages (
     reply_to_id TEXT,
     is_encrypted INTEGER NOT NULL DEFAULT 1
 );
-
-CREATE INDEX IF NOT EXISTS idx_messages_channel
-    ON messages (channel_id, sent_at) WHERE channel_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_messages_dm
-    ON messages (sender_slug, sent_at) WHERE envelope_kind = 'dm';
--- Covers the inbound (recipient_slug=?) arm of get_dm_history's OR.
-CREATE INDEX IF NOT EXISTS idx_messages_dm_recipient
-    ON messages (recipient_slug, sent_at) WHERE envelope_kind = 'dm';
-CREATE INDEX IF NOT EXISTS idx_messages_received
-    ON messages (received_at);
-CREATE INDEX IF NOT EXISTS idx_messages_thread_root
-    ON messages (thread_root_id, sent_at) WHERE thread_root_id IS NOT NULL;
 
 -- Per-thread cursor used by the thread-batched priority queue. After
 -- ``on_message_batch`` finishes successfully, the consumer advances
@@ -84,6 +74,54 @@ CREATE TABLE IF NOT EXISTS dm_notices (
 );
 """
 
+_DEPENDENT_SCHEMA = """
+CREATE INDEX IF NOT EXISTS idx_messages_channel
+    ON messages (channel_id, sent_at) WHERE channel_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_dm
+    ON messages (sender_slug, sent_at) WHERE envelope_kind = 'dm';
+CREATE INDEX IF NOT EXISTS idx_messages_dm_recipient
+    ON messages (recipient_slug, sent_at) WHERE envelope_kind = 'dm';
+CREATE INDEX IF NOT EXISTS idx_messages_received ON messages (received_at);
+CREATE INDEX IF NOT EXISTS idx_messages_thread_root
+    ON messages (thread_root_id, sent_at) WHERE thread_root_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_server_seq_unique
+    ON messages (server_seq) WHERE server_seq IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_pending_fifo
+    ON messages (processing_state, server_seq, after_server_seq, local_ordinal);
+CREATE INDEX IF NOT EXISTS idx_messages_turn
+    ON messages (processing_turn_id, processing_state);
+CREATE INDEX IF NOT EXISTS idx_messages_channel_pending
+    ON messages (space_id, channel_id, processing_state, server_seq);
+
+CREATE TABLE IF NOT EXISTS channel_context_state (
+    space_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    context_baseline_seq INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (space_id, channel_id)
+);
+CREATE TABLE IF NOT EXISTS turn_runs (
+    turn_id TEXT PRIMARY KEY,
+    provider_session_id TEXT,
+    state TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS turn_run_messages (
+    turn_id TEXT NOT NULL,
+    envelope_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY (turn_id, envelope_id),
+    UNIQUE (turn_id, ordinal),
+    FOREIGN KEY (turn_id) REFERENCES turn_runs(turn_id)
+);
+CREATE TABLE IF NOT EXISTS local_ordinal_allocator (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    next_ordinal INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO local_ordinal_allocator(singleton, next_ordinal) VALUES (1, 1);
+"""
+
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
@@ -95,6 +133,54 @@ class DataNotFound(Exception):
     window is empty after filters". The MCP tool layer surfaces a
     different user-facing message for each.
     """
+
+
+class ReceiptDisposition(str, Enum):
+    ELIGIBLE = "eligible"
+    TERMINAL = "terminal"
+    FOREIGN_DM_GATED = "foreign_dm_gated"
+    LOCAL_RUNTIME = "local_runtime"
+
+
+class ProcessingState(str, Enum):
+    PENDING = "pending"
+    IN_TURN = "in_turn"
+    PROCESSED = "processed"
+
+
+class ReceiptWriteStatus(str, Enum):
+    COMMITTED = "committed"
+    IDEMPOTENT = "idempotent"
+    CONFLICT = "conflict"
+
+
+@dataclass(frozen=True)
+class ReceiptResult:
+    status: ReceiptWriteStatus
+    disposition: ReceiptDisposition
+    reason: str
+    acknowledge: bool
+
+
+@dataclass(frozen=True)
+class PendingPage:
+    items: tuple["StoredMessage", ...]
+    through_seq: int | None
+    more_available: bool
+
+
+@dataclass(frozen=True)
+class TurnRun:
+    turn_id: str
+    provider_session_id: str | None
+    state: str
+    message_ids: tuple[str, ...]
+    started_at: int
+    completed_at: int | None
+
+
+class LifecycleConflict(Exception):
+    """An exact Inbox lifecycle transition could not be applied."""
 
 
 @dataclass
@@ -113,6 +199,15 @@ class StoredMessage:
     reply_to_id: Optional[str] = None
     # False only for a plaintext (non-E2EE) message; absent/legacy rows are True.
     is_encrypted: bool = True
+    server_seq: int | None = None
+    receipt_disposition: ReceiptDisposition | None = None
+    receipt_reason: str | None = None
+    processing_state: ProcessingState | None = None
+    processing_turn_id: str | None = None
+    model_visible_at: int | None = None
+    processed_at: int | None = None
+    local_ordinal: int | None = None
+    after_server_seq: int | None = None
 
 
 @dataclass
@@ -131,12 +226,17 @@ class MessageStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._db: Optional[aiosqlite.Connection] = None
+        # aiosqlite multiplexes one connection. Keep every Inbox transaction
+        # and lifecycle-sensitive read outside another coroutine's transaction.
+        self._inbox_lock = asyncio.Lock()
 
     @staticmethod
     def for_agent(agent_id: str) -> MessageStore:
         return MessageStore(home_dir() / "agents" / agent_id / "messages.db")
 
     async def open(self) -> None:
+        if self._db is not None:
+            return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(self.db_path))
         self._db.row_factory = aiosqlite.Row
@@ -149,15 +249,97 @@ class MessageStore:
             "PRAGMA cache_size=-20000;"
             "PRAGMA mmap_size=268435456;"
         )
-        await self._db.executescript(_SCHEMA)
-        # Pre-existing DBs: everything before this column was E2EE → default 1.
+        # Phase 1: tables that do not depend on additive Inbox columns.
+        await self._db.executescript(_BASE_SCHEMA)
+
+        # Phase 2: migrate the baseline and older legacy layouts atomically.
         cur = await self._db.execute("PRAGMA table_info(messages)")
         cols = {row[1] for row in await cur.fetchall()}
-        if "is_encrypted" not in cols:
-            await self._db.execute(
-                "ALTER TABLE messages ADD COLUMN is_encrypted INTEGER NOT NULL DEFAULT 1"
-            )
+        additions = {
+            "is_encrypted": "is_encrypted INTEGER NOT NULL DEFAULT 1",
+            "server_seq": "server_seq INTEGER",
+            "receipt_disposition": (
+                "receipt_disposition TEXT CHECK (receipt_disposition IS NULL OR "
+                "receipt_disposition IN ('eligible','terminal','foreign_dm_gated','local_runtime'))"
+            ),
+            "receipt_reason": "receipt_reason TEXT",
+            "processing_state": (
+                "processing_state TEXT CHECK (processing_state IS NULL OR "
+                "processing_state IN ('pending','in_turn','processed'))"
+            ),
+            "processing_turn_id": "processing_turn_id TEXT",
+            "model_visible_at": "model_visible_at INTEGER",
+            "processed_at": "processed_at INTEGER",
+            "local_ordinal": "local_ordinal INTEGER",
+            "after_server_seq": "after_server_seq INTEGER",
+        }
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            for name, declaration in additions.items():
+                if name not in cols:
+                    await self._db.execute(
+                        f"ALTER TABLE messages ADD COLUMN {declaration}"
+                    )
             await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
+
+        # Phase 3: indexes and tables whose definitions use the new columns.
+        await self._db.executescript(_DEPENDENT_SCHEMA)
+        await self._db.commit()
+        await self._migrate_nullable_provider_session()
+
+    async def _migrate_nullable_provider_session(self) -> None:
+        """Upgrade databases created by the first Package 1 implementation."""
+        assert self._db is not None
+        async with self._db.execute("PRAGMA table_info(turn_runs)") as cursor:
+            columns = {row["name"]: row for row in await cursor.fetchall()}
+        provider_column = columns.get("provider_session_id")
+        if provider_column is None or not provider_column["notnull"]:
+            return
+
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            await self._db.execute(
+                "ALTER TABLE turn_run_messages "
+                "RENAME TO turn_run_messages_nonnullable_migration"
+            )
+            await self._db.execute(
+                "ALTER TABLE turn_runs RENAME TO turn_runs_nonnullable_migration"
+            )
+            statements = (
+                """CREATE TABLE turn_runs (
+                    turn_id TEXT PRIMARY KEY,
+                    provider_session_id TEXT,
+                    state TEXT NOT NULL,
+                    started_at INTEGER NOT NULL,
+                    completed_at INTEGER
+                )""",
+                """CREATE TABLE turn_run_messages (
+                    turn_id TEXT NOT NULL,
+                    envelope_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    PRIMARY KEY (turn_id, envelope_id),
+                    UNIQUE (turn_id, ordinal),
+                    FOREIGN KEY (turn_id) REFERENCES turn_runs(turn_id)
+                )""",
+                """INSERT INTO turn_runs
+                    (turn_id, provider_session_id, state, started_at, completed_at)
+                SELECT turn_id, provider_session_id, state, started_at, completed_at
+                FROM turn_runs_nonnullable_migration""",
+                """INSERT INTO turn_run_messages (turn_id, envelope_id, ordinal)
+                SELECT turn_id, envelope_id, ordinal
+                FROM turn_run_messages_nonnullable_migration""",
+                "DROP TABLE turn_run_messages_nonnullable_migration",
+                "DROP TABLE turn_runs_nonnullable_migration",
+            )
+            for statement in statements:
+                await self._db.execute(statement)
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
 
     async def close(self) -> None:
         if self._db:
@@ -171,6 +353,12 @@ class MessageStore:
         return self._db
 
     async def store(self, payload: Any, *, received_at: int | None = None) -> None:
+        async with self._inbox_lock:
+            await self._store_unlocked(payload, received_at=received_at)
+
+    async def _store_unlocked(
+        self, payload: Any, *, received_at: int | None = None
+    ) -> None:
         db = await self._ensure_db()
         if isinstance(payload, dict):
             envelope_id = payload.get("envelope_id", "")
@@ -216,6 +404,841 @@ class MessageStore:
             ),
         )
         await db.commit()
+
+    @staticmethod
+    def _payload_values(payload: Any, received_at: int | None) -> tuple[Any, ...]:
+        def value(name: str, default: Any = None) -> Any:
+            if isinstance(payload, dict):
+                return payload.get(name, default)
+            return getattr(payload, name, default)
+
+        envelope_id = value("envelope_id", "")
+        content = value("content", "")
+        content_str = json.dumps(content) if not isinstance(content, str) else content
+        return (
+            envelope_id,
+            value("envelope_kind", "channel"),
+            value("sender_slug", ""),
+            value("channel_id"),
+            value("space_id"),
+            value("recipient_slug"),
+            value("content_type", "text/plain"),
+            content_str,
+            value("sent_at", _now_ms()),
+            received_at if received_at is not None else _now_ms(),
+            value("thread_root_id"),
+            value("reply_to_id"),
+            1 if value("is_encrypted", True) else 0,
+        )
+
+    @staticmethod
+    def _receipt_ack(disposition: ReceiptDisposition) -> bool:
+        return disposition in (
+            ReceiptDisposition.ELIGIBLE,
+            ReceiptDisposition.TERMINAL,
+        )
+
+    async def store_receipt(
+        self,
+        payload: Any,
+        *,
+        server_seq: int,
+        disposition: ReceiptDisposition,
+        reason: str,
+        received_at: int | None = None,
+    ) -> ReceiptResult:
+        async with self._inbox_lock:
+            return await self._store_receipt_unlocked(
+                payload,
+                server_seq=server_seq,
+                disposition=disposition,
+                reason=reason,
+                received_at=received_at,
+            )
+
+    async def _store_receipt_unlocked(
+        self,
+        payload: Any,
+        *,
+        server_seq: int,
+        disposition: ReceiptDisposition,
+        reason: str,
+        received_at: int | None = None,
+    ) -> ReceiptResult:
+        """Persist one durably classified Server receipt.
+
+        Envelope/sequence association conflicts fail closed without mutation.
+        A history-only legacy row may acquire its real sequence, but is never
+        silently activated as Inbox work.
+        """
+        if isinstance(server_seq, bool) or not isinstance(server_seq, int) or server_seq <= 0:
+            raise ValueError("server_seq must be a positive integer")
+        disposition = ReceiptDisposition(disposition)
+        values = self._payload_values(payload, received_at)
+        envelope_id = values[0]
+        if not isinstance(envelope_id, str) or not envelope_id:
+            raise ValueError("payload must contain a non-empty envelope_id")
+        db = await self._ensure_db()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute(
+                "SELECT server_seq, receipt_disposition, receipt_reason "
+                "FROM messages WHERE envelope_id = ?",
+                (envelope_id,),
+            ) as cursor:
+                by_id = await cursor.fetchone()
+            async with db.execute(
+                "SELECT envelope_id FROM messages WHERE server_seq = ?",
+                (server_seq,),
+            ) as cursor:
+                by_seq = await cursor.fetchone()
+
+            if by_id is not None:
+                existing_seq = by_id["server_seq"]
+                if existing_seq is None:
+                    if by_seq is not None and by_seq["envelope_id"] != envelope_id:
+                        await db.rollback()
+                        return ReceiptResult(
+                            ReceiptWriteStatus.CONFLICT, disposition,
+                            "server sequence belongs to another envelope", False,
+                        )
+                    await db.execute(
+                        "UPDATE messages SET server_seq = ? WHERE envelope_id = ? "
+                        "AND server_seq IS NULL",
+                        (server_seq, envelope_id),
+                    )
+                    await db.commit()
+                    return ReceiptResult(
+                        ReceiptWriteStatus.COMMITTED, disposition,
+                        "legacy sequence backfilled without Inbox activation", True,
+                    )
+                if int(existing_seq) != server_seq:
+                    await db.rollback()
+                    return ReceiptResult(
+                        ReceiptWriteStatus.CONFLICT, disposition,
+                        "envelope id belongs to another server sequence", False,
+                    )
+                stored_raw = by_id["receipt_disposition"]
+                stored = ReceiptDisposition(stored_raw) if stored_raw else disposition
+                await db.rollback()
+                return ReceiptResult(
+                    ReceiptWriteStatus.IDEMPOTENT,
+                    stored,
+                    by_id["receipt_reason"] or reason,
+                    self._receipt_ack(stored),
+                )
+
+            if by_seq is not None:
+                await db.rollback()
+                return ReceiptResult(
+                    ReceiptWriteStatus.CONFLICT, disposition,
+                    "server sequence belongs to another envelope", False,
+                )
+
+            processing = (
+                ProcessingState.PENDING.value
+                if disposition is ReceiptDisposition.ELIGIBLE
+                else None
+            )
+            await db.execute(
+                """INSERT INTO messages
+                   (envelope_id, envelope_kind, sender_slug, channel_id, space_id,
+                    recipient_slug, content_type, content, sent_at, received_at,
+                    thread_root_id, reply_to_id, is_encrypted, server_seq,
+                    receipt_disposition, receipt_reason, processing_state)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values + (server_seq, disposition.value, reason, processing),
+            )
+            await db.commit()
+            return ReceiptResult(
+                ReceiptWriteStatus.COMMITTED,
+                disposition,
+                reason,
+                self._receipt_ack(disposition),
+            )
+        except Exception:
+            await db.rollback()
+            raise
+
+    async def promote_gated_receipt(
+        self,
+        envelope_id: str,
+        server_seq: int,
+        *,
+        reason: str,
+    ) -> ReceiptResult:
+        async with self._inbox_lock:
+            return await self._promote_gated_receipt_unlocked(
+                envelope_id, server_seq, reason=reason
+            )
+
+    async def _promote_gated_receipt_unlocked(
+        self,
+        envelope_id: str,
+        server_seq: int,
+        *,
+        reason: str,
+    ) -> ReceiptResult:
+        db = await self._ensure_db()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute(
+                "SELECT server_seq, receipt_disposition, processing_state "
+                "FROM messages WHERE envelope_id = ?",
+                (envelope_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None or row["server_seq"] != server_seq:
+                await db.rollback()
+                return ReceiptResult(
+                    ReceiptWriteStatus.CONFLICT,
+                    ReceiptDisposition.FOREIGN_DM_GATED,
+                    "gated receipt association mismatch",
+                    False,
+                )
+            if (
+                row["receipt_disposition"] == ReceiptDisposition.ELIGIBLE.value
+                and row["processing_state"] == ProcessingState.PENDING.value
+            ):
+                await db.rollback()
+                return ReceiptResult(
+                    ReceiptWriteStatus.IDEMPOTENT,
+                    ReceiptDisposition.ELIGIBLE,
+                    reason,
+                    True,
+                )
+            if (
+                row["receipt_disposition"] != ReceiptDisposition.FOREIGN_DM_GATED.value
+                or row["processing_state"] is not None
+            ):
+                await db.rollback()
+                return ReceiptResult(
+                    ReceiptWriteStatus.CONFLICT,
+                    ReceiptDisposition.FOREIGN_DM_GATED,
+                    "receipt is not approval-gated",
+                    False,
+                )
+            await db.execute(
+                """UPDATE messages
+                   SET receipt_disposition = ?, receipt_reason = ?, processing_state = ?
+                   WHERE envelope_id = ? AND server_seq = ?
+                     AND receipt_disposition = ? AND processing_state IS NULL""",
+                (
+                    ReceiptDisposition.ELIGIBLE.value,
+                    reason,
+                    ProcessingState.PENDING.value,
+                    envelope_id,
+                    server_seq,
+                    ReceiptDisposition.FOREIGN_DM_GATED.value,
+                ),
+            )
+            await db.commit()
+            return ReceiptResult(
+                ReceiptWriteStatus.COMMITTED,
+                ReceiptDisposition.ELIGIBLE,
+                reason,
+                True,
+            )
+        except Exception:
+            await db.rollback()
+            raise
+
+    async def store_local_event(
+        self,
+        payload: Any,
+        *,
+        reason: str,
+        intro_channel_id: str | None = None,
+        received_at: int | None = None,
+    ) -> StoredMessage:
+        async with self._inbox_lock:
+            return await self._store_local_event_unlocked(
+                payload,
+                reason=reason,
+                intro_channel_id=intro_channel_id,
+                received_at=received_at,
+            )
+
+    async def _store_local_event_unlocked(
+        self,
+        payload: Any,
+        *,
+        reason: str,
+        intro_channel_id: str | None = None,
+        received_at: int | None = None,
+    ) -> StoredMessage:
+        values = self._payload_values(payload, received_at)
+        envelope_id = values[0]
+        if not isinstance(envelope_id, str) or not envelope_id:
+            raise ValueError("payload must contain a non-empty envelope_id")
+        db = await self._ensure_db()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            if intro_channel_id:
+                cursor = await db.execute(
+                    "INSERT OR IGNORE INTO channel_intro_prompted(channel_id, prompted_at) "
+                    "VALUES (?, ?)",
+                    (intro_channel_id, _now_ms()),
+                )
+                if cursor.rowcount == 0:
+                    async with db.execute(
+                        "SELECT receipt_disposition FROM messages WHERE envelope_id = ?",
+                        (envelope_id,),
+                    ) as existing_cursor:
+                        existing = await existing_cursor.fetchone()
+                    if (
+                        existing is None
+                        or existing["receipt_disposition"]
+                        != ReceiptDisposition.LOCAL_RUNTIME.value
+                    ):
+                        raise LifecycleConflict(
+                            "introduction marker already belongs to another local event"
+                        )
+                    await db.rollback()
+                    message = await self._get_message_by_envelope_unlocked(
+                        db, envelope_id
+                    )
+                    assert message is not None
+                    return message
+
+            async with db.execute(
+                """SELECT MAX(server_seq) FROM messages
+                   WHERE receipt_disposition = ? AND processing_state = ?
+                     AND server_seq IS NOT NULL""",
+                (ReceiptDisposition.ELIGIBLE.value, ProcessingState.PENDING.value),
+            ) as cursor:
+                frontier_row = await cursor.fetchone()
+            frontier = (
+                int(frontier_row[0]) if frontier_row[0] is not None else None
+            )
+            async with db.execute(
+                "SELECT next_ordinal FROM local_ordinal_allocator WHERE singleton = 1"
+            ) as cursor:
+                ordinal_row = await cursor.fetchone()
+            ordinal = int(ordinal_row[0])
+            await db.execute(
+                "UPDATE local_ordinal_allocator SET next_ordinal = ? WHERE singleton = 1",
+                (ordinal + 1,),
+            )
+            await db.execute(
+                """INSERT INTO messages
+                   (envelope_id, envelope_kind, sender_slug, channel_id, space_id,
+                    recipient_slug, content_type, content, sent_at, received_at,
+                    thread_root_id, reply_to_id, is_encrypted, receipt_disposition,
+                    receipt_reason, processing_state, local_ordinal, after_server_seq)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                values + (
+                    ReceiptDisposition.LOCAL_RUNTIME.value,
+                    reason,
+                    ProcessingState.PENDING.value,
+                    ordinal,
+                    frontier,
+                ),
+            )
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        message = await self._get_message_by_envelope_unlocked(db, envelope_id)
+        assert message is not None
+        return message
+
+    async def quarantine_pending(self, envelope_id: str, *, reason: str) -> bool:
+        async with self._inbox_lock:
+            return await self._quarantine_pending_unlocked(
+                envelope_id, reason=reason
+            )
+
+    async def _quarantine_pending_unlocked(
+        self, envelope_id: str, *, reason: str
+    ) -> bool:
+        db = await self._ensure_db()
+        async with db.execute(
+            """UPDATE messages
+               SET receipt_disposition = ?, receipt_reason = ?, processing_state = NULL,
+                   processing_turn_id = NULL, model_visible_at = NULL
+               WHERE envelope_id = ? AND processing_state = ?""",
+            (
+                ReceiptDisposition.TERMINAL.value,
+                reason,
+                envelope_id,
+                ProcessingState.PENDING.value,
+            ),
+        ) as cursor:
+            changed = cursor.rowcount == 1
+        await db.commit()
+        return changed
+
+    async def get_pending(self, *, limit: int | None = None) -> tuple[StoredMessage, ...]:
+        async with self._inbox_lock:
+            return await self._get_pending_unlocked(limit=limit)
+
+    async def _get_pending_unlocked(
+        self, *, limit: int | None = None
+    ) -> tuple[StoredMessage, ...]:
+        db = await self._ensure_db()
+        sql = """
+            SELECT * FROM messages
+            WHERE processing_state = ?
+              AND (
+                (receipt_disposition = ? AND server_seq IS NOT NULL)
+                OR
+                (receipt_disposition = ? AND server_seq IS NULL
+                 AND local_ordinal IS NOT NULL)
+              )
+            ORDER BY COALESCE(server_seq, after_server_seq, 0) ASC,
+                     CASE WHEN server_seq IS NOT NULL THEN 0 ELSE 1 END ASC,
+                     local_ordinal ASC, envelope_id ASC
+        """
+        params: list[Any] = [
+            ProcessingState.PENDING.value,
+            ReceiptDisposition.ELIGIBLE.value,
+            ReceiptDisposition.LOCAL_RUNTIME.value,
+        ]
+        if limit is not None:
+            if limit < 0:
+                raise ValueError("limit must be non-negative")
+            sql += " LIMIT ?"
+            params.append(limit)
+        async with db.execute(sql, tuple(params)) as cursor:
+            rows = await cursor.fetchall()
+        return tuple(self._row_to_msg(row) for row in rows)
+
+    async def get_channel_pending(
+        self,
+        space_id: str,
+        channel_id: str,
+        *,
+        after_seq: int | None = None,
+        through_seq: int | None = None,
+        limit: int = 50,
+    ) -> PendingPage:
+        async with self._inbox_lock:
+            return await self._get_channel_pending_unlocked(
+                space_id,
+                channel_id,
+                after_seq=after_seq,
+                through_seq=through_seq,
+                limit=limit,
+            )
+
+    async def _get_channel_pending_unlocked(
+        self,
+        space_id: str,
+        channel_id: str,
+        *,
+        after_seq: int | None = None,
+        through_seq: int | None = None,
+        limit: int = 50,
+    ) -> PendingPage:
+        if limit < 0:
+            raise ValueError("limit must be non-negative")
+        candidates = [
+            item
+            for item in await self._get_pending_unlocked()
+            if item.space_id == space_id and item.channel_id == channel_id
+        ]
+
+        def included(item: StoredMessage) -> bool:
+            position = (
+                item.server_seq
+                if item.server_seq is not None
+                else item.after_server_seq
+            )
+            if position is None:
+                position = 0
+            if after_seq is not None and position < after_seq:
+                return False
+            if (
+                after_seq is not None
+                and position == after_seq
+                and item.server_seq is not None
+            ):
+                return False
+            if through_seq is not None and position > through_seq:
+                return False
+            return True
+
+        filtered = [item for item in candidates if included(item)]
+        selected = tuple(filtered[:limit])
+        selected_server = [
+            item.server_seq for item in selected if item.server_seq is not None
+        ]
+        return PendingPage(
+            selected,
+            max(selected_server) if selected_server else None,
+            len(filtered) > len(selected),
+        )
+
+    @staticmethod
+    def _exact_ids(message_ids: Iterable[str]) -> tuple[str, ...]:
+        ids = tuple(message_ids)
+        if not ids or any(not isinstance(item, str) or not item for item in ids):
+            raise LifecycleConflict("message ID set must be non-empty")
+        if len(ids) != len(set(ids)):
+            raise LifecycleConflict("message ID set contains duplicates")
+        return ids
+
+    async def admit_messages(
+        self,
+        message_ids: Iterable[str],
+        *,
+        turn_id: str,
+        provider_session_id: str | None,
+        model_visible_at: int | None = None,
+    ) -> TurnRun:
+        async with self._inbox_lock:
+            return await self._admit_messages_unlocked(
+                message_ids,
+                turn_id=turn_id,
+                provider_session_id=provider_session_id,
+                model_visible_at=model_visible_at,
+            )
+
+    async def _admit_messages_unlocked(
+        self,
+        message_ids: Iterable[str],
+        *,
+        turn_id: str,
+        provider_session_id: str | None,
+        model_visible_at: int | None = None,
+    ) -> TurnRun:
+        ids = self._exact_ids(message_ids)
+        if not turn_id:
+            raise LifecycleConflict("turn ID is required")
+        visible_at = model_visible_at if model_visible_at is not None else _now_ms()
+        db = await self._ensure_db()
+        placeholders = ",".join("?" for _ in ids)
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute(
+                f"SELECT envelope_id, processing_state FROM messages "
+                f"WHERE envelope_id IN ({placeholders})",
+                ids,
+            ) as cursor:
+                rows = await cursor.fetchall()
+            states = {row["envelope_id"]: row["processing_state"] for row in rows}
+            if len(states) != len(ids) or any(
+                states.get(item) != ProcessingState.PENDING.value for item in ids
+            ):
+                raise LifecycleConflict("every exact message ID must be pending")
+            async with db.execute(
+                "SELECT provider_session_id, state FROM turn_runs WHERE turn_id = ?",
+                (turn_id,),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            if existing is not None:
+                if existing["provider_session_id"] != provider_session_id:
+                    raise LifecycleConflict("turn belongs to another provider session")
+                if existing["state"] != ProcessingState.IN_TURN.value:
+                    raise LifecycleConflict("turn is not active")
+                async with db.execute(
+                    f"""SELECT envelope_id FROM turn_run_messages
+                        WHERE turn_id = ? AND envelope_id IN ({placeholders})""",
+                    (turn_id, *ids),
+                ) as cursor:
+                    duplicate_members = await cursor.fetchall()
+                if duplicate_members:
+                    raise LifecycleConflict(
+                        "message ID is already a member of this turn"
+                    )
+                async with db.execute(
+                    "SELECT COALESCE(MAX(ordinal), -1) FROM turn_run_messages "
+                    "WHERE turn_id = ?",
+                    (turn_id,),
+                ) as cursor:
+                    ordinal_row = await cursor.fetchone()
+                first_ordinal = int(ordinal_row[0]) + 1
+            else:
+                await db.execute(
+                    """INSERT INTO turn_runs
+                       (turn_id, provider_session_id, state, started_at, completed_at)
+                       VALUES (?, ?, ?, ?, NULL)""",
+                    (
+                        turn_id,
+                        provider_session_id,
+                        ProcessingState.IN_TURN.value,
+                        visible_at,
+                    ),
+                )
+                first_ordinal = 0
+            for offset, envelope_id in enumerate(ids):
+                await db.execute(
+                    "INSERT INTO turn_run_messages(turn_id, envelope_id, ordinal) "
+                    "VALUES (?, ?, ?)",
+                    (turn_id, envelope_id, first_ordinal + offset),
+                )
+            cursor = await db.execute(
+                f"""UPDATE messages
+                    SET processing_state = ?, processing_turn_id = ?, model_visible_at = ?
+                    WHERE envelope_id IN ({placeholders}) AND processing_state = ?""",
+                (
+                    ProcessingState.IN_TURN.value,
+                    turn_id,
+                    visible_at,
+                    *ids,
+                    ProcessingState.PENDING.value,
+                ),
+            )
+            if cursor.rowcount != len(ids):
+                raise LifecycleConflict("admission changed fewer rows than requested")
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        run = await self._get_turn_run_unlocked(db, turn_id)
+        assert run is not None
+        return run
+
+    async def mark_processed(
+        self,
+        message_ids: Iterable[str],
+        *,
+        turn_id: str,
+        processed_at: int | None = None,
+    ) -> TurnRun:
+        async with self._inbox_lock:
+            return await self._mark_processed_unlocked(
+                message_ids, turn_id=turn_id, processed_at=processed_at
+            )
+
+    async def _mark_processed_unlocked(
+        self,
+        message_ids: Iterable[str],
+        *,
+        turn_id: str,
+        processed_at: int | None = None,
+    ) -> TurnRun:
+        ids = self._exact_ids(message_ids)
+        completed = processed_at if processed_at is not None else _now_ms()
+        db = await self._ensure_db()
+        placeholders = ",".join("?" for _ in ids)
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            expected = await self._turn_message_ids(db, turn_id)
+            if len(expected) != len(ids) or set(expected) != set(ids):
+                raise LifecycleConflict("completion IDs do not exactly match the turn")
+            async with db.execute(
+                f"""SELECT envelope_id FROM messages
+                    WHERE envelope_id IN ({placeholders})
+                      AND processing_state = ? AND processing_turn_id = ?""",
+                (*ids, ProcessingState.IN_TURN.value, turn_id),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            if len(rows) != len(ids):
+                raise LifecycleConflict("every exact message ID must be in this turn")
+            cursor = await db.execute(
+                f"""UPDATE messages SET processing_state = ?, processed_at = ?
+                    WHERE envelope_id IN ({placeholders})
+                      AND processing_state = ? AND processing_turn_id = ?""",
+                (
+                    ProcessingState.PROCESSED.value,
+                    completed,
+                    *ids,
+                    ProcessingState.IN_TURN.value,
+                    turn_id,
+                ),
+            )
+            if cursor.rowcount != len(ids):
+                raise LifecycleConflict("completion changed fewer rows than requested")
+            cursor = await db.execute(
+                "UPDATE turn_runs SET state = ?, completed_at = ? "
+                "WHERE turn_id = ? AND state = ?",
+                (
+                    ProcessingState.PROCESSED.value,
+                    completed,
+                    turn_id,
+                    ProcessingState.IN_TURN.value,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise LifecycleConflict("turn is not active")
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        run = await self._get_turn_run_unlocked(db, turn_id)
+        assert run is not None
+        return run
+
+    async def requeue_messages(
+        self,
+        message_ids: Iterable[str],
+        *,
+        turn_id: str,
+    ) -> TurnRun:
+        async with self._inbox_lock:
+            return await self._requeue_messages_unlocked(
+                message_ids, turn_id=turn_id
+            )
+
+    async def _requeue_messages_unlocked(
+        self,
+        message_ids: Iterable[str],
+        *,
+        turn_id: str,
+    ) -> TurnRun:
+        ids = self._exact_ids(message_ids)
+        db = await self._ensure_db()
+        placeholders = ",".join("?" for _ in ids)
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            expected = await self._turn_message_ids(db, turn_id)
+            if len(expected) != len(ids) or set(expected) != set(ids):
+                raise LifecycleConflict("requeue IDs do not exactly match the turn")
+            cursor = await db.execute(
+                f"""UPDATE messages
+                    SET processing_state = ?, processing_turn_id = NULL,
+                        model_visible_at = NULL, processed_at = NULL
+                    WHERE envelope_id IN ({placeholders})
+                      AND processing_state = ? AND processing_turn_id = ?""",
+                (
+                    ProcessingState.PENDING.value,
+                    *ids,
+                    ProcessingState.IN_TURN.value,
+                    turn_id,
+                ),
+            )
+            if cursor.rowcount != len(ids):
+                raise LifecycleConflict("every exact message ID must be in this turn")
+            cursor = await db.execute(
+                "UPDATE turn_runs SET state = ?, completed_at = ? "
+                "WHERE turn_id = ? AND state = ?",
+                ("requeued", _now_ms(), turn_id, ProcessingState.IN_TURN.value),
+            )
+            if cursor.rowcount != 1:
+                raise LifecycleConflict("turn is not active")
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        run = await self._get_turn_run_unlocked(db, turn_id)
+        assert run is not None
+        return run
+
+    async def _turn_message_ids(
+        self, db: aiosqlite.Connection, turn_id: str
+    ) -> tuple[str, ...]:
+        async with db.execute(
+            "SELECT envelope_id FROM turn_run_messages WHERE turn_id = ? "
+            "ORDER BY ordinal",
+            (turn_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return tuple(row["envelope_id"] for row in rows)
+
+    async def get_turn_run(self, turn_id: str) -> TurnRun | None:
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            return await self._get_turn_run_unlocked(db, turn_id)
+
+    async def _get_turn_run_unlocked(
+        self, db: aiosqlite.Connection, turn_id: str
+    ) -> TurnRun | None:
+        async with db.execute(
+            "SELECT * FROM turn_runs WHERE turn_id = ?", (turn_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        ids = await self._turn_message_ids(db, turn_id)
+        return TurnRun(
+            row["turn_id"],
+            row["provider_session_id"],
+            row["state"],
+            ids,
+            int(row["started_at"]),
+            int(row["completed_at"]) if row["completed_at"] is not None else None,
+        )
+
+    async def get_in_turn_messages(
+        self, turn_id: str, provider_session_id: str | None
+    ) -> tuple[StoredMessage, ...]:
+        # A stateless provider has no durable identity to authenticate recovery.
+        if provider_session_id is None:
+            return ()
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            run = await self._get_turn_run_unlocked(db, turn_id)
+            if (
+                run is None
+                or run.provider_session_id != provider_session_id
+                or run.state != ProcessingState.IN_TURN.value
+            ):
+                return ()
+            async with db.execute(
+                """SELECT m.* FROM turn_run_messages trm
+                   JOIN messages m ON m.envelope_id = trm.envelope_id
+                   WHERE trm.turn_id = ? AND m.processing_state = ?
+                     AND m.processing_turn_id = ?
+                   ORDER BY trm.ordinal""",
+                (turn_id, ProcessingState.IN_TURN.value, turn_id),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return tuple(self._row_to_msg(row) for row in rows)
+
+    async def get_context_baseline(
+        self, space_id: str, channel_id: str
+    ) -> int | None:
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            async with db.execute(
+                "SELECT context_baseline_seq FROM channel_context_state "
+                "WHERE space_id = ? AND channel_id = ?",
+                (space_id, channel_id),
+            ) as cursor:
+                row = await cursor.fetchone()
+            return int(row[0]) if row is not None else None
+
+    async def set_context_baseline(
+        self,
+        space_id: str,
+        channel_id: str,
+        context_baseline_seq: int,
+        *,
+        updated_at: int | None = None,
+    ) -> None:
+        if context_baseline_seq < 0:
+            raise ValueError("context baseline must be non-negative")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute(
+                """INSERT INTO channel_context_state
+                   (space_id, channel_id, context_baseline_seq, updated_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(space_id, channel_id) DO UPDATE SET
+                     context_baseline_seq = excluded.context_baseline_seq,
+                     updated_at = excluded.updated_at""",
+                (
+                    space_id,
+                    channel_id,
+                    context_baseline_seq,
+                    updated_at if updated_at is not None else _now_ms(),
+                ),
+            )
+            await db.commit()
+
+    async def get_model_visible_through_seq(
+        self, turn_id: str, space_id: str, channel_id: str
+    ) -> int | None:
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            async with db.execute(
+                """SELECT MAX(server_seq) FROM messages
+                   WHERE processing_turn_id = ? AND space_id = ? AND channel_id = ?
+                     AND envelope_kind != 'dm' AND server_seq IS NOT NULL
+                     AND model_visible_at IS NOT NULL
+                     AND processing_state IN (?, ?)""",
+                (
+                    turn_id,
+                    space_id,
+                    channel_id,
+                    ProcessingState.IN_TURN.value,
+                    ProcessingState.PROCESSED.value,
+                ),
+            ) as cursor:
+                row = await cursor.fetchone()
+            return int(row[0]) if row is not None and row[0] is not None else None
 
     async def channel_exists(self, channel_id: str) -> bool:
         """True iff the store has ever recorded a message in
@@ -287,16 +1310,17 @@ class MessageStore:
         the first inbound message lands."""
         if not channel_id or not space_id:
             return
-        db = await self._ensure_db()
-        await db.execute(
-            """INSERT INTO channel_space_map (channel_id, space_id, learned_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(channel_id) DO UPDATE SET
-                 space_id = excluded.space_id,
-                 learned_at = excluded.learned_at""",
-            (channel_id, space_id, _now_ms()),
-        )
-        await db.commit()
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute(
+                """INSERT INTO channel_space_map (channel_id, space_id, learned_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(channel_id) DO UPDATE SET
+                     space_id = excluded.space_id,
+                     learned_at = excluded.learned_at""",
+                (channel_id, space_id, _now_ms()),
+            )
+            await db.commit()
 
     async def unmark_channel_space(self, channel_id: str) -> None:
         """Drop a single channel→space mapping. Called by the per-
@@ -307,12 +1331,13 @@ class MessageStore:
         silently skipped."""
         if not channel_id:
             return
-        db = await self._ensure_db()
-        await db.execute(
-            "DELETE FROM channel_space_map WHERE channel_id = ?",
-            (channel_id,),
-        )
-        await db.commit()
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute(
+                "DELETE FROM channel_space_map WHERE channel_id = ?",
+                (channel_id,),
+            )
+            await db.commit()
 
     async def unmark_channel_space_for_space(self, space_id: str) -> None:
         """Per-space companion to ``unmark_channel_space`` — drops
@@ -324,12 +1349,13 @@ class MessageStore:
         the server for a guaranteed-403."""
         if not space_id:
             return
-        db = await self._ensure_db()
-        await db.execute(
-            "DELETE FROM channel_space_map WHERE space_id = ?",
-            (space_id,),
-        )
-        await db.commit()
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute(
+                "DELETE FROM channel_space_map WHERE space_id = ?",
+                (space_id,),
+            )
+            await db.commit()
 
     async def get_channel_history(
         self,
@@ -388,7 +1414,13 @@ class MessageStore:
         """
         if not envelope_id:
             return None
-        db = await self._ensure_db()
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            return await self._get_message_by_envelope_unlocked(db, envelope_id)
+
+    async def _get_message_by_envelope_unlocked(
+        self, db: aiosqlite.Connection, envelope_id: str
+    ) -> Optional["StoredMessage"]:
         async with db.execute(
             "SELECT * FROM messages WHERE envelope_id = ?", (envelope_id,),
         ) as cursor:
@@ -583,18 +1615,19 @@ class MessageStore:
         """
         if not root_id:
             return
-        db = await self._ensure_db()
-        await db.execute(
-            """INSERT INTO thread_processing_state (root_id, last_processed_sent_at)
-               VALUES (?, ?)
-               ON CONFLICT(root_id) DO UPDATE SET
-                 last_processed_sent_at = MAX(
-                   thread_processing_state.last_processed_sent_at,
-                   excluded.last_processed_sent_at
-                 )""",
-            (root_id, sent_at),
-        )
-        await db.commit()
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute(
+                """INSERT INTO thread_processing_state (root_id, last_processed_sent_at)
+                   VALUES (?, ?)
+                   ON CONFLICT(root_id) DO UPDATE SET
+                     last_processed_sent_at = MAX(
+                       thread_processing_state.last_processed_sent_at,
+                       excluded.last_processed_sent_at
+                     )""",
+                (root_id, sent_at),
+            )
+            await db.commit()
 
     async def has_channel_intro_been_prompted(self, channel_id: str) -> bool:
         """True iff the agent already had a self-introduction prompted
@@ -637,38 +1670,49 @@ class MessageStore:
     async def set_dm_notice(self, sender_slug: str, notified_at: int) -> None:
         if not sender_slug:
             return
-        db = await self._ensure_db()
-        await db.execute(
-            """INSERT INTO dm_notices (sender_slug, last_notified_at)
-               VALUES (?, ?)
-               ON CONFLICT(sender_slug) DO UPDATE SET last_notified_at = excluded.last_notified_at""",
-            (sender_slug, notified_at),
-        )
-        await db.commit()
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute(
+                """INSERT INTO dm_notices (sender_slug, last_notified_at)
+                   VALUES (?, ?)
+                   ON CONFLICT(sender_slug) DO UPDATE SET
+                     last_notified_at = excluded.last_notified_at""",
+                (sender_slug, notified_at),
+            )
+            await db.commit()
 
     async def mark_channel_intro_prompted(self, channel_id: str) -> None:
         """Record that an intro nudge has been enqueued for
         ``channel_id``. Idempotent."""
         if not channel_id:
             return
-        db = await self._ensure_db()
-        await db.execute(
-            """INSERT INTO channel_intro_prompted (channel_id, prompted_at)
-               VALUES (?, ?)
-               ON CONFLICT(channel_id) DO NOTHING""",
-            (channel_id, _now_ms()),
-        )
-        await db.commit()
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute(
+                """INSERT INTO channel_intro_prompted (channel_id, prompted_at)
+                   VALUES (?, ?)
+                   ON CONFLICT(channel_id) DO NOTHING""",
+                (channel_id, _now_ms()),
+            )
+            await db.commit()
 
     async def cleanup(self, retention_days: int = 90) -> int:
-        db = await self._ensure_db()
-        cutoff = _now_ms() - retention_days * 86_400_000
-        async with db.execute(
-            "DELETE FROM messages WHERE received_at < ?", (cutoff,)
-        ) as cursor:
-            count = cursor.rowcount
-        await db.commit()
-        return count
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            cutoff = _now_ms() - retention_days * 86_400_000
+            async with db.execute(
+                """DELETE FROM messages
+                   WHERE received_at < ?
+                     AND (processing_state IS NULL OR processing_state = 'processed')
+                     AND (
+                       receipt_disposition IS NULL
+                       OR receipt_disposition != 'foreign_dm_gated'
+                     )""",
+                (cutoff,),
+            ) as cursor:
+                count = cursor.rowcount
+            await db.commit()
+            return count
 
     def _row_to_msg(self, row: aiosqlite.Row) -> StoredMessage:
         content_raw = row["content"]
@@ -691,4 +1735,21 @@ class MessageStore:
             thread_root_id=row["thread_root_id"],
             reply_to_id=row["reply_to_id"],
             is_encrypted=bool(row["is_encrypted"]),
+            server_seq=row["server_seq"],
+            receipt_disposition=(
+                ReceiptDisposition(row["receipt_disposition"])
+                if row["receipt_disposition"] is not None
+                else None
+            ),
+            receipt_reason=row["receipt_reason"],
+            processing_state=(
+                ProcessingState(row["processing_state"])
+                if row["processing_state"] is not None
+                else None
+            ),
+            processing_turn_id=row["processing_turn_id"],
+            model_visible_at=row["model_visible_at"],
+            processed_at=row["processed_at"],
+            local_ordinal=row["local_ordinal"],
+            after_server_seq=row["after_server_seq"],
         )
