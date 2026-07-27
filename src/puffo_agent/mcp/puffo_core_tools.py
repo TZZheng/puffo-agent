@@ -27,6 +27,7 @@ from ..crypto.encoding import base64url_decode, base64url_encode
 from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
 from ..crypto.message import (
+    build_plaintext_message,
     EncryptInput,
     RecipientDevice,
     build_supplementation_envelope,
@@ -34,10 +35,20 @@ from ..crypto.message import (
     encrypt_message_with_content_key,
 )
 from ..crypto.primitives import Ed25519KeyPair
+from ..limits import MESSAGE_SEGMENT_CHARS
 from .data_client import DataClient, DataNotFound
 from ._host_mcp import PuffoRpcClient
 
 logger = logging.getLogger(__name__)
+
+
+async def _send_encryption_required(cfg, resolved_root):
+    """Daemon-level send-mode decision. Data-client shims without the
+    method (older harnesses) fail safe to E2EE."""
+    getter = getattr(cfg.data_client, "get_send_encryption", None)
+    if getter is None:
+        return True
+    return await getter(cfg.slug, resolved_root or None)
 
 
 async def _resolve_channel_space(cfg: Any, channel_id: str) -> str:
@@ -73,11 +84,12 @@ async def _resolve_channel_space(cfg: Any, channel_id: str) -> str:
                 f"channel id, call list_channels_in_all_spaces."
             )
         raise RuntimeError(
-            f"agent has no record of channel {channel_id} — it may not "
-            f"be a channel the agent belongs to, or the id may be "
-            f"wrong. Membership events are cached as they arrive over "
-            f"the WS, so a fresh channel becomes addressable as soon "
-            f"as the invite/accept/create event lands."
+            f"agent has no record of channel {channel_id} — either it "
+            f"isn't a channel the agent belongs to, the id is wrong, or "
+            f"you were just added and the membership hasn't propagated to "
+            f"this agent yet (retrying shortly resolves that last case). "
+            f"Call list_channels_in_all_spaces to see the channels the "
+            f"agent can currently reach."
         )
     return space_id
 
@@ -152,6 +164,11 @@ async def _upload_blob_keyless(cfg: Any, data: bytes) -> dict:
     ) or {}
 
 
+def _enc_tag(m: Any) -> str:
+    """`[encrypted]`/`[plaintext]` tag; legacy rows default to encrypted."""
+    return "[encrypted]" if getattr(m, "is_encrypted", True) else "[plaintext]"
+
+
 @dataclass
 class PuffoCoreToolsConfig:
     slug: str
@@ -187,6 +204,23 @@ class PuffoCoreToolsConfig:
         ``http_client.keyless``; test fakes without the attribute default
         to native, so existing native tests keep passing untouched."""
         return getattr(self.http_client, "keyless", False)
+
+
+def _note_contact(
+    cfg: "PuffoCoreToolsConfig", slug: str, *,
+    allowed: bool = False, blocked: Optional[bool] = None,
+) -> None:
+    """Reflect an allowlist/blocklist write into the in-process contact
+    cache when the tool runs inside the daemon (ws-local). Out-of-process
+    runtimes (cli-local) pick it up via the cache's TTL / miss refresh."""
+    mc = getattr(cfg, "message_client", None)
+    contacts = getattr(mc, "_contacts", None) if mc is not None else None
+    if contacts is None:
+        return
+    if allowed:
+        contacts.note_allowed(slug)
+    if blocked is not None:
+        contacts.note_blocked(slug, blocked)
 
 
 async def _fetch_device_keys(
@@ -271,117 +305,30 @@ async def _supplement_missing_devices(
 from ..agent._visibility import resolve_visibility as _resolve_visibility
 
 
-_RESOLVE_ROOT_MAX_DEPTH = 4
+_RESOLVE_ROOT_MAX_DEPTH = 8
 
 
-async def _validate_root_same_channel(
-    resolved_root: Optional[str],
-    expected_channel_id: Optional[str],
-    expected_space_id: Optional[str],
+async def _resolve_outgoing_root(
+    root_id: str,
     data_client: Any,
+    *,
+    self_slug: str,
+    channel_id: Optional[str],
+    space_id: Optional[str],
+    dm_peer: Optional[str],
 ) -> tuple[Optional[str], str]:
-    """PUF-227-A: enforce the operator's strict-cache invariant on
-    send. If ``resolved_root`` is set, look the parent envelope up
-    in the agent's local message store. Wipe the id to ``None``
-    when:
-      - the parent isn't in local cache (strict per operator's
-        Q1(a) — "client should only see thread_root_id that's in
-        its local cache");
-      - the parent's ``channel_id`` differs from the outbound
-        ``expected_channel_id`` (this is the load-bearing PUF-227
-        check — cross-channel thread_root_id is the bug Scout's
-        symptom traced back to);
-      - the parent's ``space_id`` differs from the outbound
-        ``expected_space_id`` (belt-and-braces alongside the
-        channel check).
+    """Resolve the agent-supplied ``root_id`` to a server-valid thread
+    root for an outbound send. Returns ``(root_or_None, note)``:
 
-    On wipe, returns a warning ``note`` for the tool response so
-    the agent can self-correct on its next compose. Pass-through
-    case (parent in cache + same channel/space): returns
-    ``(resolved_root, "")``.
-    """
-    if not resolved_root or not resolved_root.strip():
-        return resolved_root, ""
-    try:
-        msg = await data_client.get_message_by_envelope(resolved_root)
-    except DataNotFound:
-        msg = None
-    except Exception as exc:
-        # Daemon-log grep symmetry with the receiver-side
-        # _validate_incoming_parent_id wipes — same "wiped %s — ..."
-        # shape so operators can filter both sides with one regex.
-        # Transport errors stay at WARNING (vs INFO for the other 3
-        # wipe branches) — distinguishes "we couldn't verify
-        # (operationally interesting)" from "we verified and it
-        # failed validation (expected steady-state)".
-        logger.warning(
-            "validate_root_same_channel: wiped %s — lookup transport error: %s",
-            resolved_root, exc,
-        )
-        return None, (
-            f"\nnote: thread_root_id {resolved_root} could not be verified "
-            "(local cache lookup failed); wiped to null and sent as "
-            "top-level."
-        )
-    if msg is None:
-        logger.info(
-            "validate_root_same_channel: wiped %s — parent not in local cache",
-            resolved_root,
-        )
-        return None, (
-            f"\nnote: thread_root_id {resolved_root} not in local cache; "
-            "wiped to null and sent as top-level. Agents can only reply "
-            "in threads whose root is in their own local message store."
-        )
-    if expected_channel_id and msg.channel_id != expected_channel_id:
-        logger.info(
-            "validate_root_same_channel: wiped %s — parent channel %r != "
-            "outbound channel %r",
-            resolved_root, msg.channel_id, expected_channel_id,
-        )
-        return None, (
-            f"\nnote: thread_root_id {resolved_root} belongs to channel "
-            f"{msg.channel_id!r}, not the outbound channel "
-            f"{expected_channel_id!r}; wiped to null and sent as "
-            "top-level."
-        )
-    if (
-        expected_space_id
-        and msg.space_id
-        and msg.space_id != expected_space_id
-    ):
-        logger.info(
-            "validate_root_same_channel: wiped %s — parent space %r != "
-            "outbound space %r",
-            resolved_root, msg.space_id, expected_space_id,
-        )
-        return None, (
-            f"\nnote: thread_root_id {resolved_root} belongs to space "
-            f"{msg.space_id!r}, not the outbound space "
-            f"{expected_space_id!r}; wiped to null and sent as "
-            "top-level."
-        )
-    return resolved_root, ""
-
-
-async def _resolve_root_id(
-    root_id: str, data_client: Any,
-) -> tuple[Optional[str], str]:
-    """When an agent passes a reply's envelope id as ``root_id``,
-    look that envelope up and substitute its own ``thread_root_id``
-    so the new message threads under the real root instead of
-    silently disappearing into a sub-thread.
-
-    On healthy data ``thread_root_id`` is always a true root (its
-    own ``thread_root_id IS NULL`` per ``message_store.py``'s schema
-    contract), so the loop terminates after at most one hop. The
-    multi-step walk + cycle break are corruption defense for relay
-    data shapes the schema shouldn't produce.
-
-    Returns ``(resolved_root_or_None, note)`` — ``None`` only when
-    ``root_id.strip()`` is empty. Lookup miss / transport failure
-    falls through with the original id plus a soft warning so the
-    send still completes.
+      - daemon-local system envelope (sender ``system`` / self-referencing
+        root) -> ``None``: the server has no such row, so the message goes
+        out as a new top-level root;
+      - reference from another channel/DM -> raises ``RuntimeError`` so
+        the agent can correct itself;
+      - same-scope reply -> walks up and returns the true root;
+      - not in the local store / lookup failure -> ``None`` + note (agents
+        may only thread under roots they hold locally);
+      - cycle / over-deep chain (corrupt data) -> original id + warning.
     """
     if not root_id.strip():
         return None, ""
@@ -390,7 +337,6 @@ async def _resolve_root_id(
     seen: set[str] = set()
     walked = False
     cycle = False
-
     for _ in range(_RESOLVE_ROOT_MAX_DEPTH):
         if current in seen:
             cycle = True
@@ -402,23 +348,72 @@ async def _resolve_root_id(
             msg = None
         except Exception as exc:
             logger.warning(
-                "resolve_root_id: lookup transport error for %s: %s",
-                current, exc,
+                "resolve_outgoing_root: wiped %s — lookup transport error: %s",
+                root_id, exc,
             )
-            return root_id, (
-                f"\nnote: could not verify root_id {root_id} is a thread "
-                "root (lookup failed); sent as-is. If this lands in the "
-                "wrong thread, pass the metadata block's thread_root_id, "
-                "not post_id."
+            return None, (
+                f"\nnote: thread_root_id {root_id} could not be verified "
+                "(local cache lookup failed); sent as top-level."
             )
         if msg is None:
-            return root_id, (
-                f"\nnote: could not verify root_id {root_id} is a thread "
-                "root (message not in local store); sent as-is. If this "
-                "lands in the wrong thread, pass the metadata block's "
-                "thread_root_id, not post_id."
+            logger.info(
+                "resolve_outgoing_root: wiped %s — %s not in local cache",
+                root_id, current,
             )
-        parent_root = msg.thread_root_id
+            return None, (
+                f"\nnote: thread_root_id {root_id} not in local cache; "
+                "sent as top-level. Agents can only reply in threads "
+                "whose root is in their own local message store."
+            )
+        # Cross-scope first: rejecting before the system/self-ref wipe
+        # keeps misdirected content out of the wrong conversation.
+        if dm_peer is not None:
+            kind = getattr(msg, "envelope_kind", None)
+            peer = (
+                getattr(msg, "recipient_slug", None)
+                if getattr(msg, "sender_slug", None) == self_slug
+                else getattr(msg, "sender_slug", None)
+            )
+            if kind != "dm" or peer != dm_peer:
+                logger.info(
+                    "resolve_outgoing_root: rejected %s — not part of the "
+                    "DM with %s (kind=%r peer=%r)",
+                    root_id, dm_peer, kind, peer,
+                )
+                raise RuntimeError(
+                    f"thread_root_id {root_id} does not belong to this DM "
+                    f"with @{dm_peer}; pass a root from this conversation "
+                    "or omit root_id to start a new thread."
+                )
+        else:
+            msg_space = getattr(msg, "space_id", None)
+            if msg.channel_id != channel_id or (
+                space_id and msg_space and msg_space != space_id
+            ):
+                logger.info(
+                    "resolve_outgoing_root: rejected %s — belongs to "
+                    "channel %r, outbound is %r",
+                    root_id, msg.channel_id, channel_id,
+                )
+                raise RuntimeError(
+                    f"thread_root_id {root_id} belongs to channel "
+                    f"{msg.channel_id!r}, not this send's channel "
+                    f"{channel_id!r}; pass a root from the current channel "
+                    "or omit root_id to start a new thread."
+                )
+        parent_root = getattr(msg, "thread_root_id", None)
+        if getattr(msg, "sender_slug", None) == "system" or parent_root == current:
+            # Daemon-minted system envelopes have no server row — threading
+            # under them would dangle. Send as a new root instead.
+            logger.info(
+                "resolve_outgoing_root: wiped %s — daemon-local system thread",
+                root_id,
+            )
+            return None, (
+                f"\nnote: thread_root_id {root_id} refers to a local "
+                "system message that doesn't exist on the server; sent "
+                "as a new top-level message."
+            )
         if parent_root is None:
             if walked:
                 return current, (
@@ -426,13 +421,10 @@ async def _resolve_root_id(
                     f"auto-corrected to {current}. Pass the metadata "
                     "block's thread_root_id, not post_id."
                 )
-            return root_id, ""
+            return current, ""
         walked = True
         current = parent_root
 
-    # Corruption defense: ran out of depth or hit a cycle without
-    # finding a true root. Don't auto-correct to a value we can't
-    # trust — send to the original id and warn loudly.
     reason = (
         "cycle detected in thread chain"
         if cycle
@@ -529,7 +521,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             shortcuts are not supported.
         text: message body. Markdown preserved verbatim.
         root_id: optional — reply inside a thread; pass the
-            envelope_id of the message you're replying to.
+            envelope_id of the message you're replying to. Non-root
+            ids auto-correct to their thread root; roots from other
+            channels/DMs are rejected; replies to daemon-local system
+            messages go out as new top-level posts.
         visibility_level: one of ``"human"`` | ``"default"`` |
             ``"agent_only"`` (default: ``"default"``).
             - ``"human"`` — anything a person should read (replies,
@@ -573,11 +568,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 keyless_recipient = channel_ref[1:]
                 if not keyless_recipient:
                     raise RuntimeError("DM recipient slug is required after '@'")
-                resolved_root, root_note = await _resolve_root_id(
-                    root_id, cfg.data_client,
-                )
-                resolved_root, validate_note = await _validate_root_same_channel(
-                    resolved_root, None, None, cfg.data_client,
+                resolved_root, root_note = await _resolve_outgoing_root(
+                    root_id,
+                    cfg.data_client,
+                    self_slug=cfg.slug,
+                    channel_id=None,
+                    space_id=None,
+                    dm_peer=keyless_recipient,
                 )
                 body: dict[str, Any] = {
                     "plaintext": text,
@@ -588,12 +585,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 keyless_space_id = await _resolve_channel_space(
                     cfg, keyless_channel_id,
                 )
-                resolved_root, root_note = await _resolve_root_id(
-                    root_id, cfg.data_client,
-                )
-                resolved_root, validate_note = await _validate_root_same_channel(
-                    resolved_root, keyless_channel_id, keyless_space_id,
+                resolved_root, root_note = await _resolve_outgoing_root(
+                    root_id,
                     cfg.data_client,
+                    self_slug=cfg.slug,
+                    channel_id=keyless_channel_id,
+                    space_id=keyless_space_id,
+                    dm_peer=None,
                 )
                 body = {
                     "plaintext": text,
@@ -611,7 +609,6 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             return (
                 f"posted {(ack or {}).get('envelope_id', '?')} to {channel}"
                 f"{root_note}"
-                f"{validate_note}"
             )
 
         if channel_ref.startswith("@"):
@@ -647,23 +644,28 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                     f"(searched space {send_space_id})"
                 )
 
-        devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
-        if not devices:
-            raise RuntimeError("no recipient devices found")
-
         sess = cfg.keystore.load_session(cfg.slug)
         signing_key = Ed25519KeyPair.from_secret_bytes(
             decode_secret(sess.subkey_secret_key)
         )
 
-        effective_visible, visibility_note = await _resolve_visibility(
-            visibility_level, channel_ref, text, root_id, cfg.http_client,
-        )
-        resolved_root, root_note = await _resolve_root_id(
+        resolved_root, root_note = await _resolve_outgoing_root(
             root_id, cfg.data_client,
+            self_slug=cfg.slug,
+            channel_id=channel_id,
+            space_id=send_space_id,
+            dm_peer=recipient_slug,
         )
-        resolved_root, validate_note = await _validate_root_same_channel(
-            resolved_root, channel_id, send_space_id, cfg.data_client,
+        encrypt = await _send_encryption_required(cfg, resolved_root)
+        devices: list = []
+        if encrypt:
+            devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
+            if not devices:
+                raise RuntimeError("no recipient devices found")
+        # Visibility floors key off the RESOLVED root — a wiped root makes
+        # this a root-level post, which can't fold in the UI.
+        effective_visible, visibility_note = await _resolve_visibility(
+            visibility_level, channel_ref, text, resolved_root or "", cfg.http_client,
         )
         inp = EncryptInput(
             envelope_kind=envelope_kind,
@@ -678,22 +680,25 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             content=text,
             recipients=devices,
         )
-        envelope, content_key = encrypt_message_with_content_key(
-            inp, signing_key,
-        )
-        # Server expects the envelope at the top level, not wrapped.
-        resp = await cfg.http_client.post("/messages", envelope) or {}
-        missing = resp.get("missing_devices") or []
-        if missing:
-            asyncio.create_task(_supplement_missing_devices(
-                cfg.http_client, envelope, content_key,
-                recipient_slugs, missing,
-            ))
+        if encrypt:
+            envelope, content_key = encrypt_message_with_content_key(
+                inp, signing_key,
+            )
+            # Server expects the envelope at the top level, not wrapped.
+            resp = await cfg.http_client.post("/messages", envelope) or {}
+            missing = resp.get("missing_devices") or []
+            if missing:
+                asyncio.create_task(_supplement_missing_devices(
+                    cfg.http_client, envelope, content_key,
+                    recipient_slugs, missing,
+                ))
+        else:
+            envelope = build_plaintext_message(inp, signing_key)
+            await cfg.http_client.post("/v2/messages/plaintext", envelope)
         return (
             f"posted {envelope.get('envelope_id', '?')} to {channel}"
             f"{visibility_note}"
             f"{root_note}"
-            f"{validate_note}"
         )
 
     @mcp.tool()
@@ -758,7 +763,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 if entry.reply_count > 0 else ""
             )
             lines.append(
-                f"{ts}  post:{m.envelope_id}  @{m.sender_slug}: {text}{suffix}"
+                f"{ts}  {_enc_tag(m)}  post:{m.envelope_id}  @{m.sender_slug}: {text}{suffix}"
             )
         return "\n".join(lines)
 
@@ -790,7 +795,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         for m in msgs:
             ts = _ts_to_iso(m.sent_at)
             text = str(m.content).replace("\n", " ") if m.content else ""
-            lines.append(f"{ts}  msg:{m.envelope_id}  @{m.sender_slug}: {text}")
+            lines.append(f"{ts}  {_enc_tag(m)}  msg:{m.envelope_id}  @{m.sender_slug}: {text}")
         return "\n".join(lines)
 
     @mcp.tool()
@@ -836,7 +841,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             ts = _ts_to_iso(m.sent_at)
             text = str(m.content).replace("\n", " ") if m.content else ""
             lines.append(
-                f"{ts}  post:{m.envelope_id}  @{m.sender_slug}: {text}"
+                f"{ts}  {_enc_tag(m)}  post:{m.envelope_id}  @{m.sender_slug}: {text}"
             )
         return "\n".join(lines)
 
@@ -1038,6 +1043,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             lines.append(f"channel_id: {msg.channel_id}")
         if msg.thread_root_id:
             lines.append(f"thread_root_id: {msg.thread_root_id}")
+        lines.append(f"is_encrypted: {str(getattr(msg, 'is_encrypted', True)).lower()}")
         lines.append(f"message:\n{content_str}")
         return "\n".join(lines)
 
@@ -1045,7 +1051,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
     async def get_post_segment(
         envelope_id: str,
         segment: int,
-        segment_size: int = 2000,
+        segment_size: int = MESSAGE_SEGMENT_CHARS,
     ) -> str:
         """Page a long message body back in chunks.
 
@@ -1067,9 +1073,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
           * unknown envelope_id → "message <id> not found in local storage"
           * empty content       → "message <id> has no text body"
 
-        ``segment_size`` defaults to 2000 to match the daemon's
-        default redaction page size; pass the value the placeholder
-        cited if the operator has overridden it on their host.
+        ``segment_size`` defaults to the daemon's default redaction
+        page size; pass the value the placeholder cited if the operator
+        has overridden it on their host.
         """
         envelope_id = (envelope_id or "").strip()
         if not envelope_id:
@@ -1230,14 +1236,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 )
 
             # (2) Resolve + validate the thread root before uploads.
-            resolved_root, root_note = await _resolve_root_id(
-                root_id, cfg.data_client,
-            )
-            resolved_root, validate_note = await _validate_root_same_channel(
-                resolved_root,
-                None if is_dm else keyless_channel_id,
-                None if is_dm else keyless_space_id,
+            resolved_root, root_note = await _resolve_outgoing_root(
+                root_id,
                 cfg.data_client,
+                self_slug=cfg.slug,
+                channel_id=None if is_dm else keyless_channel_id,
+                space_id=None if is_dm else keyless_space_id,
+                dm_peer=keyless_recipient if is_dm else None,
             )
 
             # (3) Read every file + run the 8 MiB check for ALL files
@@ -1301,7 +1306,6 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 f"bytes total) to {channel}{thread_note} "
                 f"(envelope_id {(ack or {}).get('envelope_id', '?')})"
                 f"{root_note}"
-                f"{validate_note}"
             )
 
         # Encrypt + upload each file. ``blob_id`` is patched in
@@ -1373,10 +1377,6 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                     f"send_message_with_attachments: channel {channel_id} has no resolvable members"
                 )
 
-        devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
-        if not devices:
-            raise RuntimeError("send_message_with_attachments: no recipient devices found")
-
         sess = cfg.keystore.load_session(cfg.slug)
         signing_key = Ed25519KeyPair.from_secret_bytes(
             decode_secret(sess.subkey_secret_key)
@@ -1385,14 +1385,23 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             "text": caption,
             "attachments": [m.to_dict() for m in attachment_metas],
         }
-        effective_visible, visibility_note = await _resolve_visibility(
-            visibility_level, channel_ref, caption, root_id, cfg.http_client,
-        )
-        resolved_root, root_note = await _resolve_root_id(
+        resolved_root, root_note = await _resolve_outgoing_root(
             root_id, cfg.data_client,
+            self_slug=cfg.slug,
+            channel_id=channel_id,
+            space_id=send_space_id,
+            dm_peer=recipient_slug,
         )
-        resolved_root, validate_note = await _validate_root_same_channel(
-            resolved_root, channel_id, send_space_id, cfg.data_client,
+        encrypt = await _send_encryption_required(cfg, resolved_root)
+        devices: list = []
+        if encrypt:
+            devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
+            if not devices:
+                raise RuntimeError(
+                    "send_message_with_attachments: no recipient devices found"
+                )
+        effective_visible, visibility_note = await _resolve_visibility(
+            visibility_level, channel_ref, caption, resolved_root or "", cfg.http_client,
         )
         inp = EncryptInput(
             envelope_kind=envelope_kind,
@@ -1407,16 +1416,20 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             content=body_content,
             recipients=devices,
         )
-        envelope, content_key = encrypt_message_with_content_key(
-            inp, signing_key,
-        )
-        resp = await cfg.http_client.post("/messages", envelope) or {}
-        missing = resp.get("missing_devices") or []
-        if missing:
-            asyncio.create_task(_supplement_missing_devices(
-                cfg.http_client, envelope, content_key,
-                recipient_slugs, missing,
-            ))
+        if encrypt:
+            envelope, content_key = encrypt_message_with_content_key(
+                inp, signing_key,
+            )
+            resp = await cfg.http_client.post("/messages", envelope) or {}
+            missing = resp.get("missing_devices") or []
+            if missing:
+                asyncio.create_task(_supplement_missing_devices(
+                    cfg.http_client, envelope, content_key,
+                    recipient_slugs, missing,
+                ))
+        else:
+            envelope = build_plaintext_message(inp, signing_key)
+            await cfg.http_client.post("/v2/messages/plaintext", envelope)
         names = ", ".join(t.name for t in targets)
         thread_note = f" in thread {resolved_root}" if resolved_root else ""
         return (
@@ -1425,7 +1438,6 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             f"(envelope_id {envelope.get('envelope_id', '?')})"
             f"{visibility_note}"
             f"{root_note}"
-            f"{validate_note}"
         )
 
     @mcp.tool()
@@ -1578,3 +1590,73 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         from .lifecycle_tools import register_lifecycle_tools
         register_lifecycle_tools(mcp, cfg)
 
+    @mcp.tool()
+    async def get_dm_allowlists() -> str:
+        """List your DM allowlist (peers whose DMs skip the approval
+        gate). Per-agent — every identity keeps its own list; this
+        reads yours only."""
+        data = await cfg.http_client.get("/allowlists")
+        slugs = sorted(
+            e.get("peer_slug", "")
+            for e in (data.get("entries") or [])
+            if e.get("peer_slug")
+        )
+        if not slugs:
+            return "DM allowlist is empty."
+        return "DM allowlist:\n" + "\n".join(f"- {s}" for s in slugs)
+
+    @mcp.tool()
+    async def get_dm_blocklists() -> str:
+        """List your DM blocklist (senders whose messages are silently
+        dropped). Per-agent — every identity keeps its own list; this
+        reads yours only."""
+        data = await cfg.http_client.get("/blocklists")
+        slugs = sorted(
+            b.get("id", "")
+            for b in (data.get("blocks") or [])
+            if b.get("target") == "user" and b.get("id")
+        )
+        if not slugs:
+            return "DM blocklist is empty."
+        return "DM blocklist:\n" + "\n".join(f"- {s}" for s in slugs)
+
+    @mcp.tool()
+    async def add_dm_allowlist(slug: str) -> str:
+        """Allow a user to DM you. Future DMs from this sender skip
+        the ``auto_accept_dm`` approval prompt and deliver directly.
+        Idempotent: re-allowlisting an entry is a no-op. Per-agent —
+        only your own allowlist changes; other agents are unaffected.
+
+        slug: peer to allow (e.g. ``alice-1234``).
+        """
+        target = (slug or "").strip()
+        if not target:
+            raise RuntimeError("slug is required")
+        await cfg.http_client.post("/allowlists", {"slugs": [target]})
+        _note_contact(cfg, target, allowed=True)
+        return f"allowlisted {target}"
+
+    @mcp.tool()
+    async def update_dm_blocklist(slug: str, on: bool) -> str:
+        """Block (``on=True``) or unblock (``on=False``) a sender.
+        Server-enforced — blocked senders' messages are silently
+        dropped at the server, so you never see them. Per-agent —
+        only your own blocklist changes; other agents are unaffected.
+
+        slug: peer to (un)block (e.g. ``alice-1234``).
+        on: ``True`` adds to blocklist, ``False`` removes.
+        """
+        target = (slug or "").strip()
+        if not target:
+            raise RuntimeError("slug is required")
+        if on:
+            await cfg.http_client.post(
+                "/blocklists", {"target": "user", "id": target},
+            )
+            _note_contact(cfg, target, blocked=True)
+            return f"blocked {target}"
+        await cfg.http_client.delete(
+            "/blocklists", body={"id": target},
+        )
+        _note_contact(cfg, target, blocked=False)
+        return f"unblocked {target}"

@@ -190,8 +190,9 @@ class PuffoCoreHttpClient:
         _, data = await self._request("PATCH", path, raw)
         return data
 
-    async def delete(self, path: str) -> Any:
-        _, data = await self._request("DELETE", path)
+    async def delete(self, path: str, body: dict | None = None) -> Any:
+        raw = json.dumps(body).encode() if body else b""
+        _, data = await self._request("DELETE", path, raw)
         return data
 
     def _egress_headers(self, base: dict[str, str] | None = None) -> dict[str, str]:
