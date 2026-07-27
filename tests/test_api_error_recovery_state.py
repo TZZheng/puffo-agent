@@ -193,58 +193,15 @@ async def test_fire_turn_success_passes_batch_and_meta_unchanged():
     assert channel_meta == sample_meta
 
 
-@pytest.mark.asyncio
-async def test_fresh_dispatch_success_path_fires_recovery_callback():
-    """Seals the ``_consume_queue`` success branch (every other
-    test exercises only the kick-retry-recovery path)."""
-    from puffo_agent.agent.puffo_core_client import _ThreadEntry
+def test_fresh_dispatch_uses_global_runtime_not_thread_consumer():
+    import inspect
+    from puffo_agent.agent import puffo_core_client
 
-    client = _make_client(max_retries=1)
-    client._queue = asyncio.PriorityQueue()
-    client._thread_state = {}
-
-    root_id = "root_fresh"
-    batch = [{"envelope_id": "env_1", "sent_at": 100}]
-    entry = _ThreadEntry(
-        messages=list(batch),
-        channel_meta={"channel_id": "ch_x"},
-        current_priority=0,
-        current_seq=1,
-        in_queue=True,
+    source = inspect.getsource(puffo_core_client.PuffoCoreMessageClient.listen)
+    assert "global_runtime" in inspect.getsource(
+        puffo_core_client.PuffoCoreMessageClient
     )
-    client._thread_state[root_id] = entry
-    await client._queue.put((0, 1, root_id))
-
-    async def on_message_batch(_root_id, _batch, _meta):
-        return None
-
-    success_calls: list[tuple[Any, ...]] = []
-    done = asyncio.Event()
-
-    async def on_turn_success(_root_id, _batch, _meta):
-        success_calls.append((_root_id, list(_batch), dict(_meta)))
-        done.set()
-
-    task = asyncio.create_task(
-        client._consume_queue(  # type: ignore[arg-type]
-            on_message_batch=on_message_batch,
-            on_turn_success=on_turn_success,
-        )
-    )
-    try:
-        await asyncio.wait_for(done.wait(), timeout=2.0)
-    finally:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    assert len(success_calls) == 1
-    fired_root, fired_batch, fired_meta = success_calls[0]
-    assert fired_root == root_id
-    assert fired_batch == batch
-    assert fired_meta == {"channel_id": "ch_x"}
+    assert "_consume_queue" not in source
 
 
 # ── Worker callback unit tests (drive the lifted staticmethod) ───

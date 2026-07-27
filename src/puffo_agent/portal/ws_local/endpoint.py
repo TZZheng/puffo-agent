@@ -37,7 +37,10 @@ async def serve_connection(
     is_servable: Callable[[str], bool],
     agent_context: Callable[[str], Awaitable[dict]],
     registry: SessionRegistry[WsLocalSession],
-    make_session: Callable[[AuthedAgent, str, Transport, WsLocalBridge], WsLocalSession],
+    make_session: Callable[
+        [AuthedAgent, str, Transport, WsLocalBridge, tuple[str, ...]],
+        WsLocalSession,
+    ],
     start_consumer: Callable[[AuthedAgent, Callable], Awaitable[None]],
     new_session_id: Callable[[], str],
     base64_decode: Callable[[str], bytes],
@@ -71,14 +74,20 @@ async def serve_connection(
 
     session_id = new_session_id()
     bridge = WsLocalBridge()
-    session = make_session(authed, session_id, transport, bridge)
+    session = make_session(
+        authed, session_id, transport, bridge, frame.capabilities
+    )
     if not registry.acquire(authed.slug, session):
         await _reject(transport, f"{authed.slug!r} already has an active connection")
         return
 
     try:
         context = await agent_context(authed.slug)
-        await transport.send(encode(Connected(session_id, context)))
+        await transport.send(encode(Connected(
+            session_id,
+            context,
+            capabilities=("multi-target-v2", "explicit-admission-v2"),
+        )))
         await _run_attached(authed, session, bridge, start_consumer)
     except Exception as exc:  # noqa: BLE001
         logger.exception("ws-local %s: serve failed: %s", authed.slug, exc)

@@ -116,7 +116,12 @@ def read_current_turn(cwd: str) -> dict | None:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if not isinstance(data, dict) or not data.get("channel_id"):
+    if not isinstance(data, dict):
+        return None
+    targets = data.get("targets")
+    if not data.get("channel_id") and not (
+        data.get("version") == 2 and isinstance(targets, list) and targets
+    ):
         return None
     return data
 
@@ -191,6 +196,8 @@ def request_via_rpc(
     tool_name: str,
     summary: str,
     timeout_s: int,
+    *,
+    fail_closed: bool = False,
 ) -> None:
     """puffo-core transport: the daemon DMs the operator and
     long-polls the y/n; translate its decision into the PreToolUse
@@ -204,6 +211,8 @@ def request_via_rpc(
             timeout=timeout_s + 30,
         )
     except Exception as exc:
+        if fail_closed:
+            _deny(f"daemon permission request failed: {exc}")
         _fail_open(f"daemon permission request failed: {exc}")
     decision = (resp.get("message") or "").strip().lower()
     if decision == "allow":
@@ -212,6 +221,8 @@ def request_via_rpc(
         _deny("operator denied via chat")
     if decision == "timeout":
         _deny(f"permission request timed out after {timeout_s}s (no operator reply)")
+    if fail_closed:
+        _deny(f"unexpected daemon decision {decision!r}")
     _fail_open(f"unexpected daemon decision {decision!r}")
 
 
@@ -226,15 +237,38 @@ def main() -> None:
     except ValueError:
         timeout_s = 300
 
+    try:
+        raw = sys.stdin.read() or "{}"
+        payload = json.loads(raw)
+    except Exception as exc:
+        _fail_open(f"could not parse hook payload: {exc}")
+
+    cwd = payload.get("cwd", "")
+    turn = read_current_turn(cwd)
+    raw_targets = turn.get("targets", []) if turn else []
+    distinct_targets = {
+        tuple(str(part) for part in target)
+        for target in raw_targets
+        if isinstance(target, list)
+    }
+    if len(distinct_targets) > 1:
+        if not rpc_url:
+            _deny(
+                "multi-target permission request requires the operator-DM RPC"
+            )
+        request_via_rpc(
+            rpc_url,
+            agent_id,
+            payload.get("tool_name", "unknown"),
+            summarise_tool_input(payload.get("tool_input", {})),
+            timeout_s,
+            fail_closed=True,
+        )
+
     # No legacy creds (puffo-core deployment) → route through the
     # daemon's rpc service, which DMs the operator a /permission card.
     if not (base_url and bot_token):
         if rpc_url:
-            try:
-                raw = sys.stdin.read() or "{}"
-                payload = json.loads(raw)
-            except Exception as exc:
-                _fail_open(f"could not parse hook payload: {exc}")
             request_via_rpc(
                 rpc_url,
                 agent_id,
@@ -246,18 +280,11 @@ def main() -> None:
     if not operator:
         _fail_open("PUFFO_OPERATOR_USERNAME empty — no operator to DM")
 
-    try:
-        raw = sys.stdin.read() or "{}"
-        payload = json.loads(raw)
-    except Exception as exc:
-        _fail_open(f"could not parse hook payload: {exc}")
     tool_name = payload.get("tool_name", "unknown")
     tool_input = payload.get("tool_input", {})
     # claude passes its subprocess cwd (== agent's workspace_dir);
     # the daemon writes current_turn.json there so the hook knows
     # which channel + thread to reply in.
-    cwd = payload.get("cwd", "")
-
     turn = read_current_turn(cwd)
     if turn is None:
         _fail_open(

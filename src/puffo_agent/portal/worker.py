@@ -917,6 +917,7 @@ class Worker:
             keystore=client.keystore,
             http_client=client.http,
             message_client=client,
+            send_coordinator=getattr(client, "send_delegate", None),
         )
 
     async def stop(self) -> None:
@@ -1164,6 +1165,122 @@ class Worker:
         # is a separate subprocess and reads this file to learn which
         # channel + root to reply to.
         current_turn_path = Path(workspace_path) / ".puffo-agent" / "current_turn.json"
+
+        # Package 4: one durable global scheduler and one persistent semantic
+        # coordinator per worker. The legacy callback definitions below remain
+        # only as source-compatible listener arguments; receipt handling no
+        # longer invokes them.
+        from ..agent.global_inbox_runtime import (
+            ActiveBoundaryAdapter,
+            BaselineAdapter,
+            GlobalInboxRuntime,
+            TrackingSendDelegate,
+        )
+        from ..agent.send_coordinator import SemanticSendRequest, SendCoordinator
+        from .ws_local.in_process_data_client import InProcessDataClient
+
+        global_runtime: GlobalInboxRuntime
+
+        async def run_global_turn(planned):
+            await _process_refresh_flags(
+                agent_id=agent_id,
+                harness_name=(self.agent_cfg.runtime.harness or "").strip(),
+                shared_path=shared_path,
+                profile_path=profile_path,
+                memory_path=memory_path,
+                workspace_path=workspace_path,
+                puffo=puffo,
+                adapter=self._adapter,
+                refresh_agent_flag=refresh_agent_flag_path,
+                refresh_host_sync_flag=refresh_host_sync_flag_path,
+                refresh_session_flag=refresh_session_flag_path,
+            )
+            self._maybe_wake_refresher_if_auth_failed(agent_id)
+            if (
+                self._ensure_fresh_token is not None
+                and self.agent_cfg.runtime.kind in (
+                    RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER,
+                )
+                and not await self._ensure_fresh_token()
+            ):
+                self._enter_auth_failed(agent_id)
+                raise AgentAPIError("credential refresh failed before delivery")
+            Worker._flip_health_in_progress(self.runtime, agent_id, logger)
+            reply = await puffo.handle_global_inbox_turn(planned)
+            self.runtime.msg_count += 1
+            self.runtime.last_event_at = int(time.time())
+            if not reply:
+                return
+            # Plain output has exactly one legal implicit route. Every explicit,
+            # failed, attachment, or held attempt suppresses it.
+            if len(planned.targets) != 1 or global_runtime.attempts.attempts:
+                logger.warning(
+                    "agent %s: suppressed ambiguous global plain output "
+                    "(targets=%d attempts=%d)",
+                    agent_id, len(planned.targets), global_runtime.attempts.attempts,
+                )
+                return
+            target = planned.targets[0]
+            if target[0] == "dm":
+                destination = f"@{target[1]}"
+                root_id = ""
+            else:
+                destination = target[2]
+                root_id = target[3] if target[0] == "thread" else ""
+            await global_runtime.send_delegate.send(SemanticSendRequest(
+                destination=destination,
+                text=reply,
+                root_id=root_id,
+            ))
+
+        async def retry_global_turn(planned):
+            reply = await puffo.handle_global_inbox_retry(planned)
+            if not reply:
+                return
+            if len(planned.targets) != 1 or global_runtime.attempts.attempts:
+                logger.warning(
+                    "agent %s: suppressed ambiguous global retry output "
+                    "(targets=%d attempts=%d)",
+                    agent_id, len(planned.targets), global_runtime.attempts.attempts,
+                )
+                return
+            target = planned.targets[0]
+            destination = f"@{target[1]}" if target[0] == "dm" else target[2]
+            root_id = target[3] if target[0] == "thread" else ""
+            await global_runtime.send_delegate.send(SemanticSendRequest(
+                destination=destination,
+                text=reply,
+                root_id=root_id,
+            ))
+
+        run_global_turn.handle_global_inbox_retry = retry_global_turn
+
+        global_runtime = GlobalInboxRuntime(
+            store=client.store,
+            adapter=self._adapter,
+            run_turn=run_global_turn,
+            workspace=workspace_path,
+        )
+        coordinator = SendCoordinator(
+            slug=client.slug,
+            keystore=client.keystore,
+            http_client=client.http,
+            data_client=InProcessDataClient(client.store, client),
+            workspace=workspace_path,
+            baseline_source=BaselineAdapter(client.store),
+            active_turn_source=ActiveBoundaryAdapter(
+                client.store, global_runtime.active
+            ),
+            held_recovery_source=global_runtime.held_recovery_source,
+        )
+        global_runtime.coordinator = coordinator
+        global_runtime.send_delegate = TrackingSendDelegate(
+            coordinator, global_runtime.attempts
+        )
+        client.global_runtime = global_runtime
+        client.send_coordinator = coordinator
+        client.send_delegate = global_runtime.send_delegate
+        global_runtime_task = asyncio.ensure_future(global_runtime.run())
 
         async def on_message_batch(
             root_id: str,
@@ -1548,6 +1665,12 @@ class Worker:
                 except asyncio.TimeoutError:
                     pass
         finally:
+            global_runtime.stop()
+            global_runtime_task.cancel()
+            try:
+                await global_runtime_task
+            except (asyncio.CancelledError, Exception):
+                pass
             reporter.stop()
             hb_task.cancel()
             status_task.cancel()

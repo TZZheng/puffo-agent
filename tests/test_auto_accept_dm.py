@@ -241,12 +241,22 @@ def _make_client(*, auto_accept_dm: bool, operator_slug: str = "op-1"):
     # Stub WS whose on_message the drain feeds re-fetched envelopes through.
     handled: list[dict] = []
 
-    async def _stub_on_message(envelope):
-        handled.append(envelope)
-        return None  # not gated → ack
+    async def _stub_on_message(delivery):
+        handled.append(delivery["envelope"])
+        from puffo_agent.crypto.ws_client import TransportOutcome
+        return TransportOutcome.ACK
 
     class _StubWs:
         on_message = None
+
+        async def dispatch_delivery(self, item):
+            from types import SimpleNamespace
+            from puffo_agent.crypto.ws_client import TransportOutcome
+            await self.on_message({
+                "seq": item.get("seq", 1),
+                "envelope": item.get("envelope", item),
+            })
+            return SimpleNamespace(outcome=TransportOutcome.ACK)
 
     ws = _StubWs()
     ws.on_message = _stub_on_message  # type: ignore[assignment]
@@ -809,8 +819,8 @@ def test_gate_ladder_wiring_order():
     from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
     src = inspect.getsource(PuffoCoreMessageClient)
     drop = src.index("dm_gate: dropped DM from blocked")
-    store = src.index('"envelope_id": payload.envelope_id', drop)
-    assert drop < store, "blocked-DM drop must precede persistence"
+    assert "blocked dm tombstone" in src[drop:]
+    assert "_BLOCKED_MESSAGE_PLACEHOLDER" in src[drop:]
     fyi = src.index("_maybe_send_dm_notice(payload.sender_slug)")
     gate = src.index("_maybe_gate_foreign_dm(", fyi)
     assert fyi < gate, "FYI must precede the permission prompt"

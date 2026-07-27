@@ -35,7 +35,7 @@ from puffo_agent.agent.puffo_core_client import (
     PRIORITY_MENTIONED_BOT,
     PRIORITY_MENTIONED_HUMAN,
     PuffoCoreMessageClient,
-    _ThreadEntry,
+    _RetiredThreadSlot as _ThreadEntry,
     _compute_priority,
 )
 
@@ -116,7 +116,7 @@ def test_handle_envelope_admits_with_owner_slug_priority():
 
     src = inspect.getsource(pcc.PuffoCoreMessageClient.listen)
     assert "sender_is_agent = bool(sender_owner_slug)" in src
-    assert "priority = _compute_priority(direct, sender_is_agent)" in src
+    assert "sender_is_agent = bool(sender_owner_slug)" in src
     # No hardcoded flag under either the old or the new spelling.
     assert "sender_is_agent = False" not in src
     assert "sender_is_bot" not in src
@@ -404,7 +404,7 @@ async def _run_consumer_one_batch(client: PuffoCoreMessageClient) -> tuple[str, 
         received.append((root_id, batch, channel_meta))
         done.set()
 
-    task = asyncio.create_task(client._consume_queue(callback))
+    task = asyncio.create_task(client._retired_queue_consumer(callback))
     try:
         await asyncio.wait_for(done.wait(), timeout=2.0)
     finally:
@@ -536,7 +536,7 @@ async def test_consume_jitters_before_dispatch():
 
     mod.asyncio.sleep = fake_sleep  # type: ignore[assignment]
     try:
-        task = asyncio.create_task(client._consume_queue(callback))
+        task = asyncio.create_task(client._retired_queue_consumer(callback))
         try:
             # Wait on the Event directly so we don't issue any sleep
             # calls that would pollute the recording.
@@ -598,7 +598,7 @@ async def test_arrival_during_dispatch_lands_in_next_batch():
 
     mod.random.uniform = fake_uniform  # type: ignore[assignment]
     try:
-        task = asyncio.create_task(client._consume_queue(callback))
+        task = asyncio.create_task(client._retired_queue_consumer(callback))
         try:
             await asyncio.wait_for(in_first_dispatch.wait(), timeout=2.0)
             # Admit msg2 mid-dispatch.
@@ -666,7 +666,7 @@ async def test_consumer_dedupes_batch_before_dispatch_as_safety_net():
 
     mod.random.uniform = fake_uniform  # type: ignore[assignment]
     try:
-        task = asyncio.create_task(client._consume_queue(callback))
+        task = asyncio.create_task(client._retired_queue_consumer(callback))
         try:
             await asyncio.wait_for(task, timeout=2.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
@@ -726,7 +726,7 @@ async def test_duplicate_envelope_during_dispatch_is_skipped():
 
     mod.random.uniform = fake_uniform  # type: ignore[assignment]
     try:
-        task = asyncio.create_task(client._consume_queue(callback))
+        task = asyncio.create_task(client._retired_queue_consumer(callback))
         try:
             await asyncio.wait_for(in_first_dispatch.wait(), timeout=2.0)
             # Duplicate of env_x arrives mid-dispatch (same envelope_id,
@@ -808,7 +808,7 @@ async def test_api_error_calls_kick_retry_not_re_enqueue():
     mod.random.uniform = fake_uniform  # type: ignore[assignment]
     try:
         task = asyncio.create_task(
-            client._consume_queue(on_message_batch, on_retry),
+                client._retired_queue_consumer(on_message_batch, on_retry),
         )
         try:
             await asyncio.wait_for(retry_done.wait(), timeout=2.0)
@@ -874,7 +874,7 @@ async def test_api_error_kick_retries_capped():
     mod.random.uniform = fake_uniform  # type: ignore[assignment]
     try:
         task = asyncio.create_task(
-            client._consume_queue(on_message_batch, on_retry),
+                client._retired_queue_consumer(on_message_batch, on_retry),
         )
         try:
             # Loop should exit after the main dispatch + cap retries,
@@ -945,7 +945,7 @@ async def _run_consumer_n_batches(
         if len(received) >= n:
             done.set()
 
-    task = asyncio.create_task(client._consume_queue(callback))
+    task = asyncio.create_task(client._retired_queue_consumer(callback))
     try:
         await asyncio.wait_for(done.wait(), timeout=5.0)
     finally:

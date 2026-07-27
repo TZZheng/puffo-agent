@@ -551,7 +551,7 @@ async def test_announce_skips_dedup_when_event_id_empty():
 
 
 @pytest.mark.asyncio
-async def test_persist_failure_still_delivers_in_memory_envelope(
+async def test_persist_failure_does_not_deliver_undurable_envelope(
     monkeypatch, caplog,
 ):
     """sqlite raising must not block in-memory delivery; warn instead."""
@@ -560,10 +560,10 @@ async def test_persist_failure_still_delivers_in_memory_envelope(
     client._channel_space["ch_1"] = "sp_1"
     client._log = logging.getLogger("test_persist_failure")
 
-    async def _explode(_payload):
+    async def _explode(_payload, **_kwargs):
         raise RuntimeError("disk full")
 
-    monkeypatch.setattr(client.store, "store", _explode)
+    monkeypatch.setattr(client.store, "store_local_event", _explode)
 
     with caplog.at_level(logging.WARNING, logger="test_persist_failure"):
         await client._enqueue_membership_system_message(
@@ -572,9 +572,7 @@ async def test_persist_failure_still_delivers_in_memory_envelope(
             action="joined",
         )
 
-    assert client._queue.qsize() == 1
-    _, _, root_id = await client._queue.get()
-    assert "joined" in client._thread_state[root_id].messages[0]["text"]
+    assert client._queue.qsize() == 0
 
     assert any(
         "membership system-message" in rec.message
