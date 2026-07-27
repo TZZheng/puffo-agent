@@ -8,12 +8,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import random
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Optional
+from typing import Any, Callable, Optional
 
 from ..crypto.encoding import base64url_decode
 from ..limits import (
@@ -41,7 +39,6 @@ from ..crypto.ws_client import (
 from . import disk_cache
 from ._invite_strings import format_invite_error, format_leave_error
 from .contact_cache import ContactCache
-from .core import AgentAPIError
 from .permission_prompt import format_permission_prompt
 from .events import random_nonce, sign_event
 from .event_kinds import EventKind
@@ -69,13 +66,6 @@ _MENTION_RE = re.compile(
 )
 
 
-# Lower number = higher priority — drained first by the consumer loop.
-PRIORITY_MENTIONED_HUMAN = 1
-PRIORITY_MENTIONED_BOT = 2
-PRIORITY_HUMAN = 3
-PRIORITY_BOT = 4
-PRIORITY_SYSTEM = 5
-
 # Per-slug profile cache TTL — keeps display_name + avatar_url
 # fresh enough that a rename / avatar change on puffo-server
 # propagates within ~10 min on the next render, without paying
@@ -88,13 +78,6 @@ _PROFILE_CACHE_TTL_SECONDS = 10 * 60
 # deeper chains are corrupt and the reply is admitted as its own root.
 _INCOMING_ROOT_MAX_DEPTH = 8
 
-# Mirrors ``adapters/cli_session.MAX_USER_MESSAGE_BYTES``; a test pins them.
-DEFAULT_MAX_INPUT_BYTES = 180 * 1000
-
-# Deliberately over-counts the ``_format_user_block`` metadata header so a
-# near-boundary split lands one turn early, never over the cap.
-_BLOCK_METADATA_OVERHEAD_BYTES = 2048
-
 # Auto-reply to a foreign sender whose first DM is held pending approval.
 _DM_GATE_SENDER_ACK = (
     "Thanks — your message has reached me. I've asked my operator to "
@@ -104,18 +87,6 @@ _DM_GATE_SENDER_ACK = (
 # Stored in place of a blocked account's channel-message body: keeps the
 # thread/seq metadata intact for history reads without the content.
 _BLOCKED_MESSAGE_PLACEHOLDER = "[message from a blocked account was dropped]"
-
-
-@dataclass
-class _RetiredThreadSlot:
-    """Compatibility fixture for regression tests of the retired queue path."""
-
-    current_priority: int
-    current_seq: int
-    messages: list[dict] = field(default_factory=list)
-    in_queue: bool = True
-    channel_meta: dict = field(default_factory=dict)
-    dispatching_ids: set[str] = field(default_factory=set)
 
 
 async def _fetch_blob_with_retry(
@@ -217,19 +188,6 @@ def _parse_operator_pubkey(identity_cert_json: Optional[str]) -> Optional[bytes]
     if len(op_pk) != 32:
         return None
     return op_pk
-
-
-def _compute_priority(direct: bool, sender_is_agent: bool) -> int:
-    """Map (direct, sender_is_agent) to one of the PRIORITY_* bands.
-    PRIORITY_SYSTEM is reserved for a future service-message envelope.
-    """
-    if direct and not sender_is_agent:
-        return PRIORITY_MENTIONED_HUMAN
-    if direct and sender_is_agent:
-        return PRIORITY_MENTIONED_BOT
-    if not sender_is_agent:
-        return PRIORITY_HUMAN
-    return PRIORITY_BOT
 
 
 # Hard cap on the preview length embedded in the redaction
@@ -463,7 +421,6 @@ class PuffoCoreMessageClient:
         segment_chars: int = MESSAGE_SEGMENT_CHARS,
         agent_created_at: int = 0,
         image_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
-        max_input_bytes: int = DEFAULT_MAX_INPUT_BYTES,
         catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS,
     ):
         self.slug = slug
@@ -488,7 +445,6 @@ class PuffoCoreMessageClient:
         # 200k-context model with a verbose system prompt.
         self._max_inline_chars = max(1, int(max_inline_chars))
         self._segment_chars = max(1, int(segment_chars))
-        self._max_input_bytes = max(1, int(max_input_bytes))
         # Catch-up older than this skips the LLM (still stored); <= 0 disables.
         self._catchup_stale_ms = (
             int(catchup_stale_hours * 3600 * 1000) if catchup_stale_hours > 0 else 0
@@ -636,41 +592,13 @@ class PuffoCoreMessageClient:
 
     async def listen(
         self,
-        on_message: Callable[..., Coroutine[Any, Any, Any]],
-        on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-        on_api_error_abandon: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-        on_turn_success: Callable[..., Coroutine[Any, Any, Any]] | None = None,
+        on_message: Callable[..., Any] | None = None,
     ) -> None:
-        """``on_message`` is the thread-batch callback. Despite the
-        legacy parameter name kept for caller compatibility, it's
-        invoked as ``on_message(root_id, batch, channel_meta)`` —
-        the consumer collapses every arrival on the same thread
-        into a single dispatch (legacy behavior, no longer active).
+        """Listen for durable receipts.
 
-        ``on_api_error_retry`` is the kick-retry callback invoked
-        after the consumer catches an ``AgentAPIError``. Same
-        signature, but the implementation is expected to nudge
-        claude-code via ``--resume`` rather than re-sending the
-        ``batch`` payload (so the agent's transcript doesn't pick up
-        a duplicate of the original user input on every retry). When
-        omitted, the consumer abandons the batch on first failure.
-
-        PUF-252: ``on_api_error_abandon`` is the state-honesty
-        hook fired exactly once when kick-retries have all failed
-        and the batch is being abandoned. The worker uses this to
-        flip ``runtime.health`` + ``runtime.error`` so the
-        discoverable-action affordances on Nova's lane (FB-197
-        status dot + FB-198 restart lever, both in the Operator
-        Action Panel cluster) have a signal to surface — Sam's
-        "agent went silent without warning" symptom stops being
-        invisible. Invoked as ``on_api_error_abandon(root_id,
-        batch, channel_meta, attempts)``. When omitted, the
-        abandon stays silent (pre-PUF-252 behaviour).
-
-        ``on_turn_success`` is the recovery-side matched-pair
-        for ``on_api_error_abandon``. Fires on every successful
-        turn exit (fresh dispatch AND kick-retry recovery).
-        Invoked as ``on_turn_success(root_id, batch, channel_meta)``.
+        ``on_message`` is an unused optional positional argument retained for
+        the frozen ws-local route. Provider work is scheduled exclusively by
+        ``GlobalInboxRuntime``.
         """
         identity = self.keystore.load_identity(self.slug)
         kem_kp = KemKeyPair.from_secret_bytes(
@@ -803,12 +731,21 @@ class PuffoCoreMessageClient:
                     )
                 if result.status is ReceiptWriteStatus.CONFLICT:
                     return TransportOutcome.HOLD
-                if (
-                    result.disposition is ReceiptDisposition.ELIGIBLE
-                    and result.status is ReceiptWriteStatus.COMMITTED
-                ):
-                    runtime = getattr(self, "global_runtime", None)
-                    if runtime is not None:
+                runtime = getattr(self, "global_runtime", None)
+                if runtime is not None:
+                    if (
+                        payload.envelope_kind == "channel"
+                        and result.status
+                        in (
+                            ReceiptWriteStatus.COMMITTED,
+                            ReceiptWriteStatus.IDEMPOTENT,
+                        )
+                    ):
+                        runtime.notify_delivery()
+                    if (
+                        result.disposition is ReceiptDisposition.ELIGIBLE
+                        and result.status is ReceiptWriteStatus.COMMITTED
+                    ):
                         runtime.notify()
                 return (
                     TransportOutcome.ACK
@@ -1103,506 +1040,6 @@ class PuffoCoreMessageClient:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
-
-    async def _admit_thread_message(
-        self,
-        *,
-        root_id: str,
-        priority: int,
-        msg_dict: dict,
-        channel_meta: dict,
-    ) -> None:
-        """Add (or coalesce) a message into the thread-batched queue.
-
-        Cases (all keyed on ``root_id``):
-
-        - **New root** (no entry yet): build a retired queue slot
-          with this message as the only element and push a heap tuple.
-        - **Reopen** (entry exists but ``in_queue`` is False — a
-          previous batch was already dispatched): reset the entry with
-          this message as the new cursor and push a fresh heap tuple.
-        - **In-queue, same-or-lower priority** (priority numeric value
-          unchanged or larger): append to the existing batch. The
-          cursor (``messages[0]``) stays pinned; the heap tuple
-          doesn't move.
-        - **In-queue, higher priority** (smaller numeric value): append
-          to the batch AND push a new heap tuple with the upgraded
-          priority and a fresh seq. The old tuple is left in the heap
-          and gets skipped on pop via the ``current_seq`` mismatch
-          check in the retired consumer.
-
-        Caller must have already filtered out messages whose
-        ``sent_at`` is at or below
-        the retired timestamp cursor; this method
-        doesn't re-check the durable cursor.
-        """
-        entry = self._thread_state.get(root_id)
-        incoming_id = msg_dict.get("envelope_id", "")
-
-        # Cross-batch dedup: skip a duplicate of an envelope the
-        # consumer just claimed and is sending to the agent right
-        # now. Without this, the reopen branch below would create a
-        # fresh ``entry.messages = [dup]`` slot and the duplicate
-        # gets dispatched as the next batch — agent sees the same
-        # envelope across two turns. Retired queue path only.
-        if entry is not None and incoming_id and incoming_id in entry.dispatching_ids:
-            self._log.info(
-                "_admit_thread_message: dispatching_ids-rejected duplicate "
-                "envelope=%s root=%s", incoming_id, root_id,
-            )
-            return
-
-        if entry is None or not entry.in_queue:
-            self._queue_seq += 1
-            if entry is None:
-                entry = _RetiredThreadSlot(
-                    current_priority=priority,
-                    current_seq=self._queue_seq,
-                    messages=[msg_dict],
-                    in_queue=True,
-                    channel_meta=channel_meta,
-                )
-                self._thread_state[root_id] = entry
-            else:
-                entry.current_priority = priority
-                entry.current_seq = self._queue_seq
-                entry.messages = [msg_dict]
-                entry.in_queue = True
-                entry.channel_meta = channel_meta
-            await self._queue.put((priority, entry.current_seq, root_id))
-            return
-
-        # Dedup by envelope_id within the live batch. The same wire
-        # envelope can land here twice when the server's pending-
-        # message redelivery overlaps with live WS delivery (e.g.
-        # after a daemon restart or brief WS reconnect). sqlite-side
-        # INSERT OR IGNORE in MessageStore.store already covers the
-        # durable table, but the in-memory batch is independent and
-        # would otherwise feed the agent the same post N times.
-        if incoming_id and any(
-            m.get("envelope_id") == incoming_id for m in entry.messages
-        ):
-            self._log.info(
-                "_admit_thread_message: in-batch-rejected duplicate "
-                "envelope=%s root=%s (pending batch=%d)",
-                incoming_id, root_id, len(entry.messages),
-            )
-            return
-
-        entry.messages.append(msg_dict)
-        if priority < entry.current_priority:
-            self._queue_seq += 1
-            entry.current_priority = priority
-            entry.current_seq = self._queue_seq
-            await self._queue.put((priority, entry.current_seq, root_id))
-
-    # Upper bound on consecutive AgentAPIError retries for a single
-    # batch before we give up. claude-code's rate limit usually lifts
-    # well inside 3 × (15-45s) of backoff; staying any longer is
-    # bad for everything else queued behind this thread.
-    MAX_API_ERROR_RETRIES = 3
-
-    async def _do_api_error_retries(
-        self,
-        *,
-        root_id: str,
-        entry: Any,
-        batch: list[dict],
-        channel_meta: dict,
-        on_api_error_retry: Optional[Callable[..., Coroutine[Any, Any, Any]]],
-        on_api_error_abandon: Optional[Callable[..., Coroutine[Any, Any, Any]]],
-        on_turn_success: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
-        last_envelope: str,
-        is_auth: bool = False,
-    ) -> None:
-        """Loop the API-Error kick-retry path until the agent
-        succeeds, the retry cap is hit, or a non-retry exception
-        bubbles up. The original ``batch`` doesn't go back into
-        ``entry.messages`` — the kick path tells claude-code (via
-        --resume) to re-attempt its previous turn; if --resume is
-        gone, the adapter falls back to the payload internally.
-
-        Mid-dispatch arrivals: any new messages that landed on the
-        same thread during the failed dispatch were admitted via
-        ``_admit_thread_message``'s reopen branch and are now in
-        ``entry.messages`` with a fresh queue tuple. We don't touch
-        them; the consumer picks them up after this retry loop
-        exits.
-
-        Cursor is NOT advanced on the failed batch — if a later
-        message succeeds on this thread it'll mark a higher
-        ``sent_at`` past the failed one, effectively leaving the
-        failed envelope readable via ``get_channel_history`` for the
-        agent if it wants to backfill.
-        """
-        # Reset the in-flight set for this slot. The failed batch is
-        # no longer "currently dispatching"; future duplicates of
-        # those envelopes need to be caught by the cursor (advanced
-        # by the kick's successful dispatch) or by in-batch dedup.
-        entry.dispatching_ids = set()
-
-        if is_auth:
-            # Retrying is pointless until re-login (worker already set
-            # auth_failed + DMed). Don't fire the abandon callback — it
-            # would overwrite auth_failed; cursor stays un-advanced so
-            # the batch redelivers on recovery.
-            self._log.warning(
-                "agent reply was an auth error for thread %s (last envelope "
-                "%s); skipping kick-retries until operator re-login",
-                root_id, last_envelope,
-            )
-            return
-
-        if on_api_error_retry is None:
-            self._log.warning(
-                "agent reply contained 'API Error' for thread %s "
-                "(last envelope %s); no retry callback wired, "
-                "abandoning batch",
-                root_id, last_envelope,
-            )
-            await self._fire_api_error_abandon(
-                on_api_error_abandon=on_api_error_abandon,
-                root_id=root_id,
-                batch=batch,
-                channel_meta=channel_meta,
-                attempts=0,
-            )
-            return
-
-        for attempt in range(1, self.MAX_API_ERROR_RETRIES + 1):
-            delay = random.uniform(15.0, 45.0)
-            self._log.warning(
-                "agent reply contained 'API Error' for thread %s "
-                "(last envelope %s); kick-retry %d/%d in %.1fs",
-                root_id, last_envelope, attempt,
-                self.MAX_API_ERROR_RETRIES, delay,
-            )
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                raise
-            try:
-                await on_api_error_retry(root_id, batch, channel_meta)
-                # Success path: no exception. The agent processed
-                # the retry. Advance cursor past the failed batch
-                # so we don't re-trigger on redelivery.
-                if batch:
-                    tail_sent_at = batch[-1].get("sent_at", 0)
-                    try:
-                        cursor_update = getattr(
-                            self.store, "mark_thread_" + "processed"
-                        )
-                        await cursor_update(root_id, tail_sent_at)
-                    except Exception:
-                        self._log.exception(
-                            "retired cursor update (%s, %d) failed "
-                            "after kick-retry; agent may re-process "
-                            "after restart",
-                            root_id, tail_sent_at,
-                        )
-                self._log.info(
-                    "agent thread %s recovered after kick-retry %d/%d",
-                    root_id, attempt, self.MAX_API_ERROR_RETRIES,
-                )
-                await self._fire_turn_success(
-                    on_turn_success=on_turn_success,
-                    root_id=root_id,
-                    batch=batch,
-                    channel_meta=channel_meta,
-                )
-                return
-            except AgentAPIError:
-                # Still rate-limited; loop with another backoff.
-                continue
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self._log.exception(
-                    "kick-retry %d/%d for thread %s raised; abandoning",
-                    attempt, self.MAX_API_ERROR_RETRIES, root_id,
-                )
-                await self._fire_api_error_abandon(
-                    on_api_error_abandon=on_api_error_abandon,
-                    root_id=root_id,
-                    batch=batch,
-                    channel_meta=channel_meta,
-                    attempts=attempt,
-                )
-                return
-        self._log.warning(
-            "agent thread %s exhausted %d kick-retries (last envelope %s); "
-            "abandoning the batch — agent will see these messages via "
-            "get_channel_history on the next dispatch",
-            root_id, self.MAX_API_ERROR_RETRIES, last_envelope,
-        )
-        await self._fire_api_error_abandon(
-            on_api_error_abandon=on_api_error_abandon,
-            root_id=root_id,
-            batch=batch,
-            channel_meta=channel_meta,
-            attempts=self.MAX_API_ERROR_RETRIES,
-        )
-
-    async def _fire_api_error_abandon(
-        self,
-        *,
-        on_api_error_abandon: Optional[Callable[..., Coroutine[Any, Any, Any]]],
-        root_id: str,
-        batch: list[dict],
-        channel_meta: dict,
-        attempts: int,
-    ) -> None:
-        """PUF-252: state-honesty hook fired exactly once per
-        abandoned batch. ``attempts`` is the number of kick-retries
-        that actually fired (0 when no retry callback was wired, or
-        an internal raise short-circuited the loop before any
-        attempt completed). The worker uses this to flip
-        ``runtime.health`` so FB-197 (status dot) + FB-198 (restart
-        lever) on Nova's lane can surface the "agent went silent"
-        signal."""
-        if on_api_error_abandon is None:
-            return
-        try:
-            await on_api_error_abandon(root_id, batch, channel_meta, attempts)
-        except Exception:
-            self._log.exception(
-                "on_api_error_abandon callback raised for thread %s; "
-                "the abandon itself stands -- the callback's job is "
-                "purely observational",
-                root_id,
-            )
-
-    async def _fire_turn_success(
-        self,
-        *,
-        on_turn_success: Optional[Callable[..., Coroutine[Any, Any, Any]]],
-        root_id: str,
-        batch: list[dict],
-        channel_meta: dict,
-    ) -> None:
-        """Recovery-side matched-pair for ``_fire_api_error_abandon``."""
-        if on_turn_success is None:
-            return
-        try:
-            await on_turn_success(root_id, batch, channel_meta)
-        except Exception:
-            self._log.exception(
-                "on_turn_success callback raised for thread %s",
-                root_id,
-            )
-
-    def _message_block_bytes(self, msg: dict) -> int:
-        """Conservative byte estimate of one formatted block — over-counts
-        so greedy-fill never lets an over-cap block through."""
-        n = len((msg.get("text") or "").encode("utf-8"))
-        for att in (msg.get("attachments") or []):
-            n += len(str(att).encode("utf-8")) + 16
-        for mention in (msg.get("mentions") or []):
-            n += len(str(mention).encode("utf-8")) + 8
-        return n + _BLOCK_METADATA_OVERHEAD_BYTES
-
-    def _greedy_fit_prefix(self, messages: list[dict]) -> int:
-        """Largest K where ``messages[:K]`` fits ``_max_input_bytes``.
-        Always >= 1 — a lone over-budget message dispatches alone (the
-        adapter cap is the backstop) instead of stalling the thread."""
-        budget = self._max_input_bytes
-        total = 0
-        for i, msg in enumerate(messages):
-            size = self._message_block_bytes(msg)
-            sep = 2 if i > 0 else 0  # blocks join with a blank line "\n\n"
-            if i > 0 and total + sep + size > budget:
-                return i
-            total += sep + size
-        return len(messages)
-
-    async def _retired_queue_consumer(
-        self,
-        on_message_batch: Callable[..., Coroutine[Any, Any, Any]],
-        on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-        on_api_error_abandon: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-        on_turn_success: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-    ) -> None:
-        """Drain the priority queue serially. One turn at a time so
-        the underlying session keeps a coherent conversation history;
-        concurrent turns would interleave context.
-
-        Each pop yields a ``root_id``. We look up the per-thread
-        entry, drop the message batch out (claim it), and dispatch
-        the whole list as one agent invocation. While the agent is
-        running, new arrivals on the same thread create a fresh
-        entry that will be picked up on the next pop — the agent
-        won't re-see messages it already processed.
-        """
-        while True:
-            try:
-                _priority, popped_seq, root_id = await self._queue.get()
-            except asyncio.CancelledError:
-                return
-
-            entry = self._thread_state.get(root_id)
-            if entry is None or not entry.in_queue or entry.current_seq != popped_seq:
-                # Stale heap entry: a higher-priority arrival
-                # already pushed a fresh tuple for this root, or
-                # the slot has been closed since we popped. Drop
-                # and continue.
-                continue
-
-            # Claim the batch atomically — mark the slot closed
-            # before dispatch so concurrent arrivals open a fresh
-            # entry instead of stacking into a batch the agent is
-            # already chewing through. Record the batch's
-            # envelope_ids in ``dispatching_ids`` so that a duplicate
-            # arriving mid-dispatch can be rejected at admit time
-            # (the durable cursor hasn't advanced yet, so it can't
-            # catch it).
-            all_msgs = entry.messages
-            channel_meta = entry.channel_meta
-
-            # Paranoid in-batch dedup (before the split, so byte accounting
-            # sees the real set). Admit-time dedup should make this a no-op;
-            # the warning exposes any upstream race that slips one through.
-            seen_ids: set[str] = set()
-            deduped: list[dict] = []
-            dropped: list[str] = []
-            for m in all_msgs:
-                mid = m.get("envelope_id", "")
-                if mid and mid in seen_ids:
-                    dropped.append(mid)
-                    continue
-                if mid:
-                    seen_ids.add(mid)
-                deduped.append(m)
-            if dropped:
-                self._log.warning(
-                    "consumer dropped %d in-batch duplicate envelope_id(s) "
-                    "for thread %s before dispatch: %s",
-                    len(dropped), root_id, dropped,
-                )
-
-            # Greedy-fill: dispatch the FIFO prefix that fits the byte
-            # budget; the remainder stays queued.
-            split = self._greedy_fit_prefix(deduped)
-            batch = deduped[:split]
-            deferred = deduped[split:]
-            entry.dispatching_ids = {
-                m.get("envelope_id") for m in batch if m.get("envelope_id")
-            }
-            if deferred:
-                # Slot stays OPEN so a mid-dispatch arrival appends after the
-                # deferred tail instead of overwriting via the reopen branch;
-                # the cursor covers only ``batch``, so deferred survive restart.
-                entry.messages = deferred
-                entry.in_queue = True
-                self._queue_seq += 1
-                entry.current_seq = self._queue_seq
-                await self._queue.put(
-                    (entry.current_priority, entry.current_seq, root_id)
-                )
-                self._log.info(
-                    "greedy-fill: thread %s dispatching %d/%d msgs, "
-                    "deferring %d to next turn (budget=%d bytes)",
-                    root_id, len(batch), len(deduped), len(deferred),
-                    self._max_input_bytes,
-                )
-            else:
-                entry.messages = []
-                entry.in_queue = False
-
-            # Pre-dispatch jitter. When several agents on the same
-            # host get activated by the same message (e.g. a channel
-            # broadcast), unblocked dispatch sends them all into the
-            # claude-code API at once and trips its rate limit. A
-            # 0.0–1.5s random sleep here desynchronises them; each
-            # agent picks independently. Messages that arrive during
-            # the sleep land in the next batch because in_queue is
-            # already False.
-            try:
-                await asyncio.sleep(random.uniform(0.0, 1.5))
-            except asyncio.CancelledError:
-                raise
-
-            # Missing key counts as encrypted — never downgrade on doubt.
-            send_mode.note_turn_bundle(
-                [getattr(self, "slug", "")],
-                any(m.get("is_encrypted", True) for m in batch),
-            )
-            try:
-                await on_message_batch(root_id, batch, channel_meta)
-            except AgentAPIError as exc:
-                # Adapter surfaced "API Error" — most commonly
-                # claude-code's transient rate-limit error. The
-                # original user input is already in claude-code's
-                # ``--resume``-backed transcript from the failed
-                # dispatch; the retry just needs to nudge the agent
-                # to try again, NOT re-send the payload (which would
-                # accumulate visible duplicates in the agent's
-                # transcript on every retry).
-                #
-                # The retry path uses a small kick message ("session
-                # errored on rate limiting, please resume processing")
-                # via ``on_api_error_retry``; if ``--resume`` is no
-                # longer valid the adapter falls back to the original
-                # payload on its own so the agent has something to
-                # work from. Auth errors skip retries entirely (the
-                # worker already flipped auth_failed + DMed).
-                last_envelope = batch[-1].get("envelope_id", "") if batch else ""
-                await self._do_api_error_retries(
-                    root_id=root_id,
-                    entry=entry,
-                    batch=batch,
-                    channel_meta=channel_meta,
-                    on_api_error_retry=on_api_error_retry,
-                    on_api_error_abandon=on_api_error_abandon,
-                    on_turn_success=on_turn_success,
-                    last_envelope=last_envelope,
-                    is_auth=getattr(exc, "is_auth", False),
-                )
-                continue
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self._log.exception(
-                    "on_message_batch handler failed for thread %s (%d messages)",
-                    root_id, len(batch),
-                )
-                # Treat poison-message style failures as terminal for
-                # the batch — don't loop forever. The sqlite cursor
-                # stays untouched so a restart can retry, but we mark
-                # the slot done in-memory so live arrivals keep
-                # flowing for other threads.
-                continue
-            finally:
-                # Between turns the default (plaintext) applies.
-                send_mode.clear_turn_bundle([getattr(self, "slug", "")])
-
-            # Success: persist the cursor so a restart-then-redeliver
-            # doesn't re-trigger this thread. ``batch[-1].sent_at`` is
-            # the high-water mark we just covered.
-            if batch:
-                tail_sent_at = batch[-1].get("sent_at", 0)
-                try:
-                    cursor_update = getattr(
-                        self.store, "mark_thread_" + "processed"
-                    )
-                    await cursor_update(root_id, tail_sent_at)
-                except Exception:
-                    self._log.exception(
-                        "retired cursor update (%s, %d) failed; agent "
-                        "may re-process this thread after a restart",
-                        root_id, tail_sent_at,
-                    )
-            # Cursor now covers the dispatched batch — duplicates of
-            # any of its envelopes will be caught by the handle_envelope
-            # cursor check from this point on, so the in-memory
-            # dispatching_ids set has done its job and can be released.
-            entry.dispatching_ids = set()
-
-            await self._fire_turn_success(
-                on_turn_success=on_turn_success,
-                root_id=root_id,
-                batch=batch,
-                channel_meta=channel_meta,
-            )
 
     async def _invite_poll_loop(self) -> None:
         """Poll ``/invites`` to catch invites the WS can't reach (the
@@ -2956,32 +2393,6 @@ class PuffoCoreMessageClient:
             "top-level post in the channel."
         )
 
-        msg_dict = {
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "space_id": space_id,
-            "space_name": space_name,
-            "sender_slug": "system",
-            "sender_display_name": "",
-            "sender_email": "",
-            "text": prompt_text,
-            "root_id": "",
-            "is_dm": False,
-            "attachments": [],
-            "sender_is_agent": False,
-            "mentions": [],
-            "envelope_id": envelope_id,
-            "sent_at": now_ms,
-            "is_encrypted": True,
-        }
-        channel_meta = {
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "space_id": space_id,
-            "space_name": space_name,
-            "is_dm": False,
-        }
-
         # Persist the synthetic envelope to ``messages.db`` so the
         # agent can resolve it through its normal data-service paths
         # (``mcp__puffo__get_channel_history`` /
@@ -3020,16 +2431,6 @@ class PuffoCoreMessageClient:
         runtime = getattr(self, "global_runtime", None)
         if runtime is not None:
             runtime.notify()
-        elif hasattr(self, "_queue"):
-            # Compatibility-only seam used by the restored pre-Package-4
-            # membership regression fixtures. Real listeners install the
-            # global runtime and never activate this retired queue.
-            await self._admit_thread_message(
-                root_id=envelope_id,
-                priority=PRIORITY_SYSTEM,
-                msg_dict=msg_dict,
-                channel_meta=channel_meta,
-            )
         self._log.info(
             "enqueued channel-intro nudge for channel=%s (space=%s)",
             channel_id, space_id,
@@ -3299,32 +2700,6 @@ class PuffoCoreMessageClient:
             f"{body} This is an announcement, for your context."
         )
 
-        msg_dict = {
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "space_id": space_id,
-            "space_name": space_name,
-            "sender_slug": "system",
-            "sender_display_name": "",
-            "sender_email": "",
-            "text": prompt_text,
-            "root_id": "",
-            "is_dm": False,
-            "attachments": [],
-            "sender_is_agent": False,
-            "mentions": [],
-            "envelope_id": envelope_id,
-            "sent_at": now_ms,
-            "is_encrypted": True,
-        }
-        channel_meta = {
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "space_id": space_id,
-            "space_name": space_name,
-            "is_dm": False,
-        }
-
         store_payload = {
             "envelope_id": envelope_id,
             "envelope_kind": "channel",
@@ -3353,15 +2728,6 @@ class PuffoCoreMessageClient:
         runtime = getattr(self, "global_runtime", None)
         if runtime is not None:
             runtime.notify()
-        elif hasattr(self, "_queue"):
-            # Compatibility-only seam for the restored membership regression
-            # fixtures; production listeners always own a global runtime.
-            await self._admit_thread_message(
-                root_id=envelope_id,
-                priority=PRIORITY_SYSTEM,
-                msg_dict=msg_dict,
-                channel_meta=channel_meta,
-            )
         self._log.info(
             "enqueued membership system-message channel=%s "
             "actor=%s action=%s",

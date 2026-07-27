@@ -26,10 +26,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.message_store import MessageStore
-from puffo_agent.agent.puffo_core_client import (
-    PRIORITY_SYSTEM,
-    PuffoCoreMessageClient,
-)
+from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 
 
 async def _make_store() -> MessageStore:
@@ -41,13 +38,20 @@ async def _make_store() -> MessageStore:
 
 def _make_client(store: MessageStore) -> PuffoCoreMessageClient:
     """Bare client with just enough state to exercise the intro path.
-    Mirrors ``test_thread_queue._make_client_for_queue`` and stubs the
-    HTTP-backed name resolvers so no network is touched."""
+    Stubs the HTTP-backed name resolvers so no network is touched."""
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client.store = store
-    client._queue = asyncio.PriorityQueue()
-    client._queue_seq = 0
-    client._thread_state = {}
+    class RuntimeSpy:
+        work = 0
+        delivery = 0
+
+        def notify(self):
+            self.work += 1
+
+        def notify_delivery(self):
+            self.delivery += 1
+
+    client.global_runtime = RuntimeSpy()
     # ``_find_public_general_channel`` warms this cache from the
     # /channels response so the immediately-following
     # ``_resolve_channel_name`` inside the intro nudge becomes a hit.
@@ -612,7 +616,7 @@ async def test_handle_event_ignores_accept_for_other_slug():
     )
     await client._handle_event(scope="sp_1", event=event)
 
-    assert client._queue.qsize() == 0
+    assert client.global_runtime.work == 0
     assert await store.has_channel_intro_been_prompted("ch_1") is False
     await store.close()
 
@@ -634,7 +638,7 @@ async def test_handle_event_ignores_operator_signed_accept():
     del event["payload"]["original_invite"]
     await client._handle_event(scope="sp_1", event=event)
 
-    assert client._queue.qsize() == 0
+    assert client.global_runtime.work == 0
     assert await store.has_channel_intro_been_prompted("ch_1") is False
     await store.close()
 
@@ -670,13 +674,13 @@ async def test_handle_event_synthetic_accept_missing_ids_is_safe():
         agent_slug="agent-1", space_id="", channel_id="ch_1",
     )
     await client._handle_event(scope="", event=event)
-    assert client._queue.qsize() == 0
+    assert client.global_runtime.work == 0
 
     event = _synthetic_accept_event(
         agent_slug="agent-1", space_id="sp_1", channel_id="",
     )
     await client._handle_event(scope="sp_1", event=event)
-    assert client._queue.qsize() == 0
+    assert client.global_runtime.work == 0
 
     await store.close()
 
