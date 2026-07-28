@@ -1454,7 +1454,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 "on this MCP runtime, so the puffo-agent daemon's "
                 "rpc_service isn't reachable."
             )
-        return await cfg.rpc_client.sync_mcp(name=name)
+        return await cfg.rpc_client.sync_mcp(template_id=name)
 
     @mcp.tool()
     async def leave_space(space_id: str, reason: str = "") -> str:

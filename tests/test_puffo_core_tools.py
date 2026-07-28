@@ -2227,3 +2227,43 @@ async def test_send_message_requires_channel_or_dm():
     mcp = _build_tools(cfg)
     with pytest.raises(Exception, match="channel or dm"):
         await _call(mcp, "send_message", {"text": "hi"})
+
+
+class _StubRpc:
+    """Records the kwargs the tool wrapper forwards. ``sync_mcp`` is
+    keyword-only ``template_id`` — same as the real ``PuffoRpcClient``
+    — so a regression back to ``sync_mcp(name=...)`` raises TypeError
+    here exactly as it does in production."""
+
+    def __init__(self):
+        self.template_ids = []
+
+    async def sync_mcp(self, *, template_id: str) -> str:
+        self.template_ids.append(template_id)
+        return f"mirrored {template_id} into your config"
+
+
+@pytest.mark.asyncio
+async def test_sync_host_mcp_forwards_name_as_template_id():
+    # PUF-402: agent-facing param stays `name` (AC#4) but must forward
+    # to the RPC client's keyword-only `template_id` — not `name=name`.
+    cfg, _, _ = _setup()
+    stub = _StubRpc()
+    cfg.rpc_client = stub
+    mcp = _build_tools(cfg)
+    tool = mcp._tool_manager._tools["sync_host_mcp"]
+    result = await tool.fn(name="linear")
+    assert stub.template_ids == ["linear"]
+    assert "linear" in result
+
+
+@pytest.mark.asyncio
+async def test_sync_host_mcp_raises_when_rpc_unavailable():
+    # Non-regression: the no-rpc guard still fires with the guidance
+    # string instead of an AttributeError on None.
+    cfg, _, _ = _setup()
+    cfg.rpc_client = None
+    mcp = _build_tools(cfg)
+    tool = mcp._tool_manager._tools["sync_host_mcp"]
+    with pytest.raises(RuntimeError, match="PUFFO_RPC_URL"):
+        await tool.fn(name="linear")
