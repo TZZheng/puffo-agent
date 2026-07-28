@@ -18,6 +18,7 @@ from ..state import (
     agent_yml_path,
     archive_flag_path,
     archived_dir,
+    derive_role_short,
     discover_agents,
     refresh_agent_flag_path,
     refresh_host_sync_flag_path,
@@ -268,6 +269,8 @@ async def execute_command(
         if isinstance(params.get("role"), str):
             cfg.role = params["role"]
             patch["role"] = params["role"]
+            cfg.role_short = derive_role_short(params["role"])
+            patch["role_short"] = cfg.role_short
             prompt_changed = True
         # avatar_url points to a blob the operator already uploaded; sync it to
         # the server identity (avatars are public, so no gating needed).

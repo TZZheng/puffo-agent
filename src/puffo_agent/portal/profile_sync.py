@@ -10,7 +10,7 @@ import logging
 import time
 from typing import Any
 
-from .state import AgentConfig
+from .state import AgentConfig, derive_role_short
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,13 @@ async def sync_full_profile(cfg: AgentConfig) -> None:
     ``# Soul`` section extracted from profile.md. Soul is omitted
     when profile.md is missing OR has no soul-like heading — the
     server's stored value is preserved rather than clobbered."""
+    # Repair a stale on-disk role_short BEFORE syncing, so a restart fixes
+    # the chip instead of pushing the stale value back to the server.
+    if cfg.role:
+        derived = derive_role_short(cfg.role)
+        if cfg.role_short != derived:
+            cfg.role_short = derived
+            cfg.save()
     patch: dict[str, Any] = {
         "display_name": cfg.display_name,
         "role": cfg.role,

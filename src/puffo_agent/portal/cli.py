@@ -37,6 +37,7 @@ from .state import (
     clear_daemon_pid,
     clear_stop_request,
     daemon_yml_path,
+    derive_role_short,
     daemon_pid_path,
     discover_agents,
     docker_shared_dir,
@@ -448,21 +449,8 @@ def _resolve_api_key_for_create(
 
 
 def _derive_role_short_cli(role: str) -> str:
-    """Local mirror of ``profiles::derive_role_short`` (server) +
-    ``_derive_role_short`` (bridge). Keeps the chip label in
-    agent.yml consistent with what the server stores when the
-    daemon syncs on first connect. See server-side validators for
-    the canonical contract."""
-    if ":" not in role:
-        return ""
-    head, tail = role.split(":", 1)
-    candidate = head.strip()
-    rest = tail.strip()
-    if not candidate or not rest or len(candidate) > 32:
-        return ""
-    if any(ch.isspace() for ch in candidate):
-        return ""
-    return candidate
+    """Thin wrapper over the canonical :func:`state.derive_role_short`."""
+    return derive_role_short(role)
 
 
 def cmd_agent_create(args: argparse.Namespace) -> int:
@@ -498,7 +486,13 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     if role_short_raw and len(role_short_raw) > 32:
         print("error: --role-short must be at most 32 characters", file=sys.stderr)
         return 2
-    role_short = role_short_raw or (_derive_role_short_cli(role) if role else "")
+    role_short = _derive_role_short_cli(role) if role else ""
+    if role_short_raw and role_short_raw != role_short:
+        print(
+            f"warning: --role-short is deprecated (PUF-401); ignoring "
+            f"{role_short_raw!r}, using role-derived {role_short!r}",
+            file=sys.stderr,
+        )
 
     target.mkdir(parents=True)
 
@@ -959,6 +953,16 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     if role_short_arg is not None and len(role_short_arg) > 32:
         print("error: --role-short must be at most 32 characters", file=sys.stderr)
         return 2
+    if role_short_arg is not None and role_short_arg.strip():
+        _authoritative = _derive_role_short_cli(
+            role_arg if isinstance(role_arg, str) else cfg.role
+        )
+        if role_short_arg.strip() != _authoritative:
+            print(
+                f"warning: --role-short is deprecated (PUF-401); ignoring "
+                f"{role_short_arg!r}, using role-derived {_authoritative!r}",
+                file=sys.stderr,
+            )
 
     # Build the wire patch + apply locally in lock-step. agent.yml
     # writes happen first so a server-side hiccup doesn't lose what
@@ -971,14 +975,8 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     if isinstance(role_arg, str):
         cfg.role = role_arg
         patch["role"] = role_arg
-        # Mirror the server-side derive locally so agent.yml stays
-        # in sync with what the server stores unless the caller
-        # explicitly overrides ``role_short`` below.
-        if not isinstance(role_short_arg, str):
-            cfg.role_short = _derive_role_short_cli(role_arg)
-    if isinstance(role_short_arg, str):
-        cfg.role_short = role_short_arg
-        patch["role_short"] = role_short_arg
+        cfg.role_short = _derive_role_short_cli(role_arg)
+        patch["role_short"] = cfg.role_short
 
     cfg.save()
 
@@ -999,9 +997,7 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     if "role" in patch:
         print(f"  role:         {cfg.role!r}")
     if "role_short" in patch:
-        print(f"  role_short:   {cfg.role_short!r}  (explicit)")
-    elif "role" in patch:
-        print(f"  role_short:   {cfg.role_short!r}  (server-derived)")
+        print(f"  role_short:   {cfg.role_short!r}  (derived from role)")
     return 0
 
 

@@ -8,6 +8,17 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`role_short` is now single-source-derived from `role` (PUF-401).**
+  The chip label is always derived from the `<short>: <description>`
+  role on every write path (bridge, CLI, provision, control-WS, agent
+  detail) instead of being stored independently, so it can no longer
+  orphan a stale value. Explicit `role_short` / `--role-short` is
+  deprecated: still accepted for backward compatibility but ignored,
+  with a warning when the supplied value differs from the derived one.
+  A daemon-startup backfill repairs a stale on-disk `role_short` before
+  the first server sync, so a restart fixes the chip instead of pushing
+  the stale value back.
+
 - **Default agent task timeout raised 600s → 1800s (30 min) (PUF-399).**
   `runtime.task_timeout_seconds` — the per-agent per-turn wall-clock
   budget — now defaults to 30 minutes so long-running projects aren't
@@ -25,6 +36,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   outside any turn use the plaintext default. Applies to all send
   paths (LLM replies, MCP tools, daemon system DMs); attachments
   remain encrypted blob references.
+
+### Fixed
+
+- **Cap `mcp` below 2.0.** The 2.x SDK dropped the bundled
+  `mcp.server.fastmcp`; pin `mcp>=1.0,<2` until the tool servers move
+  to the standalone `fastmcp` package.
 
 ## [1.1.5] — 2026-07-23
 
