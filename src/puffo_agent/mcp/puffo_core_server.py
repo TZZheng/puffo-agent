@@ -345,6 +345,7 @@ def build_server(
 
     core_cfg = PuffoCoreToolsConfig(
         slug=slug,
+        agent_id=agent_id,
         device_id=device_id,
         keystore=ks,
         http_client=http,

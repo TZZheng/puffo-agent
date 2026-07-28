@@ -15,6 +15,11 @@ from puffo_agent.agent.adapters.codex_session import (
     CodexSession,
     _PendingTurn,
 )
+from puffo_agent.agent.adapters.cli_session import AuditLog
+from puffo_agent.portal.ui.widgets.per_agent_log_source import (
+    PerAgentLogSource,
+    _format_audit_extras,
+)
 
 
 class _AuditSpy:
@@ -34,6 +39,33 @@ def _make_session(audit: Any = None) -> CodexSession:
 
 def _make_turn() -> _PendingTurn:
     return _PendingTurn(request_id=1, started_at=0.0)
+
+
+def test_audit_reader_counter_is_monotonic_across_rotation(tmp_path):
+    path = tmp_path / "audit.log"
+    audit = AuditLog(path, "agent-test", max_bytes=1, backup_count=2)
+    source = PerAgentLogSource(path)
+
+    audit.write("session.start", session_id="session-1")
+    assert source.counter() == 1
+    audit.write("turn.end", turn_id="turn-1")
+    assert source.counter() == 2
+    audit.write("turn.end", turn_id="turn-2")
+    assert source.counter() == 3
+    assert source.counter() == 3
+    assert path.exists()
+    assert path.with_name("audit.log.1").exists()
+    assert path.with_name("audit.log.2").exists()
+    assert not path.with_name("audit.log.3").exists()
+
+
+def test_redacted_audit_summary_does_not_render_empty_sha256():
+    rendered = _format_audit_extras(
+        "assistant.text",
+        {"text_summary": {"type": "str", "length": 12, "bytes": 12}},
+    )
+    assert rendered == "content redacted length=12"
+    assert "sha256" not in rendered
 
 
 # ─── streaming delta buffers, completion emits one assistant.text ─

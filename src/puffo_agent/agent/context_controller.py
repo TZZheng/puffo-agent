@@ -112,6 +112,7 @@ class ProviderAdmissionEvent:
     provider_session_id: str | None
     admitted_at: datetime
     provider_turn_id: str | None = None
+    tool_call_id: str | None = None
 
 
 AdmissionCallback = Callable[[ProviderAdmissionEvent], Awaitable[None]]

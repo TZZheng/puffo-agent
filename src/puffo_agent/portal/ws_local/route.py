@@ -85,6 +85,7 @@ def _build_tool_dispatch(point: AttachPoint):
     send_coordinator = getattr(client, "send_delegate", None)
     cfg = PuffoCoreToolsConfig(
         slug=client.slug,
+        agent_id=point.agent_id,
         device_id=client.device_id,
         keystore=client.keystore,
         http_client=client.http,
@@ -165,6 +166,7 @@ async def serve_attached(transport: Transport, hub: WsLocalHub) -> None:
                 run_turn=run_turn,
                 workspace=client.workspace or point.agent_cfg.resolve_workspace_dir(),
                 send_mode_keys=(point.agent_id, client.slug),
+                agent_id=point.agent_id,
             )
             coordinator = SendCoordinator(
                 slug=client.slug,
@@ -178,7 +180,7 @@ async def serve_attached(transport: Transport, hub: WsLocalHub) -> None:
             )
             runtime.coordinator = coordinator
             runtime.send_delegate = TrackingSendDelegate(
-                coordinator, runtime.attempts,
+                coordinator, runtime.attempts, runtime,
             )
             client.global_runtime = runtime
             client.send_coordinator = coordinator

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -998,7 +999,11 @@ async def test_message_read_tools_stage_highest_model_visible_server_sequence():
 
 
 @pytest.mark.asyncio
-async def test_dm_and_unsequenced_reads_do_not_stage_channel_freshness():
+async def test_dm_and_unsequenced_reads_do_not_stage_channel_freshness(caplog):
+    caplog.set_level(
+        logging.DEBUG,
+        logger="puffo_agent.mcp.puffo_core_tools",
+    )
     cfg, _, ms = _setup()
     await ms.store({
         "envelope_id": "legacy",
@@ -1042,6 +1047,15 @@ async def test_dm_and_unsequenced_reads_do_not_stage_channel_freshness():
     await _call(mcp, "get_post", {"post_ref": "legacy"})
     await _call(mcp, "get_post", {"post_ref": "dm_9"})
     assert rpc.calls == []
+    history_states = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if "runtime_event=" not in message:
+            continue
+        event = json.loads(message.split("runtime_event=", 1)[1])
+        if event["event"] == "history.read_staged":
+            history_states.append(event["state"])
+    assert history_states == ["unsequenced", "dm_unsupported"]
     await ms.close()
 
 

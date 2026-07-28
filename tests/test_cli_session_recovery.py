@@ -142,6 +142,99 @@ def _read_audit_events(path: Path) -> list[dict]:
     return out
 
 
+def test_audit_log_summarizes_sensitive_turn_and_tool_payloads(tmp_path):
+    secret = "sensitive-payload-that-must-never-be-logged"
+    path = tmp_path / "audit.log"
+    audit = AuditLog(path, agent_id="agent")
+
+    audit.write("turn.input", content=secret)
+    audit.write("assistant.text", text=secret)
+    audit.write(
+        "tool",
+        id="call-1",
+        name="mcp__puffo__send_message",
+        input={"text": secret, "token": secret},
+    )
+    raw = path.read_text(encoding="utf-8")
+    assert secret not in raw
+
+    events = _read_audit_events(path)
+    assert events[0]["content_summary"]["length"] == len(secret)
+    assert events[1]["text_summary"]["length"] == len(secret)
+    assert events[2]["id"] == "call-1"
+    assert events[2]["input_summary"]["fields"] == ["text", "token"]
+    assert "sha256" not in events[2]["input_summary"]
+
+
+def test_audit_log_rotates_with_bounded_backup_count(tmp_path):
+    path = tmp_path / "audit.log"
+    audit = AuditLog(path, agent_id="agent", max_bytes=128, backup_count=2)
+    for index in range(12):
+        audit.write("turn.end", attempt=index, diagnostic="x" * 80)
+
+    assert path.exists()
+    assert path.with_name("audit.log.1").exists()
+    assert path.with_name("audit.log.2").exists()
+    assert not path.with_name("audit.log.3").exists()
+
+
+def test_audit_log_write_pipeline_is_fully_best_effort(tmp_path, monkeypatch):
+    path = tmp_path / "audit.log"
+    audit = AuditLog(path, agent_id="agent")
+
+    import puffo_agent.agent.adapters.cli_session as cli_module
+
+    monkeypatch.setattr(
+        cli_module,
+        "safe_value_summary",
+        lambda _value: (_ for _ in ()).throw(RuntimeError("summary")),
+    )
+    audit.write("turn.input", content="secret")
+    monkeypatch.undo()
+
+    monkeypatch.setattr(
+        cli_module.json,
+        "dumps",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TypeError("serialize")),
+    )
+    audit.write("turn.end", attempt=1)
+    monkeypatch.undo()
+
+    monkeypatch.setattr(
+        audit,
+        "_rotate_if_needed",
+        lambda: (_ for _ in ()).throw(OSError("rotate")),
+    )
+    audit.write("turn.end", attempt=2)
+    monkeypatch.undo()
+
+    audit.path = tmp_path
+    monkeypatch.setattr(
+        cli_module.logger,
+        "warning",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("logger")),
+    )
+    audit.write("turn.end", attempt=3)
+
+
+def test_claude_stderr_logs_only_safe_summary(tmp_path, caplog):
+    secret = "provider stderr includes bearer secret-message-body"
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        reader = asyncio.StreamReader()
+        reader.feed_data((secret + "\n").encode())
+        reader.feed_eof()
+        await session._drain_stderr(type("Proc", (), {"stderr": reader})())
+
+    caplog.set_level(logging.WARNING)
+    asyncio.run(drive())
+    joined = " ".join(record.getMessage() for record in caplog.records)
+    assert secret not in joined
+    assert "category=authentication" in joined
+    assert "sha256=" not in joined
+
+
 # ── Test 1: big line ─────────────────────────────────────────────────────────
 
 
@@ -440,6 +533,11 @@ def test_history_continuation_matches_exact_claude_tool_result(tmp_path):
     assert {
         event.provider_turn_id for _, event in admitted
     } == {admitted[0][1].provider_turn_id}
+    assert [event.tool_call_id for _, event in admitted[1:]] == [
+        "read-b",
+        "read-clamped",
+        "read-a",
+    ]
     assert session._continuation_admissions == []
 
     with pytest.raises(RuntimeError, match="no active Claude provider turn"):
@@ -1157,7 +1255,10 @@ def test_one_turn_drains_pre_turn_cron_stdout(tmp_path):
     pre = [e for e in events if e.get("event") == "turn.pre_drain"]
     assert len(pre) == 1
     assert pre[0]["event_type"] == "assistant"
-    assert "News check complete" in pre[0]["text"]
+    assert "text" not in pre[0]
+    assert pre[0]["text_summary"]["length"] == len(
+        "News check complete. 3 new items."
+    )
 
 
 def test_drain_consumes_stale_result_so_next_turn_doesnt_break_early(tmp_path):

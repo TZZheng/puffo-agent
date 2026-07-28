@@ -453,6 +453,7 @@ def _build_puffo_core_client(
         agent_created_at=agent_cfg.created_at,
         image_edge_px=max_image_edge_px(model),
         catchup_stale_hours=catchup_stale_hours,
+        agent_id=agent_id,
         bridge_client=bridge,
     )
 
@@ -1416,6 +1417,7 @@ class Worker:
             workspace=workspace_path,
             held_catchup=client.recover_pending_delivery,
             send_mode_keys=(agent_id, client.slug),
+            agent_id=agent_id,
         )
         coordinator = SendCoordinator(
             slug=client.slug,
@@ -1431,7 +1433,7 @@ class Worker:
         )
         global_runtime.coordinator = coordinator
         global_runtime.send_delegate = TrackingSendDelegate(
-            coordinator, global_runtime.attempts
+            coordinator, global_runtime.attempts, global_runtime
         )
         client.global_runtime = global_runtime
         client.send_coordinator = coordinator

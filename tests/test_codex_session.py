@@ -40,6 +40,27 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from puffo_agent.agent.adapters.codex_session import CodexSession
 
 
+@pytest.mark.asyncio
+async def test_codex_stderr_is_logged_as_safe_summary(caplog):
+    secret = "codex stderr bearer sensitive-provider-output"
+    session = CodexSession.__new__(CodexSession)
+    session.agent_id = "agent"
+    reader = asyncio.StreamReader()
+    reader.feed_data((secret + "\n").encode())
+    reader.feed_eof()
+
+    import logging
+    caplog.set_level(
+        logging.INFO,
+        logger="puffo_agent.agent.adapters.codex_session",
+    )
+    await session._stderr_loop(reader)
+    joined = " ".join(record.getMessage() for record in caplog.records)
+    assert secret not in joined
+    assert "category=authentication" in joined
+    assert "sha256=" not in joined
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Fake codex app-server
 # ─────────────────────────────────────────────────────────────────────────────
@@ -683,6 +704,11 @@ def test_history_continuation_matches_exact_codex_tool_result(tmp_path):
             "item/completed", tool_result("receipt-a"),
         )
         assert [label for label, _event in events] == ["clamped", "b", "a"]
+        assert [event.tool_call_id for _label, event in events] == [
+            "call-receipt-clamped",
+            "call-receipt-b",
+            "call-receipt-a",
+        ]
 
         register("late", "receipt-late", {"channel": "ch-other"})
         await cs._handle_notification("turn/completed", {

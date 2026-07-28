@@ -51,6 +51,7 @@ from typing import Any, Callable, Optional
 
 from .base import STATUS_PREVIEW_CHARS, TurnResult, is_silent
 from .cli_session import AuditLog
+from .._logging import safe_diagnostic_summary
 from ..context_controller import (
     AdmissionCallback,
     CompactionResult,
@@ -413,7 +414,9 @@ class CodexSession:
                 from ..core import AgentAPIError
                 logger.info(
                     "agent %s: codex mid-reconnect; deferring batch for retry "
-                    "(not a wedged strike): %s", self.agent_id, err_text,
+                    "(not a wedged strike): %s",
+                    self.agent_id,
+                    safe_diagnostic_summary(err_text),
                 )
                 raise AgentAPIError(
                     f"codex reconnecting (transient): {err_text}", is_auth=False,
@@ -657,7 +660,7 @@ class CodexSession:
         except Exception as exc:
             logger.warning(
                 "agent %s: codex health probe failed: %s",
-                self.agent_id, exc,
+                self.agent_id, safe_diagnostic_summary(exc),
             )
             return False
         return bool(self._conversation_id)
@@ -888,7 +891,7 @@ class CodexSession:
             logger.info(
                 "agent %s: codex initialize returned %s (continuing — "
                 "initialize is sometimes optional)",
-                self.agent_id, exc,
+                self.agent_id, safe_diagnostic_summary(exc),
             )
 
         # 2. Start or resume the conversation/thread.
@@ -914,7 +917,7 @@ class CodexSession:
                 logger.warning(
                     "agent %s: resume failed (%s); starting fresh "
                     "thread",
-                    self.agent_id, exc,
+                    self.agent_id, safe_diagnostic_summary(exc),
                 )
                 self._conversation_id = ""
 
@@ -1044,7 +1047,7 @@ class CodexSession:
             except Exception as exc:
                 logger.warning(
                     "agent %s: codex stdout read failed: %s",
-                    self.agent_id, exc,
+                    self.agent_id, safe_diagnostic_summary(exc),
                 )
                 break
             if not line:
@@ -1057,7 +1060,7 @@ class CodexSession:
             except json.JSONDecodeError:
                 logger.debug(
                     "agent %s: codex emitted non-JSON line: %s",
-                    self.agent_id, text[:200],
+                    self.agent_id, safe_diagnostic_summary(text),
                 )
                 continue
             await self._dispatch_message(msg)
@@ -1088,7 +1091,9 @@ class CodexSession:
             logger.info(
                 "agent %s: codex stderr: %s",
                 self.agent_id,
-                line.decode("utf-8", errors="replace").rstrip(),
+                safe_diagnostic_summary(
+                    line.decode("utf-8", errors="replace").rstrip()
+                ),
             )
 
     async def _dispatch_message(self, msg: dict) -> None:
@@ -1436,6 +1441,7 @@ class CodexSession:
             planning_cycle_key=admission.planning_cycle_key,
             provider_session_id=self.get_provider_session_id(),
             provider_turn_id=expected_turn,
+            tool_call_id=str(item.get("id") or "") or None,
             admitted_at=datetime.now(timezone.utc),
         ))
 

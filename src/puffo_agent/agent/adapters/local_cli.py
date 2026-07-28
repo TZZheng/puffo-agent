@@ -44,6 +44,7 @@ from ...portal.state import (
     sync_host_skills,
 )
 from ..cli_bin import resolve_claude_bin, resolve_codex_bin, resolve_hermes_bin
+from .._logging import safe_diagnostic_summary
 from .base import Adapter, TurnContext, TurnResult, anthropic_base_url_env
 from ..context_controller import (
     ContextCapabilities,
@@ -747,8 +748,8 @@ class LocalCLIAdapter(Adapter):
             logger.error(
                 "agent %s: hermes turn rc=%d in %.1fs | stdout: %r | stderr: %s",
                 self.agent_id, rc, elapsed,
-                stdout_text.strip()[:400],
-                stderr_text.strip()[-400:] or "(empty)",
+                safe_diagnostic_summary(stdout_text),
+                safe_diagnostic_summary(stderr_text),
             )
             if self._hermes_audit is not None:
                 self._hermes_audit.write(
@@ -758,8 +759,8 @@ class LocalCLIAdapter(Adapter):
                 )
             return TurnResult(reply="", metadata={
                 "error": f"hermes exited rc={rc}",
-                "stdout_snippet": stdout_text[:400],
-                "stderr_tail": stderr_text[-400:],
+                "stdout_summary": safe_diagnostic_summary(stdout_text),
+                "stderr_summary": safe_diagnostic_summary(stderr_text),
             })
 
         reply, session_id, tool_calls = parse_hermes_reply(stdout_text)
@@ -780,7 +781,7 @@ class LocalCLIAdapter(Adapter):
         if not reply:
             logger.warning(
                 "agent %s: hermes rc=0 but parser found no reply. "
-                "stdout: %r", self.agent_id, stdout_text[:400],
+                "stdout: %s", self.agent_id, safe_diagnostic_summary(stdout_text),
             )
         if self._hermes_audit is not None:
             for name in tool_calls:

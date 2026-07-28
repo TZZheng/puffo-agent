@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -35,6 +36,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .base import STATUS_PREVIEW_CHARS, TurnResult, is_silent
+from .._logging import safe_diagnostic_summary, safe_value_summary
 from ..context_controller import (
     AdmissionCallback,
     CompactionResult,
@@ -49,9 +51,27 @@ from ..context_controller import (
 logger = logging.getLogger(__name__)
 
 
-# Cap any single audit field so one huge user message or tool input
-# doesn't bloat the log / the docker-logs stream.
-AUDIT_FIELD_MAX = 2000
+AUDIT_MAX_BYTES = 5 * 1024 * 1024
+AUDIT_BACKUP_COUNT = 3
+_AUDIT_PAYLOAD_FIELDS = frozenset({
+    "content", "text", "input", "reply", "raw_reply", "raw_event",
+    "stdout", "stderr", "result", "tool_result",
+})
+_AUDIT_DIAGNOSTIC_FIELDS = frozenset({"error", "diagnostic"})
+_AUDIT_METADATA_FIELDS = frozenset({
+    "action", "attempt", "attempts", "cap", "duration_ms", "event_type",
+    "event_types", "id", "input_tokens", "name", "of", "output_tokens",
+    "phase", "reply_len", "resume", "session_id", "tool_calls",
+    "user_message_bytes", "error_type",
+})
+
+
+def _is_audit_payload_field(key: str) -> bool:
+    return (
+        key in _AUDIT_PAYLOAD_FIELDS
+        or key.startswith(("stdout", "stderr", "raw_"))
+        or key.endswith(("_input", "_result"))
+    )
 
 
 # 180KB leaves ~20KB headroom under Anthropic's ~200KB request cap
@@ -122,45 +142,98 @@ class AuditLog:
     ``tail -F`` PID 1 and ``docker logs``.
     """
 
-    def __init__(self, path: Path, agent_id: str):
+    def __init__(
+        self,
+        path: Path,
+        agent_id: str,
+        *,
+        max_bytes: int = AUDIT_MAX_BYTES,
+        backup_count: int = AUDIT_BACKUP_COUNT,
+    ):
         self.path = path
         self.agent_id = agent_id
+        self.max_bytes = max(1, max_bytes)
+        self.backup_count = max(0, backup_count)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             # Touch so the container's tail starts cleanly even if no
             # turn has happened yet.
             self.path.touch(exist_ok=True)
         except OSError as exc:
-            logger.warning(
-                "agent %s: cannot prepare audit log at %s: %s",
-                agent_id, path, exc,
-            )
+            self._warn("cannot prepare audit log", exc)
 
     def write(self, event: str, **fields) -> None:
-        rec = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "agent": self.agent_id,
-            "event": event,
-            **{k: _truncate(v) for k, v in fields.items()},
-        }
         try:
+            safe_fields = {}
+            for key, value in fields.items():
+                if _is_audit_payload_field(key):
+                    safe_fields[f"{key}_summary"] = safe_value_summary(value)
+                elif key in _AUDIT_DIAGNOSTIC_FIELDS:
+                    safe_fields[f"{key}_summary"] = safe_diagnostic_summary(value)
+                elif key in _AUDIT_METADATA_FIELDS:
+                    safe_fields[key] = _bounded_metadata(value)
+                else:
+                    safe_fields[f"{key}_summary"] = safe_value_summary(value)
+            rec = {
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "agent": self.agent_id,
+                "event": event,
+                **safe_fields,
+            }
+            encoded = json.dumps(rec, ensure_ascii=False)
+            self._rotate_if_needed()
             with self.path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except OSError as exc:
-            # Audit failure must not kill the turn.
+                f.write(encoded + "\n")
+        except Exception as exc:
+            self._warn("audit log write failed", exc)
+
+    def _warn(self, message: str, exc: BaseException) -> None:
+        try:
             logger.warning(
-                "agent %s: audit log write failed: %s",
-                self.agent_id, exc,
+                "agent %s: %s: %s",
+                self.agent_id,
+                message,
+                type(exc).__name__,
             )
+        except Exception:
+            pass
+
+    def _rotate_if_needed(self) -> None:
+        try:
+            if self.path.stat().st_size < self.max_bytes:
+                return
+            if self.backup_count == 0:
+                self.path.write_text("", encoding="utf-8")
+                return
+            oldest = self.path.with_name(f"{self.path.name}.{self.backup_count}")
+            try:
+                oldest.unlink()
+            except FileNotFoundError:
+                pass
+            for index in range(self.backup_count - 1, 0, -1):
+                source = self.path.with_name(f"{self.path.name}.{index}")
+                if source.exists():
+                    os.replace(
+                        source,
+                        self.path.with_name(f"{self.path.name}.{index + 1}"),
+                    )
+            os.replace(self.path, self.path.with_name(f"{self.path.name}.1"))
+            self.path.touch()
+        except Exception as exc:
+            self._warn("audit log rotation failed", exc)
 
 
-def _truncate(v):
-    if isinstance(v, str) and len(v) > AUDIT_FIELD_MAX:
-        return v[:AUDIT_FIELD_MAX] + "... (truncated)"
+def _bounded_metadata(v):
+    """Bound non-payload metadata while retaining IDs and counters."""
+    if isinstance(v, str) and len(v) > 256:
+        return safe_value_summary(v)
     if isinstance(v, dict):
-        return {k: _truncate(x) for k, x in v.items()}
+        return {
+            str(k): _bounded_metadata(x)
+            for k, x in list(v.items())[:64]
+        }
     if isinstance(v, list):
-        return [_truncate(x) for x in v]
+        return [_bounded_metadata(x) for x in v[:64]]
     return v
 
 
@@ -255,8 +328,8 @@ class ClaudeSession:
             return result
         logger.warning(
             "agent %s: claude reply matched Prompt-is-too-long pattern; "
-            "rewriting to friendly error (raw: %s)",
-            self.agent_id, result.reply[:200],
+            "rewriting to friendly error (%s)",
+            self.agent_id, safe_diagnostic_summary(result.reply),
         )
         if self.audit is not None:
             self.audit.write(
@@ -341,9 +414,9 @@ class ClaudeSession:
             # metadata.
             logger.error(
                 "agent %s: auth error persisted across %d attempts; "
-                "suppressing reply. last reply: %s",
+                "suppressing reply. last_reply=%s",
                 self.agent_id, attempts,
-                (last_result.reply if last_result else "")[:500],
+                safe_diagnostic_summary(last_result.reply if last_result else ""),
             )
             if self.audit is not None:
                 self.audit.write(
@@ -528,6 +601,7 @@ class ClaudeSession:
             return
         content = (event.get("message") or {}).get("content") or []
         selected: list[int] = []
+        selected_tool_ids: dict[int, str] = {}
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
                 continue
@@ -559,6 +633,7 @@ class ClaudeSession:
             )
             if exact is not None:
                 selected.append(exact)
+                selected_tool_ids[exact] = tool_use_id
                 continue
             if tool_call is None:
                 continue
@@ -571,25 +646,29 @@ class ClaudeSession:
                 and admission.matches(tool_name, tool_arguments)
             ]
             if candidates:
-                selected.append(max(
+                selected_index = max(
                     candidates,
                     key=lambda index: (
                         self._continuation_admissions[index].match_specificity,
                         -index,
                     ),
-                ))
+                )
+                selected.append(selected_index)
+                selected_tool_ids[selected_index] = tool_use_id
             self._active_puffo_tool_calls.pop(tool_use_id, None)
 
         admissions = [
-            self._continuation_admissions[index] for index in selected
+            (self._continuation_admissions[index], selected_tool_ids[index])
+            for index in selected
         ]
         for index in sorted(selected, reverse=True):
             self._continuation_admissions.pop(index)
-        for admission in admissions:
+        for admission, selected_tool_id in admissions:
             await admission.callback(ProviderAdmissionEvent(
                 planning_cycle_key=admission.planning_cycle_key,
                 provider_session_id=self.get_provider_session_id(),
                 provider_turn_id=provider_turn_id,
+                tool_call_id=selected_tool_id,
                 admitted_at=datetime.now(timezone.utc),
             ))
 
@@ -734,7 +813,10 @@ class ClaudeSession:
                         pass
                 raise _ResumeFailed(
                     f"claude exited rc={rc} before init event"
-                    + (f"; stderr: {stderr_tail}" if stderr_tail else "")
+                    + (
+                        f"; stderr_summary: {safe_diagnostic_summary(stderr_tail)}"
+                        if stderr_tail else ""
+                    )
                 )
             event = _parse_event(line)
             if not isinstance(event, dict):
@@ -757,7 +839,7 @@ class ClaudeSession:
                 # complaint worth seeing.
                 logger.warning(
                     "agent %s claude stderr: %s",
-                    self.agent_id, text,
+                    self.agent_id, safe_diagnostic_summary(text),
                 )
         except Exception:
             return
@@ -773,7 +855,7 @@ class ClaudeSession:
         logger.error(
             "agent %s: claude stream failure in %s (%s: %s) — "
             "killing subprocess; next turn will respawn",
-            self.agent_id, phase, err_type, err_str,
+            self.agent_id, phase, err_type, safe_diagnostic_summary(err_str),
         )
         if self.audit is not None:
             self.audit.write(
@@ -795,8 +877,8 @@ class ClaudeSession:
         logger.error(
             "agent %s: claude session poisoned (API rejects the whole "
             "conversation) — clearing session id, respawning fresh. "
-            "reply: %s",
-            self.agent_id, reply[:300],
+            "reply_summary: %s",
+            self.agent_id, safe_diagnostic_summary(reply),
         )
         if self.audit is not None:
             self.audit.write(
@@ -1001,7 +1083,13 @@ class ClaudeSession:
             event_types_seen.append(
                 f"{event.get('type')}/{event.get('subtype', '-')}"
             )
-            logger.debug("agent %s stream event: %s", self.agent_id, event)
+            logger.debug(
+                "agent %s stream event: type=%s subtype=%s session_present=%s",
+                self.agent_id,
+                event.get("type"),
+                event.get("subtype"),
+                bool(event.get("session_id")),
+            )
 
             t = event.get("type")
             if t == "assistant":

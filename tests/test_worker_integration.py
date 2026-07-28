@@ -464,5 +464,6 @@ def test_worker_build_and_listener_use_global_runtime_contract():
         "agent_created_at",
         "image_edge_px",
         "catchup_stale_hours",
+        "agent_id",
         "bridge_client",
     )

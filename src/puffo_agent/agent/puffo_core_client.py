@@ -47,6 +47,7 @@ if TYPE_CHECKING:
 from . import disk_cache
 from ._invite_strings import format_invite_error, format_leave_error
 from .contact_cache import ContactCache
+from ._logging import log_runtime_event
 from .permission_prompt import format_permission_prompt
 from .events import random_nonce, sign_event
 from .event_kinds import EventKind
@@ -458,8 +459,10 @@ class PuffoCoreMessageClient:
         image_edge_px: int = _DEFAULT_IMAGE_EDGE_PX,
         catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS,
         *,
+        agent_id: str = "",
         bridge_client: "CloudBridgeClient | None" = None,
     ):
+        self.agent_id = agent_id
         self.slug = slug
         self.device_id = device_id
         self.space_id = space_id
@@ -786,6 +789,20 @@ class PuffoCoreMessageClient:
                     )
                 if result.status is ReceiptWriteStatus.CONFLICT:
                     return TransportOutcome.HOLD
+                if result.status is ReceiptWriteStatus.COMMITTED:
+                    log_runtime_event(
+                        self._log,
+                        "inbox.receipt_committed",
+                        level=logging.DEBUG,
+                        agent_id=self.agent_id,
+                        agent_slug=self.slug,
+                        envelope_id=payload.envelope_id,
+                        space_id=payload.space_id,
+                        channel_id=payload.channel_id,
+                        seq=server_seq,
+                        mode="transport_receipt",
+                        state=result.disposition.value,
+                    )
                 runtime = getattr(self, "global_runtime", None)
                 if runtime is not None:
                     if (

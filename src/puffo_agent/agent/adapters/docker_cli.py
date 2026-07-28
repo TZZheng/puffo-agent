@@ -41,6 +41,7 @@ from ...mcp.config import (
     INFERENCE_LEVELS,
     write_cli_mcp_config,
 )
+from .._logging import safe_diagnostic_summary
 from .hermes_helpers import (
     HERMES_NO_RESUME_SIGNATURE,
     hermes_model_id,
@@ -348,8 +349,8 @@ class DockerCLIAdapter(Adapter):
                 "agent %s: hermes mcp add puffo rc=%d | stdout: %s | stderr: %s "
                 "(chat will work, tool calls won't)",
                 self.agent_id, proc.returncode,
-                stdout.decode("utf-8", errors="replace").strip()[-400:],
-                stderr.decode("utf-8", errors="replace").strip()[-400:],
+                safe_diagnostic_summary(stdout.decode("utf-8", errors="replace")),
+                safe_diagnostic_summary(stderr.decode("utf-8", errors="replace")),
             )
             return
         logger.info(
@@ -436,13 +437,13 @@ class DockerCLIAdapter(Adapter):
             logger.error(
                 "agent %s: hermes turn rc=%d in %.1fs | stdout: %r | stderr: %s",
                 self.agent_id, rc, elapsed,
-                stdout_text.strip()[:400],
-                stderr_text.strip()[-400:] or "(empty)",
+                safe_diagnostic_summary(stdout_text),
+                safe_diagnostic_summary(stderr_text),
             )
             return TurnResult(reply="", metadata={
                 "error": f"hermes exited rc={rc}",
-                "stdout_snippet": stdout_text[:400],
-                "stderr_tail": stderr_text[-400:],
+                "stdout_summary": safe_diagnostic_summary(stdout_text),
+                "stderr_summary": safe_diagnostic_summary(stderr_text),
             })
 
         reply, session_id, tool_calls = parse_hermes_reply(stdout_text)
@@ -463,7 +464,7 @@ class DockerCLIAdapter(Adapter):
         if not reply:
             logger.warning(
                 "agent %s: hermes rc=0 but parser found no reply. "
-                "stdout: %r", self.agent_id, stdout_text[:400],
+                "stdout: %s", self.agent_id, safe_diagnostic_summary(stdout_text),
             )
 
         # First-ever success: write the sentinel so subsequent turns
@@ -575,7 +576,7 @@ class DockerCLIAdapter(Adapter):
             logger.info(
                 "agent %s: gemini -r latest rc=%d; clearing sentinel "
                 "and retrying with a fresh session. stderr: %s",
-                self.agent_id, rc, stderr_text.strip()[-200:] or "(empty)",
+                self.agent_id, rc, safe_diagnostic_summary(stderr_text),
             )
             try:
                 self.session_file.unlink()
@@ -589,13 +590,13 @@ class DockerCLIAdapter(Adapter):
             logger.error(
                 "agent %s: gemini turn rc=%d in %.1fs | stdout: %r | stderr: %s",
                 self.agent_id, rc, elapsed,
-                stdout_text.strip()[:400],
-                stderr_text.strip()[-400:] or "(empty)",
+                safe_diagnostic_summary(stdout_text),
+                safe_diagnostic_summary(stderr_text),
             )
             return TurnResult(reply="", metadata={
                 "error": f"gemini exited rc={rc}",
-                "stdout_snippet": stdout_text[:400],
-                "stderr_tail": stderr_text[-400:],
+                "stdout_summary": safe_diagnostic_summary(stdout_text),
+                "stderr_summary": safe_diagnostic_summary(stderr_text),
             })
 
         reply, session_id, err = _parse_gemini_reply(stdout_text)
@@ -616,7 +617,7 @@ class DockerCLIAdapter(Adapter):
         if not reply:
             logger.warning(
                 "agent %s: gemini rc=0 but parser found no reply. "
-                "stdout: %r", self.agent_id, stdout_text[:400],
+                "stdout: %s", self.agent_id, safe_diagnostic_summary(stdout_text),
             )
 
         if not has_prior_session:

@@ -24,6 +24,8 @@ from puffo_agent.agent.global_inbox_runtime import (
     BaselineAdapter,
     GlobalInboxRuntime,
     HeldRecoverySource,
+    MessageRoute,
+    SendAttemptState,
     TrackingSendDelegate,
     await_listener_with_runtime,
 )
@@ -34,8 +36,115 @@ from puffo_agent.agent.message_store import (
     ReceiptResult,
     ReceiptWriteStatus,
 )
+from puffo_agent.agent._logging import log_runtime_event
 from puffo_agent.crypto.message import MessagePayload
 from puffo_agent.crypto.ws_client import TransportOutcome
+
+
+def runtime_events(caplog):
+    events = []
+    for record in caplog.records:
+        message = record.getMessage()
+        marker = "runtime_event="
+        if marker in message:
+            events.append(json.loads(message.split(marker, 1)[1]))
+    return events
+
+
+def test_runtime_event_helper_fails_open_and_omits_unavailable(
+    caplog, monkeypatch,
+):
+    caplog.set_level(
+        logging.INFO,
+        logger=__name__,
+    )
+    target = logging.getLogger(__name__)
+    log_runtime_event(target, "unknown_event", agent_id="agent")
+    log_runtime_event(
+        target, "batch.planned", unknown_field=["ignored"],
+    )
+    log_runtime_event(
+        target, "batch.planned", agent_id=object(), first_seq=float("nan"),
+    )
+
+    import puffo_agent.agent._logging as logging_module
+    original_dumps = logging_module.json.dumps
+    monkeypatch.setattr(
+        logging_module.json,
+        "dumps",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TypeError("serialize")),
+    )
+    log_runtime_event(target, "batch.planned", agent_id="agent")
+    monkeypatch.setattr(logging_module.json, "dumps", original_dumps)
+
+    class RaisingHandler(logging.Handler):
+        def emit(self, _record):
+            raise RuntimeError("handler failed")
+
+    isolated = logging.getLogger("test.runtime-event-fail-open")
+    isolated.handlers[:] = [RaisingHandler()]
+    isolated.propagate = False
+    isolated.setLevel(logging.INFO)
+    try:
+        log_runtime_event(isolated, "batch.planned", agent_id="agent")
+    finally:
+        isolated.handlers.clear()
+
+    log_runtime_event(
+        target,
+        "batch.planned",
+        agent_id="agent",
+        first_seq=None,
+        last_seq=None,
+    )
+    log_runtime_event(
+        target,
+        "batch.planned",
+        envelope_ids=["env-1"],
+        routes=[{
+            "space_id": "sp-1",
+            "channel_id": "ch-1",
+            "count": 1,
+            "min_seq": 2,
+            "max_seq": 2,
+        }],
+    )
+    log_runtime_event(
+        target,
+        "batch.planned",
+        routes=[{"channel_id": "ch-1", "payload": "rejected"}],
+    )
+    assert runtime_events(caplog) == [
+        {"event": "batch.planned"},
+        {"event": "batch.planned"},
+        {
+            "event": "batch.planned",
+            "agent_id": "agent",
+        },
+        {
+            "event": "batch.planned",
+            "envelope_ids": ["env-1"],
+            "routes": [{
+                "channel_id": "ch-1",
+                "count": 1,
+                "max_seq": 2,
+                "min_seq": 2,
+                "space_id": "sp-1",
+            }],
+        },
+        {"event": "batch.planned"},
+    ]
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if "runtime observability degraded" in record.getMessage()
+    ]
+    assert warnings
+    assert all(
+        "unknown_event" not in warning
+        and "unknown_field" not in warning
+        for warning in warnings
+    )
 
 
 class Adapter:
@@ -64,13 +173,17 @@ class Adapter:
         self.callback = callback
         self.key = planning_cycle_key
 
-    async def admit(self, session: str | None = "provider-1"):
+    async def admit(
+        self,
+        session: str | None = "provider-1",
+        provider_turn_id: str = "provider-turn",
+    ):
         callback, self.callback = self.callback, None
         assert callback is not None
         await callback(ProviderAdmissionEvent(
             planning_cycle_key=self.key,
             provider_session_id=session,
-            provider_turn_id="provider-turn",
+            provider_turn_id=provider_turn_id,
             admitted_at=datetime.now(timezone.utc),
         ))
 
@@ -187,6 +300,7 @@ async def listen_delivery(
             return SimpleNamespace(outcome=outcome)
 
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
+    client.agent_id = "agent-id"
     client.slug = "agent"
     client.device_id = "dev"
     client.operator_slug = "operator"
@@ -302,8 +416,12 @@ async def test_receipt_commit_before_ack_and_wake_without_admission(tmp_path):
 
 @pytest.mark.asyncio
 async def test_receipt_listen_eligible_commit_before_ack_and_scheduler_wake(
-    monkeypatch, tmp_path,
+    monkeypatch, tmp_path, caplog,
 ):
+    caplog.set_level(
+        logging.DEBUG,
+        logger="receipt-listen",
+    )
     _client, store, events, _delivery = await listen_delivery(
         monkeypatch, tmp_path, payload=payload_for("eligible"), seq=11,
     )
@@ -316,6 +434,21 @@ async def test_receipt_listen_eligible_commit_before_ack_and_scheduler_wake(
     row = (await store.get_pending())[0]
     assert row.envelope_id == "eligible"
     assert row.model_visible_at is None
+    receipt_event = next(
+        item for item in runtime_events(caplog)
+        if item["event"] == "inbox.receipt_committed"
+    )
+    assert receipt_event == {
+        "event": "inbox.receipt_committed",
+        "agent_id": "agent-id",
+        "agent_slug": "agent",
+        "envelope_id": "eligible",
+        "space_id": "sp-1",
+        "channel_id": "ch-1",
+        "seq": 11,
+        "mode": "transport_receipt",
+        "state": "eligible",
+    }
     await store.close()
 
 
@@ -655,7 +788,13 @@ async def test_local_event_has_no_fabricated_server_seq_and_global_order(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_multi_target_global_order_route_metadata_and_current_turn(tmp_path):
+async def test_multi_target_global_order_route_metadata_and_current_turn(
+    tmp_path, caplog,
+):
+    caplog.set_level(
+        logging.DEBUG,
+        logger="puffo_agent.agent.global_inbox_runtime",
+    )
     store = await make_store(tmp_path)
     await receipt(store, "c1", 1)
     await receipt(store, "d1", 2, kind="dm", sender="bob")
@@ -684,6 +823,83 @@ async def test_multi_target_global_order_route_metadata_and_current_turn(tmp_pat
     assert '"route":' in sent and '"sender_slug":"bob"' in sent
     assert (await store.get_turn_run(turn_ids[0])).state == ProcessingState.PROCESSED.value
     assert not (tmp_path / ".puffo-agent/current_turn.json").exists()
+    events = runtime_events(caplog)
+    names = [item["event"] for item in events]
+    assert names.index("batch.planned") < names.index("turn.admitted")
+    assert names.index("turn.admitted") < names.index("turn.processed")
+    batch = next(
+        item for item in events if item["event"] == "batch.planned"
+    )
+    assert batch["message_count"] == 2
+    assert batch["target_count"] == 2
+    assert batch["first_seq"] == 1
+    assert batch["last_seq"] == 2
+    assert "member_ids" not in batch
+    assert batch["batch_id"] == batch["correlation_key"]
+    assert batch["envelope_count"] == 2
+    assert batch["envelope_ids"] == ["c1", "d1"]
+    assert batch["routes"] == [
+        {
+            "channel_id": "ch-1",
+            "count": 1,
+            "max_seq": 1,
+            "min_seq": 1,
+            "space_id": "sp-1",
+        },
+        {
+            "count": 1,
+            "dm_peer": "bob",
+            "max_seq": 2,
+            "min_seq": 2,
+        },
+    ]
+    admitted = next(
+        item for item in events if item["event"] == "turn.admitted"
+    )
+    assert admitted["provider_session_id"] == "provider-1"
+    assert admitted["provider_turn_id"] == "provider-turn"
+    assert next(
+        item for item in events if item["event"] == "turn.processed"
+    )["state"] == "processed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_committed_turn_survives_runtime_log_handler_failure(tmp_path):
+    store = await make_store(tmp_path)
+    await receipt(store, "committed", 1)
+    adapter = Adapter()
+    admitted_turn_id = ""
+
+    async def run(planned):
+        nonlocal admitted_turn_id
+        admitted_turn_id = planned.turn_id
+        await adapter.admit()
+
+    class RaisingHandler(logging.Handler):
+        def emit(self, _record):
+            raise RuntimeError("log handler failed")
+
+    import puffo_agent.agent.global_inbox_runtime as runtime_module
+    handler = RaisingHandler()
+    runtime_module.logger.addHandler(handler)
+    runtime_module.logger.setLevel(logging.INFO)
+    try:
+        runtime = GlobalInboxRuntime(
+            store=store,
+            adapter=adapter,
+            run_turn=run,
+            workspace=tmp_path,
+            agent_id="real-agent-id",
+        )
+        assert await runtime.process_once()
+    finally:
+        runtime_module.logger.removeHandler(handler)
+
+    run_state = await store.get_turn_run(admitted_turn_id)
+    assert run_state is not None
+    assert run_state.state == ProcessingState.PROCESSED.value
+    assert await store.get_pending() == ()
     await store.close()
 
 
@@ -716,11 +932,19 @@ async def test_turn_send_mode_tracks_encrypted_bundle_and_clears(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_turn_send_mode_aliases_clear_after_provider_failure(tmp_path):
+async def test_turn_send_mode_aliases_clear_after_provider_failure(tmp_path, caplog):
     from puffo_agent.agent import send_mode
 
+    caplog.set_level(logging.INFO)
     store = await make_store(tmp_path)
-    await receipt(store, "encrypted-failure", 1, is_encrypted=True)
+    secret = "runtime-sensitive-message-body"
+    await receipt(
+        store,
+        "encrypted-failure",
+        1,
+        is_encrypted=True,
+        content=secret,
+    )
     adapter = Adapter()
     keys = ("agent-id-send-mode", "agent-slug-send-mode")
 
@@ -739,6 +963,15 @@ async def test_turn_send_mode_aliases_clear_after_provider_failure(tmp_path):
     )
     assert await runtime.process_once()
     assert runtime.health.state == "degraded"
+    requeued = next(
+        item for item in runtime_events(caplog)
+        if item["event"] == "turn.requeued"
+    )
+    assert requeued["state"] == "requeued"
+    assert requeued["error_category"] == "provider_error"
+    assert secret not in " ".join(
+        record.getMessage() for record in caplog.records
+    )
     for key in keys:
         assert not await send_mode.encryption_required(key, store, None)
     await store.close()
@@ -1027,8 +1260,12 @@ async def test_baseline_boundary_stateless_and_same_channel_advance(tmp_path):
 
 @pytest.mark.asyncio
 async def test_model_visible_read_advances_only_after_exact_tool_result_admission(
-    tmp_path,
+    tmp_path, caplog,
 ):
+    caplog.set_level(
+        logging.DEBUG,
+        logger="puffo_agent.agent.global_inbox_runtime",
+    )
     store = await make_store(tmp_path)
     await receipt(store, "history-2", 2)
 
@@ -1062,6 +1299,7 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
                 planning_cycle_key=key,
                 provider_session_id="provider-1",
                 provider_turn_id="provider-turn",
+                tool_call_id="tool-call-history",
                 admitted_at=datetime.now(timezone.utc),
             ))
 
@@ -1074,6 +1312,10 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
     )
     runtime.active.turn_id = "turn"
     runtime.active.provider_session_id = "provider-1"
+    runtime.active.provider_turn_id = "provider-turn"
+    runtime.active.routes[:] = [
+        MessageRoute("history-2", "channel", "sp-1", "ch-1"),
+    ]
     boundary = ActiveBoundaryAdapter(store, runtime.active)
 
     result = await runtime.stage_model_visible_read(
@@ -1090,9 +1332,65 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
     assert adapter.continuations[0][3] == ("get_channel_history",)
     assert adapter.continuations[0][4] == {"channel": "ch-1"}
     assert adapter.continuations[0][5] == result["correlation_receipt"]
+    staged_events = runtime_events(caplog)
+    assert [event["event"] for event in staged_events].count(
+        "history.read_staged"
+    ) == 1
+    assert not any(
+        event["event"] == "history.read_admitted" for event in staged_events
+    )
 
     await adapter.admit_continuation()
     assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 2
+    history_events = [
+        event for event in runtime_events(caplog)
+        if event["event"].startswith("history.")
+    ]
+    assert [event["event"] for event in history_events] == [
+        "history.read_staged", "history.read_admitted",
+    ]
+    assert history_events[0]["correlation_key"] == history_events[1][
+        "correlation_key"
+    ]
+    assert history_events[1]["provider_turn_id"] == "provider-turn"
+    assert history_events[1]["tool_call_id"] == "tool-call-history"
+
+    class BoundaryCoordinator:
+        async def send(self, _request):
+            seen_seq = await boundary.get_active_turn_through_seq(
+                "sp-1", "ch-1",
+            )
+            return {
+                "state": "held",
+                "seen_seq": seen_seq,
+                "latest_seq": 3,
+            }
+
+    delegate = TrackingSendDelegate(
+        BoundaryCoordinator(),
+        SendAttemptState(),
+        runtime=runtime,
+    )
+    await delegate.send({"destination": "ch-1"})
+    correlated = [
+        event for event in runtime_events(caplog)
+        if event["event"] in {
+            "history.read_staged",
+            "history.read_admitted",
+            "send.attempted",
+        }
+    ]
+    assert [event["event"] for event in correlated] == [
+        "history.read_staged",
+        "history.read_admitted",
+        "send.attempted",
+    ]
+    attempted = correlated[-1]
+    assert attempted["turn_id"] == "turn"
+    assert attempted["provider_session_id"] == "provider-1"
+    assert attempted["provider_turn_id"] == "provider-turn"
+    assert attempted["space_id"] == "sp-1"
+    assert attempted["channel_id"] == "ch-1"
 
     with pytest.raises(RuntimeError, match="does not match local storage"):
         await runtime.stage_model_visible_read(
@@ -1103,27 +1401,173 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
             tool_name="get_channel_history",
             tool_arguments={"channel": "ch-1"},
         )
+    assert any(
+        event["event"] == "history.read_staged"
+        and event.get("latest_seq") == 3
+        and event.get("state") == "invalid_watermark"
+        for event in runtime_events(caplog)
+    )
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_failed_held_and_attachment_send_attempts_are_tracked():
+async def test_failed_held_and_attachment_send_attempts_are_tracked(caplog):
+    caplog.set_level(
+        logging.DEBUG,
+        logger="puffo_agent.agent.global_inbox_runtime",
+    )
+
     class Coordinator:
         async def send(self, request=None, **kwargs):
             destination = (
                 request.get("destination") if isinstance(request, dict) else ""
             )
-            return {"state": "held" if destination == "ch-held" else "failed"}
+            if destination == "ch-held":
+                return {
+                    "state": "held", "envelope_id": "held-envelope",
+                    "seen_seq": 4, "latest_seq": 5,
+                }
+            if destination == "ch-sent":
+                return {
+                    "state": "sent", "envelope_id": "sent-envelope", "seq": 6,
+                    "latest_seq_before_send": 5,
+                }
+            return {"state": "failed", "error_kind": "validation"}
 
     from puffo_agent.agent.global_inbox_runtime import SendAttemptState
     attempts = SendAttemptState()
     delegate = TrackingSendDelegate(Coordinator(), attempts)
     assert (await delegate.send({"destination": "ch-held"}))["state"] == "held"
+    assert (await delegate.send({"destination": "ch-held"}))["state"] == "held"
+    assert (await delegate.send({
+        "destination": "ch-sent", "send_anyway": True,
+    }))["state"] == "sent"
+    assert (await delegate.send({"destination": "@operator"}))["state"] == "failed"
     assert (await delegate.send({
         "destination": "ch-failed", "attachment_paths": ["/tmp/a"],
     }))["state"] == "failed"
-    assert attempts.attempts == 2
-    assert attempts.states == ["held", "failed"]
+    assert attempts.attempts == 5
+    assert attempts.states == ["held", "held", "sent", "failed", "failed"]
+    send_event_records = [
+        event for event in runtime_events(caplog)
+        if event["event"].startswith("send.")
+    ]
+    assert [event["event"] for event in send_event_records] == [
+        "send.attempted", "send.held",
+        "send.attempted", "send.held",
+        "send.attempted", "send.committed",
+        "send.attempted", "send.failed",
+        "send.attempted", "send.failed",
+    ]
+    attempts_only = [
+        event for event in send_event_records
+        if event["event"] == "send.attempted"
+    ]
+    assert [event.get("mode") for event in attempts_only] == [
+        "require_current", "require_current", "send_anyway", None,
+        "require_current",
+    ]
+    assert [event["attempt_phase"] for event in attempts_only] == [
+        "initial", "reconsider", "initial", "initial", "initial",
+    ]
+    assert [event["transport"] for event in attempts_only] == [
+        "channel", "channel", "channel", "dm", "channel",
+    ]
+    committed = next(
+        event for event in send_event_records
+        if event["event"] == "send.committed"
+    )
+    assert committed["latest_seq_before_send"] == 5
+    assert "latest_seq" not in committed
+    held = next(
+        event for event in send_event_records
+        if event["event"] == "send.held"
+    )
+    assert held["latest_seq"] == 5
+    assert "latest_seq_before_send" not in held
+    assert all(
+        record.levelno == (
+            logging.DEBUG
+            if json.loads(record.getMessage().split("runtime_event=", 1)[1])[
+                "event"
+            ] == "send.attempted"
+            else logging.INFO
+        )
+        for record in caplog.records
+        if "runtime_event=" in record.getMessage()
+    )
+
+    keyless_coordinator = Coordinator()
+    keyless_coordinator.http_client = SimpleNamespace(keyless=True)
+    keyless_delegate = TrackingSendDelegate(keyless_coordinator, SendAttemptState())
+    await keyless_delegate.send({"destination": "ch-unsequenced"})
+    assert [
+        event["transport"]
+        for event in runtime_events(caplog)
+        if event["event"] == "send.attempted"
+    ][-1] == "keyless"
+
+
+@pytest.mark.asyncio
+async def test_coordinator_exception_is_tracked_and_re_raised(caplog):
+    caplog.set_level(
+        logging.DEBUG,
+        logger="puffo_agent.agent.global_inbox_runtime",
+    )
+
+    class Coordinator:
+        async def send(self, *_args, **_kwargs):
+            raise RuntimeError("coordinator failed")
+
+    from puffo_agent.agent.global_inbox_runtime import SendAttemptState
+    attempts = SendAttemptState()
+    delegate = TrackingSendDelegate(Coordinator(), attempts)
+    with pytest.raises(RuntimeError, match="coordinator failed"):
+        await delegate.send({"destination": "ch-failed"})
+
+    assert attempts.states == ["failed"]
+    assert [event["event"] for event in runtime_events(caplog)] == [
+        "send.attempted",
+        "send.failed",
+    ]
+    assert runtime_events(caplog)[-1]["error_category"] == "delegate_exception"
+
+
+@pytest.mark.asyncio
+async def test_send_events_use_only_active_resolved_route(caplog, tmp_path):
+    caplog.set_level(
+        logging.DEBUG,
+        logger="puffo_agent.agent.global_inbox_runtime",
+    )
+
+    class Coordinator:
+        async def send(self, request=None, **_kwargs):
+            return {"state": "sent", "envelope_id": "sent", "seq": 9}
+
+    runtime = GlobalInboxRuntime(
+        store=await make_store(tmp_path),
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.active.routes[:] = [
+        MessageRoute("incoming", "channel", "sp-1", "resolved-channel"),
+    ]
+    delegate = TrackingSendDelegate(
+        Coordinator(), SendAttemptState(), runtime=runtime,
+    )
+    await delegate.send({"destination": "resolved-channel"})
+    await delegate.send({"destination": "model-only-destination"})
+
+    attempted = [
+        event for event in runtime_events(caplog)
+        if event["event"] == "send.attempted"
+    ]
+    assert attempted[0]["space_id"] == "sp-1"
+    assert attempted[0]["channel_id"] == "resolved-channel"
+    assert "channel_id" not in attempted[1]
+    assert "space_id" not in attempted[1]
+    await runtime.store.close()
 
 
 @pytest.mark.asyncio
@@ -1775,6 +2219,41 @@ async def test_admission_retry_success_preserves_union_without_reappend(tmp_path
     assert runner.initial_calls == 1 and runner.retry_calls == 1
     assert await store.get_pending() == ()
     assert not runtime.current_turn_path.exists()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_api_retry_rebinds_processed_event_to_new_provider_turn(
+    tmp_path, caplog,
+):
+    caplog.set_level(logging.INFO)
+    store = await make_store(tmp_path)
+    await receipt(store, "retry-provider-turn", 1)
+    adapter = Adapter()
+
+    class Runner:
+        async def __call__(self, _planned):
+            await adapter.admit(provider_turn_id="provider-turn-initial")
+            raise AgentAPIError("rate limit", is_auth=False)
+
+        async def handle_global_inbox_retry(self, _planned):
+            await adapter.admit(provider_turn_id="provider-turn-retry")
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=Runner(),
+        workspace=tmp_path,
+        agent_id="real-agent-id",
+        retry_sleep=lambda _delay: asyncio.sleep(0),
+    )
+    assert await runtime.process_once()
+    processed = next(
+        event for event in runtime_events(caplog)
+        if event["event"] == "turn.processed"
+    )
+    assert processed["provider_turn_id"] == "provider-turn-retry"
+    assert await store.get_pending() == ()
     await store.close()
 
 

@@ -37,6 +37,7 @@ from ..crypto.message import (
 from ..crypto.primitives import Ed25519KeyPair
 from ..limits import MESSAGE_SEGMENT_CHARS
 from ..agent.context_controller import MODEL_VISIBLE_READ_RECEIPT_PREFIX
+from ..agent._logging import log_runtime_event
 from ..agent.send_coordinator import (
     SemanticSendRequest,
     SendCoordinator,
@@ -121,6 +122,14 @@ async def _stage_model_visible_messages(
     """Stage the highest channel watermark returned to the provider."""
     rpc = getattr(cfg, "rpc_client", None)
     if rpc is None:
+        log_runtime_event(
+            logger,
+            "history.read_staged",
+            level=logging.DEBUG,
+            agent_id=cfg.agent_id,
+            agent_slug=cfg.slug,
+            state="unsupported_adapter",
+        )
         return ""
     candidates = [
         message
@@ -132,6 +141,21 @@ async def _stage_model_visible_messages(
         and not isinstance(getattr(message, "server_seq", None), bool)
     ]
     if not candidates:
+        state = (
+            "dm_unsupported"
+            if any(getattr(message, "envelope_kind", "") == "dm" for message in messages)
+            else "unsequenced"
+            if any(getattr(message, "server_seq", None) is None for message in messages)
+            else "unsupported_history"
+        )
+        log_runtime_event(
+            logger,
+            "history.read_staged",
+            level=logging.DEBUG,
+            agent_id=cfg.agent_id,
+            agent_slug=cfg.slug,
+            state=state,
+        )
         return ""
     watermark = max(candidates, key=lambda message: message.server_seq)
     staged = await rpc.stage_model_visible_read(
@@ -219,6 +243,7 @@ class PuffoCoreToolsConfig:
     keystore: KeyStore
     http_client: PuffoCoreHttpClient
     data_client: DataClient
+    agent_id: str = ""
     space_id: Optional[str] = None
     # Workspace root used by ``send_message_with_attachments`` to
     # safety-resolve LLM-supplied relative paths (no ``..`` escape,

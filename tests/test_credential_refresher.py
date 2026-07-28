@@ -477,7 +477,7 @@ def test_refresh_now_treats_backend_exception_as_failed(tmp_path, monkeypatch):
     assert captured == [RefreshOutcome.FAILED]
 
 
-def test_filebackend_unchanged_logs_stdout_and_stderr(tmp_path, monkeypatch, caplog):
+def test_filebackend_unchanged_redacts_stdout_and_stderr(tmp_path, monkeypatch, caplog):
     from puffo_agent.portal.credential_refresh import FileBackend
     _write_creds(tmp_path, expires_in_seconds=3600)
     backend = FileBackend(host_home=tmp_path)
@@ -495,8 +495,9 @@ def test_filebackend_unchanged_logs_stdout_and_stderr(tmp_path, monkeypatch, cap
     outcome = asyncio.run(backend.refresh())
     assert outcome is RefreshOutcome.UNCHANGED
     joined = " ".join(rec.getMessage() for rec in caplog.records)
-    assert "hello-out" in joined
-    assert "hello-err" in joined
+    assert "hello-out" not in joined
+    assert "hello-err" not in joined
+    assert "output_category=unchanged" in joined
 
 
 def test_refresh_broken_flips_all_registered_agents(tmp_path, monkeypatch):
