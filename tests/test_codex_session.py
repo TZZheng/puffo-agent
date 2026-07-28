@@ -597,8 +597,134 @@ def test_initial_admission_ignores_compact_and_continuation_is_distinct(tmp_path
             },
         })
         assert [event.planning_cycle_key for event in events] == [
-            "initial", "continuation", "continuation-b", "continuation-a",
+            "initial", "continuation",
         ]
+        assert cs._continuation_admissions == []
+
+    asyncio.run(drive())
+
+
+def test_history_continuation_matches_exact_codex_tool_result(tmp_path):
+    from puffo_agent.agent.adapters.codex_session import _PendingTurn
+
+    async def drive():
+        cs = CodexSession("history-continuation", tmp_path / "session.json", ["true"])
+        cs._conversation_id = "thread-current"
+        cs._active_turn = _PendingTurn(2, time.time())
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current",
+            "turn": {"id": "user-turn"},
+        })
+        events = []
+
+        def register(label, receipt, arguments):
+            async def admitted(event):
+                events.append((label, event))
+
+            cs.register_continuation_callback(
+                admitted,
+                f"visible-read-{label}",
+                tool_names=("get_channel_history",),
+                tool_arguments=arguments,
+                correlation_receipt=receipt,
+            )
+
+        register("a", "receipt-a", {"channel": "ch-a"})
+        register("b", "receipt-b", {"channel": "ch-a"})
+        register("failed", "receipt-failed", {"channel": "ch-a"})
+        register(
+            "clamped",
+            "receipt-clamped",
+            {"channel": "ch-a", "limit": 999},
+        )
+
+        def tool_result(receipt, *, status="completed", arguments=None):
+            return {
+                "threadId": "thread-current",
+                "turnId": "user-turn",
+                "item": {
+                    "id": f"call-{receipt}",
+                    "type": "mcpToolCall",
+                    "server": "puffo",
+                    "tool": "get_channel_history",
+                    "status": status,
+                    "arguments": arguments or {"channel": "ch-a"},
+                    "result": {
+                        "content": [{
+                            "type": "text",
+                            "text": (
+                                "history\n[puffo:model-visible-read:"
+                                f"{receipt}]"
+                            ),
+                        }],
+                    },
+                },
+            }
+
+        await cs._handle_notification(
+            "item/completed",
+            tool_result("receipt-failed", status="failed"),
+        )
+        wrong_tool = tool_result("receipt-b")
+        wrong_tool["item"]["tool"] = "get_post"
+        await cs._handle_notification("item/completed", wrong_tool)
+        assert events == []
+        await cs._handle_notification(
+            "item/completed",
+            tool_result(
+                "receipt-clamped",
+                arguments={"channel": "ch-a", "limit": 200},
+            ),
+        )
+        await cs._handle_notification(
+            "item/completed", tool_result("receipt-b"),
+        )
+        await cs._handle_notification(
+            "item/completed", tool_result("receipt-a"),
+        )
+        assert [label for label, _event in events] == ["clamped", "b", "a"]
+
+        register("late", "receipt-late", {"channel": "ch-other"})
+        await cs._handle_notification("turn/completed", {
+            "threadId": "thread-current",
+            "turn": {"id": "user-turn"},
+        })
+        await cs._handle_notification(
+            "item/completed", tool_result("receipt-late"),
+        )
+        assert [label for label, _event in events] == ["clamped", "b", "a"]
+        assert cs._continuation_admissions == []
+        assert {event.provider_turn_id for _, event in events} == {"user-turn"}
+
+        cs._active_turn = _PendingTurn(3, time.time())
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current",
+            "turn": {"id": "next-turn"},
+        })
+        register("next", "receipt-next", {"channel": "ch-a"})
+        stale = tool_result("receipt-late")
+        stale["turnId"] = "next-turn"
+        stale["item"]["id"] = "late-from-previous-turn"
+        await cs._handle_notification("item/completed", stale)
+        current = tool_result("receipt-next")
+        current["turnId"] = "next-turn"
+        await cs._handle_notification("item/completed", current)
+        assert [label for label, _event in events] == [
+            "clamped", "b", "a", "next",
+        ]
+
+        cs._active_turn = None
+        with pytest.raises(RuntimeError, match="no active Codex provider turn"):
+            async def unused(_event):
+                pass
+
+            cs.register_continuation_callback(
+                unused,
+                "late-visible-read",
+                tool_names=("get_channel_history",),
+                tool_arguments={"channel": "ch-a"},
+                correlation_receipt="unused",
+            )
 
     asyncio.run(drive())
 

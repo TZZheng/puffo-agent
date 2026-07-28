@@ -36,6 +36,7 @@ from ..crypto.message import (
 )
 from ..crypto.primitives import Ed25519KeyPair
 from ..limits import MESSAGE_SEGMENT_CHARS
+from ..agent.context_controller import MODEL_VISIBLE_READ_RECEIPT_PREFIX
 from ..agent.send_coordinator import (
     SemanticSendRequest,
     SendCoordinator,
@@ -108,6 +109,43 @@ def _ts_to_iso(ms: int) -> str:
 def _enc_tag(m: Any) -> str:
     """`[encrypted]`/`[plaintext]` tag; legacy rows default to encrypted."""
     return "[encrypted]" if getattr(m, "is_encrypted", True) else "[plaintext]"
+
+
+async def _stage_model_visible_messages(
+    cfg: "PuffoCoreToolsConfig",
+    messages: list[Any],
+    *,
+    tool_name: str,
+    tool_arguments: dict[str, object],
+) -> str:
+    """Stage the highest channel watermark returned to the provider."""
+    rpc = getattr(cfg, "rpc_client", None)
+    if rpc is None:
+        return ""
+    candidates = [
+        message
+        for message in messages
+        if getattr(message, "envelope_kind", "") != "dm"
+        and getattr(message, "space_id", None)
+        and getattr(message, "channel_id", None)
+        and isinstance(getattr(message, "server_seq", None), int)
+        and not isinstance(getattr(message, "server_seq", None), bool)
+    ]
+    if not candidates:
+        return ""
+    watermark = max(candidates, key=lambda message: message.server_seq)
+    staged = await rpc.stage_model_visible_read(
+        space_id=watermark.space_id,
+        channel_id=watermark.channel_id,
+        through_seq=watermark.server_seq,
+        through_envelope_id=watermark.envelope_id,
+        tool_name=tool_name,
+        tool_arguments=tool_arguments,
+    )
+    receipt = staged.get("correlation_receipt")
+    if not isinstance(receipt, str) or not receipt:
+        raise RuntimeError("model-visible read staging returned no receipt")
+    return f"[{MODEL_VISIBLE_READ_RECEIPT_PREFIX}{receipt}]"
 
 
 # ── transport seam ─────────────────────────────────────────────────
@@ -819,6 +857,21 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             return f"(no such channel: {channel_id})"
         if not roots:
             return "(no root posts in the requested window)"
+        tool_arguments: dict[str, object] = {"channel": channel}
+        if limit != 20:
+            tool_arguments["limit"] = limit
+        if since:
+            tool_arguments["since"] = since
+        if before:
+            tool_arguments["before"] = before
+        if after:
+            tool_arguments["after"] = after
+        receipt_marker = await _stage_model_visible_messages(
+            cfg,
+            [entry.message for entry in roots],
+            tool_name="get_channel_history",
+            tool_arguments=tool_arguments,
+        )
         lines = []
         for entry in roots:
             m = entry.message
@@ -831,7 +884,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             lines.append(
                 f"{ts}  {_enc_tag(m)}  post:{m.envelope_id}  @{m.sender_slug}: {text}{suffix}"
             )
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        return f"{result}\n{receipt_marker}" if receipt_marker else result
 
     @mcp.tool()
     async def get_dm_history(
@@ -902,6 +956,21 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             return f"(no such thread: {root_id.strip()})"
         if not msgs:
             return "(no messages in this thread for the requested window)"
+        tool_arguments = {"root_id": root_id}
+        if limit != 50:
+            tool_arguments["limit"] = limit
+        if since:
+            tool_arguments["since"] = since
+        if before:
+            tool_arguments["before"] = before
+        if after:
+            tool_arguments["after"] = after
+        receipt_marker = await _stage_model_visible_messages(
+            cfg,
+            msgs,
+            tool_name="get_thread_history",
+            tool_arguments=tool_arguments,
+        )
         lines = []
         for m in msgs:
             ts = _ts_to_iso(m.sent_at)
@@ -909,7 +978,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             lines.append(
                 f"{ts}  {_enc_tag(m)}  post:{m.envelope_id}  @{m.sender_slug}: {text}"
             )
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        return f"{result}\n{receipt_marker}" if receipt_marker else result
 
     @mcp.tool()
     async def list_spaces() -> str:
@@ -1096,6 +1166,12 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         msg = await cfg.data_client.get_message_by_envelope(envelope_id)
         if msg is None:
             return f"message {envelope_id} not found in local storage"
+        receipt_marker = await _stage_model_visible_messages(
+            cfg,
+            [msg],
+            tool_name="get_post",
+            tool_arguments={"post_ref": post_ref},
+        )
 
         ts = _ts_to_iso(msg.sent_at)
         content_str = str(msg.content) if msg.content else ""
@@ -1111,7 +1187,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             lines.append(f"thread_root_id: {msg.thread_root_id}")
         lines.append(f"is_encrypted: {str(getattr(msg, 'is_encrypted', True)).lower()}")
         lines.append(f"message:\n{content_str}")
-        return "\n".join(lines)
+        result = "\n".join(lines)
+        return f"{result}\n{receipt_marker}" if receipt_marker else result
 
     @mcp.tool()
     async def get_post_segment(
@@ -1180,10 +1257,23 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         start = segment * segment_size
         end = min(start + segment_size, total)
         chunk = text[start:end]
-        return (
+        tool_arguments = {
+            "envelope_id": envelope_id,
+            "segment": segment,
+        }
+        if segment_size != MESSAGE_SEGMENT_CHARS:
+            tool_arguments["segment_size"] = segment_size
+        receipt_marker = await _stage_model_visible_messages(
+            cfg,
+            [msg],
+            tool_name="get_post_segment",
+            tool_arguments=tool_arguments,
+        )
+        result = (
             f"segment {segment}/{seg_count - 1} "
             f"(chars {start}..{end - 1} of {total}):\n{chunk}"
         )
+        return f"{result}\n{receipt_marker}" if receipt_marker else result
 
     @mcp.tool()
     async def send_message_with_attachments(

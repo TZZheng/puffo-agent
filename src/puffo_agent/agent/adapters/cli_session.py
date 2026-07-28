@@ -42,6 +42,7 @@ from ..context_controller import (
     ContextSnapshot,
     ProviderAdmissionEvent,
     RolloverResult,
+    ToolResultAdmission,
     normalize_context_snapshot,
 )
 
@@ -241,10 +242,10 @@ class ClaudeSession:
         self._context_measured_at: datetime | None = None
         self._admission_callback: AdmissionCallback | None = None
         self._admission_planning_cycle_key: str = ""
-        self._continuation_admissions: list[
-            tuple[AdmissionCallback, str, str, str]
-        ] = []
-        self._active_send_tool_channels: dict[str, str] = {}
+        self._continuation_admissions: list[ToolResultAdmission] = []
+        self._active_puffo_tool_calls: dict[
+            str, tuple[str, dict[str, object]]
+        ] = {}
         self._active_provider_turn_id: str | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -477,16 +478,34 @@ class ClaudeSession:
         planning_cycle_key: str = "",
         *,
         channel_id: str = "",
+        tool_names: tuple[str, ...] = (),
+        tool_arguments: dict[str, object] | None = None,
+        correlation_receipt: str = "",
     ) -> None:
         if callback is None:
             self._continuation_admissions.clear()
             return
         provider_turn_id = self._active_provider_turn_id
         if provider_turn_id is None:
+            if tool_names or tool_arguments is not None or correlation_receipt:
+                raise RuntimeError(
+                    "no active Claude provider turn for tool-result admission"
+                )
             self.register_admission_callback(callback, planning_cycle_key)
             return
         self._continuation_admissions.append(
-            (callback, planning_cycle_key, provider_turn_id, channel_id)
+            ToolResultAdmission.build(
+                callback,
+                planning_cycle_key,
+                provider_turn_id,
+                channel_id=channel_id,
+                tool_names=tool_names or (
+                    "send_message",
+                    "send_message_with_attachments",
+                ),
+                tool_arguments=tool_arguments,
+                correlation_receipt=correlation_receipt,
+            )
         )
 
     async def _fire_admission(self, provider_turn_id: str) -> None:
@@ -512,51 +531,63 @@ class ClaudeSession:
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
                 continue
+            tool_use_id = str(block.get("tool_use_id") or "")
+            tool_call = self._active_puffo_tool_calls.get(tool_use_id)
+            if block.get("is_error") is True:
+                self._active_puffo_tool_calls.pop(tool_use_id, None)
+                continue
             serialized = json.dumps(block, sort_keys=True, default=str)
+            tool_name = tool_call[0] if tool_call is not None else ""
+            tool_arguments = tool_call[1] if tool_call is not None else {}
             exact = next(
                 (
                     index
-                    for index, (_callback, key, turn_id, _channel) in enumerate(
+                    for index, admission in enumerate(
                         self._continuation_admissions
                     )
                     if index not in selected
-                    and turn_id == provider_turn_id
-                    and key
-                    and key in serialized
+                    and admission.provider_turn_id == provider_turn_id
+                    and admission.receipt_marker
+                    and admission.receipt_marker in serialized
+                    and tool_call is not None
+                    and (
+                        not admission.tool_names
+                        or tool_name in admission.tool_names
+                    )
                 ),
                 None,
             )
             if exact is not None:
                 selected.append(exact)
                 continue
-            tool_use_id = str(block.get("tool_use_id") or "")
-            channel_id = self._active_send_tool_channels.get(tool_use_id, "")
-            if not channel_id:
+            if tool_call is None:
                 continue
-            correlated = next(
-                (
-                    index
-                    for index, (_callback, _key, turn_id, channel) in enumerate(
-                        self._continuation_admissions
-                    )
-                    if index not in selected
-                    and turn_id == provider_turn_id
-                    and channel == channel_id
-                ),
-                None,
-            )
-            if correlated is not None:
-                selected.append(correlated)
-            self._active_send_tool_channels.pop(tool_use_id, None)
+            candidates = [
+                index
+                for index, admission in enumerate(self._continuation_admissions)
+                if index not in selected
+                and admission.provider_turn_id == provider_turn_id
+                and not admission.correlation_receipt
+                and admission.matches(tool_name, tool_arguments)
+            ]
+            if candidates:
+                selected.append(max(
+                    candidates,
+                    key=lambda index: (
+                        self._continuation_admissions[index].match_specificity,
+                        -index,
+                    ),
+                ))
+            self._active_puffo_tool_calls.pop(tool_use_id, None)
 
         admissions = [
             self._continuation_admissions[index] for index in selected
         ]
         for index in sorted(selected, reverse=True):
             self._continuation_admissions.pop(index)
-        for callback, key, _turn_id, _channel in admissions:
-            await callback(ProviderAdmissionEvent(
-                planning_cycle_key=key,
+        for admission in admissions:
+            await admission.callback(ProviderAdmissionEvent(
+                planning_cycle_key=admission.planning_cycle_key,
                 provider_session_id=self.get_provider_session_id(),
                 provider_turn_id=provider_turn_id,
                 admitted_at=datetime.now(timezone.utc),
@@ -861,13 +892,18 @@ class ClaudeSession:
     async def _one_turn(self, user_message: str) -> TurnResult:
         provider_turn_id = f"claude-turn-{uuid.uuid4().hex}"
         self._active_provider_turn_id = provider_turn_id
-        self._active_send_tool_channels.clear()
+        self._active_puffo_tool_calls.clear()
         try:
             return await self._one_turn_inner(user_message, provider_turn_id)
         finally:
             if self._active_provider_turn_id == provider_turn_id:
                 self._active_provider_turn_id = None
-            self._active_send_tool_channels.clear()
+            self._continuation_admissions = [
+                admission
+                for admission in self._continuation_admissions
+                if admission.provider_turn_id != provider_turn_id
+            ]
+            self._active_puffo_tool_calls.clear()
 
     async def _one_turn_inner(
         self,
@@ -1003,12 +1039,16 @@ class ClaudeSession:
                                 "channel": str(tool_input.get("channel", "")),
                                 "root_id": str(tool_input.get("root_id", "")),
                             })
-                        if "send_message" in name:
+                        if name.startswith("mcp__puffo__"):
                             tool_use_id = str(block.get("id") or "")
-                            channel_id = str(tool_input.get("channel") or "")
-                            if tool_use_id and channel_id:
-                                self._active_send_tool_channels[tool_use_id] = (
-                                    channel_id
+                            tool_name = name.removeprefix("mcp__puffo__")
+                            if tool_use_id:
+                                self._active_puffo_tool_calls[tool_use_id] = (
+                                    tool_name,
+                                    {
+                                        str(key): value
+                                        for key, value in tool_input.items()
+                                    },
                                 )
                         if self.audit is not None:
                             self.audit.write(

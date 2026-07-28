@@ -652,6 +652,81 @@ class GlobalInboxRuntime:
     def notify_delivery(self) -> None:
         self.held_recovery_source.notify_delivery()
 
+    async def stage_model_visible_read(
+        self,
+        *,
+        space_id: str,
+        channel_id: str,
+        through_seq: int,
+        through_envelope_id: str,
+        tool_name: str,
+        tool_arguments: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Advance freshness only after the provider admits a read result."""
+        if through_seq < 0:
+            raise RuntimeError("model-visible read sequence must be non-negative")
+        row = await self.store.get_message_by_envelope(through_envelope_id)
+        if (
+            row is None
+            or row.server_seq != through_seq
+            or row.space_id != space_id
+            or row.channel_id != channel_id
+            or row.envelope_kind == "dm"
+        ):
+            raise RuntimeError("model-visible read watermark does not match local storage")
+        active_turn_id = self.active.turn_id
+        provider_session_id = self.active.provider_session_id
+        if not active_turn_id or not provider_session_id:
+            raise RuntimeError("no active provider turn for model-visible read")
+        correlation_key = f"visible_read_{uuid.uuid4().hex}"
+        correlation_receipt = uuid.uuid4().hex
+        fired = False
+
+        async def admit_read(event: ProviderAdmissionEvent) -> None:
+            nonlocal fired
+            if fired or event.planning_cycle_key != correlation_key:
+                return
+            if (
+                self.active.turn_id != active_turn_id
+                or self.active.provider_session_id != provider_session_id
+                or event.provider_session_id != provider_session_id
+            ):
+                raise RuntimeError(
+                    "model-visible read admission crossed the active provider turn"
+                )
+            fired = True
+            await ActiveBoundaryAdapter(
+                self.store, self.active
+            ).advance_active_turn_through_seq(
+                space_id,
+                channel_id,
+                through_seq,
+            )
+
+        register_continuation = getattr(
+            self.adapter, "register_continuation_callback", None
+        )
+        if not callable(register_continuation):
+            raise RuntimeError(
+                "provider cannot correlate model-visible history results"
+            )
+        register_continuation(
+            admit_read,
+            correlation_key,
+            tool_names=(tool_name,),
+            tool_arguments=dict(tool_arguments),
+            correlation_receipt=correlation_receipt,
+        )
+        return {
+            "state": "staged",
+            "correlation_key": correlation_key,
+            "correlation_receipt": correlation_receipt,
+            "space_id": space_id,
+            "channel_id": channel_id,
+            "through_seq": through_seq,
+            "through_envelope_id": through_envelope_id,
+        }
+
     async def run(self) -> None:
         await self.recover_current_turn()
         if self._defer_requeued_resume:

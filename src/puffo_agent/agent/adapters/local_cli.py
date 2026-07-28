@@ -409,7 +409,14 @@ class LocalCLIAdapter(Adapter):
     register_provider_admission_callback = register_admission_callback
 
     def register_continuation_callback(
-        self, callback, planning_cycle_key: str = "", *, channel_id: str = "",
+        self,
+        callback,
+        planning_cycle_key: str = "",
+        *,
+        channel_id: str = "",
+        tool_names: tuple[str, ...] = (),
+        tool_arguments: dict[str, object] | None = None,
+        correlation_receipt: str = "",
     ) -> None:
         delegate = self._context_delegate()
         if delegate is not None and hasattr(
@@ -419,12 +426,18 @@ class LocalCLIAdapter(Adapter):
                 callback,
                 planning_cycle_key,
                 channel_id=channel_id,
+                tool_names=tool_names,
+                tool_arguments=tool_arguments,
+                correlation_receipt=correlation_receipt,
             )
         else:
             super().register_continuation_callback(
                 callback,
                 planning_cycle_key,
                 channel_id=channel_id,
+                tool_names=tool_names,
+                tool_arguments=tool_arguments,
+                correlation_receipt=correlation_receipt,
             )
 
     def _ensure_codex_session(self) -> CodexSession:

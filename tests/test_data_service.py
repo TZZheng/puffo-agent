@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
@@ -17,8 +18,28 @@ from aiohttp.test_utils import TestClient, TestServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.agent.message_store import MessageStore
+from puffo_agent.agent.message_store import MessageStore, ReceiptDisposition
 from puffo_agent.portal import data_service as ds
+
+
+def test_msg_to_dict_accepts_legacy_message_without_server_seq() -> None:
+    legacy = SimpleNamespace(
+        envelope_id="legacy",
+        envelope_kind="channel",
+        sender_slug="alice",
+        recipient_slug=None,
+        channel_id="ch_legacy",
+        space_id="sp_legacy",
+        content_type="text/plain",
+        content="hello",
+        sent_at=1,
+        received_at=2,
+        thread_root_id=None,
+        reply_to_id=None,
+        is_encrypted=True,
+    )
+
+    assert ds._msg_to_dict(legacy)["server_seq"] is None
 
 
 def _isolated_home() -> str:
@@ -39,7 +60,7 @@ async def _seed_agent(home: str, agent_id: str) -> Path:
     db_path = agent_path / "messages.db"
     store = MessageStore(db_path)
     await store.open()
-    await store.store({
+    first = {
         "envelope_id": "msg_aaa",
         "envelope_kind": "channel",
         "sender_slug": "alice",
@@ -48,8 +69,8 @@ async def _seed_agent(home: str, agent_id: str) -> Path:
         "content_type": "text/plain",
         "content": "hello",
         "sent_at": 1700000000_000,
-    })
-    await store.store({
+    }
+    second = {
         "envelope_id": "msg_bbb",
         "envelope_kind": "channel",
         "sender_slug": "bob",
@@ -58,7 +79,14 @@ async def _seed_agent(home: str, agent_id: str) -> Path:
         "content_type": "text/plain",
         "content": "world",
         "sent_at": 1700000001_000,
-    })
+    }
+    for seq, payload in ((11, first), (12, second)):
+        await store.store_receipt(
+            payload,
+            server_seq=seq,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="test",
+        )
     await store.close()
     return db_path
 
@@ -99,7 +127,19 @@ async def test_recent_messages_returns_chronological() -> None:
         body = await resp.json()
         msgs = body["messages"]
         assert [m["envelope_id"] for m in msgs] == ["msg_aaa", "msg_bbb"]
+        assert [m["server_seq"] for m in msgs] == [11, 12]
         assert msgs[0]["sender_slug"] == "alice"
+
+        from puffo_agent.mcp.data_client import DataClient
+
+        data_client = DataClient(
+            str(client.server.make_url("")).rstrip("/"), "agent-data-3",
+        )
+        try:
+            parsed = await data_client.get_channel_history("ch_1", 10)
+            assert [message.server_seq for message in parsed] == [11, 12]
+        finally:
+            await data_client.close()
 
 
 async def _seed_dms(home: str, agent_id: str) -> None:
@@ -157,6 +197,7 @@ async def test_message_by_envelope_returns_single_row() -> None:
         body = await resp.json()
         assert body["message"]["envelope_id"] == "msg_bbb"
         assert body["message"]["content"] == "world"
+        assert body["message"]["server_seq"] == 12
 
 
 @pytest.mark.asyncio

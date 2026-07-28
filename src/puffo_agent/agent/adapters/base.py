@@ -197,6 +197,9 @@ class Adapter(ABC):
         planning_cycle_key: str = "",
         *,
         channel_id: str = "",
+        tool_names: tuple[str, ...] = (),
+        tool_arguments: dict[str, object] | None = None,
+        correlation_receipt: str = "",
     ) -> None:
         """Register model-visible admission for a returned tool result.
 
@@ -204,6 +207,10 @@ class Adapter(ABC):
         provider's concrete tool-result event. The default preserves
         compatibility for adapters without live continuation events.
         """
+        if tool_names or tool_arguments is not None or correlation_receipt:
+            raise RuntimeError(
+                "adapter cannot correlate a concrete provider tool result"
+            )
         self.register_admission_callback(callback, planning_cycle_key)
 
     async def _fire_admission_callback(

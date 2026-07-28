@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.agent.message_store import MessageStore
+from puffo_agent.agent.message_store import MessageStore, ReceiptDisposition
 from puffo_agent.crypto.encoding import base64url_encode
 from puffo_agent.crypto.keystore import KeyStore, Session, StoredIdentity, encode_secret
 from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
@@ -908,6 +908,140 @@ async def test_get_channel_history_from_local():
     assert "bob-0001" in result
     assert "Hello from Alice" in result
     assert "Hello from Bob" in result
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_message_read_tools_stage_highest_model_visible_server_sequence():
+    cfg, _, ms = _setup()
+    base = _now_ms()
+    root = {
+        "envelope_id": "env_root",
+        "envelope_kind": "channel",
+        "sender_slug": "alice-0001",
+        "channel_id": "ch_visible",
+        "space_id": "sp_visible",
+        "content_type": "text/plain",
+        "content": "root body",
+        "sent_at": base,
+    }
+    reply = {
+        "envelope_id": "env_reply",
+        "envelope_kind": "channel",
+        "sender_slug": "bob-0001",
+        "channel_id": "ch_visible",
+        "space_id": "sp_visible",
+        "content_type": "text/plain",
+        "content": "reply body",
+        "sent_at": base + 1,
+        "thread_root_id": "env_root",
+    }
+    for seq, payload in ((41, root), (42, reply)):
+        await ms.store_receipt(
+            payload,
+            server_seq=seq,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="test",
+        )
+
+    class RecordingRpc:
+        def __init__(self):
+            self.calls = []
+
+        async def stage_model_visible_read(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "state": "staged",
+                "correlation_receipt": f"receipt-{len(self.calls)}",
+            }
+
+    rpc = RecordingRpc()
+    cfg.rpc_client = rpc
+    mcp = _build_tools(cfg)
+
+    channel_result = await _call(
+        mcp, "get_channel_history", {"channel": "ch_visible"},
+    )
+    clamped_result = await _call(
+        mcp,
+        "get_channel_history",
+        {"channel": "ch_visible", "limit": 999},
+    )
+    await _call(mcp, "get_thread_history", {"root_id": "env_root"})
+    await _call(mcp, "get_post", {"post_ref": "env_reply"})
+    await _call(
+        mcp,
+        "get_post_segment",
+        {"envelope_id": "env_reply", "segment": 0},
+    )
+
+    assert [
+        (call["tool_name"], call["through_seq"], call["through_envelope_id"])
+        for call in rpc.calls
+    ] == [
+        ("get_channel_history", 41, "env_root"),
+        ("get_channel_history", 41, "env_root"),
+        ("get_thread_history", 42, "env_reply"),
+        ("get_post", 42, "env_reply"),
+        ("get_post_segment", 42, "env_reply"),
+    ]
+    assert [call["tool_arguments"] for call in rpc.calls] == [
+        {"channel": "ch_visible"},
+        {"channel": "ch_visible", "limit": 200},
+        {"root_id": "env_root"},
+        {"post_ref": "env_reply"},
+        {"envelope_id": "env_reply", "segment": 0},
+    ]
+    assert "[puffo:model-visible-read:receipt-1]" in channel_result
+    assert "[puffo:model-visible-read:receipt-2]" in clamped_result
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_dm_and_unsequenced_reads_do_not_stage_channel_freshness():
+    cfg, _, ms = _setup()
+    await ms.store({
+        "envelope_id": "legacy",
+        "envelope_kind": "channel",
+        "sender_slug": "alice-0001",
+        "channel_id": "ch_legacy",
+        "space_id": "sp_legacy",
+        "content_type": "text/plain",
+        "content": "legacy body",
+        "sent_at": _now_ms(),
+    })
+    await ms.store_receipt(
+        {
+            "envelope_id": "dm_9",
+            "envelope_kind": "dm",
+            "sender_slug": "alice-0001",
+            "recipient_slug": "agent-0001",
+            "content_type": "text/plain",
+            "content": "private",
+            "sent_at": _now_ms() + 1,
+        },
+        server_seq=43,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+
+    class RecordingRpc:
+        def __init__(self):
+            self.calls = []
+
+        async def stage_model_visible_read(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "state": "staged",
+                "correlation_receipt": f"receipt-{len(self.calls)}",
+            }
+
+    rpc = RecordingRpc()
+    cfg.rpc_client = rpc
+    mcp = _build_tools(cfg)
+    await _call(mcp, "get_post", {"post_ref": "legacy"})
+    await _call(mcp, "get_post", {"post_ref": "dm_9"})
+    assert rpc.calls == []
     await ms.close()
 
 

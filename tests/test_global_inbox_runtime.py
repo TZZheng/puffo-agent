@@ -1026,6 +1026,87 @@ async def test_baseline_boundary_stateless_and_same_channel_advance(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_model_visible_read_advances_only_after_exact_tool_result_admission(
+    tmp_path,
+):
+    store = await make_store(tmp_path)
+    await receipt(store, "history-2", 2)
+
+    class ContinuationAdapter(Adapter):
+        def __init__(self):
+            super().__init__()
+            self.continuations = []
+
+        def register_continuation_callback(
+            self,
+            callback,
+            planning_cycle_key="",
+            *,
+            channel_id="",
+            tool_names=(),
+            tool_arguments=None,
+            correlation_receipt="",
+        ):
+            self.continuations.append((
+                callback,
+                planning_cycle_key,
+                channel_id,
+                tool_names,
+                tool_arguments,
+                correlation_receipt,
+            ))
+
+        async def admit_continuation(self):
+            callback, key, *_ = self.continuations.pop(0)
+            await callback(ProviderAdmissionEvent(
+                planning_cycle_key=key,
+                provider_session_id="provider-1",
+                provider_turn_id="provider-turn",
+                admitted_at=datetime.now(timezone.utc),
+            ))
+
+    adapter = ContinuationAdapter()
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.active.turn_id = "turn"
+    runtime.active.provider_session_id = "provider-1"
+    boundary = ActiveBoundaryAdapter(store, runtime.active)
+
+    result = await runtime.stage_model_visible_read(
+        space_id="sp-1",
+        channel_id="ch-1",
+        through_seq=2,
+        through_envelope_id="history-2",
+        tool_name="get_channel_history",
+        tool_arguments={"channel": "ch-1"},
+    )
+
+    assert result["state"] == "staged"
+    assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") is None
+    assert adapter.continuations[0][3] == ("get_channel_history",)
+    assert adapter.continuations[0][4] == {"channel": "ch-1"}
+    assert adapter.continuations[0][5] == result["correlation_receipt"]
+
+    await adapter.admit_continuation()
+    assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 2
+
+    with pytest.raises(RuntimeError, match="does not match local storage"):
+        await runtime.stage_model_visible_read(
+            space_id="sp-1",
+            channel_id="ch-1",
+            through_seq=3,
+            through_envelope_id="history-2",
+            tool_name="get_channel_history",
+            tool_arguments={"channel": "ch-1"},
+        )
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_held_and_attachment_send_attempts_are_tracked():
     class Coordinator:
         async def send(self, request=None, **kwargs):

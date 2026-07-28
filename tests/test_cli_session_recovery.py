@@ -311,6 +311,246 @@ def test_held_continuations_match_tool_results_in_same_claude_turn(tmp_path):
     assert initial_event.provider_turn_id.startswith("claude-turn-")
 
 
+def test_history_continuation_matches_exact_claude_tool_result(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    admitted = []
+
+    def encode(event):
+        return (json.dumps(event) + "\n").encode()
+
+    def result(tool_use_id, receipt, *, is_error=False):
+        return {
+            "type": "user",
+            "session_id": "sess-history",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "is_error": is_error,
+                    "content": (
+                        "history\n[puffo:model-visible-read:"
+                        f"{receipt}]"
+                    ),
+                }],
+            },
+        }
+
+    async def initial(event):
+        admitted.append(("initial", event))
+
+        async def continuation_a(admission):
+            admitted.append(("a", admission))
+
+        async def continuation_b(admission):
+            admitted.append(("b", admission))
+
+        async def continuation_failed(admission):
+            admitted.append(("failed", admission))
+
+        async def continuation_clamped(admission):
+            admitted.append(("clamped", admission))
+
+        session.register_continuation_callback(
+            continuation_a,
+            "visible-read-a",
+            tool_names=("get_channel_history",),
+            tool_arguments={"channel": "ch-a"},
+            correlation_receipt="receipt-a",
+        )
+        session.register_continuation_callback(
+            continuation_b,
+            "visible-read-b",
+            tool_names=("get_channel_history",),
+            tool_arguments={"channel": "ch-a"},
+            correlation_receipt="receipt-b",
+        )
+        session.register_continuation_callback(
+            continuation_failed,
+            "visible-read-failed",
+            tool_names=("get_channel_history",),
+            tool_arguments={"channel": "ch-a"},
+            correlation_receipt="receipt-failed",
+        )
+        session.register_continuation_callback(
+            continuation_clamped,
+            "visible-read-clamped",
+            tool_names=("get_channel_history",),
+            tool_arguments={"channel": "ch-a", "limit": 999},
+            correlation_receipt="receipt-clamped",
+        )
+
+    tool_uses = {
+        "type": "assistant",
+        "session_id": "sess-history",
+        "message": {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": call_id,
+                    "name": "mcp__puffo__get_channel_history",
+                    "input": arguments,
+                }
+                for call_id, arguments in (
+                    ("read-a", {"channel": "ch-a"}),
+                    ("read-b", {"channel": "ch-a"}),
+                    ("read-failed", {"channel": "ch-a"}),
+                    ("read-clamped", {"channel": "ch-a", "limit": 200}),
+                )
+            ],
+        },
+    }
+    lines = [
+        encode({"type": "system", "subtype": "init", "session_id": "sess-history"}),
+        encode(tool_uses),
+        encode({
+            "type": "assistant",
+            "session_id": "sess-history",
+            "message": {"content": [{
+                "type": "tool_use",
+                "id": "wrong-tool",
+                "name": "mcp__puffo__get_post",
+                "input": {"post_ref": "ch-a"},
+            }]},
+        }),
+        encode(result("wrong-tool", "receipt-b")),
+        encode(result("read-b", "receipt-b")),
+        encode(result("read-failed", "receipt-failed", is_error=True)),
+        encode(result("read-clamped", "receipt-clamped")),
+        encode(result("read-a", "receipt-a")),
+        encode({
+            "type": "result",
+            "subtype": "success",
+            "session_id": "sess-history",
+            "usage": {"input_tokens": 1},
+        }),
+    ]
+
+    async def drive():
+        session.register_admission_callback(initial, "initial")
+        session._proc = _FakeProc(stdout_lines=lines)
+        return await session._one_turn("hello")
+
+    asyncio.run(drive())
+    assert [kind for kind, _event in admitted] == [
+        "initial",
+        "b",
+        "clamped",
+        "a",
+    ]
+    assert {
+        event.provider_turn_id for _, event in admitted
+    } == {admitted[0][1].provider_turn_id}
+    assert session._continuation_admissions == []
+
+    with pytest.raises(RuntimeError, match="no active Claude provider turn"):
+        session.register_continuation_callback(
+            lambda _event: None,
+            "late-visible-read",
+            tool_names=("get_channel_history",),
+            tool_arguments={"channel": "ch-a"},
+            correlation_receipt="receipt-late",
+        )
+
+
+def test_claude_turn_end_discards_old_history_continuation(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    admitted = []
+
+    def encode(event):
+        return (json.dumps(event) + "\n").encode()
+
+    async def old_initial(_event):
+        async def old_continuation(_admission):
+            admitted.append("old")
+
+        session.register_continuation_callback(
+            old_continuation,
+            "old",
+            tool_names=("get_channel_history",),
+            tool_arguments={"channel": "ch-a"},
+            correlation_receipt="old-receipt",
+        )
+
+    async def new_initial(_event):
+        async def new_continuation(_admission):
+            admitted.append("new")
+
+        session.register_continuation_callback(
+            new_continuation,
+            "new",
+            tool_names=("get_channel_history",),
+            tool_arguments={"channel": "ch-a"},
+            correlation_receipt="new-receipt",
+        )
+
+    async def drive():
+        session.register_admission_callback(old_initial, "first")
+        session._proc = _FakeProc(stdout_lines=[
+            encode({"type": "system", "session_id": "sess-history"}),
+            encode({
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess-history",
+            }),
+        ])
+        await session._one_turn("first")
+        assert session._continuation_admissions == []
+
+        session.register_admission_callback(new_initial, "second")
+        session._proc = _FakeProc(stdout_lines=[
+            encode({"type": "system", "session_id": "sess-history"}),
+                encode({
+                    "type": "assistant",
+                    "session_id": "sess-history",
+                    "message": {"content": [
+                        {
+                            "type": "tool_use",
+                            "id": "stale-call",
+                            "name": "mcp__puffo__get_channel_history",
+                            "input": {"channel": "ch-a"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "new-call",
+                            "name": "mcp__puffo__get_channel_history",
+                            "input": {"channel": "ch-a"},
+                        },
+                    ]},
+                }),
+                encode({
+                    "type": "user",
+                    "session_id": "sess-history",
+                    "message": {"content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "stale-call",
+                        "content": (
+                            "[puffo:model-visible-read:old-receipt]"
+                        ),
+                }]},
+            }),
+            encode({
+                "type": "user",
+                "session_id": "sess-history",
+                "message": {"content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "new-call",
+                    "content": (
+                        "[puffo:model-visible-read:new-receipt]"
+                    ),
+                }]},
+            }),
+            encode({
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess-history",
+            }),
+        ])
+        await session._one_turn("second")
+
+    asyncio.run(drive())
+    assert admitted == ["new"]
+
+
 def test_compact_unsupported_without_text_frame_and_rollover_clears(tmp_path):
     session = _make_session(tmp_path, audit=False)
     session._save_session_id("sess-roll")

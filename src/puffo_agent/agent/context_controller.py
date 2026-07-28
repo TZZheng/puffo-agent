@@ -10,10 +10,11 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
+from typing import Any, Awaitable, Callable, Mapping, Protocol, runtime_checkable
 
 
 FALLBACK_CONTEXT_WINDOW = 200_000
+MODEL_VISIBLE_READ_RECEIPT_PREFIX = "puffo:model-visible-read:"
 SOFT_TARGET_FRACTION = 0.5
 
 
@@ -115,6 +116,74 @@ class ProviderAdmissionEvent:
 
 AdmissionCallback = Callable[[ProviderAdmissionEvent], Awaitable[None]]
 ReplanCallback = Callable[[AdmissionCandidate], Awaitable[AdmissionCandidate]]
+
+
+@dataclass(frozen=True)
+class ToolResultAdmission:
+    """One callback correlated to a concrete provider tool result."""
+
+    callback: AdmissionCallback
+    planning_cycle_key: str
+    provider_turn_id: str
+    channel_id: str = ""
+    tool_names: frozenset[str] = frozenset()
+    tool_arguments: tuple[tuple[str, str], ...] = ()
+    correlation_receipt: str = ""
+
+    @classmethod
+    def build(
+        cls,
+        callback: AdmissionCallback,
+        planning_cycle_key: str,
+        provider_turn_id: str,
+        *,
+        channel_id: str = "",
+        tool_names: tuple[str, ...] = (),
+        tool_arguments: Mapping[str, Any] | None = None,
+        correlation_receipt: str = "",
+    ) -> "ToolResultAdmission":
+        encoded_arguments = tuple(
+            sorted(
+                (
+                    str(key),
+                    repr(value),
+                )
+                for key, value in (tool_arguments or {}).items()
+            )
+        )
+        return cls(
+            callback=callback,
+            planning_cycle_key=planning_cycle_key,
+            provider_turn_id=provider_turn_id,
+            channel_id=channel_id,
+            tool_names=frozenset(name for name in tool_names if name),
+            tool_arguments=encoded_arguments,
+            correlation_receipt=correlation_receipt,
+        )
+
+    @property
+    def receipt_marker(self) -> str:
+        if not self.correlation_receipt:
+            return ""
+        return (
+            f"[{MODEL_VISIBLE_READ_RECEIPT_PREFIX}"
+            f"{self.correlation_receipt}]"
+        )
+
+    def matches(self, tool_name: str, arguments: Mapping[str, Any]) -> bool:
+        if self.tool_names and tool_name not in self.tool_names:
+            return False
+        if self.channel_id and str(arguments.get("channel") or "") != self.channel_id:
+            return False
+        return all(
+            key in arguments and repr(arguments[key]) == expected
+            for key, expected in self.tool_arguments
+        )
+
+    @property
+    def match_specificity(self) -> int:
+        """Prefer the most constrained admission when argument subsets overlap."""
+        return len(self.tool_arguments) + int(bool(self.channel_id))
 
 
 @runtime_checkable

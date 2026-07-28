@@ -359,6 +359,7 @@ def _msg_to_dict(m: Any) -> dict[str, Any]:
         "thread_root_id": m.thread_root_id,
         "reply_to_id": m.reply_to_id,
         "is_encrypted": m.is_encrypted,
+        "server_seq": getattr(m, "server_seq", None),
     }
 
 

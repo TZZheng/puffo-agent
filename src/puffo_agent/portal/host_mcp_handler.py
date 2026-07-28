@@ -544,6 +544,30 @@ async def send_message(
     return result
 
 
+async def stage_model_visible_read(
+    ctx: HostMcpContext,
+    *,
+    space_id: str,
+    channel_id: str,
+    through_seq: int,
+    through_envelope_id: str,
+    tool_name: str,
+    tool_arguments: dict[str, object],
+) -> dict[str, Any]:
+    """Correlate a local-history tool result with the live provider turn."""
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global message runtime is unavailable")
+    return await runtime.stage_model_visible_read(
+        space_id=space_id,
+        channel_id=channel_id,
+        through_seq=through_seq,
+        through_envelope_id=through_envelope_id,
+        tool_name=tool_name,
+        tool_arguments=tool_arguments,
+    )
+
+
 async def request_command_permission(
     ctx: HostMcpContext,
     *,

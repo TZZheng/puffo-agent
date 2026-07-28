@@ -118,6 +118,21 @@ _SEND_BODY_KEYS = frozenset({
     "visibility_level", "send_anyway",
 })
 
+_MODEL_VISIBLE_READ_BODY_KEYS = frozenset({
+    "space_id",
+    "channel_id",
+    "through_seq",
+    "through_envelope_id",
+    "tool_name",
+    "tool_arguments",
+})
+_MODEL_VISIBLE_READ_TOOLS = frozenset({
+    "get_channel_history",
+    "get_thread_history",
+    "get_post",
+    "get_post_segment",
+})
+
 
 async def send_message_route(request: web.Request) -> web.Response:
     """Strict structured semantic send RPC.
@@ -194,6 +209,95 @@ async def send_message_route(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def stage_model_visible_read_route(request: web.Request) -> web.Response:
+    """Stage a trusted local-history watermark for provider admission."""
+    agent_id = request.match_info["agent_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    if not isinstance(body, dict):
+        return web.json_response(
+            {"error": "body must be a JSON object"}, status=400,
+        )
+    unknown = set(body) - _MODEL_VISIBLE_READ_BODY_KEYS
+    if unknown:
+        return web.json_response(
+            {
+                "error": "unknown model-visible read field(s): "
+                + ", ".join(sorted(unknown))
+            },
+            status=400,
+        )
+    for key in (
+        "space_id",
+        "channel_id",
+        "through_envelope_id",
+        "tool_name",
+    ):
+        if not isinstance(body.get(key), str) or not body[key].strip():
+            return web.json_response(
+                {"error": f"{key} is required"}, status=400,
+            )
+    if (
+        not isinstance(body.get("through_seq"), int)
+        or isinstance(body["through_seq"], bool)
+        or body["through_seq"] < 0
+    ):
+        return web.json_response(
+            {"error": "through_seq must be a non-negative integer"},
+            status=400,
+        )
+    if body["tool_name"] not in _MODEL_VISIBLE_READ_TOOLS:
+        return web.json_response(
+            {"error": "tool_name is not a model-visible message read"},
+            status=400,
+        )
+    tool_arguments = body.get("tool_arguments")
+    if not isinstance(tool_arguments, dict) or not all(
+        isinstance(key, str)
+        and (
+            value is None
+            or isinstance(value, (str, int, float, bool))
+        )
+        for key, value in tool_arguments.items()
+    ):
+        return web.json_response(
+            {"error": "tool_arguments must contain scalar JSON values"},
+            status=400,
+        )
+
+    resolver = _RPC_RESOLVER
+    if resolver is None:
+        return web.json_response({"error": "rpc resolver not wired"}, status=503)
+    ctx = resolver(agent_id)
+    if ctx is None:
+        return web.json_response(
+            {"error": f"no warm worker for agent_id {agent_id!r}"}, status=404,
+        )
+    try:
+        result = await host_mcp_handler.stage_model_visible_read(
+            ctx,
+            space_id=body["space_id"],
+            channel_id=body["channel_id"],
+            through_seq=body["through_seq"],
+            through_envelope_id=body["through_envelope_id"],
+            tool_name=body["tool_name"],
+            tool_arguments=tool_arguments,
+        )
+    except RuntimeError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        logger.exception(
+            "rpc-service: model-visible read staging raised for agent=%s",
+            agent_id,
+        )
+        return web.json_response(
+            {"error": f"handler raised: {exc}"}, status=500,
+        )
+    return web.json_response(result)
+
+
 def build_app(cfg: RpcServiceConfig) -> web.Application:
     app = web.Application()
     app.router.add_post(
@@ -215,6 +319,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/send-message",
         send_message_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/model-visible-read",
+        stage_model_visible_read_route,
     )
     return app
 

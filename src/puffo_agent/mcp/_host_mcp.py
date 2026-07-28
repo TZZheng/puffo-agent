@@ -140,6 +140,58 @@ class PuffoRpcClient:
             body["text"] = text
         return await self._post_structured("send-message", body)
 
+    async def stage_model_visible_read(
+        self,
+        *,
+        space_id: str,
+        channel_id: str,
+        through_seq: int,
+        through_envelope_id: str,
+        tool_name: str,
+        tool_arguments: dict[str, object],
+    ) -> dict[str, Any]:
+        body = {
+            "space_id": space_id,
+            "channel_id": channel_id,
+            "through_seq": through_seq,
+            "through_envelope_id": through_envelope_id,
+            "tool_name": tool_name,
+            "tool_arguments": tool_arguments,
+        }
+        path = (
+            f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/"
+            "model-visible-read"
+        )
+        session = await self._get_session()
+        try:
+            async with session.post(f"{self.base_url}{path}", json=body) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    raw = await resp.text()
+                    raise RuntimeError(
+                        "rpc model-visible-read returned non-JSON body "
+                        f"(status {resp.status}): {raw[:500]}"
+                    )
+                if resp.status >= 400:
+                    error = data.get("error") if isinstance(data, dict) else None
+                    raise RuntimeError(
+                        str(
+                            error
+                            or "rpc model-visible-read failed with "
+                            f"status {resp.status}"
+                        )
+                    )
+                if not isinstance(data, dict) or data.get("state") != "staged":
+                    raise RuntimeError(
+                        "rpc model-visible-read returned an invalid result"
+                    )
+                return data
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(
+                f"rpc model-visible-read transport error: {exc}"
+            ) from exc
+
     async def install_mcp(
         self,
         *,

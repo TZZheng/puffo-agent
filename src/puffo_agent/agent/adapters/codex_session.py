@@ -58,6 +58,7 @@ from ..context_controller import (
     ContextSnapshot,
     ProviderAdmissionEvent,
     RolloverResult,
+    ToolResultAdmission,
     normalize_context_snapshot,
 )
 
@@ -299,9 +300,7 @@ class CodexSession:
         self._pending_compact: _PendingCompact | None = None
         self._admission_callback: AdmissionCallback | None = None
         self._admission_planning_cycle_key: str = ""
-        self._continuation_admissions: list[
-            tuple[AdmissionCallback, str, str, str]
-        ] = []
+        self._continuation_admissions: list[ToolResultAdmission] = []
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -402,6 +401,7 @@ class CodexSession:
                     # below so the worker's error path still logs.
                     turn_failed_exc = exc
         finally:
+            self._discard_turn_continuations(turn.provider_turn_id)
             self._active_turn = None
 
         if turn_failed_exc is not None:
@@ -527,6 +527,9 @@ class CodexSession:
         planning_cycle_key: str = "",
         *,
         channel_id: str = "",
+        tool_names: tuple[str, ...] = (),
+        tool_arguments: dict[str, object] | None = None,
+        correlation_receipt: str = "",
     ) -> None:
         if callback is None:
             self._continuation_admissions.clear()
@@ -534,11 +537,32 @@ class CodexSession:
         turn = self._active_turn
         provider_turn_id = turn.provider_turn_id if turn is not None else None
         if turn is None or not provider_turn_id:
+            if tool_names or tool_arguments is not None or correlation_receipt:
+                raise RuntimeError(
+                    "no active Codex provider turn for tool-result admission"
+                )
             self.register_admission_callback(callback, planning_cycle_key)
             return
         self._continuation_admissions.append(
-            (callback, planning_cycle_key, provider_turn_id, channel_id)
+            ToolResultAdmission.build(
+                callback,
+                planning_cycle_key,
+                provider_turn_id,
+                channel_id=channel_id,
+                tool_names=tool_names or tuple(_PUFFO_SEND_MESSAGE_TOOLS),
+                tool_arguments=tool_arguments,
+                correlation_receipt=correlation_receipt,
+            )
         )
+
+    def _discard_turn_continuations(self, provider_turn_id: str | None) -> None:
+        if not provider_turn_id:
+            return
+        self._continuation_admissions = [
+            admission
+            for admission in self._continuation_admissions
+            if admission.provider_turn_id != provider_turn_id
+        ]
 
     async def _fire_admission(self, provider_turn_id: str | None) -> None:
         callback = self._admission_callback
@@ -1329,6 +1353,7 @@ class CodexSession:
             await self._handle_item_event(m, params, turn)
             return
         if m.startswith("turn/completed") and turn is not None:
+            self._discard_turn_continuations(turn.provider_turn_id)
             self._absorb_turn_usage(turn, params)
             if not turn.completed.done():
                 turn.completed.set_result(None)
@@ -1336,6 +1361,7 @@ class CodexSession:
         # turn/failed OR top-level error, depending on where it failed; both
         # are turn-fatal, else the turn times out into "no reply".
         if (m == "error" or m.startswith("turn/failed")) and turn is not None:
+            self._discard_turn_continuations(turn.provider_turn_id)
             err = (params or {}).get("error") or params or "(no detail)"
             # error wraps the upstream JSON-as-string under params.error.message;
             # unwrap for a readable reason.
@@ -1365,44 +1391,49 @@ class CodexSession:
             and (not turn_id or turn_id == expected_turn)
             and kind == "mcptoolcall"
             and server == "puffo"
-            and tool in _PUFFO_SEND_MESSAGE_TOOLS
             and status == "completed"
         ):
+            return
+        arguments = item.get("arguments") or {}
+        if not isinstance(arguments, dict):
             return
         serialized = json.dumps(item, sort_keys=True, default=str)
         exact = next(
             (
                 index
-                for index, (_callback, key, admission_turn, _channel) in enumerate(
-                    self._continuation_admissions
+                for index, admission in enumerate(self._continuation_admissions)
+                if admission.provider_turn_id == expected_turn
+                and admission.receipt_marker
+                and admission.receipt_marker in serialized
+                and (
+                    not admission.tool_names
+                    or tool in admission.tool_names
                 )
-                if admission_turn == expected_turn and key and key in serialized
             ),
             None,
         )
-        channel_id = str((item.get("arguments") or {}).get("channel") or "")
         matched = exact
-        if matched is None and channel_id:
-            matched = next(
-                (
-                    index
-                    for index, (
-                        _callback,
-                        _key,
-                        admission_turn,
-                        channel,
-                    ) in enumerate(self._continuation_admissions)
-                    if admission_turn == expected_turn and channel == channel_id
-                ),
-                None,
-            )
+        if matched is None:
+            candidates = [
+                index
+                for index, admission in enumerate(self._continuation_admissions)
+                if admission.provider_turn_id == expected_turn
+                and not admission.correlation_receipt
+                and admission.matches(tool, arguments)
+            ]
+            if candidates:
+                matched = max(
+                    candidates,
+                    key=lambda index: (
+                        self._continuation_admissions[index].match_specificity,
+                        -index,
+                    ),
+                )
         if matched is None:
             return
-        callback, key, _turn_id, _channel = self._continuation_admissions.pop(
-            matched
-        )
-        await callback(ProviderAdmissionEvent(
-            planning_cycle_key=key,
+        admission = self._continuation_admissions.pop(matched)
+        await admission.callback(ProviderAdmissionEvent(
+            planning_cycle_key=admission.planning_cycle_key,
             provider_session_id=self.get_provider_session_id(),
             provider_turn_id=expected_turn,
             admitted_at=datetime.now(timezone.utc),
