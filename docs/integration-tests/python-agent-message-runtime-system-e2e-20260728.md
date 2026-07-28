@@ -20,6 +20,22 @@ The Web, Server, daemon, PostgreSQL database, encrypted WebSocket clients,
 SQLite stores, and Codex sessions were all running as separate real
 components.
 
+### Web harness note
+
+The isolated Web checkout had three uncommitted compatibility overrides so it
+could target the test Python daemon on port `63389` while unrelated local
+production daemons continued using `63387` and `63388`:
+
+- Agent-core discovery candidates were limited to the test port.
+- The bridge default was changed from `63387` to `63389`.
+- A non-agent-core `/v1/info` response was classified as the Python runtime.
+
+These overrides did not alter message content, Server coordination, WebSocket
+delivery, SQLite processing, or provider behavior. They are nevertheless part
+of the test harness and are not included in either feature PR. Cloud staging
+must provide equivalent supported configuration or land a separate Web
+compatibility change before this run can be reproduced there.
+
 ## Deployed topology
 
 ```mermaid
@@ -205,4 +221,6 @@ This run used an isolated local deployment and real Codex sessions. It did not
 exercise Claude continuation, forced WebSocket loss with signed catch-up, a
 cloud staging deployment, or a provider crash during a held continuation.
 Those remain separate deployment scenarios; they do not weaken the observed
-same-channel counting and stale-override results.
+same-channel counting and stale-override results. The local Web harness
+overrides described above also need a supported configuration or tracked Web
+change before cloud staging.
