@@ -95,6 +95,7 @@ class SendResult:
     seen_seq: Optional[int] = None
     latest_seq: Optional[int] = None
     latest_envelope_id: Optional[str] = None
+    latest_seq_before_send: Optional[int] = None
     missing_devices: list[str] = field(default_factory=list)
     recovered_messages: list[dict[str, Any]] = field(default_factory=list)
     error: Optional[str] = None
@@ -383,9 +384,15 @@ class SendCoordinator:
         self, request: SemanticSendRequest, space_id: str, channel_id: str,
     ) -> dict[str, Any]:
         baseline = await self._baseline(space_id, channel_id)
+        if baseline is None:
+            # No trusted visibility floor is a valid conservative state. Zero
+            # claims no inaccessible history as model-visible; the Server can
+            # hold the attempt, and the model can independently reconsider or
+            # choose send_anyway.
+            baseline = 0
         if isinstance(baseline, bool) or not isinstance(baseline, int) or baseline < 0:
             return failed_result(
-                "context baseline unavailable for channel send",
+                "context baseline is invalid for channel send",
                 kind="freshness_unavailable",
             )
         active = await self._active_boundary(space_id, channel_id)
@@ -420,17 +427,31 @@ class SendCoordinator:
         response = await self._post_channel_exact(body)
         result = self._validate_channel_response(response, envelope, freshness)
         action = "uploaded" if request.attachment_paths else "posted"
-        result.note = (
-            f"{action} {envelope.get('envelope_id', '?')} to {request.destination}"
-            f"{resolved['note']}"
-        )
         if result.state == "sent":
-            await self._advance(space_id, channel_id, result.seq)  # type: ignore[arg-type]
+            result.note = (
+                f"{action} {envelope.get('envelope_id', '?')} to "
+                f"{request.destination}{resolved['note']}"
+            )
+            # A stale send_anyway may cross messages this turn has not seen.
+            # The outbound itself is visible, but the boundary is contiguous,
+            # so it can advance only when there was no intervening gap.
+            if result.latest_seq_before_send == result.seen_seq:
+                await self._advance(
+                    space_id, channel_id, result.seq  # type: ignore[arg-type]
+                )
             if result.missing_devices:
                 asyncio.create_task(self._supplement_channel(
                     envelope, content_key, resolved["recipient_slugs"],
                     result.missing_devices, freshness,
                 ))
+        elif result.state == "held":
+            result.note = (
+                "No message was sent because the channel advanced beyond this "
+                "turn's visible boundary. Newer context is returned when "
+                "available. You can decide whether to send revised content, "
+                "send the chosen content with send_anyway=true, or leave it "
+                f"unsent.{resolved['note']}"
+            )
         return result.to_dict()
 
     async def _post_channel_exact(self, body: dict[str, Any]) -> Any:
@@ -540,7 +561,11 @@ class SendCoordinator:
             return SendResult(
                 state="sent", envelope_id=str(envelope_id), seq=seq, replay=replay,
                 context_baseline_seq=freshness["context_baseline_seq"],
-                seen_seq=freshness["seen_seq"], missing_devices=missing,
+                seen_seq=freshness["seen_seq"],
+                latest_seq_before_send=(
+                    latest_before if response_freshness is not None else None
+                ),
+                missing_devices=missing,
             )
 
         values = {"seen_seq": raw.get("seen_seq"), "latest_seq": raw.get("latest_seq")}

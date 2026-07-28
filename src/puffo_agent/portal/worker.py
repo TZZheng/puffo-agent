@@ -1413,6 +1413,7 @@ class Worker:
             adapter=self._adapter,
             run_turn=run_global_turn,
             workspace=workspace_path,
+            held_catchup=client.recover_pending_delivery,
         )
         coordinator = SendCoordinator(
             slug=client.slug,

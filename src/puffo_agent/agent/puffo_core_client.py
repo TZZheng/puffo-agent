@@ -802,10 +802,18 @@ class PuffoCoreMessageClient:
                         and result.status is ReceiptWriteStatus.COMMITTED
                     ):
                         runtime.notify()
-                return (
-                    TransportOutcome.ACK
-                    if result.acknowledge else TransportOutcome.HOLD
-                )
+                if result.acknowledge:
+                    return TransportOutcome.ACK
+                if (
+                    result.disposition is ReceiptDisposition.FOREIGN_DM_GATED
+                    and result.status
+                    in (
+                        ReceiptWriteStatus.COMMITTED,
+                        ReceiptWriteStatus.IDEMPOTENT,
+                    )
+                ):
+                    return TransportOutcome.DEFER
+                return TransportOutcome.HOLD
             # Blocked sender's DM: ack-and-drop before persistence.
             if (
                 payload.envelope_kind == "dm"
@@ -1095,6 +1103,12 @@ class PuffoCoreMessageClient:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+
+    async def recover_pending_delivery(self, envelope_id: str) -> bool:
+        """Fetch a late held watermark through the signed pending path."""
+        if self._bridge is not None or self._ws is None:
+            return False
+        return await self._ws.recover_pending_until(envelope_id)
 
     async def _listen_bridge(
         self, legacy_test_callback: Callable[..., Any] | None = None,

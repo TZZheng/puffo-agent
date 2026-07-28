@@ -99,7 +99,7 @@ async def test_exact_rust_request_shape_and_send_anyway():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("baseline", [None, -1, "2", True])
+@pytest.mark.parametrize("baseline", [-1, "2", True])
 async def test_baseline_invalid_fails_without_send(baseline):
     coordinator, _, http = await coordinator_fixture(baseline=baseline)
     result = await coordinator.send(
@@ -108,6 +108,24 @@ async def test_baseline_invalid_fails_without_send(baseline):
     assert result["state"] == "failed"
     assert result["attempted"] is True
     assert not [call for call in http.calls if call[0].startswith("POST")]
+
+
+@pytest.mark.asyncio
+async def test_missing_baseline_defaults_to_zero_and_active_turn_advances_seen():
+    coordinator, _, http = await coordinator_fixture(baseline=None, active=7)
+    result = await coordinator.send(
+        SemanticSendRequest(destination="ch_a", text="hello"),
+    )
+    assert result["state"] == "sent"
+    body = [
+        body for method, path, body in http.calls
+        if method == "POST" and path == CHANNEL_SEND_PATH
+    ][-1]
+    assert body["freshness"] == {
+        "context_baseline_seq": 0,
+        "seen_seq": 7,
+        "mode": "require_current",
+    }
 
 
 @pytest.mark.asyncio

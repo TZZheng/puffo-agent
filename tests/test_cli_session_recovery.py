@@ -242,6 +242,75 @@ def test_admission_waits_for_first_valid_post_write_provider_event(tmp_path):
     assert events[0].provider_session_id == "sess-admitted"
 
 
+def test_held_continuations_match_tool_results_in_same_claude_turn(tmp_path):
+    lines = [
+        b'{"type":"system","subtype":"init","session_id":"sess-held"}\n',
+        b'{"type":"system","subtype":"status","session_id":"sess-held"}\n',
+        (
+            b'{"type":"assistant","session_id":"sess-held","message":{"content":'
+            b'[{"type":"tool_use","id":"send-1","name":"mcp__puffo__send_message",'
+            b'"input":{"channel":"ch-a","text":"a"}},'
+            b'{"type":"tool_use","id":"send-2","name":"mcp__puffo__send_message",'
+            b'"input":{"channel":"ch-b","text":"b"}}]}}\n'
+        ),
+        (
+            b'{"type":"user","session_id":"sess-held","message":{"content":'
+            b'[{"type":"tool_result","tool_use_id":"unrelated","content":"ok"}]}}\n'
+        ),
+        (
+            b'{"type":"user","session_id":"sess-held","message":{"content":'
+            b'[{"type":"tool_result","tool_use_id":"send-2","content":"held-b"}]}}\n'
+        ),
+        (
+            b'{"type":"user","session_id":"sess-held","message":{"content":'
+            b'[{"type":"tool_result","tool_use_id":"send-1","content":"held-a"}]}}\n'
+        ),
+        (
+            b'{"type":"result","subtype":"success","session_id":"sess-held",'
+            b'"usage":{"input_tokens":1}}\n'
+        ),
+    ]
+    session = _make_session(tmp_path, audit=False)
+    admitted = []
+
+    async def continuation_a(event):
+        admitted.append(("continuation-a", event))
+
+    async def continuation_b(event):
+        admitted.append(("continuation-b", event))
+
+    async def initial(event):
+        admitted.append(("initial", event))
+        session.register_continuation_callback(
+            continuation_a, "held-continuation-a", channel_id="ch-a",
+        )
+        session.register_continuation_callback(
+            continuation_b, "held-continuation-b", channel_id="ch-b",
+        )
+
+    async def drive():
+        session.register_admission_callback(initial, "initial")
+        session._proc = _FakeProc(stdout_lines=lines)
+        return await session._one_turn("hello")
+
+    asyncio.run(drive())
+    assert [kind for kind, _event in admitted] == [
+        "initial", "continuation-b", "continuation-a",
+    ]
+    initial_event = admitted[0][1]
+    continuation_b_event = admitted[1][1]
+    continuation_a_event = admitted[2][1]
+    assert initial_event.planning_cycle_key == "initial"
+    assert continuation_b_event.planning_cycle_key == "held-continuation-b"
+    assert continuation_a_event.planning_cycle_key == "held-continuation-a"
+    assert {
+        initial_event.provider_turn_id,
+        continuation_a_event.provider_turn_id,
+        continuation_b_event.provider_turn_id,
+    } == {initial_event.provider_turn_id}
+    assert initial_event.provider_turn_id.startswith("claude-turn-")
+
+
 def test_compact_unsupported_without_text_frame_and_rollover_clears(tmp_path):
     session = _make_session(tmp_path, audit=False)
     session._save_session_id("sess-roll")

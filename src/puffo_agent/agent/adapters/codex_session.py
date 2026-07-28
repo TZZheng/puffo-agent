@@ -299,8 +299,9 @@ class CodexSession:
         self._pending_compact: _PendingCompact | None = None
         self._admission_callback: AdmissionCallback | None = None
         self._admission_planning_cycle_key: str = ""
-        self._admission_is_continuation: bool = False
-        self._admission_turn_id: str | None = None
+        self._continuation_admissions: list[
+            tuple[AdmissionCallback, str, str, str]
+        ] = []
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -515,24 +516,35 @@ class CodexSession:
     ) -> None:
         self._admission_callback = callback
         self._admission_planning_cycle_key = planning_cycle_key
-        # Registration during an already-running turn represents acceptance of
-        # a newly supplied tool result, not the initial user-input boundary.
-        self._admission_is_continuation = callback is not None and self._active_turn is not None
-        self._admission_turn_id = (
-            self._active_turn.provider_turn_id
-            if self._admission_is_continuation and self._active_turn is not None
-            else None
-        )
+        if callback is None:
+            self._continuation_admissions.clear()
 
     register_provider_admission_callback = register_admission_callback
+
+    def register_continuation_callback(
+        self,
+        callback: AdmissionCallback | None,
+        planning_cycle_key: str = "",
+        *,
+        channel_id: str = "",
+    ) -> None:
+        if callback is None:
+            self._continuation_admissions.clear()
+            return
+        turn = self._active_turn
+        provider_turn_id = turn.provider_turn_id if turn is not None else None
+        if turn is None or not provider_turn_id:
+            self.register_admission_callback(callback, planning_cycle_key)
+            return
+        self._continuation_admissions.append(
+            (callback, planning_cycle_key, provider_turn_id, channel_id)
+        )
 
     async def _fire_admission(self, provider_turn_id: str | None) -> None:
         callback = self._admission_callback
         key = self._admission_planning_cycle_key
         self._admission_callback = None
         self._admission_planning_cycle_key = ""
-        self._admission_is_continuation = False
-        self._admission_turn_id = None
         if callback is not None:
             await callback(ProviderAdmissionEvent(
                 planning_cycle_key=key,
@@ -1272,7 +1284,7 @@ class CodexSession:
                 and (turn.provider_turn_id is None or turn.provider_turn_id == turn_id)
             ):
                 turn.provider_turn_id = turn_id
-                if self._admission_callback is not None and not self._admission_is_continuation:
+                if self._admission_callback is not None:
                     await self._fire_admission(turn_id)
                 return
             if (
@@ -1312,13 +1324,11 @@ class CodexSession:
                 return
 
         if m.startswith("item/") and turn is not None:
-            if self._continuation_item_admits(m, params, turn):
-                await self._fire_admission(turn.provider_turn_id)
+            if m.endswith("/completed"):
+                await self._fire_matching_continuation(params, turn)
             await self._handle_item_event(m, params, turn)
             return
         if m.startswith("turn/completed") and turn is not None:
-            if self._continuation_terminal_admits(params, turn):
-                await self._fire_admission(turn.provider_turn_id)
             self._absorb_turn_usage(turn, params)
             if not turn.completed.done():
                 turn.completed.set_result(None)
@@ -1336,42 +1346,67 @@ class CodexSession:
                 )
             return
 
-    def _continuation_item_admits(
-        self, method: str, params: dict, turn: _PendingTurn,
-    ) -> bool:
-        if (
-            self._admission_callback is None
-            or not self._admission_is_continuation
-            or not method.endswith("/completed")
-        ):
-            return False
+    async def _fire_matching_continuation(
+        self, params: dict, turn: _PendingTurn,
+    ) -> None:
+        if not self._continuation_admissions:
+            return
         item = (params or {}).get("item") or {}
-        kind = str(item.get("type") or "")
+        kind = str(item.get("type") or "").lower()
         thread_id = str((params or {}).get("threadId") or "")
         turn_id = str((params or {}).get("turnId") or "")
-        expected_turn = self._admission_turn_id or turn.provider_turn_id
-        return (
-            thread_id == self._conversation_id
-            and bool(expected_turn)
-            and turn_id == expected_turn
-            and kind.lower() != "contextcompaction"
-            and bool(kind)
+        server = str(item.get("server") or "")
+        tool = str(item.get("tool") or "")
+        status = str(item.get("status") or "").lower()
+        expected_turn = turn.provider_turn_id
+        if not (
+            (not thread_id or thread_id == self._conversation_id)
+            and expected_turn
+            and (not turn_id or turn_id == expected_turn)
+            and kind == "mcptoolcall"
+            and server == "puffo"
+            and tool in _PUFFO_SEND_MESSAGE_TOOLS
+            and status == "completed"
+        ):
+            return
+        serialized = json.dumps(item, sort_keys=True, default=str)
+        exact = next(
+            (
+                index
+                for index, (_callback, key, admission_turn, _channel) in enumerate(
+                    self._continuation_admissions
+                )
+                if admission_turn == expected_turn and key and key in serialized
+            ),
+            None,
         )
-
-    def _continuation_terminal_admits(
-        self, params: dict, turn: _PendingTurn,
-    ) -> bool:
-        if self._admission_callback is None or not self._admission_is_continuation:
-            return False
-        thread_id = str((params or {}).get("threadId") or "")
-        turn_obj = (params or {}).get("turn") or {}
-        turn_id = str(turn_obj.get("id") or (params or {}).get("turnId") or "")
-        expected_turn = self._admission_turn_id or turn.provider_turn_id
-        return (
-            thread_id == self._conversation_id
-            and bool(expected_turn)
-            and turn_id == expected_turn
+        channel_id = str((item.get("arguments") or {}).get("channel") or "")
+        matched = exact
+        if matched is None and channel_id:
+            matched = next(
+                (
+                    index
+                    for index, (
+                        _callback,
+                        _key,
+                        admission_turn,
+                        channel,
+                    ) in enumerate(self._continuation_admissions)
+                    if admission_turn == expected_turn and channel == channel_id
+                ),
+                None,
+            )
+        if matched is None:
+            return
+        callback, key, _turn_id, _channel = self._continuation_admissions.pop(
+            matched
         )
+        await callback(ProviderAdmissionEvent(
+            planning_cycle_key=key,
+            provider_session_id=self.get_provider_session_id(),
+            provider_turn_id=expected_turn,
+            admitted_at=datetime.now(timezone.utc),
+        ))
 
     async def _handle_item_event(
         self, normalised_method: str, params: dict, turn: _PendingTurn,

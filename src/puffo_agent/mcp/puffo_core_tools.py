@@ -587,6 +587,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
               safety net is skipped. Use only when you're confident
               no human is waiting for this reply. Root-level posts
               are still forced visible (can't fold either way).
+        send_anyway: for a channel send, keep the chosen content even
+            when the Server reports that newer channel messages exist.
+            The result exposes the visible and latest boundaries plus
+            any recovered context. You can independently choose revised
+            content, ``send_anyway=True``, or no message.
         """
         return await _dispatch_semantic_send(
             cfg,
@@ -1205,6 +1210,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         visibility_level: same semantics as ``send_message`` —
             ``"human"`` | ``"default"`` | ``"agent_only"``, default
             ``"default"``. The @-mention floor keys off ``caption``.
+        send_anyway: same channel-freshness override as
+            ``send_message``. It is an available judgment choice, not
+            an automatic retry.
         """
         return await _dispatch_semantic_send(
             cfg,

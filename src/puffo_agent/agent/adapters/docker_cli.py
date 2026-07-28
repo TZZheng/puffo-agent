@@ -739,6 +739,22 @@ class DockerCLIAdapter(Adapter):
 
     register_provider_admission_callback = register_admission_callback
 
+    def register_continuation_callback(
+        self, callback, planning_cycle_key: str = "", *, channel_id: str = "",
+    ) -> None:
+        if self.harness.name() == "claude-code":
+            self._ensure_session().register_continuation_callback(
+                callback,
+                planning_cycle_key,
+                channel_id=channel_id,
+            )
+        else:
+            super().register_continuation_callback(
+                callback,
+                planning_cycle_key,
+                channel_id=channel_id,
+            )
+
     async def aclose(self) -> None:
         if self._session is not None:
             await self._session.aclose()

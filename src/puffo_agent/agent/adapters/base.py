@@ -191,6 +191,21 @@ class Adapter(ABC):
     # More explicit alias used by some integration call sites.
     register_provider_admission_callback = register_admission_callback
 
+    def register_continuation_callback(
+        self,
+        callback: AdmissionCallback | None,
+        planning_cycle_key: str = "",
+        *,
+        channel_id: str = "",
+    ) -> None:
+        """Register model-visible admission for a returned tool result.
+
+        Stateful adapters override this to correlate the callback with the
+        provider's concrete tool-result event. The default preserves
+        compatibility for adapters without live continuation events.
+        """
+        self.register_admission_callback(callback, planning_cycle_key)
+
     async def _fire_admission_callback(
         self, event: ProviderAdmissionEvent,
     ) -> None:

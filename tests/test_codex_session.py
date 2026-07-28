@@ -531,21 +531,37 @@ def test_initial_admission_ignores_compact_and_continuation_is_distinct(tmp_path
         })
         assert [event.planning_cycle_key for event in events] == ["initial"]
 
-        # Registration after turn start is continuation admission.
-        cs.register_admission_callback(admitted, "continuation")
+        # Registration after turn start is correlated tool-result admission.
+        cs.register_continuation_callback(
+            admitted, "continuation", channel_id="ch-a",
+        )
         for params in (
             {"threadId": "wrong", "turnId": "user-turn",
-             "item": {"id": "m1", "type": "mcpToolCall"}},
+             "item": {"id": "m1", "type": "mcpToolCall", "server": "puffo",
+                      "tool": "send_message", "status": "completed",
+                      "arguments": {"channel": "ch-a"}}},
             {"threadId": "thread-current", "turnId": "wrong-turn",
-             "item": {"id": "m2", "type": "mcpToolCall"}},
+             "item": {"id": "m2", "type": "mcpToolCall", "server": "puffo",
+                      "tool": "send_message", "status": "completed",
+                      "arguments": {"channel": "ch-a"}}},
             {"threadId": "thread-current", "turnId": "user-turn",
              "item": {"id": "c1", "type": "contextCompaction"}},
+            {"threadId": "thread-current", "turnId": "user-turn",
+             "item": {"id": "m3", "type": "mcpToolCall", "server": "puffo",
+                      "tool": "send_message", "status": "completed",
+                      "arguments": {"channel": "ch-other"}}},
         ):
             await cs._handle_notification("item/completed", params)
         assert len(events) == 1
+        # Live Codex item/completed events may contain only params.item.
+        # Missing correlation IDs inherit the current active turn; supplied
+        # non-empty IDs above still have to match.
         accepted = {
-            "threadId": "thread-current", "turnId": "user-turn",
-            "item": {"id": "m3", "type": "mcpToolCall", "status": "completed"},
+            "item": {
+                "id": "m4", "type": "mcpToolCall", "server": "puffo",
+                "tool": "send_message", "status": "completed",
+                "arguments": {"channel": "ch-a"},
+            },
         }
         await cs._handle_notification("item/completed", accepted)
         await cs._handle_notification("item/completed", accepted)
@@ -554,16 +570,34 @@ def test_initial_admission_ignores_compact_and_continuation_is_distinct(tmp_path
         ]
         assert events[-1].provider_turn_id == "user-turn"
 
-        cs.register_admission_callback(admitted, "continuation-terminal")
-        await cs._handle_notification("turn/completed", {
-            "threadId": "wrong", "turn": {"id": "user-turn"},
-        })
-        assert len(events) == 2
+        cs.register_continuation_callback(
+            admitted, "continuation-a", channel_id="ch-a",
+        )
+        cs.register_continuation_callback(
+            admitted, "continuation-b", channel_id="ch-b",
+        )
         await cs._handle_notification("turn/completed", {
             "threadId": "thread-current", "turn": {"id": "user-turn"},
         })
+        assert len(events) == 2
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current", "turnId": "user-turn",
+            "item": {
+                "id": "b", "type": "mcpToolCall", "server": "puffo",
+                "tool": "send_message", "status": "completed",
+                "arguments": {"channel": "ch-b"},
+            },
+        })
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current", "turnId": "user-turn",
+            "item": {
+                "id": "a", "type": "mcpToolCall", "server": "puffo",
+                "tool": "send_message", "status": "completed",
+                "arguments": {"channel": "ch-a"},
+            },
+        })
         assert [event.planning_cycle_key for event in events] == [
-            "initial", "continuation", "continuation-terminal",
+            "initial", "continuation", "continuation-b", "continuation-a",
         ]
 
     asyncio.run(drive())

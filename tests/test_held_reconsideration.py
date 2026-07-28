@@ -104,7 +104,7 @@ async def test_recovery_unavailable_exposes_nothing_and_does_not_advance():
 
 @pytest.mark.asyncio
 async def test_later_explicit_send_anyway_is_new_checked_request():
-    coordinator, _, http = await coordinator_fixture(baseline=2)
+    coordinator, freshness, http = await coordinator_fixture(baseline=2)
     calls = []
 
     async def post(path, body):
@@ -133,6 +133,7 @@ async def test_later_explicit_send_anyway_is_new_checked_request():
     assert second["state"] == "sent"
     assert calls[0]["envelope"]["envelope_id"] != calls[1]["envelope"]["envelope_id"]
     assert calls[1]["freshness"]["mode"] == "send_anyway"
+    assert freshness.advances == []
     assert all(
         path == CHANNEL_SEND_PATH
         for method, path, _body in http.calls

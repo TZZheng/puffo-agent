@@ -482,7 +482,8 @@ class MessageStore:
         await db.execute("BEGIN IMMEDIATE")
         try:
             async with db.execute(
-                "SELECT server_seq, receipt_disposition, receipt_reason "
+                "SELECT server_seq, receipt_disposition, receipt_reason, "
+                "processing_state "
                 "FROM messages WHERE envelope_id = ?",
                 (envelope_id,),
             ) as cursor:
@@ -502,6 +503,32 @@ class MessageStore:
                             ReceiptWriteStatus.CONFLICT, disposition,
                             "server sequence belongs to another envelope", False,
                         )
+                    if (
+                        by_id["receipt_disposition"] is None
+                        and by_id["processing_state"] is None
+                        and disposition is ReceiptDisposition.FOREIGN_DM_GATED
+                    ):
+                        await db.execute(
+                            """UPDATE messages
+                               SET server_seq = ?, receipt_disposition = ?,
+                                   receipt_reason = ?
+                               WHERE envelope_id = ? AND server_seq IS NULL
+                                 AND receipt_disposition IS NULL
+                                 AND processing_state IS NULL""",
+                            (
+                                server_seq,
+                                disposition.value,
+                                reason,
+                                envelope_id,
+                            ),
+                        )
+                        await db.commit()
+                        return ReceiptResult(
+                            ReceiptWriteStatus.COMMITTED,
+                            disposition,
+                            reason,
+                            False,
+                        )
                     await db.execute(
                         "UPDATE messages SET server_seq = ? WHERE envelope_id = ? "
                         "AND server_seq IS NULL",
@@ -510,7 +537,8 @@ class MessageStore:
                     await db.commit()
                     return ReceiptResult(
                         ReceiptWriteStatus.COMMITTED, disposition,
-                        "legacy sequence backfilled without Inbox activation", True,
+                        "legacy sequence backfilled without Inbox activation",
+                        self._receipt_ack(disposition),
                     )
                 if int(existing_seq) != server_seq:
                     await db.rollback()

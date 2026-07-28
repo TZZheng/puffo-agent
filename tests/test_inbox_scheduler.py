@@ -44,6 +44,7 @@ def test_count_cap_accepts_exactly_50_and_does_not_skip_51st_selection():
     assert len(batch.items) == 50
     assert batch.message_ids == tuple(f"m{i}" for i in range(50))
     assert batch.more_available
+    assert batch.pending_target_projections == (("channel", "sp", "ch"),)
 
 
 def test_token_cap_is_inclusive_and_one_over_stops_selection():
@@ -85,6 +86,7 @@ def test_planned_batch_is_immutable_tuple_backed_and_planning_is_read_only():
     assert isinstance(batch.message_ids, tuple)
     assert isinstance(batch.formatted_messages, tuple)
     assert isinstance(batch.target_projections, tuple)
+    assert isinstance(batch.pending_target_projections, tuple)
     with pytest.raises(FrozenInstanceError):
         batch.estimated_tokens = 99
     with pytest.raises(TypeError):
@@ -109,6 +111,24 @@ def test_order_local_metadata_neutral_targets_and_defensive_deduplication():
         ("channel", "sp", "ch"),
         ("thread", "sp", "ch", "root"),
         ("dm", "d", "agent"),
+    )
+
+
+def test_pending_target_projections_only_describe_the_unselected_suffix():
+    items = [
+        *[_message(f"selected-{i}", channel="selected") for i in range(50)],
+        _message("pending-thread", channel="later", thread="root"),
+        _message("pending-dm", kind="dm", sender="bob", recipient="agent"),
+    ]
+    batch = InboxPlanner().plan(
+        items,
+        formatter=lambda item: str(item.content),
+        estimator=lambda _: 1,
+    )
+    assert batch.target_projections == (("channel", "sp", "selected"),)
+    assert batch.pending_target_projections == (
+        ("thread", "sp", "later", "root"),
+        ("dm", "bob", "agent"),
     )
 
 

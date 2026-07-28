@@ -42,6 +42,7 @@ class ServerDelivery(TypedDict):
 
 class TransportOutcome(str, Enum):
     ACK = "ack"
+    DEFER = "defer"
     HOLD = "hold"
 
 
@@ -78,6 +79,7 @@ class PuffoCoreWsClient:
         self.on_cert_update: CertHandler | None = None
         # Fires after every (re)connect handshake, before catch-up.
         self.on_connect: Callable[[], Coroutine[Any, Any, None]] | None = None
+        self._catchup_lock = asyncio.Lock()
 
     def _build_connect_frame(self) -> str:
         sess = self.keystore.load_session(self.slug)
@@ -112,32 +114,67 @@ class PuffoCoreWsClient:
         were offline. MUST run after ``_handshake`` (it registers the
         session); ordering is register → pending fetch → live listen.
         """
-        try:
-            data = await self.http_client.get("/messages/pending")
-            messages = data.get("messages", [])
-            # Log on every reconnect, even zero — a silent reconnect
-            # should still leave one line (else it's indistinguishable
-            # from a no-op).
-            logger.info(
-                "Catch-up: %d pending messages (session=%s)",
-                len(messages), self.session_id or "<pre-handshake>",
+        if not await self._run_catchup():
+            raise ConnectionError(
+                "catch-up stopped at an unacknowledged delivery"
             )
-            if not messages:
-                return
-            # HTTP, not WS-frame (no pong until the listen loop → WS dies
-            # mid-catch-up); chunked so progress survives a death.
-            envelope_ids = []
-            for item in messages:
-                result = await self.dispatch_delivery(item)
-                if result.outcome is TransportOutcome.ACK and result.envelope_id:
-                    envelope_ids.append(result.envelope_id)
-                if len(envelope_ids) >= 25:
+
+    async def recover_pending_until(self, envelope_id: str) -> bool:
+        """Use the signed pending endpoint when a held WS watermark is late."""
+        if not envelope_id:
+            return False
+        return await self._run_catchup(required_envelope_id=envelope_id)
+
+    async def _run_catchup(self, required_envelope_id: str | None = None) -> bool:
+        found_required = False
+        try:
+            async with self._catchup_lock:
+                data = await self.http_client.get("/messages/pending")
+                messages = data.get("messages", [])
+                # Log on every reconnect, even zero — a silent reconnect
+                # should still leave one line (else it's indistinguishable
+                # from a no-op).
+                logger.info(
+                    "Catch-up: %d pending messages (session=%s)",
+                    len(messages), self.session_id or "<pre-handshake>",
+                )
+                if not messages:
+                    return required_envelope_id is None
+                # HTTP, not WS-frame (no pong until the listen loop → WS dies
+                # mid-catch-up); chunked so progress survives a death.
+                envelope_ids = []
+                blocked = False
+                for item in messages:
+                    result = await self.dispatch_delivery(item)
+                    if result.outcome is TransportOutcome.DEFER:
+                        # Reliably classified local deferrals, such as a
+                        # foreign DM awaiting operator approval, do not own
+                        # their Server ACK yet but also do not block unrelated
+                        # later deliveries.
+                        continue
+                    if result.outcome is not TransportOutcome.ACK:
+                        # Do not prove an exact later watermark by skipping an
+                        # earlier delivery the receiver could not durably own.
+                        # The local model-visible boundary is contiguous.
+                        blocked = True
+                        break
+                    if result.envelope_id:
+                        envelope_ids.append(result.envelope_id)
+                        if result.envelope_id == required_envelope_id:
+                            found_required = True
+                    if len(envelope_ids) >= 25:
+                        await self._ack_http(envelope_ids)
+                        envelope_ids = []
+                    if found_required:
+                        break
+                if envelope_ids:
                     await self._ack_http(envelope_ids)
-                    envelope_ids = []
-            if envelope_ids:
-                await self._ack_http(envelope_ids)
+                if blocked:
+                    return False
         except Exception:
             logger.exception("Catch-up failed")
+            return False
+        return found_required if required_envelope_id is not None else True
 
     async def _ack_http(self, envelope_ids: list[str]) -> None:
         try:
@@ -185,6 +222,12 @@ class PuffoCoreWsClient:
             return DeliveryResult(TransportOutcome.HOLD, envelope_id, "handler exception")
         if outcome is TransportOutcome.ACK:
             return DeliveryResult(TransportOutcome.ACK, envelope_id, "handler committed")
+        if outcome is TransportOutcome.DEFER:
+            return DeliveryResult(
+                TransportOutcome.DEFER,
+                envelope_id,
+                "handler durably deferred",
+            )
         if outcome is TransportOutcome.HOLD:
             return DeliveryResult(TransportOutcome.HOLD, envelope_id, "handler held")
         return DeliveryResult(TransportOutcome.HOLD, envelope_id, "unexpected handler result")
@@ -203,6 +246,13 @@ class PuffoCoreWsClient:
             result = await self.dispatch_delivery(msg)
             if result.outcome is TransportOutcome.ACK and result.envelope_id:
                 await self._send_ack([result.envelope_id])
+            elif result.outcome is TransportOutcome.HOLD:
+                # Stop this live stream at the first delivery we could not
+                # durably own. Reconnecting re-enters the ordered signed
+                # pending catch-up path before any later live delivery.
+                raise ConnectionError(
+                    "live delivery stopped at an unacknowledged envelope"
+                )
 
         elif msg_type == "cert_update":
             if self.on_cert_update:

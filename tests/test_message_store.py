@@ -591,7 +591,11 @@ async def test_receipt_handler_seam_maps_durable_acknowledge_to_transport_outcom
         return (
             TransportOutcome.ACK
             if result.acknowledge
-            else TransportOutcome.HOLD
+            else (
+                TransportOutcome.DEFER
+                if disposition is ReceiptDisposition.FOREIGN_DM_GATED
+                else TransportOutcome.HOLD
+            )
         )
 
     client.on_message = handler
@@ -604,7 +608,7 @@ async def test_receipt_handler_seam_maps_durable_acknowledge_to_transport_outcom
     ).outcome is TransportOutcome.ACK
     assert (
         await client.dispatch_delivery({"seq": 21, "envelope": gated})
-    ).outcome is TransportOutcome.HOLD
+    ).outcome is TransportOutcome.DEFER
 
     conflict = _channel_payload("other-id")
     conflict["_disposition"] = ReceiptDisposition.ELIGIBLE.value
@@ -641,6 +645,37 @@ async def test_legacy_sequence_backfill_does_not_activate_history_row():
     assert msg.server_seq == 8
     assert msg.receipt_disposition is None and msg.processing_state is None
     assert await store.get_pending() == ()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_gated_dm_backfill_stays_deferred_until_promotion():
+    store = _temp_store()
+    await store.store(_dm_payload("legacy-gated", "foreign", "agent"))
+
+    gated = await store.store_receipt(
+        _dm_payload("legacy-gated", "foreign", "agent"),
+        server_seq=9,
+        disposition=ReceiptDisposition.FOREIGN_DM_GATED,
+        reason="foreign dm awaiting approval",
+    )
+
+    assert gated.status is ReceiptWriteStatus.COMMITTED
+    assert not gated.acknowledge
+    row = await store.get_message_by_envelope("legacy-gated")
+    assert row is not None
+    assert row.server_seq == 9
+    assert row.receipt_disposition is ReceiptDisposition.FOREIGN_DM_GATED
+    assert row.processing_state is None
+
+    promoted = await store.promote_gated_receipt(
+        "legacy-gated", 9, reason="approved",
+    )
+    assert promoted.status is ReceiptWriteStatus.COMMITTED
+    assert promoted.acknowledge
+    assert [item.envelope_id for item in await store.get_pending()] == [
+        "legacy-gated"
+    ]
     await store.close()
 
 

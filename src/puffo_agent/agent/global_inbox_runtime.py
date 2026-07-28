@@ -12,7 +12,7 @@ import json
 import os
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
@@ -66,6 +66,7 @@ class PlannedTurn:
     items: tuple[StoredMessage, ...]
     routes: tuple[MessageRoute, ...]
     targets: tuple[tuple[str, ...], ...]
+    pending_targets: tuple[tuple[str, ...], ...]
     target_summary: str
     formatted_blocks: tuple[str, ...]
     provider_input: str
@@ -117,6 +118,8 @@ class HeldStaging:
     message_ids: tuple[str, ...] = ()
     latest_seq: int | None = None
     latest_envelope_id: str | None = None
+    recovered_through_seq: int | None = None
+    more_pending: bool = False
     synchronized: bool = False
     diagnostic: str = ""
     correlation_key: str = ""
@@ -274,6 +277,9 @@ class TrackingSendDelegate:
             staging = getattr(runtime, "held", None)
             if staging is not None:
                 result["synchronized"] = bool(staging.synchronized)
+                if staging.recovered_through_seq is not None:
+                    result["recovered_through_seq"] = staging.recovered_through_seq
+                result["recovery_more_pending"] = bool(staging.more_pending)
                 if staging.diagnostic:
                     result["synchronization_diagnostic"] = staging.diagnostic
                 if staging.correlation_key:
@@ -300,9 +306,11 @@ class HeldRecoverySource:
         runtime: "GlobalInboxRuntime",
         *,
         wait_timeout_s: float = 2.0,
+        catchup_pending: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self.runtime = runtime
         self.wait_timeout_s = wait_timeout_s
+        self.catchup_pending = catchup_pending
         self._changed = asyncio.Event()
 
     def notify_delivery(self) -> None:
@@ -330,12 +338,7 @@ class HeldRecoverySource:
         while not await proven():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                self.runtime.held = HeldStaging(
-                    latest_seq=latest_seq,
-                    latest_envelope_id=latest_envelope_id,
-                    diagnostic="exact held watermark unavailable",
-                )
-                return False
+                break
             self._changed.clear()
             # Re-check after clearing so a commit between the first query and
             # clear cannot be lost.
@@ -344,13 +347,25 @@ class HeldRecoverySource:
             try:
                 await asyncio.wait_for(self._changed.wait(), timeout=remaining)
             except asyncio.TimeoutError:
-                self.runtime.held = HeldStaging(
-                    latest_seq=latest_seq,
-                    latest_envelope_id=latest_envelope_id,
-                    diagnostic="exact held watermark unavailable",
-                )
-                return False
-        return True
+                break
+        if await proven():
+            return True
+        if self.catchup_pending is not None:
+            try:
+                await self.catchup_pending(latest_envelope_id)
+            except Exception:
+                pass
+            if await proven():
+                return True
+        self.runtime.held = HeldStaging(
+            latest_seq=latest_seq,
+            latest_envelope_id=latest_envelope_id,
+            diagnostic=(
+                "exact held watermark unavailable after WebSocket wait "
+                "and signed pending catch-up"
+            ),
+        )
+        return False
 
     async def query_held_messages(
         self,
@@ -417,6 +432,19 @@ class HeldRecoverySource:
             return ()
         staged_ids = planned.message_ids
         correlation_key = planned.planning_cycle_key
+        planned_server_seqs = [
+            row.server_seq
+            for row in planned.items
+            if row.server_seq is not None
+        ]
+        recovered_through_seq = (
+            max(planned_server_seqs) if planned_server_seqs else None
+        )
+        reached_latest = any(
+            row.envelope_id == latest_envelope_id and row.server_seq == latest_seq
+            for row in planned.items
+        )
+        more_pending = page.more_available or not reached_latest
         fired = False
 
         async def admit_continuation(event: ProviderAdmissionEvent) -> None:
@@ -424,36 +452,84 @@ class HeldRecoverySource:
             if fired or event.planning_cycle_key != planned.planning_cycle_key:
                 return
             fired = True
-            run = await self.runtime.store.admit_messages(
-                staged_ids,
-                turn_id=active.turn_id,
-                provider_session_id=provider_session_id,
+            existing_rows = await self.runtime.store.get_in_turn_messages(
+                active.turn_id,
+                provider_session_id,
             )
-            active.message_ids[:] = list(run.message_ids)
+            existing_ids = {row.envelope_id for row in existing_rows}
+            new_ids = tuple(
+                envelope_id
+                for envelope_id in staged_ids
+                if envelope_id not in existing_ids
+            )
+            if new_ids:
+                run = await self.runtime.store.admit_messages(
+                    new_ids,
+                    turn_id=active.turn_id,
+                    provider_session_id=provider_session_id,
+                )
+                active.message_ids[:] = list(run.message_ids)
+            else:
+                active.message_ids[:] = [
+                    row.envelope_id for row in existing_rows
+                ]
+            rows = await self.runtime.store.get_in_turn_messages(
+                active.turn_id,
+                provider_session_id,
+            )
+            if rows:
+                self.runtime._write_current_turn(
+                    self.runtime._reconstruct_exact_turn(
+                        turn_id=active.turn_id,
+                        rows=rows,
+                    )
+                )
             self.runtime.held = HeldStaging(
                 message_ids=staged_ids,
                 latest_seq=latest_seq,
                 latest_envelope_id=latest_envelope_id,
-                synchronized=True,
+                recovered_through_seq=recovered_through_seq,
+                more_pending=more_pending,
+                synchronized=reached_latest,
+                diagnostic=(
+                    "additional held context remains pending"
+                    if more_pending
+                    else ""
+                ),
                 correlation_key=correlation_key,
             )
 
-        self.runtime.adapter.register_admission_callback(
-            admit_continuation, planned.planning_cycle_key
+        register_continuation = getattr(
+            self.runtime.adapter, "register_continuation_callback", None
         )
+        if callable(register_continuation):
+            register_continuation(
+                admit_continuation,
+                planned.planning_cycle_key,
+                channel_id=channel_id,
+            )
+        else:
+            self.runtime.adapter.register_admission_callback(
+                admit_continuation, planned.planning_cycle_key
+            )
         self.runtime.held = HeldStaging(
             message_ids=staged_ids,
             latest_seq=latest_seq,
             latest_envelope_id=latest_envelope_id,
+            recovered_through_seq=recovered_through_seq,
+            more_pending=more_pending,
             diagnostic="continuation staged; awaiting correlated admission",
             correlation_key=correlation_key,
         )
         return tuple(
             {
                 "envelope_id": row.envelope_id,
+                "server_seq": row.server_seq,
                 "content": row.content,
                 "latest_seq": latest_seq,
                 "latest_envelope_id": latest_envelope_id,
+                "recovered_through_seq": recovered_through_seq,
+                "more_pending": more_pending,
                 "provider_session_id": provider_session_id,
                 "synchronized": False,
                 "continuation_correlation_key": correlation_key,
@@ -486,6 +562,7 @@ class GlobalInboxRuntime:
         max_context_decisions: int = 12,
         max_api_retries: int = 2,
         retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        held_catchup: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -510,7 +587,10 @@ class GlobalInboxRuntime:
         self.max_api_retries = max_api_retries
         self.retry_sleep = retry_sleep
         self.send_delegate: TrackingSendDelegate | None = None
-        self.held_recovery_source = HeldRecoverySource(self)
+        self.held_recovery_source = HeldRecoverySource(
+            self,
+            catchup_pending=held_catchup,
+        )
 
     @property
     def current_turn_path(self) -> Path:
@@ -541,9 +621,22 @@ class GlobalInboxRuntime:
         self._stopping = True
         self.coalescer.notify()
 
-    def _target_summary(self, targets: tuple[tuple[str, ...], ...], count: int) -> str:
+    def _target_summary(
+        self,
+        targets: tuple[tuple[str, ...], ...],
+        count: int,
+        *,
+        more_pending: bool,
+        pending_targets: tuple[tuple[str, ...], ...],
+    ) -> str:
         return json.dumps(
-            {"version": 2, "message_count": count, "targets": targets},
+            {
+                "version": 2,
+                "message_count": count,
+                "more_pending": more_pending,
+                "pending_targets": pending_targets,
+                "targets": targets,
+            },
             separators=(",", ":"),
         )
 
@@ -562,7 +655,12 @@ class GlobalInboxRuntime:
             if route.target not in targets:
                 targets.append(route.target)
         target_tuple = tuple(targets)
-        summary = self._target_summary(target_tuple, len(batch.items))
+        summary = self._target_summary(
+            target_tuple,
+            len(batch.items),
+            more_pending=batch.more_available,
+            pending_targets=batch.pending_target_projections,
+        )
         prefix = f"<global_inbox_turn>\n{summary}\n"
         suffix = "\n</global_inbox_turn>"
         provider_input = prefix + "\n".join(batch.formatted_messages) + suffix
@@ -575,6 +673,7 @@ class GlobalInboxRuntime:
             items=batch.items,
             routes=routes,
             targets=target_tuple,
+            pending_targets=batch.pending_target_projections,
             target_summary=summary,
             formatted_blocks=batch.formatted_messages,
             provider_input=provider_input,
@@ -593,7 +692,10 @@ class GlobalInboxRuntime:
         turn_id: str | None = None,
         planning_cycle_key: str | None = None,
     ) -> PlannedTurn | None:
-        pending = items if items is not None else await self.store.get_pending()
+        pending_universe = (
+            items if items is not None else await self.store.get_pending()
+        )
+        pending = pending_universe
         if max_items is not None:
             pending = pending[:max_items]
         while pending:
@@ -607,9 +709,32 @@ class GlobalInboxRuntime:
                     quarantine=self.store.quarantine_pending,
                 )
                 if changed:
-                    pending = await self.store.get_pending()
+                    pending_universe = await self.store.get_pending()
+                    pending = pending_universe
+                    if max_items is not None:
+                        pending = pending[:max_items]
                     continue
                 return None
+            selected_ids = set(batch.message_ids)
+            remaining_targets: list[tuple[str, ...]] = []
+            seen_remaining_ids: set[str] = set()
+            seen_remaining_targets: set[tuple[str, ...]] = set()
+            for item in pending_universe:
+                if (
+                    item.envelope_id in selected_ids
+                    or item.envelope_id in seen_remaining_ids
+                ):
+                    continue
+                seen_remaining_ids.add(item.envelope_id)
+                target = self.planner.target_projection(item)
+                if target not in seen_remaining_targets:
+                    seen_remaining_targets.add(target)
+                    remaining_targets.append(target)
+            batch = replace(
+                batch,
+                pending_target_projections=tuple(remaining_targets),
+                more_available=bool(seen_remaining_ids),
+            )
             planned = self._from_batch(
                 batch,
                 turn_id=turn_id,
@@ -854,7 +979,12 @@ class GlobalInboxRuntime:
             if route.target not in targets:
                 targets.append(route.target)
         target_tuple = tuple(targets)
-        summary = self._target_summary(target_tuple, len(rows))
+        summary = self._target_summary(
+            target_tuple,
+            len(rows),
+            more_pending=False,
+            pending_targets=(),
+        )
         prefix = f"<global_inbox_turn>\n{summary}\n"
         suffix = "\n</global_inbox_turn>"
         return PlannedTurn(
@@ -864,6 +994,7 @@ class GlobalInboxRuntime:
             items=rows,
             routes=routes,
             targets=target_tuple,
+            pending_targets=(),
             target_summary=summary,
             formatted_blocks=blocks,
             provider_input=prefix + "\n".join(blocks) + suffix,

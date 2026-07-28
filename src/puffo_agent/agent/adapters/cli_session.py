@@ -29,6 +29,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -240,6 +241,11 @@ class ClaudeSession:
         self._context_measured_at: datetime | None = None
         self._admission_callback: AdmissionCallback | None = None
         self._admission_planning_cycle_key: str = ""
+        self._continuation_admissions: list[
+            tuple[AdmissionCallback, str, str, str]
+        ] = []
+        self._active_send_tool_channels: dict[str, str] = {}
+        self._active_provider_turn_id: str | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -460,10 +466,30 @@ class ClaudeSession:
     ) -> None:
         self._admission_callback = callback
         self._admission_planning_cycle_key = planning_cycle_key
+        if callback is None:
+            self._continuation_admissions.clear()
 
     register_provider_admission_callback = register_admission_callback
 
-    async def _fire_admission(self) -> None:
+    def register_continuation_callback(
+        self,
+        callback: AdmissionCallback | None,
+        planning_cycle_key: str = "",
+        *,
+        channel_id: str = "",
+    ) -> None:
+        if callback is None:
+            self._continuation_admissions.clear()
+            return
+        provider_turn_id = self._active_provider_turn_id
+        if provider_turn_id is None:
+            self.register_admission_callback(callback, planning_cycle_key)
+            return
+        self._continuation_admissions.append(
+            (callback, planning_cycle_key, provider_turn_id, channel_id)
+        )
+
+    async def _fire_admission(self, provider_turn_id: str) -> None:
         callback = self._admission_callback
         key = self._admission_planning_cycle_key
         self._admission_callback = None
@@ -472,6 +498,67 @@ class ClaudeSession:
             await callback(ProviderAdmissionEvent(
                 planning_cycle_key=key,
                 provider_session_id=self.get_provider_session_id(),
+                provider_turn_id=provider_turn_id,
+                admitted_at=datetime.now(timezone.utc),
+            ))
+
+    async def _fire_matching_continuations(
+        self, event: dict, provider_turn_id: str,
+    ) -> None:
+        if event.get("type") != "user" or not self._continuation_admissions:
+            return
+        content = (event.get("message") or {}).get("content") or []
+        selected: list[int] = []
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            serialized = json.dumps(block, sort_keys=True, default=str)
+            exact = next(
+                (
+                    index
+                    for index, (_callback, key, turn_id, _channel) in enumerate(
+                        self._continuation_admissions
+                    )
+                    if index not in selected
+                    and turn_id == provider_turn_id
+                    and key
+                    and key in serialized
+                ),
+                None,
+            )
+            if exact is not None:
+                selected.append(exact)
+                continue
+            tool_use_id = str(block.get("tool_use_id") or "")
+            channel_id = self._active_send_tool_channels.get(tool_use_id, "")
+            if not channel_id:
+                continue
+            correlated = next(
+                (
+                    index
+                    for index, (_callback, _key, turn_id, channel) in enumerate(
+                        self._continuation_admissions
+                    )
+                    if index not in selected
+                    and turn_id == provider_turn_id
+                    and channel == channel_id
+                ),
+                None,
+            )
+            if correlated is not None:
+                selected.append(correlated)
+            self._active_send_tool_channels.pop(tool_use_id, None)
+
+        admissions = [
+            self._continuation_admissions[index] for index in selected
+        ]
+        for index in sorted(selected, reverse=True):
+            self._continuation_admissions.pop(index)
+        for callback, key, _turn_id, _channel in admissions:
+            await callback(ProviderAdmissionEvent(
+                planning_cycle_key=key,
+                provider_session_id=self.get_provider_session_id(),
+                provider_turn_id=provider_turn_id,
                 admitted_at=datetime.now(timezone.utc),
             ))
 
@@ -772,6 +859,21 @@ class ClaudeSession:
         return drained
 
     async def _one_turn(self, user_message: str) -> TurnResult:
+        provider_turn_id = f"claude-turn-{uuid.uuid4().hex}"
+        self._active_provider_turn_id = provider_turn_id
+        self._active_send_tool_channels.clear()
+        try:
+            return await self._one_turn_inner(user_message, provider_turn_id)
+        finally:
+            if self._active_provider_turn_id == provider_turn_id:
+                self._active_provider_turn_id = None
+            self._active_send_tool_channels.clear()
+
+    async def _one_turn_inner(
+        self,
+        user_message: str,
+        provider_turn_id: str,
+    ) -> TurnResult:
         assert self._proc is not None and self._proc.stdin is not None
         ums_bytes = len(user_message.encode("utf-8"))
         if ums_bytes > MAX_USER_MESSAGE_BYTES:
@@ -857,7 +959,9 @@ class ClaudeSession:
             event_session_id = str(event.get("session_id") or "").strip()
             if event_session_id and event_session_id != self._session_id:
                 self._save_session_id(event_session_id)
-            await self._fire_admission()
+            if self._admission_callback is not None:
+                await self._fire_admission(provider_turn_id)
+            await self._fire_matching_continuations(event, provider_turn_id)
             event_types_seen.append(
                 f"{event.get('type')}/{event.get('subtype', '-')}"
             )
@@ -899,6 +1003,13 @@ class ClaudeSession:
                                 "channel": str(tool_input.get("channel", "")),
                                 "root_id": str(tool_input.get("root_id", "")),
                             })
+                        if "send_message" in name:
+                            tool_use_id = str(block.get("id") or "")
+                            channel_id = str(tool_input.get("channel") or "")
+                            if tool_use_id and channel_id:
+                                self._active_send_tool_channels[tool_use_id] = (
+                                    channel_id
+                                )
                         if self.audit is not None:
                             self.audit.write(
                                 "tool",

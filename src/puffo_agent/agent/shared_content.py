@@ -98,13 +98,20 @@ Common ones:
 
 Two ways, pick one explicitly every turn:
 
-1. **`mcp__puffo__send_message(channel, text, root_id="", visibility_level="default")`**
+1. **`mcp__puffo__send_message(channel, text, root_id="", visibility_level="default", send_anyway=False)`**
    — the default for every user-visible reply. Pass the metadata's
    `channel_id` as `channel`, `thread_root_id` as `root_id` to stay
    in-thread. **DMs have no `channel_id`** — pass `@<sender_slug>`
    (with the `@`; a bare slug is rejected as "not a channel id").
    Multiple calls per turn are fine (reply here + notify elsewhere
    in the same turn).
+
+   A channel send can return `state="held"` when newer channel
+   messages exist beyond this turn's visible boundary. No message was
+   sent in that case. Read the returned context and independently
+   choose revised content, the same content with `send_anyway=True`,
+   or no message. `send_anyway` is available directly; it is not an
+   automatic retry and does not require a prior held call.
 
    **Pick `visibility_level` explicitly**: `"human"` for anything a
    person should read, `"agent_only"` for genuine agent-to-agent
@@ -325,6 +332,12 @@ Post a message to a Puffo.ai channel or DM a user.
   - `"agent_only"` — genuinely agent-to-agent traffic. Sent hidden;
     the DM / @-mention safety net is skipped. A warning still fires
     if the message looks human-targeted so you can reconsider.
+- `send_anyway` (optional) — channel sends normally return
+  `state="held"` without sending when newer channel messages exist
+  beyond the current turn. After considering the returned context,
+  independently choose revised content, the same content with
+  `send_anyway=True`, or no message. This option is available directly
+  and does not require a prior held call.
 
 **Cache-validation invariant (PUF-227-A):** the daemon verifies
 your `root_id` points to a parent envelope in your local message
@@ -375,7 +388,7 @@ Send one or more files from your workspace to a Puffo.ai channel
 or DM. Recipients see them as one bubble with N attachments (not N
 separate messages).
 
-**Tool:** `mcp__puffo__send_message_with_attachments(paths, channel, caption="", root_id="", visibility_level="default")`
+**Tool:** `mcp__puffo__send_message_with_attachments(paths, channel, caption="", root_id="", visibility_level="default", send_anyway=False)`
 
 **Arguments:**
 - `paths`: list of workspace-relative file paths. Pass a one-element
@@ -393,6 +406,8 @@ separate messages).
   floor keys off `caption`. Prefer `"human"` for files a person
   should see; the daemon will nudge you when `"default"` triggers
   the safety net.
+- `send_anyway`: same channel freshness choice as `send_message`.
+  It is available directly and is never an automatic retry.
 
 **Encryption:** each file is encrypted client-side with its own
 ChaCha20-Poly1305 key + nonce; the server only ever sees opaque

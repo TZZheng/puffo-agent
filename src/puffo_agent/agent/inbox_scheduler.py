@@ -25,6 +25,7 @@ class PlannedBatch:
     message_ids: tuple[str, ...]
     formatted_messages: tuple[str, ...]
     target_projections: tuple[TargetProjection, ...]
+    pending_target_projections: tuple[TargetProjection, ...]
     estimated_tokens: int
     formatted_bytes: int
     more_available: bool
@@ -36,7 +37,7 @@ class InboxPlanner:
     """Pure, policy-neutral leading-prefix planner."""
 
     @staticmethod
-    def _target(item: StoredMessage) -> TargetProjection:
+    def target_projection(item: StoredMessage) -> TargetProjection:
         if item.envelope_kind == "dm":
             return (
                 "dm",
@@ -107,17 +108,25 @@ class InboxPlanner:
         projections: list[TargetProjection] = []
         seen_targets: set[TargetProjection] = set()
         for item in selected:
-            target = self._target(item)
+            target = self.target_projection(item)
             if target not in seen_targets:
                 seen_targets.add(target)
                 projections.append(target)
 
         consumed = len(selected)
+        pending_projections: list[TargetProjection] = []
+        pending_targets: set[TargetProjection] = set()
+        for item in unique[consumed:]:
+            target = self.target_projection(item)
+            if target not in pending_targets:
+                pending_targets.add(target)
+                pending_projections.append(target)
         return PlannedBatch(
             items=tuple(selected),
             message_ids=tuple(item.envelope_id for item in selected),
             formatted_messages=tuple(formatted_selected),
             target_projections=tuple(projections),
+            pending_target_projections=tuple(pending_projections),
             estimated_tokens=tokens,
             formatted_bytes=byte_count,
             more_available=consumed < len(unique),
