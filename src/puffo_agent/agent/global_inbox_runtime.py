@@ -40,6 +40,51 @@ def conservative_token_estimate(text: str) -> int:
     return len(text.encode("utf-8"))
 
 
+async def await_listener_with_runtime(
+    listener: Awaitable[Any],
+    runtime_task: asyncio.Task[Any],
+    *,
+    label: str,
+) -> Any:
+    """Stop a transport listener as soon as its Inbox consumer exits."""
+    listener_task = asyncio.ensure_future(listener)
+    try:
+        done, _pending = await asyncio.wait(
+            {listener_task, runtime_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if runtime_task in done:
+            listener_failure: BaseException | None = None
+            if listener_task in done:
+                try:
+                    await listener_task
+                except (asyncio.CancelledError, Exception) as exc:
+                    listener_failure = exc
+            listener_diagnostic = (
+                f"; listener also failed: {listener_failure}"
+                if listener_failure is not None
+                else ""
+            )
+            if runtime_task.cancelled():
+                raise RuntimeError(
+                    f"{label} was cancelled unexpectedly{listener_diagnostic}"
+                )
+            failure = runtime_task.exception()
+            if failure is not None:
+                raise RuntimeError(
+                    f"{label} crashed: {failure}{listener_diagnostic}"
+                ) from failure
+            raise RuntimeError(f"{label} exited unexpectedly{listener_diagnostic}")
+        return await listener_task
+    finally:
+        if not listener_task.done():
+            listener_task.cancel()
+            try:
+                await listener_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
 @dataclass(frozen=True)
 class MessageRoute:
     envelope_id: str
@@ -563,6 +608,7 @@ class GlobalInboxRuntime:
         max_api_retries: int = 2,
         retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         held_catchup: Callable[[str], Awaitable[bool]] | None = None,
+        send_mode_keys: Sequence[str] = (),
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -586,6 +632,9 @@ class GlobalInboxRuntime:
         self.max_context_decisions = max_context_decisions
         self.max_api_retries = max_api_retries
         self.retry_sleep = retry_sleep
+        self.send_mode_keys = tuple(
+            dict.fromkeys(key for key in send_mode_keys if key)
+        )
         self.send_delegate: TrackingSendDelegate | None = None
         self.held_recovery_source = HeldRecoverySource(
             self,
@@ -881,6 +930,12 @@ class GlobalInboxRuntime:
             self.health = RuntimeHealth("in_progress", "")
             terminal = False
             admitted = False
+            from . import send_mode
+
+            send_mode.note_turn_bundle(
+                list(self.send_mode_keys),
+                any(item.is_encrypted for item in planned.items),
+            )
             try:
                 retries = 0
                 while True:
@@ -933,6 +988,7 @@ class GlobalInboxRuntime:
                     terminal = True
                 self.health = RuntimeHealth("degraded", "turn failed and was requeued")
             finally:
+                send_mode.clear_turn_bundle(list(self.send_mode_keys))
                 self.adapter.register_admission_callback(None, "")
                 was_active = self.active.turn_id == planned.turn_id
                 if terminal or not was_active:

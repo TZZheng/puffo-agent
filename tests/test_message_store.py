@@ -57,6 +57,118 @@ def _dm_payload(envelope_id: str, sender: str, recipient: str, sent_at: int | No
 
 
 @pytest.mark.asyncio
+async def test_concurrent_open_initializes_once():
+    store = _temp_store()
+
+    await asyncio.gather(*(store.open() for _ in range(16)))
+
+    await store.store(_channel_payload("env_concurrent_open"))
+    assert await store.has_message("env_concurrent_open")
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_open_across_instances_serializes_schema_migration():
+    for round_index in range(8):
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = os.path.join(directory, "messages.db")
+            stores = [MessageStore(db_path) for _ in range(16)]
+            try:
+                await asyncio.gather(*(store.open() for store in stores))
+
+                envelope_id = f"env_multi_instance_open_{round_index}"
+                await stores[0].store(_channel_payload(envelope_id))
+                assert await stores[-1].has_message(envelope_id)
+            finally:
+                await asyncio.gather(
+                    *(store.close() for store in stores),
+                    return_exceptions=True,
+                )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_open_across_processes_retries_wal_transition(tmp_path):
+    code = """
+import asyncio
+import sys
+from puffo_agent.agent.message_store import MessageStore
+
+async def main():
+    store = MessageStore(sys.argv[1])
+    await store.open()
+    await store.close()
+
+asyncio.run(main())
+"""
+    env = os.environ.copy()
+    src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (src_dir, env.get("PYTHONPATH", "")) if part
+    )
+
+    for round_index in range(3):
+        db_path = tmp_path / f"process-{round_index}" / "messages.db"
+        processes = [
+            await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                code,
+                str(db_path),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            for _ in range(12)
+        ]
+        results = await asyncio.gather(
+            *(process.communicate() for process in processes)
+        )
+        failures = [
+            stderr.decode("utf-8", errors="replace")
+            for process, (_stdout, stderr) in zip(processes, results, strict=True)
+            if process.returncode != 0
+        ]
+        assert not failures
+
+        store = MessageStore(db_path)
+        await store.open()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_open_releases_schema_write_lock(tmp_path, monkeypatch):
+    original = MessageStore._execute_locked_script
+    transaction_started = asyncio.Event()
+
+    async def block_after_begin(db, _script):
+        await db.execute("BEGIN IMMEDIATE")
+        transaction_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        MessageStore,
+        "_execute_locked_script",
+        staticmethod(block_after_begin),
+    )
+    db_path = tmp_path / "messages.db"
+    interrupted = MessageStore(db_path)
+    task = asyncio.create_task(interrupted.open())
+    await transaction_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    monkeypatch.setattr(
+        MessageStore,
+        "_execute_locked_script",
+        staticmethod(original),
+    )
+    replacement = MessageStore(db_path)
+    await asyncio.wait_for(replacement.open(), timeout=2.0)
+    await replacement.close()
+
+
+@pytest.mark.asyncio
 async def test_store_and_has_message():
     store = _temp_store()
     await store.open()

@@ -25,6 +25,7 @@ from puffo_agent.agent.global_inbox_runtime import (
     GlobalInboxRuntime,
     HeldRecoverySource,
     TrackingSendDelegate,
+    await_listener_with_runtime,
 )
 from puffo_agent.agent.message_store import (
     MessageStore,
@@ -92,6 +93,7 @@ async def receipt(
     sender="alice",
     disposition=ReceiptDisposition.ELIGIBLE,
     content=None,
+    is_encrypted=True,
 ):
     return await store.store_receipt(
         {
@@ -104,6 +106,7 @@ async def receipt(
             "content": content if content is not None else f"text-{envelope_id}",
             "content_type": "text/plain",
             "sent_at": seq,
+            "is_encrypted": is_encrypted,
         },
         server_seq=seq,
         disposition=disposition,
@@ -682,6 +685,185 @@ async def test_multi_target_global_order_route_metadata_and_current_turn(tmp_pat
     assert (await store.get_turn_run(turn_ids[0])).state == ProcessingState.PROCESSED.value
     assert not (tmp_path / ".puffo-agent/current_turn.json").exists()
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_send_mode_tracks_encrypted_bundle_and_clears(tmp_path):
+    from puffo_agent.agent import send_mode
+
+    store = await make_store(tmp_path)
+    await receipt(store, "encrypted", 1, is_encrypted=True)
+    adapter = Adapter()
+
+    async def run(_planned):
+        assert await send_mode.encryption_required(
+            "agent-send-mode", store, None
+        )
+        await adapter.admit()
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=run,
+        workspace=tmp_path,
+        send_mode_keys=("agent-send-mode",),
+    )
+    assert await runtime.process_once()
+    assert not await send_mode.encryption_required(
+        "agent-send-mode", store, None
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_send_mode_aliases_clear_after_provider_failure(tmp_path):
+    from puffo_agent.agent import send_mode
+
+    store = await make_store(tmp_path)
+    await receipt(store, "encrypted-failure", 1, is_encrypted=True)
+    adapter = Adapter()
+    keys = ("agent-id-send-mode", "agent-slug-send-mode")
+
+    async def run(_planned):
+        for key in keys:
+            assert await send_mode.encryption_required(key, store, None)
+        await adapter.admit()
+        raise RuntimeError("provider failed")
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=run,
+        workspace=tmp_path,
+        send_mode_keys=keys,
+    )
+    assert await runtime.process_once()
+    assert runtime.health.state == "degraded"
+    for key in keys:
+        assert not await send_mode.encryption_required(key, store, None)
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_send_mode_plaintext_bundle_does_not_require_encryption(tmp_path):
+    from puffo_agent.agent import send_mode
+
+    store = await make_store(tmp_path)
+    await receipt(store, "plaintext", 1, is_encrypted=False)
+    adapter = Adapter()
+
+    async def run(_planned):
+        assert not await send_mode.encryption_required(
+            "plaintext-agent", store, None
+        )
+        await adapter.admit()
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=run,
+        workspace=tmp_path,
+        send_mode_keys=("plaintext-agent",),
+    )
+    assert await runtime.process_once()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_send_mode_clears_when_provider_turn_is_cancelled(tmp_path):
+    from puffo_agent.agent import send_mode
+
+    store = await make_store(tmp_path)
+    await receipt(store, "cancelled-encrypted", 1, is_encrypted=True)
+    adapter = Adapter()
+    provider_started = asyncio.Event()
+
+    async def run(_planned):
+        await adapter.admit()
+        provider_started.set()
+        await asyncio.Event().wait()
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=run,
+        workspace=tmp_path,
+        send_mode_keys=("cancelled-agent",),
+    )
+    task = asyncio.create_task(runtime.process_once())
+    await provider_started.wait()
+    assert await send_mode.encryption_required("cancelled-agent", store, None)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert not await send_mode.encryption_required(
+        "cancelled-agent", store, None
+    )
+    assert [row.envelope_id for row in await store.get_pending()] == [
+        "cancelled-encrypted"
+    ]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_listener_guard_stops_transport_when_runtime_crashes():
+    listener_started = asyncio.Event()
+    listener_stopped = asyncio.Event()
+
+    async def listen_forever():
+        listener_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            listener_stopped.set()
+
+    async def crash_runtime():
+        await listener_started.wait()
+        raise ValueError("runtime boom")
+
+    runtime_task = asyncio.create_task(crash_runtime())
+    with pytest.raises(RuntimeError, match="global inbox crashed: runtime boom"):
+        await await_listener_with_runtime(
+            listen_forever(),
+            runtime_task,
+            label="global inbox",
+        )
+
+    assert listener_stopped.is_set()
+
+
+@pytest.mark.asyncio
+async def test_listener_guard_observes_simultaneous_listener_failure():
+    release = asyncio.Event()
+    listener_started = asyncio.Event()
+
+    async def fail_listener():
+        listener_started.set()
+        await release.wait()
+        raise OSError("listener boom")
+
+    async def fail_runtime():
+        await listener_started.wait()
+        await release.wait()
+        raise ValueError("runtime boom")
+
+    runtime_task = asyncio.create_task(fail_runtime())
+    guarded = asyncio.create_task(
+        await_listener_with_runtime(
+            fail_listener(),
+            runtime_task,
+            label="global inbox",
+        )
+    )
+    await listener_started.wait()
+    release.set()
+
+    with pytest.raises(
+        RuntimeError,
+        match="runtime boom; listener also failed: listener boom",
+    ):
+        await guarded
 
 
 @pytest.mark.asyncio

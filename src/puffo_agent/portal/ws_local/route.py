@@ -164,6 +164,7 @@ async def serve_attached(transport: Transport, hub: WsLocalHub) -> None:
                 adapter=adapter,
                 run_turn=run_turn,
                 workspace=client.workspace or point.agent_cfg.resolve_workspace_dir(),
+                send_mode_keys=(point.agent_id, client.slug),
             )
             coordinator = SendCoordinator(
                 slug=client.slug,
@@ -202,6 +203,8 @@ async def serve_attached(transport: Transport, hub: WsLocalHub) -> None:
         return session
 
     async def start_consumer(authed, on_message):
+        from ...agent.global_inbox_runtime import await_listener_with_runtime
+
         point = hub.get(authed.slug)
         client = point.client
         owned_runtime = getattr(client, "_ws_local_owned_runtime", None)
@@ -213,7 +216,14 @@ async def serve_attached(transport: Transport, hub: WsLocalHub) -> None:
             if owned_runtime is not None else None
         )
         try:
-            await client.listen(on_message)
+            if runtime_task is None:
+                await client.listen(on_message)
+            else:
+                await await_listener_with_runtime(
+                    client.listen(on_message),
+                    runtime_task,
+                    label=f"ws-local {authed.slug} global inbox runtime",
+                )
         finally:
             point.reporter.stop()
             hb.cancel()
@@ -227,7 +237,7 @@ async def serve_attached(transport: Transport, hub: WsLocalHub) -> None:
             if runtime_task is not None:
                 try:
                     await runtime_task
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, Exception):
                     pass
                 if getattr(client, "_ws_local_owned_runtime", None) is owned_runtime:
                     client.global_runtime = None

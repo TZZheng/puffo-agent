@@ -1290,6 +1290,7 @@ class Worker:
             BaselineAdapter,
             GlobalInboxRuntime,
             TrackingSendDelegate,
+            await_listener_with_runtime,
         )
         from ..agent.send_coordinator import SemanticSendRequest, SendCoordinator
         from .ws_local.in_process_data_client import InProcessDataClient
@@ -1414,6 +1415,7 @@ class Worker:
             run_turn=run_global_turn,
             workspace=workspace_path,
             held_catchup=client.recover_pending_delivery,
+            send_mode_keys=(agent_id, client.slug),
         )
         coordinator = SendCoordinator(
             slug=client.slug,
@@ -1512,10 +1514,28 @@ class Worker:
         try:
             while not self._stop.is_set():
                 try:
-                    await client.listen()
+                    await await_listener_with_runtime(
+                        client.listen(),
+                        global_runtime_task,
+                        label=f"agent {agent_id} global inbox runtime",
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
+                    if global_runtime_task.done():
+                        logger.error(
+                            "agent %s: stopping after global inbox runtime failure: %s",
+                            agent_id,
+                            exc,
+                            exc_info=(type(exc), exc, exc.__traceback__),
+                        )
+                        self.runtime.error = f"{type(exc).__name__}: {exc}"
+                        self.runtime.save(agent_id)
+                        try:
+                            await reporter.report_error(self.runtime.error)
+                        except Exception:
+                            pass
+                        raise
                     logger.warning(
                         "agent %s: listen() crashed: %s: %s — reconnecting in %.1fs",
                         agent_id, type(exc).__name__, exc, RECONNECT_BACKOFF_SECONDS,

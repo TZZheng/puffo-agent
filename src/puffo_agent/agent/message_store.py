@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
+import weakref
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -11,6 +13,17 @@ from typing import Any, Iterable, Optional
 import aiosqlite
 
 from ..portal.state import home_dir
+
+_SCHEMA_INIT_LOCKS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
+] = weakref.WeakKeyDictionary()
+
+
+def _schema_init_lock(db_path: Path) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    locks = _SCHEMA_INIT_LOCKS.setdefault(loop, {})
+    return locks.setdefault(str(db_path.resolve()), asyncio.Lock())
+
 
 _BASE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -226,6 +239,7 @@ class MessageStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._db: Optional[aiosqlite.Connection] = None
+        self._open_lock = asyncio.Lock()
         # aiosqlite multiplexes one connection. Keep every Inbox transaction
         # and lifecycle-sensitive read outside another coroutine's transaction.
         self._inbox_lock = asyncio.Lock()
@@ -235,77 +249,118 @@ class MessageStore:
         return MessageStore(home_dir() / "agents" / agent_id / "messages.db")
 
     async def open(self) -> None:
-        if self._db is not None:
-            return
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = await aiosqlite.connect(str(self.db_path))
-        self._db.row_factory = aiosqlite.Row
-        # synchronous=NORMAL is WAL-safe (crash may lose the last
-        # group-commit, never corrupt) and halves write latency.
-        await self._db.executescript(
-            "PRAGMA journal_mode=WAL;"
-            "PRAGMA synchronous=NORMAL;"
-            "PRAGMA temp_store=MEMORY;"
-            "PRAGMA cache_size=-20000;"
-            "PRAGMA mmap_size=268435456;"
-        )
-        # Phase 1: tables that do not depend on additive Inbox columns.
-        await self._db.executescript(_BASE_SCHEMA)
+        async with self._open_lock:
+            if self._db is not None:
+                return
 
-        # Phase 2: migrate the baseline and older legacy layouts atomically.
-        cur = await self._db.execute("PRAGMA table_info(messages)")
-        cols = {row[1] for row in await cur.fetchall()}
-        additions = {
-            "is_encrypted": "is_encrypted INTEGER NOT NULL DEFAULT 1",
-            "server_seq": "server_seq INTEGER",
-            "receipt_disposition": (
-                "receipt_disposition TEXT CHECK (receipt_disposition IS NULL OR "
-                "receipt_disposition IN ('eligible','terminal','foreign_dm_gated','local_runtime'))"
-            ),
-            "receipt_reason": "receipt_reason TEXT",
-            "processing_state": (
-                "processing_state TEXT CHECK (processing_state IS NULL OR "
-                "processing_state IN ('pending','in_turn','processed'))"
-            ),
-            "processing_turn_id": "processing_turn_id TEXT",
-            "model_visible_at": "model_visible_at INTEGER",
-            "processed_at": "processed_at INTEGER",
-            "local_ordinal": "local_ordinal INTEGER",
-            "after_server_seq": "after_server_seq INTEGER",
-        }
-        await self._db.execute("BEGIN IMMEDIATE")
+            async with _schema_init_lock(self.db_path):
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
+                db = await aiosqlite.connect(str(self.db_path), timeout=30.0)
+                db.row_factory = aiosqlite.Row
+                try:
+                    await self._configure_connection(db)
+                    # Phase 1: tables that do not depend on additive Inbox columns.
+                    await self._execute_locked_script(db, _BASE_SCHEMA)
+
+                    # Acquire the database write lock before inspecting columns.
+                    # Separate stores may initialize the same file concurrently.
+                    await db.execute("BEGIN IMMEDIATE")
+                    try:
+                        cur = await db.execute("PRAGMA table_info(messages)")
+                        cols = {row[1] for row in await cur.fetchall()}
+                        additions = {
+                            "is_encrypted": "is_encrypted INTEGER NOT NULL DEFAULT 1",
+                            "server_seq": "server_seq INTEGER",
+                            "receipt_disposition": (
+                                "receipt_disposition TEXT CHECK (receipt_disposition IS NULL OR "
+                                "receipt_disposition IN ('eligible','terminal','foreign_dm_gated','local_runtime'))"
+                            ),
+                            "receipt_reason": "receipt_reason TEXT",
+                            "processing_state": (
+                                "processing_state TEXT CHECK (processing_state IS NULL OR "
+                                "processing_state IN ('pending','in_turn','processed'))"
+                            ),
+                            "processing_turn_id": "processing_turn_id TEXT",
+                            "model_visible_at": "model_visible_at INTEGER",
+                            "processed_at": "processed_at INTEGER",
+                            "local_ordinal": "local_ordinal INTEGER",
+                            "after_server_seq": "after_server_seq INTEGER",
+                        }
+                        for name, declaration in additions.items():
+                            if name not in cols:
+                                await db.execute(
+                                    f"ALTER TABLE messages ADD COLUMN {declaration}"
+                                )
+                        await db.commit()
+                    except BaseException:
+                        await db.rollback()
+                        raise
+
+                    # Phase 3: indexes and tables whose definitions use the new columns.
+                    await self._execute_locked_script(db, _DEPENDENT_SCHEMA)
+                    await self._migrate_nullable_provider_session(db)
+                    self._db = db
+                except BaseException:
+                    await db.close()
+                    raise
+
+    @staticmethod
+    async def _configure_connection(db: aiosqlite.Connection) -> None:
+        # Setting WAL on a brand-new database can fail immediately when
+        # another process is doing the same. Retry that one-time transition;
+        # later schema work is serialized by BEGIN IMMEDIATE.
+        await db.execute("PRAGMA busy_timeout=1000")
+        deadline = time.monotonic() + 30.0
+        delay = 0.01
+        while True:
+            try:
+                async with db.execute("PRAGMA journal_mode=WAL") as cursor:
+                    row = await cursor.fetchone()
+                if row is None or str(row[0]).lower() != "wal":
+                    raise RuntimeError("SQLite refused WAL journal mode")
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or time.monotonic() >= deadline:
+                    raise
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 0.25)
+
+        await db.execute("PRAGMA busy_timeout=30000")
+        # synchronous=NORMAL is WAL-safe (crash may lose the last group
+        # commit, never corrupt) and halves write latency.
+        await db.execute("PRAGMA synchronous=NORMAL")
+        await db.execute("PRAGMA temp_store=MEMORY")
+        await db.execute("PRAGMA cache_size=-20000")
+        await db.execute("PRAGMA mmap_size=268435456")
+
+    @staticmethod
+    async def _execute_locked_script(
+        db: aiosqlite.Connection, script: str
+    ) -> None:
         try:
-            for name, declaration in additions.items():
-                if name not in cols:
-                    await self._db.execute(
-                        f"ALTER TABLE messages ADD COLUMN {declaration}"
-                    )
-            await self._db.commit()
-        except Exception:
-            await self._db.rollback()
+            await db.executescript(f"BEGIN IMMEDIATE;\n{script}\nCOMMIT;")
+        except BaseException:
+            await db.rollback()
             raise
 
-        # Phase 3: indexes and tables whose definitions use the new columns.
-        await self._db.executescript(_DEPENDENT_SCHEMA)
-        await self._db.commit()
-        await self._migrate_nullable_provider_session()
-
-    async def _migrate_nullable_provider_session(self) -> None:
+    async def _migrate_nullable_provider_session(
+        self, db: aiosqlite.Connection
+    ) -> None:
         """Upgrade databases created by the first Package 1 implementation."""
-        assert self._db is not None
-        async with self._db.execute("PRAGMA table_info(turn_runs)") as cursor:
-            columns = {row["name"]: row for row in await cursor.fetchall()}
-        provider_column = columns.get("provider_session_id")
-        if provider_column is None or not provider_column["notnull"]:
-            return
-
-        await self._db.execute("BEGIN IMMEDIATE")
+        await db.execute("BEGIN IMMEDIATE")
         try:
-            await self._db.execute(
+            async with db.execute("PRAGMA table_info(turn_runs)") as cursor:
+                columns = {row["name"]: row for row in await cursor.fetchall()}
+            provider_column = columns.get("provider_session_id")
+            if provider_column is None or not provider_column["notnull"]:
+                await db.commit()
+                return
+
+            await db.execute(
                 "ALTER TABLE turn_run_messages "
                 "RENAME TO turn_run_messages_nonnullable_migration"
             )
-            await self._db.execute(
+            await db.execute(
                 "ALTER TABLE turn_runs RENAME TO turn_runs_nonnullable_migration"
             )
             statements = (
@@ -335,16 +390,17 @@ class MessageStore:
                 "DROP TABLE turn_runs_nonnullable_migration",
             )
             for statement in statements:
-                await self._db.execute(statement)
-            await self._db.commit()
-        except Exception:
-            await self._db.rollback()
+                await db.execute(statement)
+            await db.commit()
+        except BaseException:
+            await db.rollback()
             raise
 
     async def close(self) -> None:
-        if self._db:
-            await self._db.close()
-            self._db = None
+        async with self._open_lock:
+            if self._db:
+                await self._db.close()
+                self._db = None
 
     async def _ensure_db(self) -> aiosqlite.Connection:
         if self._db is None:
