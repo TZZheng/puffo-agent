@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Callable, Coroutine
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Awaitable, Callable, Coroutine, Mapping, TypedDict
 
 import websockets
 import websockets.exceptions  # websockets>=16 lazy-loads submodules; bare `import websockets` doesn't bind `.exceptions`
@@ -33,7 +35,25 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-MessageHandler = Callable[[dict], Coroutine[Any, Any, None]]
+class ServerDelivery(TypedDict):
+    seq: int
+    envelope: dict[str, Any]
+
+
+class TransportOutcome(str, Enum):
+    ACK = "ack"
+    DEFER = "defer"
+    HOLD = "hold"
+
+
+@dataclass(frozen=True)
+class DeliveryResult:
+    outcome: TransportOutcome
+    envelope_id: str | None
+    reason: str
+
+
+MessageHandler = Callable[[ServerDelivery], Awaitable[TransportOutcome]]
 EventHandler = Callable[[str, dict], Coroutine[Any, Any, None]]
 CertHandler = Callable[[dict], Coroutine[Any, Any, None]]
 
@@ -57,6 +77,9 @@ class PuffoCoreWsClient:
         self.on_message: MessageHandler | None = None
         self.on_event: EventHandler | None = None
         self.on_cert_update: CertHandler | None = None
+        # Fires after every (re)connect handshake, before catch-up.
+        self.on_connect: Callable[[], Coroutine[Any, Any, None]] | None = None
+        self._catchup_lock = asyncio.Lock()
 
     def _build_connect_frame(self) -> str:
         sess = self.keystore.load_session(self.slug)
@@ -91,33 +114,77 @@ class PuffoCoreWsClient:
         were offline. MUST run after ``_handshake`` (it registers the
         session); ordering is register → pending fetch → live listen.
         """
-        try:
-            data = await self.http_client.get("/messages/pending")
-            messages = data.get("messages", [])
-            # Log on every reconnect, even zero — a silent reconnect
-            # should still leave one line (else it's indistinguishable
-            # from a no-op).
-            logger.info(
-                "Catch-up: %d pending messages (session=%s)",
-                len(messages), self.session_id or "<pre-handshake>",
+        if not await self._run_catchup():
+            raise ConnectionError(
+                "catch-up stopped at an unacknowledged delivery"
             )
-            if not messages:
-                return
-            envelope_ids = []
-            for item in messages:
-                envelope = item.get("envelope", item)
-                if self.on_message:
-                    try:
-                        await self.on_message(envelope)
-                    except Exception:
-                        logger.exception("on_message callback failed during catch-up")
-                eid = envelope.get("envelope_id")
-                if eid:
-                    envelope_ids.append(eid)
-            if envelope_ids and self._ws:
-                await self._send_ack(envelope_ids)
+
+    async def recover_pending_until(self, envelope_id: str) -> bool:
+        """Use the signed pending endpoint when a held WS watermark is late."""
+        if not envelope_id:
+            return False
+        return await self._run_catchup(required_envelope_id=envelope_id)
+
+    async def _run_catchup(self, required_envelope_id: str | None = None) -> bool:
+        found_required = False
+        try:
+            async with self._catchup_lock:
+                data = await self.http_client.get("/messages/pending")
+                messages = data.get("messages", [])
+                # Log on every reconnect, even zero — a silent reconnect
+                # should still leave one line (else it's indistinguishable
+                # from a no-op).
+                logger.info(
+                    "Catch-up: %d pending messages (session=%s)",
+                    len(messages), self.session_id or "<pre-handshake>",
+                )
+                if not messages:
+                    return required_envelope_id is None
+                # HTTP, not WS-frame (no pong until the listen loop → WS dies
+                # mid-catch-up); chunked so progress survives a death.
+                envelope_ids = []
+                blocked = False
+                for item in messages:
+                    result = await self.dispatch_delivery(item)
+                    if result.outcome is TransportOutcome.DEFER:
+                        # Reliably classified local deferrals, such as a
+                        # foreign DM awaiting operator approval, do not own
+                        # their Server ACK yet but also do not block unrelated
+                        # later deliveries.
+                        continue
+                    if result.outcome is not TransportOutcome.ACK:
+                        # Do not prove an exact later watermark by skipping an
+                        # earlier delivery the receiver could not durably own.
+                        # The local model-visible boundary is contiguous.
+                        blocked = True
+                        break
+                    if result.envelope_id:
+                        envelope_ids.append(result.envelope_id)
+                        if result.envelope_id == required_envelope_id:
+                            found_required = True
+                    if len(envelope_ids) >= 25:
+                        await self._ack_http(envelope_ids)
+                        envelope_ids = []
+                    if found_required:
+                        break
+                if envelope_ids:
+                    await self._ack_http(envelope_ids)
+                if blocked:
+                    return False
         except Exception:
             logger.exception("Catch-up failed")
+            return False
+        return found_required if required_envelope_id is not None else True
+
+    async def _ack_http(self, envelope_ids: list[str]) -> None:
+        try:
+            await self.http_client.post(
+                "/messages/ack", {"envelope_ids": list(envelope_ids)},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "catch-up HTTP ack failed (%d ids): %s", len(envelope_ids), exc,
+            )
 
     async def _send_ack(self, envelope_ids: list[str]) -> None:
         if self._ws:
@@ -126,23 +193,66 @@ class PuffoCoreWsClient:
                 "envelope_ids": envelope_ids,
             }))
 
+    async def dispatch_delivery(self, item: Mapping[str, Any]) -> DeliveryResult:
+        """Validate and classify one Server delivery without sending an ACK.
+
+        Both HTTP catch-up and live WebSocket delivery use this seam.  Callers
+        may also reuse it for another durable delivery source.
+        """
+        if not isinstance(item, Mapping):
+            return DeliveryResult(TransportOutcome.HOLD, None, "delivery is not a mapping")
+        seq = item.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
+            return DeliveryResult(TransportOutcome.HOLD, None, "invalid server sequence")
+        raw_envelope = item.get("envelope")
+        if not isinstance(raw_envelope, Mapping):
+            return DeliveryResult(TransportOutcome.HOLD, None, "invalid envelope")
+        envelope = dict(raw_envelope)
+        envelope_id = envelope.get("envelope_id")
+        if not isinstance(envelope_id, str) or not envelope_id.strip():
+            return DeliveryResult(TransportOutcome.HOLD, None, "invalid envelope id")
+        if self.on_message is None:
+            return DeliveryResult(TransportOutcome.HOLD, envelope_id, "no message handler")
+
+        delivery: ServerDelivery = {"seq": seq, "envelope": envelope}
+        try:
+            outcome = await self.on_message(delivery)
+        except Exception:
+            logger.exception("on_message callback failed")
+            return DeliveryResult(TransportOutcome.HOLD, envelope_id, "handler exception")
+        if outcome is TransportOutcome.ACK:
+            return DeliveryResult(TransportOutcome.ACK, envelope_id, "handler committed")
+        if outcome is TransportOutcome.DEFER:
+            return DeliveryResult(
+                TransportOutcome.DEFER,
+                envelope_id,
+                "handler durably deferred",
+            )
+        if outcome is TransportOutcome.HOLD:
+            return DeliveryResult(TransportOutcome.HOLD, envelope_id, "handler held")
+        return DeliveryResult(TransportOutcome.HOLD, envelope_id, "unexpected handler result")
+
     async def _handle_frame(self, raw: str) -> None:
         msg = json.loads(raw)
+        if not isinstance(msg, Mapping):
+            logger.warning("ignoring malformed WebSocket frame")
+            return
         msg_type = msg.get("type")
 
         if msg_type == "ping":
             await self._ws.send(json.dumps({"type": "pong"}))
 
         elif msg_type == "message":
-            envelope = msg.get("envelope", {})
-            if self.on_message:
-                try:
-                    await self.on_message(envelope)
-                except Exception:
-                    logger.exception("on_message callback failed")
-            eid = envelope.get("envelope_id")
-            if eid:
-                await self._send_ack([eid])
+            result = await self.dispatch_delivery(msg)
+            if result.outcome is TransportOutcome.ACK and result.envelope_id:
+                await self._send_ack([result.envelope_id])
+            elif result.outcome is TransportOutcome.HOLD:
+                # Stop this live stream at the first delivery we could not
+                # durably own. Reconnecting re-enters the ordered signed
+                # pending catch-up path before any later live delivery.
+                raise ConnectionError(
+                    "live delivery stopped at an unacknowledged envelope"
+                )
 
         elif msg_type == "cert_update":
             if self.on_cert_update:
@@ -168,6 +278,11 @@ class PuffoCoreWsClient:
             self._ws = ws
             self.session_id = await self._handshake(ws)
             logger.info("[%s] WS connected, session=%s", self.slug, self.session_id)
+            if self.on_connect:
+                try:
+                    await self.on_connect()
+                except Exception:
+                    logger.exception("on_connect callback failed")
             await self._catchup()
             await self._listen_loop()
 

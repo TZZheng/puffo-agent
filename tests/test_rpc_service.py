@@ -145,6 +145,145 @@ async def test_install_unexpected_exception_500(app_client_factory, monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("hidden", [
+    {"context_baseline_seq": 1},
+    {"seen_seq": 1},
+    {"unexpected": True},
+])
+async def test_send_message_hidden_or_unknown_rejected_before_resolver(
+    app_client_factory, hidden,
+):
+    resolver_calls = []
+    rpc_service.set_rpc_resolver(lambda aid: resolver_calls.append(aid))
+    client = await app_client_factory()
+    response = await client.post(
+        "/v1/rpc/agent_a/send-message",
+        json={"channel": "ch_a", "text": "x", **hidden},
+    )
+    assert response.status == 400
+    assert resolver_calls == []
+
+
+@pytest.mark.asyncio
+async def test_send_message_structured_round_trip(app_client_factory):
+    class Coordinator:
+        def __init__(self):
+            self.calls = []
+
+        async def send(self, request):
+            self.calls.append(request)
+            return {"state": "held", "attempted": True, "latest_seq": 9}
+
+    coordinator = Coordinator()
+    ctx = _stub_ctx()
+    ctx.send_coordinator = coordinator
+    rpc_service.set_rpc_resolver(lambda _aid: ctx)
+    client = await app_client_factory()
+    response = await client.post(
+        "/v1/rpc/agent_a/send-message",
+        json={"channel": "ch_a", "text": "x", "send_anyway": True},
+    )
+    assert response.status == 200
+    assert await response.json() == {
+        "state": "held", "attempted": True, "latest_seq": 9,
+    }
+    assert coordinator.calls[0].destination == "ch_a"
+    assert coordinator.calls[0].send_anyway is True
+
+
+@pytest.mark.asyncio
+async def test_send_message_unavailable_is_structured(app_client_factory):
+    rpc_service.set_rpc_resolver(lambda _aid: _stub_ctx())
+    client = await app_client_factory()
+    response = await client.post(
+        "/v1/rpc/agent_a/send-message",
+        json={"channel": "ch_a", "text": "x"},
+    )
+    assert response.status == 200
+    body = await response.json()
+    assert body["state"] == "failed"
+    assert body["attempted"] is True
+
+
+@pytest.mark.asyncio
+async def test_model_visible_read_structured_round_trip(
+    app_client_factory, monkeypatch,
+):
+    captured: dict[str, Any] = {}
+
+    async def _stub_stage(ctx, **kwargs):
+        captured.update(ctx=ctx, **kwargs)
+        return {
+            "state": "staged",
+            "correlation_key": "visible_read_1",
+            "through_seq": kwargs["through_seq"],
+        }
+
+    monkeypatch.setattr(
+        rpc_service.host_mcp_handler,
+        "stage_model_visible_read",
+        _stub_stage,
+    )
+    rpc_service.set_rpc_resolver(lambda aid: _stub_ctx(aid))
+    client = await app_client_factory()
+    body = {
+        "space_id": "sp_1",
+        "channel_id": "ch_1",
+        "through_seq": 9,
+        "through_envelope_id": "msg_9",
+        "tool_name": "get_channel_history",
+        "tool_arguments": {"channel": "ch_1"},
+    }
+    response = await client.post(
+        "/v1/rpc/agent_a/model-visible-read",
+        json=body,
+    )
+
+    assert response.status == 200
+    assert await response.json() == {
+        "state": "staged",
+        "correlation_key": "visible_read_1",
+        "through_seq": 9,
+    }
+    assert captured["ctx"].agent_id == "agent_a"
+    assert captured["tool_arguments"] == {"channel": "ch_1"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("through_seq", True),
+        ("through_seq", -1),
+        ("tool_name", "get_dm_history"),
+        ("tool_arguments", {"channel": ["ch_1"]}),
+        ("unexpected", "field"),
+    ],
+)
+async def test_model_visible_read_rejects_invalid_body_before_resolver(
+    app_client_factory, field, value,
+):
+    resolver_calls = []
+    rpc_service.set_rpc_resolver(lambda aid: resolver_calls.append(aid))
+    client = await app_client_factory()
+    body = {
+        "space_id": "sp_1",
+        "channel_id": "ch_1",
+        "through_seq": 9,
+        "through_envelope_id": "msg_9",
+        "tool_name": "get_channel_history",
+        "tool_arguments": {"channel": "ch_1"},
+    }
+    body[field] = value
+    response = await client.post(
+        "/v1/rpc/agent_a/model-visible-read",
+        json=body,
+    )
+    assert response.status == 400
+    assert resolver_calls == []
+
+
+@pytest.mark.asyncio
 async def test_install_rejects_non_json_body(app_client_factory):
     rpc_service.set_rpc_resolver(lambda aid: _stub_ctx(aid))
     app_client = await app_client_factory()

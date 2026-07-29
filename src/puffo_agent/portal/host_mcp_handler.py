@@ -15,7 +15,14 @@ from typing import Any
 from ..crypto.encoding import base64url_decode
 from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
-from ..crypto.message import EncryptInput, RecipientDevice, encrypt_message
+from ..agent import send_mode
+from ..agent.send_coordinator import SemanticSendRequest, failed_result
+from ..crypto.message import (
+    EncryptInput,
+    RecipientDevice,
+    build_plaintext_message,
+    encrypt_message,
+)
 from ..crypto.primitives import Ed25519KeyPair
 from ..mcp.config import _emit_codex_mcp_block
 
@@ -41,6 +48,9 @@ class HostMcpContext:
     # The worker's live PuffoCoreMessageClient, for tools that drive
     # daemon-side state (leave requests). None until warm().
     message_client: Any = None
+    # The worker's single persistent semantic send coordinator. Package 4
+    # supplies it; optional preserves existing context constructors.
+    send_coordinator: Any = None
 
 
 # ── filesystem helpers (host & agent .claude.json) ─────────────────
@@ -251,13 +261,17 @@ async def _send_dm_to_operator(
     signing_key = Ed25519KeyPair.from_secret_bytes(
         decode_secret(sess.subkey_secret_key)
     )
-    devices = await _fetch_device_keys(
-        ctx.http_client, [ctx.slug, ctx.operator_slug],
-    )
-    if not devices:
-        raise RuntimeError(
-            f"no recipient devices resolved for @{ctx.operator_slug}"
+    # Unthreaded DM — only the turn-bundle rule applies (no store here).
+    encrypt = await send_mode.encryption_required(ctx.slug, None, None)
+    devices: list[RecipientDevice] = []
+    if encrypt:
+        devices = await _fetch_device_keys(
+            ctx.http_client, [ctx.slug, ctx.operator_slug],
         )
+        if not devices:
+            raise RuntimeError(
+                f"no recipient devices resolved for @{ctx.operator_slug}"
+            )
     inp = EncryptInput(
         envelope_kind="dm",
         sender_slug=ctx.slug,
@@ -271,8 +285,12 @@ async def _send_dm_to_operator(
         content=text,
         recipients=devices,
     )
-    envelope = encrypt_message(inp, signing_key)
-    await ctx.http_client.post("/messages", envelope)
+    if encrypt:
+        envelope = encrypt_message(inp, signing_key)
+        await ctx.http_client.post("/messages", envelope)
+    else:
+        envelope = build_plaintext_message(inp, signing_key)
+        await ctx.http_client.post("/v2/messages/plaintext", envelope)
     return str(envelope.get("envelope_id") or "?")
 
 
@@ -486,4 +504,93 @@ async def request_leave(
         space_id=space_id,
         channel_id=channel_id,
         reason=reason or "",
+    )
+
+
+async def send_message(
+    ctx: HostMcpContext,
+    *,
+    channel: str,
+    text: str = "",
+    paths: list[str] | None = None,
+    caption: str = "",
+    root_id: str = "",
+    visibility_level: str = "default",
+    send_anyway: bool = False,
+) -> dict[str, Any]:
+    """Dispatch a semantic model send through the worker-owned coordinator."""
+    coordinator = ctx.send_coordinator
+    if coordinator is None:
+        return failed_result(
+            "persistent send coordinator is unavailable",
+            kind="coordinator_unavailable",
+        )
+    request = SemanticSendRequest(
+        destination=str(channel or ""),
+        text=str(text or ""),
+        attachment_paths=tuple(paths or ()),
+        caption=str(caption or ""),
+        root_id=str(root_id or ""),
+        visibility_level=str(visibility_level or "default"),
+        send_anyway=send_anyway is True,
+    )
+    result = await coordinator.send(request)
+    if not isinstance(result, dict):
+        return failed_result(
+            "persistent send coordinator returned a malformed result",
+            kind="protocol",
+        )
+    result.setdefault("attempted", True)
+    return result
+
+
+async def stage_model_visible_read(
+    ctx: HostMcpContext,
+    *,
+    space_id: str,
+    channel_id: str,
+    through_seq: int,
+    through_envelope_id: str,
+    tool_name: str,
+    tool_arguments: dict[str, object],
+) -> dict[str, Any]:
+    """Correlate a local-history tool result with the live provider turn."""
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global message runtime is unavailable")
+    return await runtime.stage_model_visible_read(
+        space_id=space_id,
+        channel_id=channel_id,
+        through_seq=through_seq,
+        through_envelope_id=through_envelope_id,
+        tool_name=tool_name,
+        tool_arguments=tool_arguments,
+    )
+
+
+async def request_command_permission(
+    ctx: HostMcpContext,
+    *,
+    tool_name: str,
+    summary: str,
+    timeout_s: object,
+) -> str:
+    """Hand a hook's permission ask to the message client; blocks
+    until y/n or timeout. Returns allow/deny/timeout."""
+    client = ctx.message_client
+    if client is None:
+        raise RuntimeError(
+            "agent isn't fully warm yet — try again in a moment"
+        )
+    if not tool_name:
+        raise RuntimeError("tool_name is required")
+    try:
+        timeout = int(timeout_s) if timeout_s is not None else 300
+    except (TypeError, ValueError):
+        timeout = 300
+    timeout = max(5, min(timeout, 3600))
+    return await client.request_command_permission(
+        tool_name=str(tool_name),
+        summary=str(summary or ""),
+        timeout_s=timeout,
     )

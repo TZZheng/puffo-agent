@@ -17,7 +17,9 @@ from puffo_agent.crypto.primitives import Ed25519KeyPair, ed25519_verify
 from puffo_agent.crypto.ws_client import (
     CONNECT_TIMEOUT,
     INITIAL_BACKOFF,
+    DeliveryResult,
     PuffoCoreWsClient,
+    TransportOutcome,
     _http_to_ws,
 )
 
@@ -120,11 +122,17 @@ class FakeHttpClient:
 
     def __init__(self):
         self.pending_messages: list[dict] = []
+        self.ack_posts: list[list[str]] = []
         self._ensure_subkey_called = False
 
     async def get(self, path: str):
         if path == "/messages/pending":
             return {"messages": self.pending_messages}
+        return {}
+
+    async def post(self, path: str, body: dict):
+        if path == "/messages/ack":
+            self.ack_posts.append(list(body.get("envelope_ids") or []))
         return {}
 
     async def _ensure_subkey(self):
@@ -206,14 +214,15 @@ async def test_message_callback_and_ack():
         "sender_slug": "bob-0001",
     }
     server._push_after_connect = [
-        {"type": "message", "envelope": test_envelope}
+        {"type": "message", "seq": 7, "envelope": test_envelope}
     ]
     await server.start()
 
     received = []
 
-    async def on_msg(envelope):
-        received.append(envelope)
+    async def on_msg(delivery):
+        received.append(delivery)
+        return TransportOutcome.ACK
 
     http = FakeHttpClient()
     client = PuffoCoreWsClient(
@@ -232,7 +241,7 @@ async def test_message_callback_and_ack():
         pass
 
     assert len(received) == 1
-    assert received[0]["envelope_id"] == "env_abc"
+    assert received[0] == {"seq": 7, "envelope": test_envelope}
 
     ack_frames = [f for f in server.received_frames if f.get("type") == "ack"]
     assert len(ack_frames) == 1
@@ -248,8 +257,9 @@ async def test_catchup_on_connect():
 
     received = []
 
-    async def on_msg(envelope):
-        received.append(envelope)
+    async def on_msg(delivery):
+        received.append(delivery)
+        return TransportOutcome.ACK
 
     http = FakeHttpClient()
     http.pending_messages = [
@@ -273,13 +283,93 @@ async def test_catchup_on_connect():
         pass
 
     assert len(received) == 2
-    assert received[0]["envelope_id"] == "env_pending1"
-    assert received[1]["envelope_id"] == "env_pending2"
+    assert received[0]["envelope"]["envelope_id"] == "env_pending1"
+    assert received[1]["envelope"]["envelope_id"] == "env_pending2"
 
-    ack_frames = [f for f in server.received_frames if f.get("type") == "ack"]
-    assert len(ack_frames) == 1
-    assert sorted(ack_frames[0]["envelope_ids"]) == ["env_pending1", "env_pending2"]
+    assert len(http.ack_posts) == 1
+    assert sorted(http.ack_posts[0]) == ["env_pending1", "env_pending2"]
     await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_held_recovery_uses_signed_pending_path_until_exact_envelope():
+    ks, _ = _make_keystore()
+    http = FakeHttpClient()
+    http.pending_messages = [
+        {"seq": 1, "envelope": {"envelope_id": "before", "sender_slug": "bob"}},
+        {"seq": 2, "envelope": {"envelope_id": "required", "sender_slug": "bob"}},
+        {"seq": 3, "envelope": {"envelope_id": "after", "sender_slug": "bob"}},
+    ]
+    received = []
+
+    async def on_msg(delivery):
+        received.append(delivery["envelope"]["envelope_id"])
+        return TransportOutcome.ACK
+
+    client = PuffoCoreWsClient(
+        "http://localhost", ks, "alice-0001", http,
+    )
+    client.on_message = on_msg
+    assert await client.recover_pending_until("required")
+    assert received == ["before", "required"]
+    assert http.ack_posts == [["before", "required"]]
+
+
+@pytest.mark.asyncio
+async def test_held_recovery_does_not_skip_a_held_delivery_to_reach_watermark():
+    ks, _ = _make_keystore()
+    http = FakeHttpClient()
+    http.pending_messages = [
+        {"seq": 1, "envelope": {"envelope_id": "blocked", "sender_slug": "bob"}},
+        {"seq": 2, "envelope": {"envelope_id": "required", "sender_slug": "bob"}},
+    ]
+    received = []
+
+    async def on_msg(delivery):
+        envelope_id = delivery["envelope"]["envelope_id"]
+        received.append(envelope_id)
+        return (
+            TransportOutcome.HOLD
+            if envelope_id == "blocked"
+            else TransportOutcome.ACK
+        )
+
+    client = PuffoCoreWsClient(
+        "http://localhost", ks, "alice-0001", http,
+    )
+    client.on_message = on_msg
+    assert not await client.recover_pending_until("required")
+    assert received == ["blocked"]
+    assert http.ack_posts == []
+
+
+@pytest.mark.asyncio
+async def test_signed_pending_defer_allows_later_required_delivery():
+    ks, _ = _make_keystore()
+    http = FakeHttpClient()
+    http.pending_messages = [
+        {"seq": 1, "envelope": {"envelope_id": "gated-dm", "sender_slug": "bob"}},
+        {"seq": 2, "envelope": {"envelope_id": "required", "sender_slug": "operator"}},
+    ]
+    received = []
+
+    async def on_msg(delivery):
+        envelope_id = delivery["envelope"]["envelope_id"]
+        received.append(envelope_id)
+        return (
+            TransportOutcome.DEFER
+            if envelope_id == "gated-dm"
+            else TransportOutcome.ACK
+        )
+
+    client = PuffoCoreWsClient(
+        "http://localhost", ks, "alice-0001", http,
+    )
+    client.on_message = on_msg
+
+    assert await client.recover_pending_until("required")
+    assert received == ["gated-dm", "required"]
+    assert http.ack_posts == [["required"]]
 
 
 @pytest.mark.asyncio
@@ -446,22 +536,23 @@ async def test_catchup_logs_zero_pending_count(caplog):
 
 
 @pytest.mark.asyncio
-async def test_callback_exception_does_not_kill_loop():
+async def test_callback_exception_stops_before_later_delivery():
     ks, subkey = _make_keystore()
     server = FakeWsServer()
     server._push_after_connect = [
-        {"type": "message", "envelope": {"envelope_id": "env_fail", "sender_slug": "bob"}},
-        {"type": "message", "envelope": {"envelope_id": "env_ok", "sender_slug": "carol"}},
+        {"type": "message", "seq": 1, "envelope": {"envelope_id": "env_fail", "sender_slug": "bob"}},
+        {"type": "message", "seq": 2, "envelope": {"envelope_id": "env_ok", "sender_slug": "carol"}},
     ]
     await server.start()
 
     call_count = 0
 
-    async def on_msg(envelope):
+    async def on_msg(delivery):
         nonlocal call_count
         call_count += 1
-        if envelope["envelope_id"] == "env_fail":
+        if delivery["envelope"]["envelope_id"] == "env_fail":
             raise RuntimeError("simulated callback failure")
+        return TransportOutcome.ACK
 
     http = FakeHttpClient()
     client = PuffoCoreWsClient(
@@ -479,12 +570,284 @@ async def test_callback_exception_does_not_kill_loop():
     except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError, OSError):
         pass
 
-    assert call_count == 2, "both messages should be processed despite first callback failing"
+    assert call_count == 1
 
     ack_frames = [f for f in server.received_frames if f.get("type") == "ack"]
     acked_ids = []
     for a in ack_frames:
         acked_ids.extend(a["envelope_ids"])
-    assert "env_fail" in acked_ids, "failed message should still be ACKed"
-    assert "env_ok" in acked_ids, "second message should be ACKed"
+    assert "env_fail" not in acked_ids, "failed classification must remain unACKed"
+    assert "env_ok" not in acked_ids, "later messages cannot cross an unACKed gap"
     await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_on_connect_failure_does_not_kill_the_loop():
+    """An on_connect callback that throws must not tear down the
+    connection — catch-up + listen still run."""
+    ks, _ = _make_keystore()
+    server = FakeWsServer()
+    await server.start()
+
+    received = []
+
+    async def on_msg(delivery):
+        received.append(delivery)
+        return TransportOutcome.ACK
+
+    async def boom():
+        raise RuntimeError("warm blew up")
+
+    http = FakeHttpClient()
+    http.pending_messages = [
+        {"seq": 1, "envelope": {"envelope_id": "env_p1", "sender_slug": "bob"}},
+    ]
+
+    client = PuffoCoreWsClient(
+        f"http://127.0.0.1:{server.port}", ks, "alice-0001", http,
+    )
+    client.ws_url = f"ws://127.0.0.1:{server.port}"
+    client.on_message = on_msg
+    client.on_connect = boom  # raises — must be swallowed, not kill the WS
+
+    task = asyncio.create_task(client.connect_once())
+    await asyncio.sleep(0.5)
+    client.stop()
+    try:
+        await asyncio.wait_for(task, timeout=2)
+    except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError, OSError):
+        pass
+
+    # Catch-up still delivered the pending message → the on_connect
+    # exception was caught, not propagated out of connect_once.
+    assert [e["envelope"]["envelope_id"] for e in received] == ["env_p1"]
+    await server.stop()
+
+
+@pytest.mark.asyncio
+async def test_catchup_acks_in_chunks():
+    """A big backlog must ack incrementally — one end-of-loop ack loses
+    all progress when the connection dies mid-catch-up and the whole
+    batch redelivers forever."""
+    ks, _ = _make_keystore()
+    server = FakeWsServer()
+    await server.start()
+
+    http = FakeHttpClient()
+    http.pending_messages = [
+        {"seq": i, "envelope": {"envelope_id": f"env_{i}", "sender_slug": "bob"}}
+        for i in range(1, 61)
+    ] + [
+        {"seq": 100 + i, "envelope": {"envelope_id": f"held_{i}", "sender_slug": "bob"}}
+        for i in range(3)
+    ]
+
+    client = PuffoCoreWsClient(
+        f"http://127.0.0.1:{server.port}", ks, "alice-0001", http,
+    )
+    client.ws_url = f"ws://127.0.0.1:{server.port}"
+
+    async def on_msg(delivery):
+        if delivery["envelope"]["envelope_id"].startswith("held_"):
+            return TransportOutcome.HOLD
+        return TransportOutcome.ACK
+
+    client.on_message = on_msg
+    task = asyncio.create_task(client.connect_once())
+    await asyncio.sleep(0.8)
+    client.stop()
+    try:
+        await asyncio.wait_for(task, timeout=2)
+    except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError, OSError):
+        pass
+
+    # 60 messages at 25/chunk → 25 + 25 + 10, over HTTP (immune to a
+    # WS death mid-catch-up).
+    assert [len(c) for c in http.ack_posts] == [25, 25, 10]
+    acked = [e for c in http.ack_posts for e in c]
+    assert acked == [f"env_{i}" for i in range(1, 61)]
+    await server.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "item",
+    [
+        {},
+        {"seq": True, "envelope": {"envelope_id": "env"}},
+        {"seq": "1", "envelope": {"envelope_id": "env"}},
+        {"seq": 0, "envelope": {"envelope_id": "env"}},
+        {"seq": -1, "envelope": {"envelope_id": "env"}},
+        {"seq": 1, "envelope": None},
+        {"seq": 1, "envelope": {}},
+        {"seq": 1, "envelope": {"envelope_id": ""}},
+    ],
+)
+async def test_invalid_seq_or_envelope_holds_without_callback(item):
+    ks, _ = _make_keystore()
+    client = PuffoCoreWsClient("http://localhost", ks, "alice-0001", FakeHttpClient())
+    calls = []
+
+    async def handler(delivery):
+        calls.append(delivery)
+        return TransportOutcome.ACK
+
+    client.on_message = handler
+    result = await client.dispatch_delivery(item)
+    assert result.outcome is TransportOutcome.HOLD
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_ack_waits_for_explicit_post_commit_outcome_and_later_delivery_continues():
+    ks, _ = _make_keystore()
+    client = PuffoCoreWsClient("http://localhost", ks, "alice-0001", FakeHttpClient())
+
+    class CaptureWs:
+        def __init__(self):
+            self.frames = []
+
+        async def send(self, raw):
+            self.frames.append(json.loads(raw))
+
+    ws = CaptureWs()
+    client._ws = ws
+    committed = asyncio.Event()
+
+    async def handler(delivery):
+        if delivery["seq"] == 1:
+            await committed.wait()
+        return TransportOutcome.ACK
+
+    client.on_message = handler
+    first = asyncio.create_task(client._handle_frame(json.dumps({
+        "type": "message",
+        "seq": 1,
+        "envelope": {"envelope_id": "env_1"},
+    })))
+    await asyncio.sleep(0)
+    assert ws.frames == []
+    committed.set()
+    await first
+    await client._handle_frame(json.dumps({
+        "type": "message",
+        "seq": 2,
+        "envelope": {"envelope_id": "env_2"},
+    }))
+    assert ws.frames == [
+        {"type": "ack", "envelope_ids": ["env_1"]},
+        {"type": "ack", "envelope_ids": ["env_2"]},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_live_hold_stops_before_later_delivery_can_be_acked():
+    ks, _ = _make_keystore()
+    client = PuffoCoreWsClient("http://localhost", ks, "alice-0001", FakeHttpClient())
+    handled = []
+
+    class SequenceWs:
+        def __init__(self):
+            self.frames = []
+            self.items = iter([
+                json.dumps({
+                    "type": "message",
+                    "seq": 1,
+                    "envelope": {"envelope_id": "env_1"},
+                }),
+                json.dumps({
+                    "type": "message",
+                    "seq": 2,
+                    "envelope": {"envelope_id": "env_2"},
+                }),
+            ])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.items)
+            except StopIteration:
+                raise StopAsyncIteration
+
+        async def send(self, raw):
+            self.frames.append(json.loads(raw))
+
+    async def handler(delivery):
+        handled.append(delivery["seq"])
+        return (
+            TransportOutcome.HOLD
+            if delivery["seq"] == 1
+            else TransportOutcome.ACK
+        )
+
+    ws = SequenceWs()
+    client._ws = ws
+    client.on_message = handler
+
+    with pytest.raises(ConnectionError, match="unacknowledged"):
+        await client._listen_loop()
+
+    assert handled == [1]
+    assert ws.frames == []
+
+
+@pytest.mark.asyncio
+async def test_live_defer_allows_later_delivery_to_be_acked():
+    ks, _ = _make_keystore()
+    client = PuffoCoreWsClient("http://localhost", ks, "alice-0001", FakeHttpClient())
+    handled = []
+
+    class CaptureWs:
+        def __init__(self):
+            self.frames = []
+
+        async def send(self, raw):
+            self.frames.append(json.loads(raw))
+
+    async def handler(delivery):
+        handled.append(delivery["seq"])
+        return (
+            TransportOutcome.DEFER
+            if delivery["seq"] == 1
+            else TransportOutcome.ACK
+        )
+
+    ws = CaptureWs()
+    client._ws = ws
+    client.on_message = handler
+
+    await client._handle_frame(json.dumps({
+        "type": "message",
+        "seq": 1,
+        "envelope": {"envelope_id": "gated-dm"},
+    }))
+    await client._handle_frame(json.dumps({
+        "type": "message",
+        "seq": 2,
+        "envelope": {"envelope_id": "operator-approval"},
+    }))
+
+    assert handled == [1, 2]
+    assert ws.frames == [
+        {"type": "ack", "envelope_ids": ["operator-approval"]},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returned", [TransportOutcome.HOLD, None, False, "ack"])
+async def test_unexpected_or_hold_callback_result_emits_no_ack(returned):
+    ks, _ = _make_keystore()
+    client = PuffoCoreWsClient("http://localhost", ks, "alice-0001", FakeHttpClient())
+
+    async def handler(_delivery):
+        return returned
+
+    client.on_message = handler
+    result = await client.dispatch_delivery({
+        "seq": 1,
+        "envelope": {"envelope_id": "env"},
+    })
+    assert isinstance(result, DeliveryResult)
+    assert result.outcome is TransportOutcome.HOLD

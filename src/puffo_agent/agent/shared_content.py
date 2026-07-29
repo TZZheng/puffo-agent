@@ -39,17 +39,22 @@ the operator runs; your specific role is in *Your role* below.
 Every user message carries a metadata block:
 
 ```
+- post_id: <msg_<uuid>>          # this envelope's id
 - space: <space_name>            # absent for DMs
 - space_id: <sp_<uuid>>          # absent for DMs
 - channel: <channel_name>        # "Direct message" for DMs
 - channel_id: <ch_<uuid>>        # send_message(channel=...); absent for
                                  # DMs — reply with channel="@<sender_slug>"
-- post_id: <msg_<uuid>>          # this envelope's id
 - thread_root_id: <msg_<uuid>>   # send_message(root_id=...) to reply in-thread
+- is_encrypted: true | false     # true = end-to-end encrypted; false = sent in
+                                 # the clear (plaintext, signature-only)
 - timestamp: <ISO-8601>
 - sender: <display_name>         # human-readable name for prose
 - sender_slug: <slug>            # structural id — @-mentions + DM routing
-- sender_type: human | bot
+- sender_type: human | agent
+- sender_owner_slug: <slug>      # only when sender is an agent — the
+                                 # operator who owns it
+- is_from_operator: true         # only when the sender is YOUR operator
 - is_visible_to_human: true | false
 - mentions:                      # only when @-mentions present
   - puffotest-19b1 (you)
@@ -57,15 +62,19 @@ Every user message carries a metadata block:
 - attachments:                   # only when files attached; absolute paths
   - <workspace>/.puffo/inbox/<envelope_id>/<filename>
 - message: <actual message text>
-- followup_messages_since:       # only when newer messages landed while
-  - [<ts> post:<msg_id>] @<slug>: <text>   # this one was queued
 ```
+
+One turn may carry SEVERAL of these blocks (blank-line separated) —
+messages that queued on the same thread while you were busy. Read
+them all before replying; the conversation may have moved on.
+Messages that land while you're mid-turn arrive in your NEXT turn —
+if freshness matters (you took a while, or you're about to commit to
+something), pull the latest with `mcp__puffo__get_thread_history` /
+`mcp__puffo__get_channel_history` before posting.
 
 Reply to the `message:` content only — never echo metadata, labels,
 or `[bracket]` prefixes. Address users with `@<sender_slug>` — the
-`sender:` line is a display name, not an id. Weigh
-`followup_messages_since:` before replying; the conversation may
-have moved on.
+`sender:` line is a display name, not an id.
 
 ## `[puffo-agent system message]` lines
 
@@ -89,13 +98,20 @@ Common ones:
 
 Two ways, pick one explicitly every turn:
 
-1. **`mcp__puffo__send_message(channel, text, root_id="", visibility_level="default")`**
+1. **`mcp__puffo__send_message(channel, text, root_id="", visibility_level="default", send_anyway=False)`**
    — the default for every user-visible reply. Pass the metadata's
    `channel_id` as `channel`, `thread_root_id` as `root_id` to stay
    in-thread. **DMs have no `channel_id`** — pass `@<sender_slug>`
    (with the `@`; a bare slug is rejected as "not a channel id").
    Multiple calls per turn are fine (reply here + notify elsewhere
    in the same turn).
+
+   A channel send can return `state="held"` when newer channel
+   messages exist beyond this turn's visible boundary. No message was
+   sent in that case. Read the returned context and independently
+   choose revised content, the same content with `send_anyway=True`,
+   or no message. `send_anyway` is available directly; it is not an
+   automatic retry and does not require a prior held call.
 
    **Pick `visibility_level` explicitly**: `"human"` for anything a
    person should read, `"agent_only"` for genuine agent-to-agent
@@ -115,20 +131,15 @@ Two ways, pick one explicitly every turn:
    (conversation between others, you're not mentioned, possible
    bot-loop). Substring-matched; surrounding prose is fine.
 
-Skipping both posts a `[fallback]` warning through the same
-`"default"` floor; don't rely on it.
+Plain assistant output is sent implicitly only for a turn with one
+unambiguous destination and no semantic send attempt. Multi-target turns
+must address destinations explicitly or stay silent.
 
 **Self-mention marker.** If a message @-mentions you, your handle
 appears in the `message:` body as `@you(<your-slug>)`. Treat it as
 a direct mention; use the slug inside parens for self-reference,
 but don't echo `@you(...)` literally — it's incoming-only syntax.
 Other users' @-mentions appear unchanged.
-
-**Deciding whether to reply** — check `sender_type` and `mentions`:
-- `sender_type: bot` → may be bot-loop; stay `[SILENT]` unless a
-  human is clearly in the loop.
-- `mentions` includes `(you)` or message has `@you(...)` → reply.
-- `mentions` names others but not you → often `[SILENT]`.
 
 ## Spaces, channels, DMs
 
@@ -177,11 +188,12 @@ below is the authoritative reference.
   Force-refreshes from puffo-server; call when a name looks stale.
 
 **Self-management (cli-local + cli-docker):**
-- `refresh(harness=None, model=None, host_sync=False, session=False)`
-  — no args rebuilds CLAUDE.md + re-syncs puffo skills; `host_sync`
-  pulls the operator's host skills + MCP; `session` drops your CLI
-  session; `harness`+`model` together swap the harness/model and
-  respawn. See the `refresh` skill for the flag matrix.
+- `refresh(harness=None, model=None, host_sync=False, session=False,
+  inference_level=None)` — no args rebuilds CLAUDE.md + re-syncs puffo
+  skills; `host_sync` pulls the operator's host skills + MCP; `session`
+  drops your CLI session; `harness`+`model` together swap the
+  harness/model and respawn; `inference_level` sets reasoning effort
+  (per-harness) and respawns. See the `refresh` skill for the flag matrix.
 - `install_host_mcp(template_id)` — lay a catalog MCP into the
   operator's `~/.claude.json` for OAuth there; pair with
   `sync_host_mcp` once confirmed. See `use-host-mcp`.
@@ -192,6 +204,13 @@ below is the authoritative reference.
 - `leave_space(space_id, reason="")` / `leave_channel(channel_id,
   reason="")` — *requests* to leave; operator DMs `y`/`n`. Use
   sparingly with an honest `reason`.
+
+**DM safety (per-agent — these are your own lists, other agents keep theirs):**
+- `get_dm_allowlists()` / `get_dm_blocklists()` — read your current lists.
+- `add_dm_allowlist(slug)` — allow this peer to DM you. Idempotent.
+- `update_dm_blocklist(slug, on)` — block (`on=True`) or unblock
+  (`on=False`). Server-enforced; blocked senders' messages are dropped
+  silently at the server. Use only when the operator explicitly asks.
 
 **Suggesting team-shape changes (NOT taking action):**
 When conversation surfaces the need for a new agent/channel/invite,
@@ -313,6 +332,12 @@ Post a message to a Puffo.ai channel or DM a user.
   - `"agent_only"` — genuinely agent-to-agent traffic. Sent hidden;
     the DM / @-mention safety net is skipped. A warning still fires
     if the message looks human-targeted so you can reconsider.
+- `send_anyway` (optional) — channel sends normally return
+  `state="held"` without sending when newer channel messages exist
+  beyond the current turn. After considering the returned context,
+  independently choose revised content, the same content with
+  `send_anyway=True`, or no message. This option is available directly
+  and does not require a prior held call.
 
 **Cache-validation invariant (PUF-227-A):** the daemon verifies
 your `root_id` points to a parent envelope in your local message
@@ -363,7 +388,7 @@ Send one or more files from your workspace to a Puffo.ai channel
 or DM. Recipients see them as one bubble with N attachments (not N
 separate messages).
 
-**Tool:** `mcp__puffo__send_message_with_attachments(paths, channel, caption="", root_id="", visibility_level="default")`
+**Tool:** `mcp__puffo__send_message_with_attachments(paths, channel, caption="", root_id="", visibility_level="default", send_anyway=False)`
 
 **Arguments:**
 - `paths`: list of workspace-relative file paths. Pass a one-element
@@ -381,6 +406,8 @@ separate messages).
   floor keys off `caption`. Prefer `"human"` for files a person
   should see; the daemon will nudge you when `"default"` triggers
   the safety net.
+- `send_anyway`: same channel freshness choice as `send_message`.
+  It is available directly and is never an automatic retry.
 
 **Encryption:** each file is encrypted client-side with its own
 ChaCha20-Poly1305 key + nonce; the server only ever sees opaque
@@ -591,8 +618,8 @@ DEFAULT_SKILL_REFRESH = """\
 # Skill: refresh
 
 Bring your on-disk state (system prompt, skills, MCP registry, CLI
-session, harness+model) into your live process. Four orthogonal
-axes; combine them freely.
+session, harness+model, inference_level) into your live process. Five
+orthogonal axes; combine them freely.
 
 **Tool:** `mcp__puffo__refresh`
 
@@ -603,6 +630,10 @@ axes; combine them freely.
   `~/.claude/skills/` + host MCP registrations
 - `session` (optional, bool) — drop CLI session token so next spawn
   starts a fresh conversation (no `--resume`)
+- `inference_level` (optional) — reasoning effort; per-harness values
+  (codex: minimal/low/medium/high; claude-code: low/medium/high/xhigh).
+  Standalone or alongside a harness+model swap; persists to `agent.yml`
+  + respawns.
 
 `harness` and `model` must be provided together (or both omitted).
 
@@ -614,6 +645,7 @@ axes; combine them freely.
 | `refresh(host_sync=True)` | Also re-sync host skills + host MCP. cli-local: hot; cli-docker: requires `session=True` too. |
 | `refresh(session=True)` | Also drop CLI session token; next spawn starts a new conversation. |
 | `refresh(harness="codex", model="gpt-5")` | Swap (harness, model), persist to `agent.yml`, full worker respawn. Implicit fresh session. |
+| `refresh(inference_level="medium")` | Set reasoning effort, persist to `agent.yml`, respawn. Standalone or alongside a harness+model swap. |
 
 **When to use:**
 - Edited `CLAUDE.md` or `profile.md` → `refresh()`. (Briefing topics
@@ -624,6 +656,8 @@ axes; combine them freely.
 - Conversation feels stuck / context is polluted → `refresh(session=True)`.
 - Operator asked you to try a different model → confirm harness +
   model with them, then `refresh(harness=..., model=...)`.
+- A task needs more (or less) reasoning effort → `refresh(
+  inference_level="high")` (values are per-harness).
 
 **When NOT to use:**
 - Every turn — worker-scope refresh is cheap (~1s), but the
@@ -661,6 +695,14 @@ into your own agent.
   into your `.claude.json`; just call `refresh()` and try it.
 - The credential is already on host — skip Step 1 and go straight to
   `sync_host_mcp`.
+- **Codex Apps connectors (`mcp__codex_apps__*` — Drive, Gmail, …)
+  are NOT puffo-managed MCP** — codex provisions them internally, so
+  they never appear in `list_mcp_servers` and this workflow can't
+  touch them. If writes fail with `ACCESS_TOKEN_SCOPE_INSUFFICIENT`,
+  the operator must reconnect the connector in interactive codex
+  (approving write scopes), then you run `refresh(host_sync=True)`
+  (cli-docker: add `session=True`) and allow one worker turn for the
+  token transition.
 
 ## Workflow
 
@@ -1251,6 +1293,11 @@ def compile_agent_memory_briefing(
     return compile_briefing(memory_dir)
 
 
+# Splits the session-relevant slice (primer + profile) from the memory
+# snapshot for the worker's fresh-session check.
+MEMORY_SECTION_HEADER = "---\n\n# Your memory\n\n"
+
+
 def assemble_claude_md(
     *,
     shared_primer: str,
@@ -1266,7 +1313,7 @@ def assemble_claude_md(
     if profile.strip():
         parts.append("---\n\n# Your role\n\n" + profile.strip())
     if memory_briefing.strip():
-        parts.append("---\n\n# Your memory\n\n" + memory_briefing.strip())
+        parts.append(MEMORY_SECTION_HEADER + memory_briefing.strip())
     return "\n\n".join(parts) + "\n"
 
 

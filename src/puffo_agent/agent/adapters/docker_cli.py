@@ -34,11 +34,14 @@ import json
 import logging
 import shutil
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ...mcp.config import (
+    INFERENCE_LEVELS,
     write_cli_mcp_config,
 )
+from .._logging import safe_diagnostic_summary
 from .hermes_helpers import (
     HERMES_NO_RESUME_SIGNATURE,
     hermes_model_id,
@@ -54,6 +57,12 @@ from ...portal.state import (
     sync_host_skills,
 )
 from .base import Adapter, TurnContext, TurnResult
+from ..context_controller import (
+    ContextCapabilities,
+    ContextSnapshot,
+    ProviderAdmissionEvent,
+    normalize_context_snapshot,
+)
 from .cli_session import AuditLog, ClaudeSession
 
 
@@ -148,6 +157,7 @@ class DockerCLIAdapter(Adapter):
         agent_home_dir: str,
         shared_fs_dir: str,
         owner_username: str = "",
+        inference_level: str = "",
         harness=None,
         google_api_key: str = "",
         memory_limit: str = "",
@@ -174,6 +184,7 @@ class DockerCLIAdapter(Adapter):
         # isolation.
         self.shared_fs_dir = Path(shared_fs_dir)
         self.owner_username = owner_username
+        self.inference_level = inference_level
         # Only used when harness is gemini-cli (passed via
         # ``docker exec -e GEMINI_API_KEY=...``).
         self.google_api_key = google_api_key
@@ -204,6 +215,7 @@ class DockerCLIAdapter(Adapter):
         # (remove + add) so a flag mismatch is safe. The gemini path
         # writes MCP config upfront via ``_ensure_started`` instead.
         self._hermes_mcp_registered = False
+        self._one_shot_provider_session_id: str | None = None
         # Set post-construction by worker.py. When non-None, claude-
         # code is routed at ``puffo_core_server``. Values must be
         # CONTAINER-local paths since the MCP subprocess runs inside
@@ -337,8 +349,8 @@ class DockerCLIAdapter(Adapter):
                 "agent %s: hermes mcp add puffo rc=%d | stdout: %s | stderr: %s "
                 "(chat will work, tool calls won't)",
                 self.agent_id, proc.returncode,
-                stdout.decode("utf-8", errors="replace").strip()[-400:],
-                stderr.decode("utf-8", errors="replace").strip()[-400:],
+                safe_diagnostic_summary(stdout.decode("utf-8", errors="replace")),
+                safe_diagnostic_summary(stderr.decode("utf-8", errors="replace")),
             )
             return
         logger.info(
@@ -425,16 +437,25 @@ class DockerCLIAdapter(Adapter):
             logger.error(
                 "agent %s: hermes turn rc=%d in %.1fs | stdout: %r | stderr: %s",
                 self.agent_id, rc, elapsed,
-                stdout_text.strip()[:400],
-                stderr_text.strip()[-400:] or "(empty)",
+                safe_diagnostic_summary(stdout_text),
+                safe_diagnostic_summary(stderr_text),
             )
             return TurnResult(reply="", metadata={
                 "error": f"hermes exited rc={rc}",
-                "stdout_snippet": stdout_text[:400],
-                "stderr_tail": stderr_text[-400:],
+                "stdout_summary": safe_diagnostic_summary(stdout_text),
+                "stderr_summary": safe_diagnostic_summary(stderr_text),
             })
 
         reply, session_id, tool_calls = parse_hermes_reply(stdout_text)
+        self._one_shot_provider_session_id = session_id or None
+        if reply or session_id or tool_calls:
+            await self._fire_admission_callback(ProviderAdmissionEvent(
+                planning_cycle_key=getattr(
+                    self, "_context_admission_planning_cycle_key", "",
+                ),
+                provider_session_id=self.get_provider_session_id(),
+                admitted_at=datetime.now(timezone.utc),
+            ))
         if tool_calls:
             logger.info(
                 "agent %s: hermes turn invoked %d tool(s): %s",
@@ -443,7 +464,7 @@ class DockerCLIAdapter(Adapter):
         if not reply:
             logger.warning(
                 "agent %s: hermes rc=0 but parser found no reply. "
-                "stdout: %r", self.agent_id, stdout_text[:400],
+                "stdout: %s", self.agent_id, safe_diagnostic_summary(stdout_text),
             )
 
         # First-ever success: write the sentinel so subsequent turns
@@ -555,7 +576,7 @@ class DockerCLIAdapter(Adapter):
             logger.info(
                 "agent %s: gemini -r latest rc=%d; clearing sentinel "
                 "and retrying with a fresh session. stderr: %s",
-                self.agent_id, rc, stderr_text.strip()[-200:] or "(empty)",
+                self.agent_id, rc, safe_diagnostic_summary(stderr_text),
             )
             try:
                 self.session_file.unlink()
@@ -569,16 +590,25 @@ class DockerCLIAdapter(Adapter):
             logger.error(
                 "agent %s: gemini turn rc=%d in %.1fs | stdout: %r | stderr: %s",
                 self.agent_id, rc, elapsed,
-                stdout_text.strip()[:400],
-                stderr_text.strip()[-400:] or "(empty)",
+                safe_diagnostic_summary(stdout_text),
+                safe_diagnostic_summary(stderr_text),
             )
             return TurnResult(reply="", metadata={
                 "error": f"gemini exited rc={rc}",
-                "stdout_snippet": stdout_text[:400],
-                "stderr_tail": stderr_text[-400:],
+                "stdout_summary": safe_diagnostic_summary(stdout_text),
+                "stderr_summary": safe_diagnostic_summary(stderr_text),
             })
 
         reply, session_id, err = _parse_gemini_reply(stdout_text)
+        self._one_shot_provider_session_id = session_id or None
+        if reply or session_id or err:
+            await self._fire_admission_callback(ProviderAdmissionEvent(
+                planning_cycle_key=getattr(
+                    self, "_context_admission_planning_cycle_key", "",
+                ),
+                provider_session_id=self.get_provider_session_id(),
+                admitted_at=datetime.now(timezone.utc),
+            ))
         if err:
             logger.warning(
                 "agent %s: gemini rc=0 but returned JSON error: %s",
@@ -587,7 +617,7 @@ class DockerCLIAdapter(Adapter):
         if not reply:
             logger.warning(
                 "agent %s: gemini rc=0 but parser found no reply. "
-                "stdout: %r", self.agent_id, stdout_text[:400],
+                "stdout: %s", self.agent_id, safe_diagnostic_summary(stdout_text),
             )
 
         if not has_prior_session:
@@ -662,6 +692,83 @@ class DockerCLIAdapter(Adapter):
                     self.agent_id, self.session_file, exc,
                 )
 
+    async def get_context_snapshot(self) -> ContextSnapshot:
+        if self.harness.name() == "claude-code":
+            return await self._ensure_session().get_context_snapshot()
+        return normalize_context_snapshot(
+            used_tokens=0,
+            estimated_source=f"{self.harness.name()}_unsupported_fallback_200000",
+        )
+
+    def get_context_capabilities(self) -> ContextCapabilities:
+        if self.harness.name() == "claude-code":
+            return self._ensure_session().get_context_capabilities()
+        return ContextCapabilities(
+            diagnostic=f"one-shot {self.harness.name()} context control unsupported",
+        )
+
+    async def compact_context(self):
+        if self.harness.name() == "claude-code":
+            return await self._ensure_session().compact_context()
+        return await super().compact_context()
+
+    async def rollover_context(self):
+        if self.harness.name() == "claude-code":
+            return await self._ensure_session().rollover_context()
+        return await super().rollover_context()
+
+    def get_provider_session_id(self) -> str | None:
+        if self.harness.name() == "claude-code":
+            return self._ensure_session().get_provider_session_id()
+        if self._one_shot_provider_session_id:
+            return self._one_shot_provider_session_id
+        try:
+            persisted = json.loads(self.session_file.read_text(encoding="utf-8"))
+            return str(persisted.get("session_id") or "") or None
+        except (OSError, ValueError):
+            return None
+
+    def register_admission_callback(
+        self, callback, planning_cycle_key: str = "",
+    ) -> None:
+        if self.harness.name() == "claude-code":
+            self._ensure_session().register_admission_callback(
+                callback, planning_cycle_key,
+            )
+        else:
+            super().register_admission_callback(callback, planning_cycle_key)
+
+    register_provider_admission_callback = register_admission_callback
+
+    def register_continuation_callback(
+        self,
+        callback,
+        planning_cycle_key: str = "",
+        *,
+        channel_id: str = "",
+        tool_names: tuple[str, ...] = (),
+        tool_arguments: dict[str, object] | None = None,
+        correlation_receipt: str = "",
+    ) -> None:
+        if self.harness.name() == "claude-code":
+            self._ensure_session().register_continuation_callback(
+                callback,
+                planning_cycle_key,
+                channel_id=channel_id,
+                tool_names=tool_names,
+                tool_arguments=tool_arguments,
+                correlation_receipt=correlation_receipt,
+            )
+        else:
+            super().register_continuation_callback(
+                callback,
+                planning_cycle_key,
+                channel_id=channel_id,
+                tool_names=tool_names,
+                tool_arguments=tool_arguments,
+                correlation_receipt=correlation_receipt,
+            )
+
     async def aclose(self) -> None:
         if self._session is not None:
             await self._session.aclose()
@@ -715,6 +822,16 @@ class DockerCLIAdapter(Adapter):
         ])
         if self.model:
             cmd.extend(["--model", self.model])
+        if self.inference_level:
+            if self.inference_level in INFERENCE_LEVELS:
+                cmd.extend(["--effort", self.inference_level])
+            else:
+                logger.warning(
+                    "agent %s: ignoring inference_level %r for claude-code "
+                    "(expected one of %s)",
+                    self.agent_id, self.inference_level,
+                    ", ".join(INFERENCE_LEVELS),
+                )
         cmd.extend(extra_args)
         return cmd
 
@@ -859,10 +976,10 @@ class DockerCLIAdapter(Adapter):
                 )
             for name, cmd in unreachable:
                 logger.warning(
-                    "agent %s: host MCP %r command %r looks host-local and "
-                    "won't resolve inside the container. Install the "
-                    "binary in the image or bind-mount it explicitly, "
-                    "otherwise this MCP will fail on first use.",
+                    "agent %s: host MCP %r has host-local path %r that won't "
+                    "resolve inside the container — SKIPPED (not injected). "
+                    "Install the binary in the image or bind-mount it, then "
+                    "re-sync, to make this MCP available.",
                     self.agent_id, name, cmd,
                 )
             # Plugins: the actual plugin tree is bind-mounted read-
@@ -916,10 +1033,10 @@ class DockerCLIAdapter(Adapter):
                 )
             for name, cmd in gemini_unreachable:
                 logger.warning(
-                    "agent %s: host gemini MCP %r command %r looks "
-                    "host-local and won't resolve inside the container. "
-                    "Install the binary in the image or bind-mount it, "
-                    "otherwise the MCP will fail on first use.",
+                    "agent %s: host gemini MCP %r has host-local path %r "
+                    "that won't resolve inside the container — SKIPPED. "
+                    "Install the binary in the image or bind-mount it, then "
+                    "re-sync, to make this MCP available.",
                     self.agent_id, name, cmd,
                 )
 

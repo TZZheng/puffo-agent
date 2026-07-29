@@ -347,7 +347,14 @@ async def test_puffo_core_client_send_fallback_message_encrypts():
     # cache from inbound envelopes + membership events; the smoke
     # test seeds it directly.
     client._channel_space["ch_abc"] = "sp_test"
-    await client.send_fallback_message("ch_abc", "hello world", root_id="")
+    # E2EE branch: mark the turn's bundle as encrypted (plaintext is
+    # the default otherwise — covered in test_plaintext_send).
+    from puffo_agent.agent import send_mode
+    send_mode.note_turn_bundle(["bot-0001"], True)
+    try:
+        await client.send_fallback_message("ch_abc", "hello world", root_id="")
+    finally:
+        send_mode.note_turn_bundle(["bot-0001"], False)
 
     # Channel resolution: members endpoint -> /certs/sync.
     assert any(
@@ -430,3 +437,33 @@ async def test_send_fallback_message_drops_when_channel_space_unknown():
     # No HTTP at all — the FakeHttp ``raise`` ensures it.
     assert http.calls == []
     await ms.close()
+
+
+def test_worker_build_and_listener_use_global_runtime_contract():
+    import inspect
+
+    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+
+    constructor_params = inspect.signature(PuffoCoreMessageClient).parameters
+    listener_params = inspect.signature(PuffoCoreMessageClient.listen).parameters
+
+    assert tuple(listener_params) == ("self", "on_message")
+    assert tuple(constructor_params) == (
+        "slug",
+        "device_id",
+        "space_id",
+        "keystore",
+        "http_client",
+        "message_store",
+        "operator_slug",
+        "auto_accept_space_invitations",
+        "auto_accept_dm",
+        "workspace",
+        "max_inline_chars",
+        "segment_chars",
+        "agent_created_at",
+        "image_edge_px",
+        "catchup_stale_hours",
+        "agent_id",
+        "bridge_client",
+    )

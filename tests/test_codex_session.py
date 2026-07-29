@@ -40,6 +40,27 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from puffo_agent.agent.adapters.codex_session import CodexSession
 
 
+@pytest.mark.asyncio
+async def test_codex_stderr_is_logged_as_safe_summary(caplog):
+    secret = "codex stderr bearer sensitive-provider-output"
+    session = CodexSession.__new__(CodexSession)
+    session.agent_id = "agent"
+    reader = asyncio.StreamReader()
+    reader.feed_data((secret + "\n").encode())
+    reader.feed_eof()
+
+    import logging
+    caplog.set_level(
+        logging.INFO,
+        logger="puffo_agent.agent.adapters.codex_session",
+    )
+    await session._stderr_loop(reader)
+    joined = " ".join(record.getMessage() for record in caplog.records)
+    assert secret not in joined
+    assert "category=authentication" in joined
+    assert "sha256=" not in joined
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Fake codex app-server
 # ─────────────────────────────────────────────────────────────────────────────
@@ -320,6 +341,420 @@ while True:
     assert result.output_tokens == 21
 
 
+def test_context_snapshot_retained_without_active_turn(tmp_path):
+    cs = CodexSession(
+        "context-test", tmp_path / "session.json", ["true"],
+    )
+
+    async def drive():
+        await cs._handle_notification("thread/tokenUsage/updated", {
+            "threadId": "c1",
+            "turnId": "t1",
+            "tokenUsage": {
+                "last": {
+                    "totalTokens": 143262,
+                    "inputTokens": 10,
+                    "outputTokens": 2,
+                },
+                "total": {"inputTokens": 99, "outputTokens": 22},
+                "modelContextWindow": 258400,
+            },
+        })
+        return await cs.get_context_snapshot()
+
+    snap = asyncio.run(drive())
+    assert snap.used_tokens == 143262
+    assert snap.context_window == 258400
+    assert snap.source == "provider"
+    assert cs._latest_usage_total == {"inputTokens": 99, "outputTokens": 22}
+
+
+def test_compact_waits_for_matching_context_compaction_completion(tmp_path):
+    cs = CodexSession("compact-test", tmp_path / "session.json", ["true"])
+    cs._conversation_id = "thread-current"
+    request_seen = asyncio.Event()
+
+    async def fake_send(request_id, method, params):
+        assert method == "thread/compact/start"
+        assert params == {"threadId": "thread-current"}
+        request_seen.set()
+        return {}
+
+    cs._send_raw_request = fake_send
+
+    async def drive():
+        task = asyncio.create_task(cs.compact_context())
+        await request_seen.wait()
+        await asyncio.sleep(0)
+        assert not task.done()  # JSON-RPC acceptance is not completion.
+        # Completion cannot establish its own identity.
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current",
+            "turnId": "compact-turn",
+            "item": {"id": "compact-item", "type": "contextCompaction"},
+        })
+        assert not task.done()
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current",
+            "turn": {"id": "compact-turn"},
+        })
+        # Missing identity and wrong turn/item/type remain pending.
+        for event in (
+            {"threadId": "thread-current", "turnId": "", "item": {
+                "id": "compact-item", "type": "contextCompaction",
+            }},
+            {"threadId": "thread-current", "turnId": "user-turn", "item": {
+                "id": "compact-item", "type": "contextCompaction",
+            }},
+            {"threadId": "thread-current", "turnId": "compact-turn", "item": {
+                "id": "wrong-type", "type": "agentMessage",
+            }},
+        ):
+            await cs._handle_notification("item/started", event)
+            assert not task.done()
+        await cs._handle_notification("item/started", {
+            "threadId": "thread-current",
+            "turnId": "compact-turn",
+            "item": {"id": "compact-item", "type": "contextCompaction"},
+        })
+        await cs._handle_notification("item/completed", {
+            "threadId": "wrong",
+            "turnId": "compact-turn",
+            "item": {"id": "compact-item", "type": "contextCompaction"},
+        })
+        assert not task.done()
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current",
+            "turnId": "compact-turn",
+            "item": {"id": "wrong-item", "type": "contextCompaction"},
+        })
+        assert not task.done()
+        await cs._handle_notification("thread/compacted", {
+            "threadId": "thread-current",
+            "turnId": "compact-turn",
+        })
+        assert not task.done()
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current",
+            "turnId": "compact-turn",
+            "item": {"id": "compact-item", "type": "contextCompaction"},
+        })
+        return await task
+
+    result = asyncio.run(drive())
+    assert result.completed is True
+    assert result.provider_session_id == "thread-current"
+    assert result.before is not None and result.after is not None
+
+
+def test_compact_timeout_cleans_state_without_rotation(tmp_path, monkeypatch):
+    import puffo_agent.agent.adapters.codex_session as codex_module
+
+    monkeypatch.setattr(codex_module, "COMPACT_TIMEOUT_SECONDS", 0.001)
+    cs = CodexSession("compact-timeout", tmp_path / "session.json", ["true"])
+    cs._conversation_id = "thread-still-valid"
+
+    async def fake_send(request_id, method, params):
+        return {}  # accepted, but no contextCompaction completion follows
+
+    cs._send_raw_request = fake_send
+    result = asyncio.run(cs.compact_context())
+    assert result.completed is False
+    assert "timed out" in result.diagnostic
+    assert cs._pending_compact is None
+    assert cs.get_provider_session_id() == "thread-still-valid"
+    assert cs._consecutive_thread_failures == 0
+
+
+def test_admission_fires_only_on_correlated_user_turn_started(tmp_path):
+    from puffo_agent.agent.adapters.codex_session import _PendingTurn
+
+    async def drive():
+        cs = CodexSession("admission-test", tmp_path / "session.json", ["true"])
+        cs._conversation_id = "thread-current"
+        events = []
+
+        async def admitted(event):
+            events.append(event)
+
+        cs.register_admission_callback(admitted, "cycle-c")
+        cs._active_turn = _PendingTurn(1, time.time())
+        assert events == []  # registration / request ACK does not admit.
+        # A JSON-RPC ACK is handled outside notification dispatch and therefore
+        # cannot consume provider admission.
+        assert cs._admission_callback is admitted
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current",
+            "turnId": "other",
+            "item": {"id": "i", "type": "agentMessage"},
+        })
+        await cs._handle_notification("turn/completed", {
+            "threadId": "wrong",
+            "turn": {"id": "wrong-turn"},
+        })
+        assert events == []
+        await cs._handle_notification("turn/started", {
+            "threadId": "wrong",
+            "turn": {"id": "wrong-turn"},
+        })
+        assert events == []
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current",
+            "turn": {"id": "user-turn"},
+        })
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current",
+            "turn": {"id": "user-turn"},
+        })
+        assert len(events) == 1
+        assert events[0].provider_turn_id == "user-turn"
+
+    asyncio.run(drive())
+
+
+def test_initial_admission_ignores_compact_and_continuation_is_distinct(tmp_path):
+    from puffo_agent.agent.adapters.codex_session import _PendingCompact, _PendingTurn
+
+    async def drive():
+        cs = CodexSession("continuation-test", tmp_path / "session.json", ["true"])
+        cs._conversation_id = "thread-current"
+        events = []
+
+        async def admitted(event):
+            events.append(event)
+
+        # Compact notifications with no active user turn do not consume the
+        # independently registered initial callback.
+        cs.register_admission_callback(admitted, "initial")
+        cs._pending_compact = _PendingCompact(
+            "thread-current",
+            await cs.get_context_snapshot(),
+            asyncio.get_running_loop().create_future(),
+        )
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current", "turn": {"id": "compact-turn"},
+        })
+        await cs._handle_notification("item/started", {
+            "threadId": "thread-current", "turnId": "compact-turn",
+            "item": {"id": "compact-item", "type": "contextCompaction"},
+        })
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current", "turnId": "compact-turn",
+            "item": {"id": "compact-item", "type": "contextCompaction"},
+        })
+        assert events == []
+        cs._pending_compact = None
+
+        user_turn = _PendingTurn(2, time.time())
+        cs._active_turn = user_turn
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current", "turn": {"id": "user-turn"},
+        })
+        assert [event.planning_cycle_key for event in events] == ["initial"]
+
+        # Registration after turn start is correlated tool-result admission.
+        cs.register_continuation_callback(
+            admitted, "continuation", channel_id="ch-a",
+        )
+        for params in (
+            {"threadId": "wrong", "turnId": "user-turn",
+             "item": {"id": "m1", "type": "mcpToolCall", "server": "puffo",
+                      "tool": "send_message", "status": "completed",
+                      "arguments": {"channel": "ch-a"}}},
+            {"threadId": "thread-current", "turnId": "wrong-turn",
+             "item": {"id": "m2", "type": "mcpToolCall", "server": "puffo",
+                      "tool": "send_message", "status": "completed",
+                      "arguments": {"channel": "ch-a"}}},
+            {"threadId": "thread-current", "turnId": "user-turn",
+             "item": {"id": "c1", "type": "contextCompaction"}},
+            {"threadId": "thread-current", "turnId": "user-turn",
+             "item": {"id": "m3", "type": "mcpToolCall", "server": "puffo",
+                      "tool": "send_message", "status": "completed",
+                      "arguments": {"channel": "ch-other"}}},
+        ):
+            await cs._handle_notification("item/completed", params)
+        assert len(events) == 1
+        # Live Codex item/completed events may contain only params.item.
+        # Missing correlation IDs inherit the current active turn; supplied
+        # non-empty IDs above still have to match.
+        accepted = {
+            "item": {
+                "id": "m4", "type": "mcpToolCall", "server": "puffo",
+                "tool": "send_message", "status": "completed",
+                "arguments": {"channel": "ch-a"},
+            },
+        }
+        await cs._handle_notification("item/completed", accepted)
+        await cs._handle_notification("item/completed", accepted)
+        assert [event.planning_cycle_key for event in events] == [
+            "initial", "continuation",
+        ]
+        assert events[-1].provider_turn_id == "user-turn"
+
+        cs.register_continuation_callback(
+            admitted, "continuation-a", channel_id="ch-a",
+        )
+        cs.register_continuation_callback(
+            admitted, "continuation-b", channel_id="ch-b",
+        )
+        await cs._handle_notification("turn/completed", {
+            "threadId": "thread-current", "turn": {"id": "user-turn"},
+        })
+        assert len(events) == 2
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current", "turnId": "user-turn",
+            "item": {
+                "id": "b", "type": "mcpToolCall", "server": "puffo",
+                "tool": "send_message", "status": "completed",
+                "arguments": {"channel": "ch-b"},
+            },
+        })
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current", "turnId": "user-turn",
+            "item": {
+                "id": "a", "type": "mcpToolCall", "server": "puffo",
+                "tool": "send_message", "status": "completed",
+                "arguments": {"channel": "ch-a"},
+            },
+        })
+        assert [event.planning_cycle_key for event in events] == [
+            "initial", "continuation",
+        ]
+        assert cs._continuation_admissions == []
+
+    asyncio.run(drive())
+
+
+def test_history_continuation_matches_exact_codex_tool_result(tmp_path):
+    from puffo_agent.agent.adapters.codex_session import _PendingTurn
+
+    async def drive():
+        cs = CodexSession("history-continuation", tmp_path / "session.json", ["true"])
+        cs._conversation_id = "thread-current"
+        cs._active_turn = _PendingTurn(2, time.time())
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current",
+            "turn": {"id": "user-turn"},
+        })
+        events = []
+
+        def register(label, receipt, arguments):
+            async def admitted(event):
+                events.append((label, event))
+
+            cs.register_continuation_callback(
+                admitted,
+                f"visible-read-{label}",
+                tool_names=("get_channel_history",),
+                tool_arguments=arguments,
+                correlation_receipt=receipt,
+            )
+
+        register("a", "receipt-a", {"channel": "ch-a"})
+        register("b", "receipt-b", {"channel": "ch-a"})
+        register("failed", "receipt-failed", {"channel": "ch-a"})
+        register(
+            "clamped",
+            "receipt-clamped",
+            {"channel": "ch-a", "limit": 999},
+        )
+
+        def tool_result(receipt, *, status="completed", arguments=None):
+            return {
+                "threadId": "thread-current",
+                "turnId": "user-turn",
+                "item": {
+                    "id": f"call-{receipt}",
+                    "type": "mcpToolCall",
+                    "server": "puffo",
+                    "tool": "get_channel_history",
+                    "status": status,
+                    "arguments": arguments or {"channel": "ch-a"},
+                    "result": {
+                        "content": [{
+                            "type": "text",
+                            "text": (
+                                "history\n[puffo:model-visible-read:"
+                                f"{receipt}]"
+                            ),
+                        }],
+                    },
+                },
+            }
+
+        await cs._handle_notification(
+            "item/completed",
+            tool_result("receipt-failed", status="failed"),
+        )
+        wrong_tool = tool_result("receipt-b")
+        wrong_tool["item"]["tool"] = "get_post"
+        await cs._handle_notification("item/completed", wrong_tool)
+        assert events == []
+        await cs._handle_notification(
+            "item/completed",
+            tool_result(
+                "receipt-clamped",
+                arguments={"channel": "ch-a", "limit": 200},
+            ),
+        )
+        await cs._handle_notification(
+            "item/completed", tool_result("receipt-b"),
+        )
+        await cs._handle_notification(
+            "item/completed", tool_result("receipt-a"),
+        )
+        assert [label for label, _event in events] == ["clamped", "b", "a"]
+        assert [event.tool_call_id for _label, event in events] == [
+            "call-receipt-clamped",
+            "call-receipt-b",
+            "call-receipt-a",
+        ]
+
+        register("late", "receipt-late", {"channel": "ch-other"})
+        await cs._handle_notification("turn/completed", {
+            "threadId": "thread-current",
+            "turn": {"id": "user-turn"},
+        })
+        await cs._handle_notification(
+            "item/completed", tool_result("receipt-late"),
+        )
+        assert [label for label, _event in events] == ["clamped", "b", "a"]
+        assert cs._continuation_admissions == []
+        assert {event.provider_turn_id for _, event in events} == {"user-turn"}
+
+        cs._active_turn = _PendingTurn(3, time.time())
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current",
+            "turn": {"id": "next-turn"},
+        })
+        register("next", "receipt-next", {"channel": "ch-a"})
+        stale = tool_result("receipt-late")
+        stale["turnId"] = "next-turn"
+        stale["item"]["id"] = "late-from-previous-turn"
+        await cs._handle_notification("item/completed", stale)
+        current = tool_result("receipt-next")
+        current["turnId"] = "next-turn"
+        await cs._handle_notification("item/completed", current)
+        assert [label for label, _event in events] == [
+            "clamped", "b", "a", "next",
+        ]
+
+        cs._active_turn = None
+        with pytest.raises(RuntimeError, match="no active Codex provider turn"):
+            async def unused(_event):
+                pass
+
+            cs.register_continuation_callback(
+                unused,
+                "late-visible-read",
+                tool_names=("get_channel_history",),
+                tool_arguments={"channel": "ch-a"},
+                correlation_receipt="unused",
+            )
+
+    asyncio.run(drive())
+
+
 def test_token_usage_sums_multi_request_turn(tmp_path):
     """A turn with several model requests reports the whole turn's usage (the
     thread total's delta), not just the last request."""
@@ -545,6 +980,167 @@ def test_turn_failed_raises(tmp_path):
     err = asyncio.run(_run())
     assert err is not None
     assert "model overloaded" in err
+
+
+RECONNECT_SCRIPT = '''\
+absorb_initialize()
+
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+
+msg = r()
+turn_id = msg["id"]
+w({"jsonrpc": "2.0", "id": turn_id, "result": None})
+w({"jsonrpc": "2.0", "method": "turn/failed",
+   "params": {"error": {"message": "Reconnecting... 2/5"}}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+'''
+
+
+def test_reconnect_turn_routes_to_retry_not_drop(tmp_path):
+    # Non-auth AgentAPIError = the consumer's re-enqueue path; a raw
+    # RuntimeError would be swallowed + dropped by the worker.
+    from puffo_agent.agent.core import AgentAPIError
+
+    fake = _write_fake(tmp_path, RECONNECT_SCRIPT)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        try:
+            await cs.run_turn("hi", "sys")
+            return ("none", None)
+        except AgentAPIError as exc:
+            return ("apierror", exc)
+        except RuntimeError as exc:
+            return ("runtime", exc)
+        finally:
+            await cs.aclose()
+
+    kind, exc = asyncio.run(_run())
+    assert kind == "apierror", f"expected AgentAPIError retry route, got {kind}"
+    assert exc.is_auth is False
+    assert "Reconnecting" in str(exc)
+    # Transient — not a wedged strike.
+    assert cs._consecutive_thread_failures == 0
+
+
+def test_looks_like_codex_reconnect():
+    from puffo_agent.agent.adapters.codex_session import _looks_like_codex_reconnect
+    assert _looks_like_codex_reconnect("codex turn failed: Reconnecting... 2/5")
+    assert _looks_like_codex_reconnect("reconnecting to backend")
+    assert not _looks_like_codex_reconnect("model overloaded")
+    assert not _looks_like_codex_reconnect("agent thread limit reached")
+    assert not _looks_like_codex_reconnect("")
+
+
+RECONNECT_THEN_RECOVER_SCRIPT = '''\
+absorb_initialize()
+
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+
+# Turn 1 fails mid-reconnect.
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+w({"jsonrpc": "2.0", "method": "turn/failed",
+   "params": {"error": {"message": "Reconnecting... 2/5"}}})
+
+# Turn 2 (the retry) succeeds on the same thread.
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+w({"jsonrpc": "2.0", "method": "item/agentMessage/delta",
+   "params": {"threadId": "c1", "turnId": "u2", "itemId": "m", "delta": "recovered"}})
+w({"jsonrpc": "2.0", "method": "turn/completed", "params": {}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+'''
+
+
+def test_reconnect_then_retry_recovers_on_same_session(tmp_path):
+    # Mirrors the worker retry path: run_retry_turn re-enters run_turn on the
+    # same session after the AgentAPIError.
+    from puffo_agent.agent.core import AgentAPIError
+
+    fake = _write_fake(tmp_path, RECONNECT_THEN_RECOVER_SCRIPT)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        try:
+            with pytest.raises(AgentAPIError):
+                await cs.run_turn("hi", "sys")
+            return await cs.run_turn("hi again", "sys")
+        finally:
+            await cs.aclose()
+
+    result = asyncio.run(_run())
+    assert result.reply == "recovered"
+    assert cs._consecutive_thread_failures == 0
+
+
+TIMEOUT_SCRIPT = '''\
+absorb_initialize()
+
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "t1"}}})
+
+# ACK every request (turn/start, turn/interrupt) but never complete a turn.
+while True:
+    msg = r()
+    if msg is None:
+        break
+    if msg.get("id") is not None:
+        w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+'''
+
+
+def test_timeout_reply_reset_claim_matches_rotation(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "home"))
+    fake = _write_fake(tmp_path, TIMEOUT_SCRIPT)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+        task_timeout_seconds=1.0,
+    )
+
+    async def _run():
+        await cs.warm("sys")
+        try:
+            r1 = await cs.run_turn("hi", "sys")
+            r2 = await cs.run_turn("still there?", "sys")
+            return r1, r2
+        finally:
+            await cs.aclose()
+
+    r1, r2 = asyncio.run(_run())
+    # First timeout: below the wedged threshold — no rotation, no reset claim.
+    assert "1-second timeout" in r1.reply
+    assert r1.metadata["codex_turn_timeout"] is True
+    assert r1.metadata["codex_thread_rotated"] is False
+    assert "reset" not in r1.reply
+    # Second consecutive timeout rotates; the reply may now claim the reset.
+    assert r2.metadata["codex_thread_rotated"] is True
+    assert "reset for the next turn" in r2.reply
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -992,3 +1588,19 @@ def test_codex_legacy_session_file_treated_as_full_access(tmp_path):
         agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
     )
     assert reset._conversation_id == ""  # now differs → reset
+
+
+def test_account_ratelimits_frame_pushes_to_reporter(tmp_path, monkeypatch):
+    from puffo_agent.portal.control import reporter as reporter_mod
+
+    rep = reporter_mod.AgentStatusReporter()
+    monkeypatch.setattr(reporter_mod, "get_reporter", lambda: rep)
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=["x"],
+        cwd=str(tmp_path),
+    )
+    raw = {"primary": {"usedPercent": 8, "windowDurationMins": 300, "resetsAt": 9}}
+    asyncio.run(cs._handle_notification("account/rateLimits/updated", {"rateLimits": raw}))
+    assert rep.latest_codex_rate_limits() == raw

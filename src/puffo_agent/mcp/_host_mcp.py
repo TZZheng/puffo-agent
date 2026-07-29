@@ -78,6 +78,120 @@ class PuffoRpcClient:
                 f"rpc {route} transport error: {exc}"
             ) from exc
 
+    async def _post_structured(
+        self, route: str, body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """POST an RPC whose successful response is a structured object.
+
+        This is intentionally separate from ``_post`` so the established
+        install/sync/leave/permission ``{"message": str}`` contract cannot
+        accidentally change.
+        """
+        path = (
+            f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/"
+            f"{route.lstrip('/')}"
+        )
+        session = await self._get_session()
+        try:
+            async with session.post(f"{self.base_url}{path}", json=body) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    raw = await resp.text()
+                    raise RuntimeError(
+                        f"rpc {route} returned non-JSON body "
+                        f"(status {resp.status}): {raw[:500]}"
+                    )
+                if resp.status >= 400:
+                    error = data.get("error") if isinstance(data, dict) else None
+                    raise RuntimeError(
+                        str(error or f"rpc {route} failed with status {resp.status}")
+                    )
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"rpc {route} returned a non-object result")
+                if data.get("state") not in ("sent", "held", "failed"):
+                    raise RuntimeError(f"rpc {route} returned an invalid send state")
+                if data.get("attempted") is not True:
+                    raise RuntimeError(f"rpc {route} omitted attempted=true")
+                return data
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(f"rpc {route} transport error: {exc}") from exc
+
+    async def send_message(
+        self,
+        *,
+        channel: str,
+        text: str = "",
+        paths: Optional[list[str]] = None,
+        caption: str = "",
+        root_id: str = "",
+        visibility_level: str = "default",
+        send_anyway: bool = False,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "channel": channel,
+            "root_id": root_id,
+            "visibility_level": visibility_level,
+            "send_anyway": send_anyway,
+        }
+        if paths:
+            body.update(paths=paths, caption=caption)
+        else:
+            body["text"] = text
+        return await self._post_structured("send-message", body)
+
+    async def stage_model_visible_read(
+        self,
+        *,
+        space_id: str,
+        channel_id: str,
+        through_seq: int,
+        through_envelope_id: str,
+        tool_name: str,
+        tool_arguments: dict[str, object],
+    ) -> dict[str, Any]:
+        body = {
+            "space_id": space_id,
+            "channel_id": channel_id,
+            "through_seq": through_seq,
+            "through_envelope_id": through_envelope_id,
+            "tool_name": tool_name,
+            "tool_arguments": tool_arguments,
+        }
+        path = (
+            f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/"
+            "model-visible-read"
+        )
+        session = await self._get_session()
+        try:
+            async with session.post(f"{self.base_url}{path}", json=body) as resp:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    raw = await resp.text()
+                    raise RuntimeError(
+                        "rpc model-visible-read returned non-JSON body "
+                        f"(status {resp.status}): {raw[:500]}"
+                    )
+                if resp.status >= 400:
+                    error = data.get("error") if isinstance(data, dict) else None
+                    raise RuntimeError(
+                        str(
+                            error
+                            or "rpc model-visible-read failed with "
+                            f"status {resp.status}"
+                        )
+                    )
+                if not isinstance(data, dict) or data.get("state") != "staged":
+                    raise RuntimeError(
+                        "rpc model-visible-read returned an invalid result"
+                    )
+                return data
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(
+                f"rpc model-visible-read transport error: {exc}"
+            ) from exc
+
     async def install_mcp(
         self,
         *,

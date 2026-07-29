@@ -49,6 +49,27 @@ def set_profile_setter(
     _PROFILE_SETTER = fn
 
 
+# Resolves an agent's live message client for the on-miss re-warm.
+_CLIENT_RESOLVER: Optional[Callable[[str], Any]] = None
+
+
+def set_client_resolver(fn: Optional[Callable[[str], Any]]) -> None:
+    """Daemon-side hook; ``None`` clears (tests + shutdown)."""
+    global _CLIENT_RESOLVER
+    _CLIENT_RESOLVER = fn
+
+
+def _client_for(agent_id: str) -> Any:
+    resolver = _CLIENT_RESOLVER
+    if resolver is None:
+        return None
+    try:
+        return resolver(agent_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("data-service: client resolver raised")
+        return None
+
+
 @dataclass
 class _AppState:
     # One MessageStore per agent_id, opened lazily and held for the
@@ -103,6 +124,12 @@ async def lookup_channel_space(request: web.Request) -> web.Response:
         return web.json_response({"error": "agent db not found"}, status=404)
     try:
         space_id = await store.lookup_channel_space(channel_id)
+        if not space_id and channel_id.startswith("ch_"):
+            # Reconnect-dropped membership event → re-warm, re-check.
+            client = _client_for(agent_id)
+            if client is not None:
+                await client.rewarm_channel_caches()
+                space_id = await store.lookup_channel_space(channel_id)
     except Exception as exc:
         logger.exception(
             "data-service: lookup_channel_space failed (agent=%s ch=%s)",
@@ -331,6 +358,8 @@ def _msg_to_dict(m: Any) -> dict[str, Any]:
         "received_at": m.received_at,
         "thread_root_id": m.thread_root_id,
         "reply_to_id": m.reply_to_id,
+        "is_encrypted": m.is_encrypted,
+        "server_seq": getattr(m, "server_seq", None),
     }
 
 
@@ -379,6 +408,23 @@ async def update_profile_cache(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def get_send_encryption(request: web.Request) -> web.Response:
+    """Daemon-level send-mode decision for out-of-process senders (the
+    MCP subprocess). Fail-safe: unknown agent/store answers encrypt."""
+    from ..agent import send_mode
+
+    agent_id = request.match_info["agent_id"]
+    slug = request.query.get("slug", "")
+    root = request.query.get("thread_root_id") or None
+    store = await _store_for(request.app, agent_id)
+    if store is None:
+        return web.json_response({"encrypt": True})
+    encrypt = await send_mode.encryption_required(
+        slug or agent_id, store, root,
+    )
+    return web.json_response({"encrypt": bool(encrypt)})
+
+
 # ── Lifecycle ────────────────────────────────────────────────────
 
 
@@ -408,6 +454,10 @@ def build_app(cfg: DataServiceConfig) -> web.Application:
     app.router.add_get(
         "/v1/data/{agent_id}/messages/{envelope_id}",
         get_message_by_envelope,
+    )
+    app.router.add_get(
+        "/v1/data/{agent_id}/send-encryption",
+        get_send_encryption,
     )
     app.router.add_post(
         "/v1/data/{agent_id}/profile-cache",

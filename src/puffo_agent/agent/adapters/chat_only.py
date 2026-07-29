@@ -13,8 +13,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 from .base import Adapter, TurnContext, TurnResult
+from ..context_controller import (
+    ContextCapabilities,
+    ContextSnapshot,
+    ProviderAdmissionEvent,
+    normalize_context_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +158,14 @@ class ChatOnlyAdapter(Adapter):
                 self._provider.complete, ctx.system_prompt, ctx.messages,
             )
 
+        await self._fire_admission_callback(ProviderAdmissionEvent(
+            planning_cycle_key=getattr(
+                self, "_context_admission_planning_cycle_key", "",
+            ),
+            provider_session_id=None,
+            admitted_at=datetime.now(timezone.utc),
+        ))
+
         # Legacy provider shape (OpenAI, or a test double): plain
         # 3-tuple, no tool metadata — unchanged behavior.
         if isinstance(result, tuple):
@@ -225,3 +240,14 @@ class ChatOnlyAdapter(Adapter):
             return str(future.result(timeout=_TOOL_CALL_TIMEOUT_SECONDS))
 
         return dispatch
+
+    async def get_context_snapshot(self) -> ContextSnapshot:
+        return normalize_context_snapshot(
+            used_tokens=0,
+            estimated_source="chat_stateless_fallback_200000",
+        )
+
+    def get_context_capabilities(self) -> ContextCapabilities:
+        return ContextCapabilities(
+            diagnostic="chat completion is stateless; context control unsupported",
+        )

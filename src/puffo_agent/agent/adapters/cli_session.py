@@ -27,20 +27,51 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 from .base import STATUS_PREVIEW_CHARS, TurnResult, is_silent
+from .._logging import safe_diagnostic_summary, safe_value_summary
+from ..context_controller import (
+    AdmissionCallback,
+    CompactionResult,
+    ContextCapabilities,
+    ContextSnapshot,
+    ProviderAdmissionEvent,
+    RolloverResult,
+    ToolResultAdmission,
+    normalize_context_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# Cap any single audit field so one huge user message or tool input
-# doesn't bloat the log / the docker-logs stream.
-AUDIT_FIELD_MAX = 2000
+AUDIT_MAX_BYTES = 5 * 1024 * 1024
+AUDIT_BACKUP_COUNT = 3
+_AUDIT_PAYLOAD_FIELDS = frozenset({
+    "content", "text", "input", "reply", "raw_reply", "raw_event",
+    "stdout", "stderr", "result", "tool_result",
+})
+_AUDIT_DIAGNOSTIC_FIELDS = frozenset({"error", "diagnostic"})
+_AUDIT_METADATA_FIELDS = frozenset({
+    "action", "attempt", "attempts", "cap", "duration_ms", "event_type",
+    "event_types", "id", "input_tokens", "name", "of", "output_tokens",
+    "phase", "reply_len", "resume", "session_id", "tool_calls",
+    "user_message_bytes", "error_type",
+})
+
+
+def _is_audit_payload_field(key: str) -> bool:
+    return (
+        key in _AUDIT_PAYLOAD_FIELDS
+        or key.startswith(("stdout", "stderr", "raw_"))
+        or key.endswith(("_input", "_result"))
+    )
 
 
 # 180KB leaves ~20KB headroom under Anthropic's ~200KB request cap
@@ -111,45 +142,98 @@ class AuditLog:
     ``tail -F`` PID 1 and ``docker logs``.
     """
 
-    def __init__(self, path: Path, agent_id: str):
+    def __init__(
+        self,
+        path: Path,
+        agent_id: str,
+        *,
+        max_bytes: int = AUDIT_MAX_BYTES,
+        backup_count: int = AUDIT_BACKUP_COUNT,
+    ):
         self.path = path
         self.agent_id = agent_id
+        self.max_bytes = max(1, max_bytes)
+        self.backup_count = max(0, backup_count)
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             # Touch so the container's tail starts cleanly even if no
             # turn has happened yet.
             self.path.touch(exist_ok=True)
         except OSError as exc:
-            logger.warning(
-                "agent %s: cannot prepare audit log at %s: %s",
-                agent_id, path, exc,
-            )
+            self._warn("cannot prepare audit log", exc)
 
     def write(self, event: str, **fields) -> None:
-        rec = {
-            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "agent": self.agent_id,
-            "event": event,
-            **{k: _truncate(v) for k, v in fields.items()},
-        }
         try:
+            safe_fields = {}
+            for key, value in fields.items():
+                if _is_audit_payload_field(key):
+                    safe_fields[f"{key}_summary"] = safe_value_summary(value)
+                elif key in _AUDIT_DIAGNOSTIC_FIELDS:
+                    safe_fields[f"{key}_summary"] = safe_diagnostic_summary(value)
+                elif key in _AUDIT_METADATA_FIELDS:
+                    safe_fields[key] = _bounded_metadata(value)
+                else:
+                    safe_fields[f"{key}_summary"] = safe_value_summary(value)
+            rec = {
+                "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "agent": self.agent_id,
+                "event": event,
+                **safe_fields,
+            }
+            encoded = json.dumps(rec, ensure_ascii=False)
+            self._rotate_if_needed()
             with self.path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except OSError as exc:
-            # Audit failure must not kill the turn.
+                f.write(encoded + "\n")
+        except Exception as exc:
+            self._warn("audit log write failed", exc)
+
+    def _warn(self, message: str, exc: BaseException) -> None:
+        try:
             logger.warning(
-                "agent %s: audit log write failed: %s",
-                self.agent_id, exc,
+                "agent %s: %s: %s",
+                self.agent_id,
+                message,
+                type(exc).__name__,
             )
+        except Exception:
+            pass
+
+    def _rotate_if_needed(self) -> None:
+        try:
+            if self.path.stat().st_size < self.max_bytes:
+                return
+            if self.backup_count == 0:
+                self.path.write_text("", encoding="utf-8")
+                return
+            oldest = self.path.with_name(f"{self.path.name}.{self.backup_count}")
+            try:
+                oldest.unlink()
+            except FileNotFoundError:
+                pass
+            for index in range(self.backup_count - 1, 0, -1):
+                source = self.path.with_name(f"{self.path.name}.{index}")
+                if source.exists():
+                    os.replace(
+                        source,
+                        self.path.with_name(f"{self.path.name}.{index + 1}"),
+                    )
+            os.replace(self.path, self.path.with_name(f"{self.path.name}.1"))
+            self.path.touch()
+        except Exception as exc:
+            self._warn("audit log rotation failed", exc)
 
 
-def _truncate(v):
-    if isinstance(v, str) and len(v) > AUDIT_FIELD_MAX:
-        return v[:AUDIT_FIELD_MAX] + "... (truncated)"
+def _bounded_metadata(v):
+    """Bound non-payload metadata while retaining IDs and counters."""
+    if isinstance(v, str) and len(v) > 256:
+        return safe_value_summary(v)
     if isinstance(v, dict):
-        return {k: _truncate(x) for k, x in v.items()}
+        return {
+            str(k): _bounded_metadata(x)
+            for k, x in list(v.items())[:64]
+        }
     if isinstance(v, list):
-        return [_truncate(x) for x in v]
+        return [_bounded_metadata(x) for x in v[:64]]
     return v
 
 
@@ -238,6 +322,15 @@ class ClaudeSession:
         # fallback needs to be sent because claude-code has no
         # transcript to resume.
         self._last_spawn_resumed: bool = False
+        self._context_used_tokens: int = 0
+        self._context_measured_at: datetime | None = None
+        self._admission_callback: AdmissionCallback | None = None
+        self._admission_planning_cycle_key: str = ""
+        self._continuation_admissions: list[ToolResultAdmission] = []
+        self._active_puffo_tool_calls: dict[
+            str, tuple[str, dict[str, object]]
+        ] = {}
+        self._active_provider_turn_id: str | None = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -246,8 +339,8 @@ class ClaudeSession:
             return result
         logger.warning(
             "agent %s: claude reply matched Prompt-is-too-long pattern; "
-            "rewriting to friendly error (raw: %s)",
-            self.agent_id, result.reply[:200],
+            "rewriting to friendly error (%s)",
+            self.agent_id, safe_diagnostic_summary(result.reply),
         )
         if self.audit is not None:
             self.audit.write(
@@ -332,9 +425,9 @@ class ClaudeSession:
             # metadata.
             logger.error(
                 "agent %s: auth error persisted across %d attempts; "
-                "suppressing reply. last reply: %s",
+                "suppressing reply. last_reply=%s",
                 self.agent_id, attempts,
-                (last_result.reply if last_result else "")[:500],
+                safe_diagnostic_summary(last_result.reply if last_result else ""),
             )
             if self.audit is not None:
                 self.audit.write(
@@ -414,6 +507,182 @@ class ClaudeSession:
         async with self._lock:
             await self._kill_proc()
 
+    async def get_context_snapshot(self) -> ContextSnapshot:
+        return normalize_context_snapshot(
+            used_tokens=self._context_used_tokens,
+            measured_at=self._context_measured_at,
+            estimated_source="claude_usage_fallback_200000",
+        )
+
+    def get_context_capabilities(self) -> ContextCapabilities:
+        return ContextCapabilities(
+            native_measurement=bool(self._context_measured_at),
+            rollover=True,
+            diagnostic="Claude reports usage; native compaction unsupported",
+        )
+
+    async def compact_context(self) -> CompactionResult:
+        return CompactionResult(
+            completed=False,
+            provider_session_id=self.get_provider_session_id(),
+            diagnostic="native Claude compaction unsupported; no text frame sent",
+        )
+
+    async def rollover_context(self) -> RolloverResult:
+        previous = self.get_provider_session_id()
+        async with self._lock:
+            self._clear_session_id()
+            await self._kill_proc()
+            self._context_used_tokens = 0
+            self._context_measured_at = None
+        return RolloverResult(
+            completed=True,
+            previous_provider_session_id=previous,
+            diagnostic="Claude session and cached occupancy cleared",
+        )
+
+    def get_provider_session_id(self) -> str | None:
+        return self._session_id or None
+
+    def register_admission_callback(
+        self,
+        callback: AdmissionCallback | None,
+        planning_cycle_key: str = "",
+    ) -> None:
+        self._admission_callback = callback
+        self._admission_planning_cycle_key = planning_cycle_key
+        if callback is None:
+            self._continuation_admissions.clear()
+
+    register_provider_admission_callback = register_admission_callback
+
+    def register_continuation_callback(
+        self,
+        callback: AdmissionCallback | None,
+        planning_cycle_key: str = "",
+        *,
+        channel_id: str = "",
+        tool_names: tuple[str, ...] = (),
+        tool_arguments: dict[str, object] | None = None,
+        correlation_receipt: str = "",
+    ) -> None:
+        if callback is None:
+            self._continuation_admissions.clear()
+            return
+        provider_turn_id = self._active_provider_turn_id
+        if provider_turn_id is None:
+            if tool_names or tool_arguments is not None or correlation_receipt:
+                raise RuntimeError(
+                    "no active Claude provider turn for tool-result admission"
+                )
+            self.register_admission_callback(callback, planning_cycle_key)
+            return
+        self._continuation_admissions.append(
+            ToolResultAdmission.build(
+                callback,
+                planning_cycle_key,
+                provider_turn_id,
+                channel_id=channel_id,
+                tool_names=tool_names or (
+                    "send_message",
+                    "send_message_with_attachments",
+                ),
+                tool_arguments=tool_arguments,
+                correlation_receipt=correlation_receipt,
+            )
+        )
+
+    async def _fire_admission(self, provider_turn_id: str) -> None:
+        callback = self._admission_callback
+        key = self._admission_planning_cycle_key
+        self._admission_callback = None
+        self._admission_planning_cycle_key = ""
+        if callback is not None:
+            await callback(ProviderAdmissionEvent(
+                planning_cycle_key=key,
+                provider_session_id=self.get_provider_session_id(),
+                provider_turn_id=provider_turn_id,
+                admitted_at=datetime.now(timezone.utc),
+            ))
+
+    async def _fire_matching_continuations(
+        self, event: dict, provider_turn_id: str,
+    ) -> None:
+        if event.get("type") != "user" or not self._continuation_admissions:
+            return
+        content = (event.get("message") or {}).get("content") or []
+        selected: list[int] = []
+        selected_tool_ids: dict[int, str] = {}
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            tool_use_id = str(block.get("tool_use_id") or "")
+            tool_call = self._active_puffo_tool_calls.get(tool_use_id)
+            if block.get("is_error") is True:
+                self._active_puffo_tool_calls.pop(tool_use_id, None)
+                continue
+            serialized = json.dumps(block, sort_keys=True, default=str)
+            tool_name = tool_call[0] if tool_call is not None else ""
+            tool_arguments = tool_call[1] if tool_call is not None else {}
+            exact = next(
+                (
+                    index
+                    for index, admission in enumerate(
+                        self._continuation_admissions
+                    )
+                    if index not in selected
+                    and admission.provider_turn_id == provider_turn_id
+                    and admission.receipt_marker
+                    and admission.receipt_marker in serialized
+                    and tool_call is not None
+                    and (
+                        not admission.tool_names
+                        or tool_name in admission.tool_names
+                    )
+                ),
+                None,
+            )
+            if exact is not None:
+                selected.append(exact)
+                selected_tool_ids[exact] = tool_use_id
+                continue
+            if tool_call is None:
+                continue
+            candidates = [
+                index
+                for index, admission in enumerate(self._continuation_admissions)
+                if index not in selected
+                and admission.provider_turn_id == provider_turn_id
+                and not admission.correlation_receipt
+                and admission.matches(tool_name, tool_arguments)
+            ]
+            if candidates:
+                selected_index = max(
+                    candidates,
+                    key=lambda index: (
+                        self._continuation_admissions[index].match_specificity,
+                        -index,
+                    ),
+                )
+                selected.append(selected_index)
+                selected_tool_ids[selected_index] = tool_use_id
+            self._active_puffo_tool_calls.pop(tool_use_id, None)
+
+        admissions = [
+            (self._continuation_admissions[index], selected_tool_ids[index])
+            for index in selected
+        ]
+        for index in sorted(selected, reverse=True):
+            self._continuation_admissions.pop(index)
+        for admission, selected_tool_id in admissions:
+            await admission.callback(ProviderAdmissionEvent(
+                planning_cycle_key=admission.planning_cycle_key,
+                provider_session_id=self.get_provider_session_id(),
+                provider_turn_id=provider_turn_id,
+                tool_call_id=selected_tool_id,
+                admitted_at=datetime.now(timezone.utc),
+            ))
+
     # ── Session id persistence ────────────────────────────────────────────────
 
     def _load_session_id(self) -> str:
@@ -487,6 +756,8 @@ class ClaudeSession:
                 self.agent_id, exc,
             )
             self._clear_session_id()
+            self._context_used_tokens = 0
+            self._context_measured_at = None
             await self._spawn(system_prompt)
             self._last_spawn_resumed = False
 
@@ -572,10 +843,13 @@ class ClaudeSession:
                         pass
                 raise _ResumeFailed(
                     f"claude exited rc={rc} before init event"
-                    + (f"; stderr: {stderr_tail}" if stderr_tail else "")
+                    + (
+                        f"; stderr_summary: {safe_diagnostic_summary(stderr_tail)}"
+                        if stderr_tail else ""
+                    )
                 )
             event = _parse_event(line)
-            if event is None:
+            if not isinstance(event, dict):
                 continue
             if event.get("type") == "system" and event.get("subtype") == "init":
                 return (event.get("session_id") or "").strip()
@@ -595,7 +869,7 @@ class ClaudeSession:
                 # complaint worth seeing.
                 logger.warning(
                     "agent %s claude stderr: %s",
-                    self.agent_id, text,
+                    self.agent_id, safe_diagnostic_summary(text),
                 )
         except Exception:
             return
@@ -611,7 +885,7 @@ class ClaudeSession:
         logger.error(
             "agent %s: claude stream failure in %s (%s: %s) — "
             "killing subprocess; next turn will respawn",
-            self.agent_id, phase, err_type, err_str,
+            self.agent_id, phase, err_type, safe_diagnostic_summary(err_str),
         )
         if self.audit is not None:
             self.audit.write(
@@ -633,8 +907,8 @@ class ClaudeSession:
         logger.error(
             "agent %s: claude session poisoned (API rejects the whole "
             "conversation) — clearing session id, respawning fresh. "
-            "reply: %s",
-            self.agent_id, reply[:300],
+            "reply_summary: %s",
+            self.agent_id, safe_diagnostic_summary(reply),
         )
         if self.audit is not None:
             self.audit.write(
@@ -644,6 +918,8 @@ class ClaudeSession:
             )
         self._clear_session_id()
         await self._kill_proc()
+        self._context_used_tokens = 0
+        self._context_measured_at = None
 
     async def _kill_proc(self) -> None:
         if self._proc is None:
@@ -726,6 +1002,26 @@ class ClaudeSession:
         return drained
 
     async def _one_turn(self, user_message: str) -> TurnResult:
+        provider_turn_id = f"claude-turn-{uuid.uuid4().hex}"
+        self._active_provider_turn_id = provider_turn_id
+        self._active_puffo_tool_calls.clear()
+        try:
+            return await self._one_turn_inner(user_message, provider_turn_id)
+        finally:
+            if self._active_provider_turn_id == provider_turn_id:
+                self._active_provider_turn_id = None
+            self._continuation_admissions = [
+                admission
+                for admission in self._continuation_admissions
+                if admission.provider_turn_id != provider_turn_id
+            ]
+            self._active_puffo_tool_calls.clear()
+
+    async def _one_turn_inner(
+        self,
+        user_message: str,
+        provider_turn_id: str,
+    ) -> TurnResult:
         assert self._proc is not None and self._proc.stdin is not None
         ums_bytes = len(user_message.encode("utf-8"))
         if ums_bytes > MAX_USER_MESSAGE_BYTES:
@@ -806,12 +1102,24 @@ class ClaudeSession:
                 await self._handle_stream_failure("eof_mid_turn", f"rc={rc}")
                 return TurnResult(reply="", metadata={"stream_error": "eof_mid_turn"})
             event = _parse_event(line)
-            if event is None:
+            if not isinstance(event, dict):
                 continue
+            event_session_id = str(event.get("session_id") or "").strip()
+            if event_session_id and event_session_id != self._session_id:
+                self._save_session_id(event_session_id)
+            if self._admission_callback is not None:
+                await self._fire_admission(provider_turn_id)
+            await self._fire_matching_continuations(event, provider_turn_id)
             event_types_seen.append(
                 f"{event.get('type')}/{event.get('subtype', '-')}"
             )
-            logger.debug("agent %s stream event: %s", self.agent_id, event)
+            logger.debug(
+                "agent %s stream event: type=%s subtype=%s session_present=%s",
+                self.agent_id,
+                event.get("type"),
+                event.get("subtype"),
+                bool(event.get("session_id")),
+            )
 
             t = event.get("type")
             if t == "assistant":
@@ -849,6 +1157,17 @@ class ClaudeSession:
                                 "channel": str(tool_input.get("channel", "")),
                                 "root_id": str(tool_input.get("root_id", "")),
                             })
+                        if name.startswith("mcp__puffo__"):
+                            tool_use_id = str(block.get("id") or "")
+                            tool_name = name.removeprefix("mcp__puffo__")
+                            if tool_use_id:
+                                self._active_puffo_tool_calls[tool_use_id] = (
+                                    tool_name,
+                                    {
+                                        str(key): value
+                                        for key, value in tool_input.items()
+                                    },
+                                )
                         if self.audit is not None:
                             self.audit.write(
                                 "tool",
@@ -870,6 +1189,10 @@ class ClaudeSession:
                 input_tokens = int(usage.get("input_tokens", 0) or 0) + int(
                     usage.get("cache_creation_input_tokens", 0) or 0
                 )
+                self._context_used_tokens = input_tokens + int(
+                    usage.get("cache_read_input_tokens", 0) or 0
+                )
+                self._context_measured_at = datetime.now(timezone.utc)
                 output_tokens = int(usage.get("output_tokens", 0) or 0)
                 # Fallback for CLI versions where the assembled text
                 # reply only appears on ``result.result``.

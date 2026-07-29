@@ -32,6 +32,8 @@ class StoredMessageDict:
     received_at: int
     thread_root_id: Optional[str]
     reply_to_id: Optional[str]
+    is_encrypted: bool = True
+    server_seq: Optional[int] = None
 
 
 # Re-exported from ``message_store`` so both the network-backed
@@ -66,6 +68,12 @@ def _msg_from_dict(d: dict[str, Any]) -> StoredMessageDict:
         received_at=int(d.get("received_at", 0)),
         thread_root_id=d.get("thread_root_id"),
         reply_to_id=d.get("reply_to_id"),
+        is_encrypted=bool(d.get("is_encrypted", True)),
+        server_seq=(
+            int(d["server_seq"])
+            if d.get("server_seq") is not None
+            else None
+        ),
     )
 
 
@@ -311,6 +319,33 @@ class DataClient:
                 "data-service: get_message_by_envelope transport: %s", exc,
             )
             return None
+
+    async def get_send_encryption(
+        self, slug: str, thread_root_id: str | None,
+    ) -> bool:
+        """Ask the daemon whether the next send must be E2EE.
+        Fail-safe: any transport/decode problem answers encrypt."""
+        path = (
+            f"/v1/data/{urllib.parse.quote(self.agent_id, safe='')}"
+            f"/send-encryption"
+        )
+        params = {"slug": slug}
+        if thread_root_id:
+            params["thread_root_id"] = thread_root_id
+        session = await self._get_session()
+        try:
+            async with session.get(
+                f"{self.base_url}{path}", params=params,
+            ) as resp:
+                if resp.status >= 400:
+                    return True
+                data = await resp.json()
+                return bool(data.get("encrypt", True))
+        except aiohttp.ClientError as exc:
+            logger.warning(
+                "data-service: get_send_encryption transport: %s", exc,
+            )
+            return True
 
     async def update_profile_cache(
         self, slug: str, display_name: str, avatar_url: str,
