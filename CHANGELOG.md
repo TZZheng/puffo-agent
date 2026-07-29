@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.6] — 2026-07-28
+
 ### Changed
 
 - **`role_short` is now single-source-derived from `role` (PUF-401).**
