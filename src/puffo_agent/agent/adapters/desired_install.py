@@ -19,15 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from ...crypto.http_client import HttpError, PuffoCoreHttpClient
+from ...skill_ids import SKILL_ID_RE
 from ..shared_content import _strip_puffo_mcp_prefix_for_codex
 
 logger = logging.getLogger(__name__)
 
 
-# Skill ids that pass the host_tools regex; tightens the picker
-# wire to the same charset the on-disk installer accepts so a
-# malformed id can't escape into a stray directory write.
-_SKILL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _MCP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
@@ -106,7 +103,7 @@ def _write_skill_to_dir(
 ) -> str:
     """Idempotent write of a SKILL.md + provenance marker to ``skill_dir``.
     Returns ``"installed"`` / ``"already-present"`` / ``"invalid"``."""
-    if not _SKILL_ID_RE.match(template_id):
+    if not SKILL_ID_RE.match(template_id):
         logger.warning("desired skill %r: invalid id — skipping", template_id)
         return "invalid"
     if not body or not body.strip():
