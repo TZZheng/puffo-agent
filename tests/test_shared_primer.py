@@ -210,6 +210,23 @@ def _assert_followup_decision_contract(text: str) -> None:
         assert forbidden not in lowered
 
 
+def _assert_assignment_completion_boundary(text: str) -> None:
+    lowered = " ".join(text.lower().split())
+    for phrase in (
+        "ordinary peer progress on an unchanged originating intent",
+        "does not by itself reopen",
+        "is_self: true",
+        "already completed this agent's part",
+        "peer-exposed work or an evolving assignment permits another response only when",
+        "newly observed content creates or changes an unresolved obligation belonging to this agent",
+        "changed objective",
+        "changed scope",
+        "changed constraint",
+        "changed deliverable",
+    ):
+        assert phrase in lowered, (phrase, text)
+
+
 def test_followup_decision_context_is_shared_across_managed_prompts():
     root = _tmp()
     shared = root / "shared"
@@ -250,6 +267,7 @@ def test_followup_decision_context_is_shared_across_managed_prompts():
         (codex_user / "AGENTS.md").read_text(encoding="utf-8"),
     ):
         _assert_followup_decision_contract(prompt)
+        _assert_assignment_completion_boundary(prompt)
 
     assert "mcp__puffo__" in claude
     assert "mcp__puffo__" not in codex
@@ -282,6 +300,11 @@ def _assert_reply_eligibility_controls(text: str) -> None:
         "newly exposed dependency",
         "otherwise changed work",
         "new work exposed by peer progress",
+        "genuine new peer-exposed work",
+        "changed objective",
+        "changed scope",
+        "changed constraint",
+        "changed deliverable",
         "permit another reply",
         "multi-target turns must address destinations explicitly",
         "choose a send or `[silent]`",
@@ -331,6 +354,7 @@ def test_context_dependent_send_contract_is_shared_across_guidance_and_skills():
         (codex_user / "AGENTS.md").read_text(encoding="utf-8"),
     )
     for prompt in guidance_surfaces:
+        _assert_assignment_completion_boundary(prompt)
         _assert_context_dependent_send_contract(prompt)
         _assert_reply_eligibility_controls(prompt)
 
@@ -360,6 +384,7 @@ def test_context_dependent_send_contract_is_shared_across_guidance_and_skills():
     )
     for skill in send_skill_surfaces:
         _assert_context_dependent_send_contract(skill)
+        _assert_assignment_completion_boundary(skill)
 
     assert "mcp__puffo__" in claude
     assert "mcp__puffo__" not in codex
@@ -423,6 +448,7 @@ def test_read_inbox_prior_context_contract_is_shared_across_claude_codex_and_ski
             "newly exposed dependency",
         ):
             assert phrase in lowered, (phrase, prompt)
+        _assert_assignment_completion_boundary(prompt)
         for forbidden in (
             "call this first for every",
             "first action after every",

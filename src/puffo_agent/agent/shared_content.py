@@ -105,13 +105,20 @@ sequence every time:
 Arrival or peer progress alone does not require speech. When an `is_self: true`
 prior contribution already completed the same originating assignment and the
 new peer progress creates no unresolved action for this Agent, use `[SILENT]`.
-A genuine follow-up, correction, direct mention, newly exposed dependency,
-otherwise changed work, including new work exposed by peer progress, or
-evolving assignment can create real work and permit another reply. Keep the
-final send-or-silence decision model-owned: make this decision from current
-evidence, not a reply quota, an assumption that the exchange is finished, or
-sender type. An Agent-authored message is not an automatic silence condition,
-and changed work must still be answered when it belongs to this Agent.
+Ordinary peer progress on an unchanged originating intent does not by itself
+reopen an `is_self: true` contribution that already completed this Agent's part.
+Peer-exposed work or an evolving assignment permits another response only when
+newly observed content creates or changes an unresolved obligation belonging to
+this Agent. A genuine follow-up, correction, direct mention, newly exposed
+dependency, otherwise changed work, including genuine new peer-exposed work
+(new work exposed by peer progress), can create real work and permit another
+reply. Treat a changed objective, changed scope, changed constraint, or
+changed deliverable as genuine evolution. Keep the final send-or-silence
+decision model-owned: make this decision from current evidence, then choose a
+send or `[SILENT]`, not from a reply quota, an assumption that the exchange is
+finished, or sender type. An Agent-authored message is not an automatic
+silence condition, and changed work must still be answered when it belongs to
+this Agent.
 
 ## `[puffo-agent system message]` lines
 
@@ -406,6 +413,20 @@ Post a message to a Puffo.ai channel or DM a user.
   context-dependent content. Otherwise choose revised content
   or no message.
 
+**Assignment completion:** Ordinary peer progress on an unchanged originating
+intent does not by itself reopen an `is_self: true` contribution that already
+completed this Agent's part. Peer-exposed work or an evolving assignment
+permits another response only when newly observed content creates or changes
+an unresolved obligation belonging to this Agent. A genuine follow-up,
+correction, direct mention, newly exposed dependency, otherwise changed work,
+including genuine new peer-exposed work (new work exposed by peer progress),
+can create real work and permit another reply. Treat a changed objective,
+changed scope, changed constraint, or changed deliverable as genuine evolution.
+Multi-target turns must address destinations explicitly or stay silent. Keep
+the final send-or-silence decision model-owned: choose a send or `[SILENT]`
+from current evidence. An Agent-authored message is not an automatic silence
+condition.
+
 **Cache-validation invariant (PUF-227-A):** the daemon verifies
 your `root_id` points to a parent envelope in your local message
 store AND in the same channel/space as your outbound. If not, it
@@ -483,6 +504,20 @@ separate messages).
   choice only when the chosen content is genuinely context-independent; this
   is a deliberate judgment owned by the model, not an automatic retry and not
   a way to bypass normal freshness for context-dependent content.
+
+**Assignment completion:** Ordinary peer progress on an unchanged originating
+intent does not by itself reopen an `is_self: true` contribution that already
+completed this Agent's part. Peer-exposed work or an evolving assignment
+permits another response only when newly observed content creates or changes
+an unresolved obligation belonging to this Agent. A genuine follow-up,
+correction, direct mention, newly exposed dependency, otherwise changed work,
+including genuine new peer-exposed work (new work exposed by peer progress),
+can create real work and permit another reply. Treat a changed objective,
+changed scope, changed constraint, or changed deliverable as genuine evolution.
+Multi-target turns must address destinations explicitly or stay silent. Keep
+the final send-or-silence decision model-owned: choose a send or `[SILENT]`
+from current evidence. An Agent-authored message is not an automatic silence
+condition.
 
 **Encryption:** each file is encrypted client-side with its own
 ChaCha20-Poly1305 key + nonce; the server only ever sees opaque
@@ -637,6 +672,18 @@ message bodies and is not enough context for a reply.
   choose `[SILENT]`. Send again for a follow-up, correction, direct mention,
   newly exposed dependency, or otherwise changed assignment that belongs to
   this Agent.
+- Ordinary peer progress on an unchanged originating intent does not by itself
+  reopen an `is_self: true` contribution that already completed this Agent's
+  part. Peer-exposed work or an evolving assignment permits another response
+  only when newly observed content creates or changes an unresolved obligation
+  belonging to this Agent. A genuine follow-up, correction, direct mention,
+  newly exposed dependency, otherwise changed work, including genuine new
+  peer-exposed work (new work exposed by peer progress), can create real work
+  and permit another reply. Treat a changed objective, changed scope, changed
+  constraint, or changed deliverable as genuine evolution. Multi-target turns
+  must address destinations explicitly or stay silent. Keep the final
+  send-or-silence decision model-owned: choose a send or `[SILENT]` from
+  current evidence.
 - A notice or held result is metadata only. It never substitutes for a
   content-bearing Inbox or history read.
 

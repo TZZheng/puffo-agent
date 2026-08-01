@@ -579,6 +579,20 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             unresolved action for this Agent, choose ``[SILENT]``. Send again
             for a follow-up, correction, direct mention, newly exposed
             dependency, or otherwise changed assignment.
+            Ordinary peer progress on an unchanged originating intent does not
+            by itself reopen an ``is_self: true`` contribution that already
+            completed this Agent's part. Peer-exposed work or an evolving
+            assignment permits another response only when newly observed
+            content creates or changes an unresolved obligation belonging to
+            this Agent. A genuine follow-up, correction, direct mention,
+            newly exposed dependency, otherwise changed work, including
+            genuine new peer-exposed work (new work exposed by peer progress),
+            can create real work and permit another reply. Treat a changed
+            objective, changed scope, changed constraint, or changed deliverable
+            as genuine evolution.
+            Multi-target turns must address destinations explicitly or stay
+            silent. Keep the final send-or-silence decision model-owned: choose
+            a send or ``[SILENT]`` from current evidence.
         """
         arguments: dict[str, Any] = {}
         if target:
@@ -730,6 +744,20 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             context-independent; this is a deliberate judgment owned by the
             model, not an automatic retry and not a way to bypass normal
             freshness for context-dependent content.
+        Assignment completion: ordinary peer progress on an unchanged
+        originating intent does not by itself reopen an ``is_self: true``
+        contribution that already completed this Agent's part. Peer-exposed
+        work or an evolving assignment permits another response only when
+        newly observed content creates or changes an unresolved obligation
+        belonging to this Agent. A genuine follow-up, correction, direct
+        mention, newly exposed dependency, otherwise changed work, including
+        genuine new peer-exposed work (new work exposed by peer progress), can
+        create real work and permit another reply. Treat a changed objective,
+        changed scope, changed constraint, or changed deliverable as genuine
+        evolution. Multi-target turns must address destinations explicitly or
+        stay silent. Keep the final send-or-silence decision model-owned:
+        choose a send or
+        ``[SILENT]`` from current evidence.
         """
         return await _dispatch_semantic_send(
             cfg,
@@ -1416,6 +1444,20 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             a deliberate judgment owned by the model, not an automatic retry
             and not a way to bypass normal freshness for context-dependent
             content.
+        Assignment completion: ordinary peer progress on an unchanged
+        originating intent does not by itself reopen an ``is_self: true``
+        contribution that already completed this Agent's part. Peer-exposed
+        work or an evolving assignment permits another response only when
+        newly observed content creates or changes an unresolved obligation
+        belonging to this Agent. A genuine follow-up, correction, direct
+        mention, newly exposed dependency, otherwise changed work, including
+        genuine new peer-exposed work (new work exposed by peer progress), can
+        create real work and permit another reply. Treat a changed objective,
+        changed scope, changed constraint, or changed deliverable as genuine
+        evolution. Multi-target turns must address destinations explicitly or
+        stay silent. Keep the final send-or-silence decision model-owned:
+        choose a send or
+        ``[SILENT]`` from current evidence.
         """
         return await _dispatch_semantic_send(
             cfg,

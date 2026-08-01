@@ -26,6 +26,42 @@ def _now_ms():
     return int(time.time() * 1000)
 
 
+def _assert_assignment_completion_boundary(text: str) -> None:
+    lowered = " ".join(text.lower().split())
+    for phrase in (
+        "ordinary peer progress on an unchanged originating intent",
+        "does not by itself reopen",
+        "is_self: true",
+        "already completed this agent's part",
+        "peer-exposed work or an evolving assignment permits another response only when",
+        "newly observed content creates or changes an unresolved obligation belonging to this agent",
+        "changed objective",
+        "changed scope",
+        "changed constraint",
+        "changed deliverable",
+    ):
+        assert phrase in lowered, (phrase, text)
+
+
+def _assert_assignment_completion_positive_controls(text: str) -> None:
+    lowered = " ".join(text.lower().split())
+    for phrase in (
+        "follow-up",
+        "correction",
+        "direct mention",
+        "newly exposed dependency",
+        "genuine new peer-exposed work",
+        "changed objective",
+        "changed scope",
+        "changed constraint",
+        "changed deliverable",
+        "multi-target turns must address destinations explicitly",
+        "final send-or-silence decision model-owned",
+        "[silent]",
+    ):
+        assert phrase in lowered, (phrase, text)
+
+
 class FakeHttpClient:
     """Test stub. Match priority: exact path, then path-without-query,
     then query params modulo the ``since`` cursor (so a test can
@@ -358,6 +394,8 @@ async def test_send_tool_descriptions_require_semantic_inspection_before_context
             "do not infer unseen content or force a stale context-dependent draft",
         ):
             assert phrase in description, (name, phrase, description)
+        _assert_assignment_completion_boundary(description)
+        _assert_assignment_completion_positive_controls(description)
 
 
 @pytest.mark.asyncio
@@ -379,6 +417,8 @@ async def test_send_tool_descriptions_preserve_context_independent_override():
             assert phrase in description_without_markup, (
                 name, phrase, description,
             )
+        _assert_assignment_completion_boundary(description)
+        _assert_assignment_completion_positive_controls(description)
 
 
 @pytest.mark.asyncio
@@ -455,6 +495,8 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
         "newly exposed dependency",
     ):
         assert phrase.lower() in description, (phrase, description)
+    _assert_assignment_completion_boundary(description)
+    _assert_assignment_completion_positive_controls(description)
 
 
 @pytest.mark.asyncio
