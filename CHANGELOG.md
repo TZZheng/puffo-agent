@@ -6,6 +6,18 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Skill ids ending in a newline are no longer accepted.** The daemon
+  validated ids with Python's `$`, which also matches immediately before
+  a trailing newline, so a name like `my-skill\n` passed on its way to
+  `.claude/skills/` while the server's own constraint rejected it. The
+  gap was reachable — `install_skill` takes its name from an
+  agent-supplied tool call. The anchor is now `\Z`, matching the server.
+  The two copies of the rule, in the desired-skill installer and the MCP
+  host tools, were also folded into one shared constant so they can't
+  drift apart again.
+
 ## [1.1.6] — 2026-07-28
 
 ### Changed
