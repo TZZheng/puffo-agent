@@ -92,6 +92,11 @@ class TurnResult:
 class Adapter(ABC):
     """Base class for all runtime adapters."""
 
+    # Legacy adapters correlate a returned tool result with a later provider
+    # completion event. Runtime-manager adapters can commit the durable read at
+    # the local tool-return boundary because crash recovery owns the active Turn.
+    tool_result_admission_boundary = "provider_completion"
+
     @abstractmethod
     async def run_turn(self, ctx: TurnContext) -> TurnResult:
         """Execute one turn against the underlying runtime."""

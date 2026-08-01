@@ -755,6 +755,105 @@ def test_history_continuation_matches_exact_codex_tool_result(tmp_path):
     asyncio.run(drive())
 
 
+def test_continuation_uses_unique_tool_arguments_when_result_is_omitted(tmp_path):
+    from puffo_agent.agent.adapters.codex_session import _PendingTurn
+
+    async def drive():
+        cs = CodexSession("missing-result", tmp_path / "session.json", ["true"])
+        cs._conversation_id = "thread-current"
+        cs._active_turn = _PendingTurn(2, time.time())
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current",
+            "turn": {"id": "user-turn"},
+        })
+        events = []
+
+        async def admitted(event):
+            events.append(event)
+
+        cs.register_continuation_callback(
+            admitted,
+            "read-page",
+            tool_names=("read_inbox",),
+            tool_arguments={},
+            correlation_receipt="receipt-not-in-frame",
+        )
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current",
+            "turnId": "user-turn",
+            "item": {
+                "id": "call-read",
+                "type": "mcpToolCall",
+                "server": "puffo",
+                "tool": "read_inbox",
+                "status": "completed",
+                "arguments": {"target": "", "cursor": "", "limit": 50},
+            },
+        })
+        assert len(events) == 1
+        assert events[0].planning_cycle_key == "read-page"
+        assert events[0].tool_call_id == "call-read"
+
+        cs.register_continuation_callback(
+            admitted,
+            "dynamic-read-page",
+            tool_names=("read_inbox",),
+            tool_arguments={"target": "channel:space:channel"},
+            correlation_receipt="dynamic-receipt-not-in-frame",
+        )
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current",
+            "turnId": "user-turn",
+            "item": {
+                "id": "call-dynamic-read",
+                "type": "dynamicToolCall",
+                "namespace": "mcp__puffo",
+                "tool": "read_inbox",
+                "status": "completed",
+                "success": True,
+                "arguments": {"target": "channel:space:channel", "limit": 50},
+                "contentItems": None,
+            },
+        })
+        assert len(events) == 2
+        assert events[1].planning_cycle_key == "dynamic-read-page"
+        assert events[1].tool_call_id == "call-dynamic-read"
+
+        async def first(_event):
+            events.append("first")
+
+        async def second(_event):
+            events.append("second")
+
+        for callback, key, receipt in (
+            (first, "ambiguous-1", "receipt-1"),
+            (second, "ambiguous-2", "receipt-2"),
+        ):
+            cs.register_continuation_callback(
+                callback,
+                key,
+                tool_names=("read_inbox",),
+                tool_arguments={},
+                correlation_receipt=receipt,
+            )
+        await cs._handle_notification("item/completed", {
+            "threadId": "thread-current",
+            "turnId": "user-turn",
+            "item": {
+                "id": "call-ambiguous",
+                "type": "mcpToolCall",
+                "server": "puffo",
+                "tool": "read_inbox",
+                "status": "completed",
+                "arguments": {},
+            },
+        })
+        assert len(events) == 2
+        assert len(cs._continuation_admissions) == 2
+
+    asyncio.run(drive())
+
+
 def test_token_usage_sums_multi_request_turn(tmp_path):
     """A turn with several model requests reports the whole turn's usage (the
     thread total's delta), not just the last request."""

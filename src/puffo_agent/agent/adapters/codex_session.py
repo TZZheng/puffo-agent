@@ -165,6 +165,22 @@ _PUFFO_SEND_MESSAGE_TOOLS = frozenset({
 })
 
 
+def _codex_tool_identity(item: dict[str, Any]) -> tuple[str, str]:
+    """Normalize MCP and dynamic-tool identities from Codex app-server."""
+    server = str(item.get("server") or "")
+    namespace = str(item.get("namespace") or "")
+    tool = str(item.get("tool") or item.get("name") or "")
+    if namespace.startswith("mcp__"):
+        server = namespace.removeprefix("mcp__")
+    elif namespace and not server:
+        server = namespace
+    if tool.startswith("mcp__") and "__" in tool:
+        prefix, tool = tool.rsplit("__", 1)
+        if not server and prefix.startswith("mcp__"):
+            server = prefix.removeprefix("mcp__")
+    return server, tool
+
+
 # codex's chunky single-line notifications (tool catalogs, session
 # snapshots) overrun asyncio's 64 KiB default -> LimitOverrunError wedges
 # the reader. 16 MiB matches ClaudeSession.
@@ -1386,15 +1402,14 @@ class CodexSession:
         kind = str(item.get("type") or "").lower()
         thread_id = str((params or {}).get("threadId") or "")
         turn_id = str((params or {}).get("turnId") or "")
-        server = str(item.get("server") or "")
-        tool = str(item.get("tool") or "")
+        server, tool = _codex_tool_identity(item)
         status = str(item.get("status") or "").lower()
         expected_turn = turn.provider_turn_id
         if not (
             (not thread_id or thread_id == self._conversation_id)
             and expected_turn
             and (not turn_id or turn_id == expected_turn)
-            and kind == "mcptoolcall"
+            and kind in {"mcptoolcall", "dynamictoolcall"}
             and server == "puffo"
             and status == "completed"
         ):
@@ -1433,6 +1448,30 @@ class CodexSession:
                         self._continuation_admissions[index].match_specificity,
                         -index,
                     ),
+                )
+        if matched is None:
+            # ``McpToolCallThreadItem.result`` is optional in the Codex
+            # app-server schema. Some live versions omit it from
+            # ``item/completed`` even though the model received the tool
+            # output, so the receipt marker is not always observable here.
+            # Fall back only when the same-turn tool + arguments identify one
+            # receipt-bearing admission exactly; ambiguity stays fail-closed.
+            receipt_candidates = [
+                index
+                for index, admission in enumerate(self._continuation_admissions)
+                if admission.provider_turn_id == expected_turn
+                and admission.correlation_receipt
+                and admission.matches(tool, arguments)
+            ]
+            if len(receipt_candidates) == 1:
+                matched = receipt_candidates[0]
+                logger.warning(
+                    "Codex item/completed omitted a visible admission receipt; "
+                    "using unique tool/argument correlation "
+                    "turn=%s tool=%s call=%s",
+                    expected_turn,
+                    tool,
+                    str(item.get("id") or ""),
                 )
         if matched is None:
             return
@@ -1505,16 +1544,16 @@ class CodexSession:
                         input=item.get("input") or item.get("arguments") or {},
                         id=str(item.get("id") or ""),
                     )
-            elif kind == "mcptoolcall":
-                # Real shape: item/completed with item.type == "mcpToolCall" and
-                # server/tool/status/arguments fields.
+            elif kind in {"mcptoolcall", "dynamictoolcall"}:
+                # Codex emits configured MCP tools as either mcpToolCall or,
+                # in newer builds, dynamicToolCall with namespace=mcp__puffo.
                 turn.tool_calls += 1
                 status = (item.get("status") or "").lower()
-                server = item.get("server") or ""
-                tool = item.get("tool") or ""
+                server, tool = _codex_tool_identity(item)
                 args = item.get("arguments") or {}
+                succeeded = status == "completed" and item.get("success") is not False
                 is_send = server == "puffo" and tool in _PUFFO_SEND_MESSAGE_TOOLS
-                if is_send and status == "completed":
+                if is_send and succeeded:
                     # Shape mirrors the claude-code adapter so core.py's
                     # ``send_message_called`` check is identical
                     # regardless of harness.

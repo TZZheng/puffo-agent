@@ -28,6 +28,7 @@ from puffo_agent.agent.global_inbox_runtime import (
     SendAttemptState,
     TrackingSendDelegate,
     await_listener_with_runtime,
+    route_for,
 )
 from puffo_agent.agent.inbox_scheduler import (
     InboxNoticeDelivery,
@@ -192,6 +193,13 @@ class Adapter:
             provider_turn_id=provider_turn_id,
             admitted_at=datetime.now(timezone.utc),
         ))
+
+
+class ToolReturnAdapter(Adapter):
+    tool_result_admission_boundary = "tool_return"
+
+    def register_continuation_callback(self, *_args, **_kwargs):
+        raise AssertionError("tool-return admission must not await provider completion")
 
 
 async def make_store(tmp_path):
@@ -1414,6 +1422,50 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
         and event.get("latest_seq") == 3
         and event.get("state") == "invalid_watermark"
         for event in runtime_events(caplog)
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_model_visible_read_admits_at_runtime_tool_return(tmp_path, caplog):
+    caplog.set_level(
+        logging.DEBUG,
+        logger="puffo_agent.agent.global_inbox_runtime",
+    )
+    store = await make_store(tmp_path)
+    await receipt(store, "history-tool-return", 7)
+    adapter = ToolReturnAdapter()
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.active.turn_id = "turn-tool-return"
+    runtime.active.provider_session_id = adapter.session
+    runtime.active.provider_turn_id = "provider-turn-tool-return"
+
+    result = await runtime.stage_model_visible_read(
+        space_id="sp-1",
+        channel_id="ch-1",
+        through_seq=7,
+        through_envelope_id="history-tool-return",
+        tool_name="get_channel_history",
+        tool_arguments={"channel": "ch-1"},
+    )
+
+    assert result["state"] == "admitted"
+    assert runtime.active.through_by_channel[("sp-1", "ch-1")] == 7
+    history_events = [
+        event for event in runtime_events(caplog)
+        if event["event"].startswith("history.")
+    ]
+    assert [event["event"] for event in history_events] == [
+        "history.read_staged", "history.read_admitted",
+    ]
+    assert history_events[0]["state"] == "tool_return"
+    assert history_events[1]["provider_turn_id"] == (
+        "provider-turn-tool-return"
     )
     await store.close()
 
@@ -2767,6 +2819,98 @@ async def test_notice_then_correlated_read_admits_and_processes_exact_page(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_correlated_read_processes_sequence_less_local_runtime_event(tmp_path):
+    store = await make_store(tmp_path)
+    await store.store_local_event(
+        {
+            "envelope_id": "intro-prompt-ch-1",
+            "envelope_kind": "channel",
+            "sender_slug": "system",
+            "channel_id": "ch-1",
+            "space_id": "sp-1",
+            "content": "introduce yourself",
+            "sent_at": 1,
+            "thread_root_id": "intro-prompt-ch-1",
+        },
+        reason="channel introduction",
+        intro_channel_id="ch-1",
+    )
+
+    class PullAdapter(Adapter):
+        def __init__(self):
+            super().__init__()
+            self.continuation = None
+            self.continuation_key = ""
+
+        def register_continuation_callback(
+            self, callback, planning_cycle_key, **_kwargs
+        ):
+            self.continuation = callback
+            self.continuation_key = planning_cycle_key
+
+        async def admit_continuation(self):
+            callback, self.continuation = self.continuation, None
+            await callback(ProviderAdmissionEvent(
+                planning_cycle_key=self.continuation_key,
+                provider_session_id=self.session,
+                provider_turn_id="provider-turn",
+                tool_call_id="tool-local",
+                admitted_at=datetime.now(timezone.utc),
+            ))
+
+    adapter = PullAdapter()
+
+    async def run(planned):
+        await adapter.admit()
+        page = await runtime.read_inbox(limit=50, tool_arguments={})
+        assert len(page["messages"]) == 1
+        assert "introduce yourself" in page["messages"][0]
+        await adapter.admit_continuation()
+        route = runtime.resolve_active_send_route(
+            "ch-1", {"root_id": ""}, {}
+        )
+        assert route is not None
+        assert route.kind == "channel"
+        assert route.thread_root_id == ""
+
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=run, workspace=tmp_path
+    )
+    assert await runtime.process_once()
+    intro = await store.get_message_by_envelope("intro-prompt-ch-1")
+    assert intro is not None
+    assert intro.server_seq is None
+    assert intro.processing_state is ProcessingState.PROCESSED
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_only_intro_system_anchor_authorizes_top_level_channel_send(tmp_path):
+    store = await make_store(tmp_path)
+    await store.store_local_event(
+        {
+            "envelope_id": "membership-joined-ch-1-agent-1-event-1",
+            "envelope_kind": "channel",
+            "sender_slug": "system",
+            "channel_id": "ch-1",
+            "space_id": "sp-1",
+            "content": "membership update",
+            "sent_at": 1,
+            "thread_root_id": "membership-joined-ch-1-agent-1-event-1",
+        },
+        reason="membership system message",
+    )
+    row = await store.get_message_by_envelope(
+        "membership-joined-ch-1-agent-1-event-1"
+    )
+    assert row is not None
+    route = route_for(row)
+    assert route.kind == "thread"
+    assert route.thread_root_id == row.envelope_id
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_path):
     plaintext = "plaintext-notice-sentinel"
     attachment = "attachment-content-sentinel"
@@ -2803,6 +2947,9 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     assert '"generation":' in initial.provider_input
     assert '"message_count":1' in initial.provider_input
     assert '"latest_seq":8' in initial.provider_input
+    assert '"version":3' in initial.provider_input
+    assert '"content_included":false' in initial.provider_input
+    assert '"read_tool":"read_inbox"' in initial.provider_input
     assert "channel:sp-1:ch-1" in initial.provider_input
     assert plaintext not in initial_serialized
     assert attachment not in initial_serialized
@@ -2846,6 +2993,119 @@ async def test_rejected_or_stale_busy_notice_retains_generation(tmp_path):
     assert [row.envelope_id for row in await store.get_pending()] == [
         "notice-reject"
     ]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_notice_turn_without_correlated_read_rearms_pending_work(tmp_path):
+    store = await make_store(tmp_path)
+    await receipt(store, "notice-unread", 10)
+    adapter = Adapter()
+
+    async def run_turn(_planned):
+        await adapter.admit()
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=run_turn,
+        workspace=tmp_path,
+    )
+    before = await store.get_notice_state()
+
+    assert await runtime.process_once()
+
+    after = await store.get_notice_state()
+    assert [row.envelope_id for row in await store.get_pending()] == [
+        "notice-unread"
+    ]
+    assert after.generation == before.generation + 1
+    assert after.last_delivered_generation == before.generation
+    assert after.delivery_pending
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_crash_recovery_requeues_empty_notice_turn_and_rearms_delivery(tmp_path):
+    store = await make_store(tmp_path)
+    await receipt(store, "notice-crash", 11)
+    adapter = Adapter()
+    seed = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    planned = await seed.plan_pending()
+    assert planned is not None
+    seed._write_current_turn(planned)
+    await store.start_turn(
+        turn_id=planned.turn_id,
+        provider_session_id=adapter.session,
+    )
+    before = await store.get_notice_state()
+    assert await store.mark_notice_delivered(before.generation)
+
+    recovered = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    assert not await recovered.recover_current_turn()
+
+    run = await store.get_turn_run(planned.turn_id)
+    after = await store.get_notice_state()
+    assert run is not None and run.state == "requeued"
+    assert [row.envelope_id for row in await store.get_pending()] == [
+        "notice-crash"
+    ]
+    assert after.generation == before.generation + 1
+    assert after.last_delivered_generation == before.generation
+    assert after.delivery_pending
+    assert not recovered.current_turn_path.exists()
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [False, True])
+async def test_startup_recovers_orphaned_turn_without_crash_join(
+    tmp_path,
+    admitted,
+):
+    store = await make_store(tmp_path)
+    await receipt(store, "orphan-pending", 12)
+    notice = await store.get_notice_state()
+    assert await store.mark_notice_delivered(notice.generation)
+    if admitted:
+        await store.admit_messages(
+            ["orphan-pending"],
+            turn_id="orphan-turn",
+            provider_session_id="provider-old",
+        )
+    else:
+        await store.start_turn(
+            turn_id="orphan-turn",
+            provider_session_id="provider-old",
+        )
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    assert await runtime.recover_orphaned_turns() == 1
+
+    run = await store.get_turn_run("orphan-turn")
+    repaired = await store.get_notice_state()
+    assert run is not None and run.state == "requeued"
+    assert [row.envelope_id for row in await store.get_pending()] == [
+        "orphan-pending"
+    ]
+    assert repaired.delivery_pending
+    assert await store.get_active_turn_runs() == ()
+    assert await runtime.recover_orphaned_turns() == 0
     await store.close()
 
 
@@ -3081,6 +3341,54 @@ async def test_read_inbox_byte_guard_repaginates_without_lifecycle_mutation(
     assert [row.envelope_id for row in await store.get_pending()] == [
         "guard-1", "guard-2"
     ]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_inbox_admits_exact_page_at_runtime_tool_return(
+    tmp_path, caplog,
+):
+    caplog.set_level(
+        logging.INFO,
+        logger="puffo_agent.agent.global_inbox_runtime",
+    )
+    store = await make_store(tmp_path)
+    await receipt(store, "tool-return-inbox", 9)
+    await store.start_turn(
+        turn_id="turn-tool-return",
+        provider_session_id="provider-1",
+    )
+    adapter = ToolReturnAdapter()
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.active.turn_id = "turn-tool-return"
+    runtime.active.provider_session_id = adapter.session
+    runtime.active.provider_turn_id = "provider-turn-tool-return"
+
+    page = await runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
+
+    assert len(page["messages"]) == 1
+    assert runtime.active.message_ids == ["tool-return-inbox"]
+    assert runtime.active.through_by_channel[("sp-1", "ch-1")] == 9
+    stored = await store.get_message_by_envelope("tool-return-inbox")
+    assert stored is not None
+    assert stored.processing_state is ProcessingState.IN_TURN
+    assert runtime.current_turn_path.exists()
+    inbox_events = [
+        event for event in runtime_events(caplog)
+        if event["event"].startswith("inbox.read")
+    ]
+    assert [event["event"] for event in inbox_events] == [
+        "inbox.read_staged", "inbox.read_admitted",
+    ]
+    assert inbox_events[0]["outcome"] == "tool_return"
+    assert inbox_events[1]["provider_turn_id"] == (
+        "provider-turn-tool-return"
+    )
     await store.close()
 
 

@@ -529,6 +529,37 @@ class MessageStore:
             await db.commit()
             return cursor.rowcount == 1
 
+    async def rearm_stranded_notice(self) -> bool:
+        """Repair pending work whose only notice was already consumed.
+
+        This is an upgrade and restart guard. It never rearms while a durable
+        Turn is active, because that Turn may still admit the pending rows.
+        """
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            completed = int(self._now_ms())
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                await self._refresh_notice_state(db)
+                cursor = await db.execute(
+                    "UPDATE inbox_notice_state "
+                    "SET generation = generation + 1, "
+                    "first_pending_deadline_ms = ? "
+                    "WHERE singleton = 1 AND pending_count > 0 "
+                    "AND generation = last_delivered_generation "
+                    "AND NOT EXISTS ("
+                    "SELECT 1 FROM turn_runs WHERE state = ?)",
+                    (
+                        completed + self.NOTICE_WINDOW_MS,
+                        ProcessingState.IN_TURN.value,
+                    ),
+                )
+                await db.commit()
+                return cursor.rowcount == 1
+            except Exception:
+                await db.rollback()
+                raise
+
     async def store(self, payload: Any, *, received_at: int | None = None) -> None:
         async with self._inbox_lock:
             await self._store_unlocked(payload, received_at=received_at)
@@ -1320,6 +1351,7 @@ class MessageStore:
         *,
         turn_id: str,
         state: str = ProcessingState.PROCESSED.value,
+        rearm_notice: bool = False,
     ) -> TurnRun:
         """Finalize a notice Turn which admitted no Inbox rows."""
         if state not in (ProcessingState.PROCESSED.value, "requeued"):
@@ -1327,22 +1359,39 @@ class MessageStore:
         async with self._inbox_lock:
             db = await self._ensure_db()
             completed = int(self._now_ms())
-            cursor = await db.execute(
-                "UPDATE turn_runs SET state = ?, completed_at = ? "
-                "WHERE turn_id = ? AND state = ? AND NOT EXISTS "
-                "(SELECT 1 FROM turn_run_messages WHERE turn_id = ?)",
-                (
-                    state,
-                    completed,
-                    turn_id,
-                    ProcessingState.IN_TURN.value,
-                    turn_id,
-                ),
-            )
-            if cursor.rowcount != 1:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    "UPDATE turn_runs SET state = ?, completed_at = ? "
+                    "WHERE turn_id = ? AND state = ? AND NOT EXISTS "
+                    "(SELECT 1 FROM turn_run_messages WHERE turn_id = ?)",
+                    (
+                        state,
+                        completed,
+                        turn_id,
+                        ProcessingState.IN_TURN.value,
+                        turn_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise LifecycleConflict("Turn is not active and empty")
+                if rearm_notice:
+                    # A notice is delivery metadata, not an Inbox ACK. If the
+                    # Turn admitted no rows, create a fresh delivery generation
+                    # for the unchanged pending set so work cannot become
+                    # stranded after an ignored tool call, failure, or restart.
+                    await db.execute(
+                        "UPDATE inbox_notice_state "
+                        "SET generation = generation + 1, "
+                        "first_pending_deadline_ms = ? "
+                        "WHERE singleton = 1 AND pending_count > 0 "
+                        "AND generation = last_delivered_generation",
+                        (completed + self.NOTICE_WINDOW_MS,),
+                    )
+                await db.commit()
+            except Exception:
                 await db.rollback()
-                raise LifecycleConflict("Turn is not active and empty")
-            await db.commit()
+                raise
             run = await self._get_turn_run_unlocked(db, turn_id)
             assert run is not None
             return run
@@ -1586,6 +1635,23 @@ class MessageStore:
         async with self._inbox_lock:
             db = await self._ensure_db()
             return await self._get_turn_run_unlocked(db, turn_id)
+
+    async def get_active_turn_runs(self) -> tuple[TurnRun, ...]:
+        """Return durable Turns that a restarted provider process cannot own."""
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            async with db.execute(
+                "SELECT turn_id FROM turn_runs WHERE state = ? "
+                "ORDER BY started_at, turn_id",
+                (ProcessingState.IN_TURN.value,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            active: list[TurnRun] = []
+            for row in rows:
+                run = await self._get_turn_run_unlocked(db, row["turn_id"])
+                if run is not None:
+                    active.append(run)
+            return tuple(active)
 
     async def _get_turn_run_unlocked(
         self, db: aiosqlite.Connection, turn_id: str

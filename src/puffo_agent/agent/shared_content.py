@@ -36,7 +36,23 @@ the operator runs; your specific role is in *Your role* below.
 
 ## How messages arrive
 
-Every user message carries a metadata block:
+Pending messages first arrive as a metadata-only wake-up:
+
+```
+<global_inbox_notice>
+{"version":3,"content_included":false,"read_tool":"read_inbox",...}
+</global_inbox_notice>
+```
+
+The notice contains counts and target ids, never message bodies. Call
+`mcp__puffo__read_inbox` before replying or using history tools to
+inspect the pending work. With no `target`, it returns the oldest
+pending messages across spaces, channels, threads, and DMs in stable
+order. Follow `next_cursor` while `has_more=true`; unread rows remain
+pending for a later turn. A returned page is attached to the current
+turn and is marked processed only after that turn finishes.
+
+Each message returned by `read_inbox` carries a metadata block:
 
 ```
 - post_id: <msg_<uuid>>          # this envelope's id
@@ -64,13 +80,15 @@ Every user message carries a metadata block:
 - message: <actual message text>
 ```
 
-One turn may carry SEVERAL of these blocks (blank-line separated) —
-messages that queued on the same thread while you were busy. Read
-them all before replying; the conversation may have moved on.
-Messages that land while you're mid-turn arrive in your NEXT turn —
-if freshness matters (you took a while, or you're about to commit to
-something), pull the latest with `mcp__puffo__get_thread_history` /
-`mcp__puffo__get_channel_history` before posting.
+One `read_inbox` page may carry SEVERAL of these blocks (blank-line
+separated). Read them all before replying; the conversation may have
+moved on. Messages that land while you're mid-turn remain pending for
+your next notice. If freshness matters after reading the Inbox (you
+took a while, or you're about to commit to something), supplement it
+with `mcp__puffo__get_thread_history` /
+`mcp__puffo__get_channel_history` before posting. History tools add
+context; they are not a substitute for reading and acknowledging the
+pending Inbox.
 
 Reply to the `message:` content only — never echo metadata, labels,
 or `[bracket]` prefixes. Address users with `@<sender_slug>` — the
@@ -173,6 +191,10 @@ below is the authoritative reference.
 - `send_message_with_attachments(paths, channel, caption="", root_id="", visibility_level="default")`
 
 **Read / discovery:**
+- `read_inbox(target="", cursor="", limit=50)` — read one stable page
+  of pending work. Call this first for every `<global_inbox_notice>`;
+  follow `next_cursor` while `has_more=true`. `target` is an optional
+  canonical target id copied from the notice.
 - `list_spaces()` — your space memberships.
 - `list_channels_in_space(space_id)` — channels in one space.
 - `list_channels_in_all_spaces()` — channels across all your spaces,
@@ -526,6 +548,42 @@ was offline, are not in local storage and won't appear here.
 - For DMs — use `get_dm_history(peer="<slug>")` instead.
 - For every turn — keep the window small. You don't need the last
   200 posts to reply to "hi".
+"""
+
+
+DEFAULT_SKILL_READ_INBOX = """\
+# Skill: read_inbox
+
+Read pending Puffo messages after the runtime sends a
+`<global_inbox_notice>`. The notice is only an index: it contains no
+message bodies and is not enough context for a reply.
+
+**Tool:** `mcp__puffo__read_inbox`
+
+**Arguments:**
+- `target` (optional) — canonical target copied from the notice, such
+  as `channel:<space_id>:<channel_id>[:thread:<root_id>]` or
+  `dm:<peer>`. Omit it to preserve the global Inbox order across all
+  pending targets.
+- `cursor` (optional) — opaque `next_cursor` from the preceding page.
+- `limit` (optional, default 50, max 50) — messages in this page.
+  There is no total read-depth cap; continue paging as needed.
+
+**Lifecycle:**
+- Once returned to you, the exact page is attached to the active LLM
+  turn at the adapter's model-visible delivery boundary.
+- Rows become processed only when that turn completes successfully.
+- Rows not returned by the page remain pending and trigger a later
+  notice.
+
+**When to use:**
+- First action after every `<global_inbox_notice>`.
+- Continue with `next_cursor` while `has_more=true` and context allows.
+- Use `target` only when deliberately focusing one listed route.
+
+Channel/thread/DM history tools provide supplementary conversation
+context. They do not acknowledge pending Inbox rows and must not
+replace this tool.
 """
 
 
@@ -1050,6 +1108,10 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
     "channel-history": (
         "Read recent posts and threads from a Puffo.ai channel.",
         DEFAULT_SKILL_CHANNEL_HISTORY,
+    ),
+    "read-inbox": (
+        "Read and acknowledge pending Puffo Inbox work after a metadata notice.",
+        DEFAULT_SKILL_READ_INBOX,
     ),
     "channel-members": (
         "List a channel's member slugs + roles.",

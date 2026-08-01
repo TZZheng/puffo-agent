@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import uuid
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -36,6 +37,8 @@ from .driver import (
     TurnRef,
     UnsupportedCapability,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeStateError(RuntimeError):
@@ -289,21 +292,46 @@ class RuntimeManager:
         arguments = fact.get("arguments")
         if not isinstance(arguments, dict):
             return
-        candidates = [
+        exact_candidates = [
             (index, admission)
             for index, admission in enumerate(self._continuation_admissions)
             if admission.provider_turn_id == event.native_turn_id
             and admission.matches(tool_name, arguments)
-            and (
-                not admission.receipt_marker
-                or admission.receipt_marker in repr(fact.get("result"))
-            )
+            and admission.receipt_marker
+            and admission.receipt_marker in repr(fact.get("result"))
         ]
+        candidates = exact_candidates
         if not candidates:
+            candidates = [
+                (index, admission)
+                for index, admission in enumerate(self._continuation_admissions)
+                if admission.provider_turn_id == event.native_turn_id
+                and not admission.correlation_receipt
+                and admission.matches(tool_name, arguments)
+            ]
+        if not candidates:
+            receipt_candidates = [
+                (index, admission)
+                for index, admission in enumerate(self._continuation_admissions)
+                if admission.provider_turn_id == event.native_turn_id
+                and admission.correlation_receipt
+                and admission.matches(tool_name, arguments)
+            ]
+            if len(receipt_candidates) == 1:
+                candidates = receipt_candidates
+        if not candidates:
+            logger.warning(
+                "provider tool result did not match an admission "
+                "native_turn=%s active_native_turn=%s tool=%s "
+                "argument_keys=%s candidate_count=%d",
+                event.native_turn_id,
+                self.native_turn_id,
+                tool_name,
+                sorted(str(key) for key in arguments),
+                len(self._continuation_admissions),
+            )
             return
-        index, admission = max(
-            candidates, key=lambda value: value[1].match_specificity
-        )
+        index, admission = max(candidates, key=lambda value: value[1].match_specificity)
         self._continuation_admissions.pop(index)
         await admission.callback(ProviderAdmissionEvent(
             planning_cycle_key=admission.planning_cycle_key,
@@ -320,6 +348,8 @@ class RuntimeManager:
 
 class RuntimeManagerAdapter(Adapter):
     """Blocking compatibility facade over the event-driven Runtime Manager."""
+
+    tool_result_admission_boundary = "tool_return"
 
     def __init__(self, manager: RuntimeManager):
         self.manager = manager

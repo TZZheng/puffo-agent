@@ -1265,6 +1265,76 @@ async def test_durable_notice_deadline_is_fixed_and_survives_reopen(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_empty_notice_turn_rearms_unchanged_pending_work_atomically(tmp_path):
+    now = [1_000]
+    store = MessageStore(tmp_path / "notice-rearm.db", now_ms=lambda: now[0])
+    await store.store_receipt(
+        _channel_payload("notice-pending"),
+        server_seq=1,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    delivered = await store.get_notice_state()
+    assert await store.mark_notice_delivered(delivered.generation)
+    await store.start_turn(
+        turn_id="empty-notice-turn",
+        provider_session_id="provider-1",
+    )
+
+    now[0] = 2_000
+    run = await store.finalize_empty_turn(
+        turn_id="empty-notice-turn",
+        state="requeued",
+        rearm_notice=True,
+    )
+    rearmed = await store.get_notice_state()
+
+    assert run.state == "requeued"
+    assert rearmed.pending_count == 1
+    assert rearmed.generation == delivered.generation + 1
+    assert rearmed.last_delivered_generation == delivered.generation
+    assert rearmed.first_pending_deadline_ms == 5_000
+    assert rearmed.delivery_pending
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_rearm_repairs_only_stranded_notice_without_active_turn(
+    tmp_path,
+):
+    store = MessageStore(tmp_path / "notice-startup-rearm.db")
+    await store.store_receipt(
+        _channel_payload("notice-stranded"),
+        server_seq=1,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    delivered = await store.get_notice_state()
+    assert await store.mark_notice_delivered(delivered.generation)
+
+    await store.start_turn(
+        turn_id="active-notice-turn",
+        provider_session_id="provider-1",
+    )
+    active = await store.get_active_turn_runs()
+    assert [run.turn_id for run in active] == ["active-notice-turn"]
+    assert not await store.rearm_stranded_notice()
+    await store.finalize_empty_turn(
+        turn_id="active-notice-turn",
+        state="requeued",
+    )
+
+    assert await store.rearm_stranded_notice()
+    repaired = await store.get_notice_state()
+    assert repaired.generation == delivered.generation + 1
+    assert repaired.last_delivered_generation == delivered.generation
+    assert repaired.delivery_pending
+    assert not await store.rearm_stranded_notice()
+    assert await store.get_active_turn_runs() == ()
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_inbox_page_snapshot_excludes_concurrent_arrival_and_is_read_only(tmp_path):
     store = MessageStore(tmp_path / "pages.db")
     for seq in range(1, 4):

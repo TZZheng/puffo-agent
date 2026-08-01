@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -45,6 +46,8 @@ CODEX_CAPABILITIES = DriverCapabilities(
     compact=CompactCapability.TYPED,
     permission_bridge=True,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CodexAppServerDriver(HarnessDriver):
@@ -315,6 +318,30 @@ class CodexAppServerDriver(HarnessDriver):
     async def _notification(self, frame: dict[str, Any]) -> None:
         method = str(frame.get("method") or "")
         params = frame.get("params") if isinstance(frame.get("params"), dict) else {}
+        diagnostic_item = params.get("item")
+        if isinstance(diagnostic_item, dict) and (
+            "tool" in method.lower()
+            or "tool" in str(diagnostic_item.get("type") or "").lower()
+            or any(
+                key in diagnostic_item
+                for key in ("tool", "server", "namespace")
+            )
+        ):
+            logger.debug(
+                "codex tool notification shape method=%s type=%s tool=%s "
+                "server=%s namespace=%s status=%s keys=%s",
+                method,
+                str(diagnostic_item.get("type") or ""),
+                str(
+                    diagnostic_item.get("tool")
+                    or diagnostic_item.get("name")
+                    or ""
+                ),
+                str(diagnostic_item.get("server") or ""),
+                str(diagnostic_item.get("namespace") or ""),
+                str(diagnostic_item.get("status") or ""),
+                sorted(str(key) for key in diagnostic_item),
+            )
         if method == "turn/started":
             await self._emit(
                 HarnessEventType.TURN_STARTED, turn_ref=self._active,
@@ -335,8 +362,15 @@ class CodexAppServerDriver(HarnessDriver):
             if isinstance(item, dict):
                 item_id = str(item.get("id") or params.get("itemId") or "")
                 item_type = str(item.get("type") or "")
-                if item_type in {"mcpToolCall", "functionCall", "toolCall"}:
+                if item_type in {
+                    "mcpToolCall",
+                    "dynamicToolCall",
+                    "functionCall",
+                    "toolCall",
+                }:
                     name = str(item.get("name") or item.get("tool") or "")
+                    if name.startswith("mcp__") and "__" in name:
+                        name = name.rsplit("__", 1)[-1]
                     arguments = item.get("arguments") or item.get("input") or {}
                     if isinstance(arguments, str):
                         try:
@@ -345,7 +379,14 @@ class CodexAppServerDriver(HarnessDriver):
                             arguments = {}
                     if not isinstance(arguments, dict):
                         arguments = {}
-                    result = item.get("result", item.get("output"))
+                    result = item.get(
+                        "result",
+                        item.get("output", item.get("contentItems")),
+                    )
+                    status = str(item.get("status") or "").lower()
+                    is_error = bool(item.get("error")) or status == "failed"
+                    if item_type == "dynamicToolCall":
+                        is_error = is_error or item.get("success") is False
                     await self._emit(
                         HarnessEventType.TOOL_COMPLETED,
                         turn_ref=self._active,
@@ -353,7 +394,7 @@ class CodexAppServerDriver(HarnessDriver):
                             "tool_call_ref": item_id,
                             "label": name or "Tool",
                             "outcome": (
-                                "failed" if item.get("error") else "succeeded"
+                                "failed" if is_error else "succeeded"
                             ),
                         },
                         native_payload={
@@ -362,7 +403,7 @@ class CodexAppServerDriver(HarnessDriver):
                             "tool_name": name,
                             "arguments": arguments,
                             "result": result,
-                            "is_error": bool(item.get("error")),
+                            "is_error": is_error,
                         },
                     )
             block_id = str(

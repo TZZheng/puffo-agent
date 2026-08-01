@@ -271,9 +271,14 @@ def test_primer_metadata_example_matches_builder():
     """The documented metadata block must track what
     ``agent/core.py`` actually emits: display-name ``sender`` +
     separate ``sender_slug``, absolute ``.puffo/inbox`` attachment
-    paths, and the global Inbox multi-message contract."""
+    paths, and the metadata-notice/read-Inbox contract."""
     assert "- sender_slug: <slug>" in DEFAULT_SHARED_CLAUDE_MD
-    assert "One turn may carry SEVERAL of these blocks" in DEFAULT_SHARED_CLAUDE_MD
+    assert "<global_inbox_notice>" in DEFAULT_SHARED_CLAUDE_MD
+    assert '"content_included":false' in DEFAULT_SHARED_CLAUDE_MD
+    assert '"read_tool":"read_inbox"' in DEFAULT_SHARED_CLAUDE_MD
+    assert "mcp__puffo__read_inbox" in DEFAULT_SHARED_CLAUDE_MD
+    assert "History tools add" in DEFAULT_SHARED_CLAUDE_MD
+    assert "not a substitute" in DEFAULT_SHARED_CLAUDE_MD
     assert "followup_messages_since" not in DEFAULT_SHARED_CLAUDE_MD
     assert ".puffo/inbox/<envelope_id>/<filename>" in DEFAULT_SHARED_CLAUDE_MD
     # The old, wrong relative form must be gone.

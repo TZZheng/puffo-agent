@@ -335,6 +335,39 @@ async def test_runtime_manager_correlates_private_tool_result_and_rejects_termin
     assert admitted[0].provider_turn_id == "native-turn"
     assert admitted[0].tool_call_id == "call-1"
 
+    admitted.clear()
+    adapter.register_continuation_callback(
+        admit,
+        "read-page-without-result",
+        tool_names=("read_inbox",),
+        tool_arguments={"cursor": "next"},
+        correlation_receipt="receipt-omitted",
+    )
+    await driver.queue.put(HarnessEvent.normalized(
+        type="turn.tool_completed", driver="fake",
+        session_ref=SessionRef("native-session"), turn_ref=driver.turn,
+        native_session_id="native-session", native_turn_id="native-turn",
+        data={
+            "tool_call_ref": "call-2", "label": "read_inbox",
+            "outcome": "succeeded",
+        },
+        native_payload={
+            "_puffo_internal": "tool_result",
+            "tool_call_id": "call-2",
+            "tool_name": "read_inbox",
+            "arguments": {"cursor": "next"},
+            "result": None,
+            "is_error": False,
+        },
+    ))
+    for _ in range(20):
+        if admitted:
+            break
+        await asyncio.sleep(0)
+    assert len(admitted) == 1
+    assert admitted[0].planning_cycle_key == "read-page-without-result"
+    assert admitted[0].tool_call_id == "call-2"
+
     await driver.queue.put(HarnessEvent(
         type="turn.completed", driver="fake",
         session_ref=SessionRef("native-session"), turn_ref=driver.turn,
@@ -686,6 +719,24 @@ async def test_codex_driver_fake_app_server_full_protocol_and_concurrency():
     }
     assert "arguments" not in tool_completed.data
     assert "result" not in tool_completed.data
+    proc.feed({
+        "method": "item/completed",
+        "params": {"item": {
+            "id": "tool-2", "type": "dynamicToolCall",
+            "namespace": "mcp__puffo", "tool": "read_inbox",
+            "status": "completed", "success": True,
+            "arguments": {"target": "", "limit": 50},
+            # Current live Codex may omit contentItems even though the model
+            # received the tool output.
+            "contentItems": None,
+        }},
+    })
+    dynamic_completed = await _next_matching(stream, "turn.tool_completed")
+    assert dynamic_completed.data == {
+        "tool_call_ref": "tool-2",
+        "label": "read_inbox",
+        "outcome": "succeeded",
+    }
     decoded = [json.loads(value) for value in proc.stdin.writes]
     assert any(value.get("method") == "turn/steer" for value in decoded)
     assert any(value.get("method") == "turn/interrupt" for value in decoded)

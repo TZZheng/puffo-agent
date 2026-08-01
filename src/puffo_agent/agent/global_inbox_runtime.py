@@ -204,7 +204,14 @@ def route_for(item: StoredMessage) -> MessageRoute:
     if item.envelope_kind == "dm":
         peer = item.sender_slug or item.recipient_slug or ""
         return MessageRoute(item.envelope_id, "dm", dm_peer=peer)
-    if item.thread_root_id:
+    # Intro prompts self-reference only to remain non-replyable in local
+    # history. They still must authorize the top-level send they request.
+    is_intro_prompt = (
+        item.sender_slug == "system"
+        and item.envelope_id.startswith("intro-prompt-")
+        and item.thread_root_id == item.envelope_id
+    )
+    if item.thread_root_id and not is_intro_prompt:
         return MessageRoute(
             item.envelope_id,
             "thread",
@@ -885,6 +892,31 @@ class GlobalInboxRuntime:
     def notify_delivery(self) -> None:
         self.held_recovery_source.notify_delivery()
 
+    @property
+    def _admits_tool_results_on_return(self) -> bool:
+        return (
+            getattr(
+                self.adapter,
+                "tool_result_admission_boundary",
+                "provider_completion",
+            )
+            == "tool_return"
+        )
+
+    async def _admit_returned_tool_result(
+        self,
+        callback: Callable[[ProviderAdmissionEvent], Awaitable[None]],
+        *,
+        planning_cycle_key: str,
+        provider_session_id: str,
+    ) -> None:
+        await callback(ProviderAdmissionEvent(
+            planning_cycle_key=planning_cycle_key,
+            provider_session_id=provider_session_id,
+            provider_turn_id=self.active.provider_turn_id,
+            admitted_at=datetime.now(timezone.utc),
+        ))
+
     def note_input_ready(self, turn_id: str) -> None:
         self.notice_delivery.note_input_ready(turn_id)
 
@@ -1007,7 +1039,7 @@ class GlobalInboxRuntime:
         tool_name: str,
         tool_arguments: Mapping[str, Any],
     ) -> dict[str, Any]:
-        """Advance freshness only after the provider admits a read result."""
+        """Advance freshness at the adapter's proven model-visible boundary."""
         if through_seq < 0:
             raise RuntimeError("model-visible read sequence must be non-negative")
         row = await self.store.get_message_by_envelope(through_envelope_id)
@@ -1111,10 +1143,8 @@ class GlobalInboxRuntime:
                 state="admitted",
             )
 
-        register_continuation = getattr(
-            self.adapter, "register_continuation_callback", None
-        )
-        if not callable(register_continuation):
+        state = "staged"
+        if self._admits_tool_results_on_return:
             log_runtime_event(
                 logger,
                 "history.read_staged",
@@ -1127,20 +1157,60 @@ class GlobalInboxRuntime:
                 space_id=space_id,
                 channel_id=channel_id,
                 latest_seq=through_seq,
-                state="unsupported_adapter",
+                state="tool_return",
             )
-            raise RuntimeError(
-                "provider cannot correlate model-visible history results"
-            )
-        try:
-            register_continuation(
+            await self._admit_returned_tool_result(
                 admit_read,
-                correlation_key,
-                tool_names=(tool_name,),
-                tool_arguments=dict(tool_arguments),
-                correlation_receipt=correlation_receipt,
+                planning_cycle_key=correlation_key,
+                provider_session_id=provider_session_id,
             )
-        except Exception:
+            state = "admitted"
+        else:
+            register_continuation = getattr(
+                self.adapter, "register_continuation_callback", None
+            )
+            if not callable(register_continuation):
+                log_runtime_event(
+                    logger,
+                    "history.read_staged",
+                    level=logging.DEBUG,
+                    agent_id=self.agent_id,
+                    turn_id=active_turn_id,
+                    provider_session_id=provider_session_id,
+                    correlation_key=correlation_key,
+                    envelope_id=through_envelope_id,
+                    space_id=space_id,
+                    channel_id=channel_id,
+                    latest_seq=through_seq,
+                    state="unsupported_adapter",
+                )
+                raise RuntimeError(
+                    "provider cannot correlate model-visible history results"
+                )
+            try:
+                register_continuation(
+                    admit_read,
+                    correlation_key,
+                    tool_names=(tool_name,),
+                    tool_arguments=dict(tool_arguments),
+                    correlation_receipt=correlation_receipt,
+                )
+            except Exception:
+                log_runtime_event(
+                    logger,
+                    "history.read_staged",
+                    level=logging.DEBUG,
+                    agent_id=self.agent_id,
+                    turn_id=active_turn_id,
+                    provider_session_id=provider_session_id,
+                    correlation_key=correlation_key,
+                    envelope_id=through_envelope_id,
+                    space_id=space_id,
+                    channel_id=channel_id,
+                    latest_seq=through_seq,
+                    state="registration_failed",
+                )
+                raise
             log_runtime_event(
                 logger,
                 "history.read_staged",
@@ -1153,25 +1223,10 @@ class GlobalInboxRuntime:
                 space_id=space_id,
                 channel_id=channel_id,
                 latest_seq=through_seq,
-                state="registration_failed",
+                state="staged",
             )
-            raise
-        log_runtime_event(
-            logger,
-            "history.read_staged",
-            level=logging.DEBUG,
-            agent_id=self.agent_id,
-            turn_id=active_turn_id,
-            provider_session_id=provider_session_id,
-            correlation_key=correlation_key,
-            envelope_id=through_envelope_id,
-            space_id=space_id,
-            channel_id=channel_id,
-            latest_seq=through_seq,
-            state="staged",
-        )
         return {
-            "state": "staged",
+            "state": state,
             "correlation_key": correlation_key,
             "correlation_receipt": correlation_receipt,
             "space_id": space_id,
@@ -1188,7 +1243,7 @@ class GlobalInboxRuntime:
         limit: int = 50,
         tool_arguments: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Stage one content page; only its matching provider receipt admits it."""
+        """Return one content page and admit it at the adapter's read boundary."""
         active_turn_id = self.active.turn_id
         provider_session_id = self.active.provider_session_id
         if not active_turn_id or not provider_session_id:
@@ -1308,35 +1363,56 @@ class GlobalInboxRuntime:
                     outcome="admitted",
                 )
 
-            register = getattr(
-                self.adapter, "register_continuation_callback", None
-            )
-            if not callable(register):
-                raise RuntimeError("provider cannot correlate Inbox tool results")
             arguments = dict(
                 tool_arguments
                 if tool_arguments is not None
                 else {"target": target, "cursor": cursor, "limit": limit}
             )
-            register(
-                admit_read,
-                correlation_key,
-                tool_names=("read_inbox",),
-                tool_arguments=arguments,
-                correlation_receipt=correlation_receipt,
-            )
-            log_runtime_event(
-                logger,
-                "inbox.read_staged",
-                agent_id=self.agent_id,
-                turn_id=active_turn_id,
-                provider_session_id=provider_session_id,
-                correlation_key=correlation_key,
-                notice_generation=page.snapshot_generation,
-                message_count=len(ids),
-                remaining_count=remaining_count,
-                outcome="staged",
-            )
+            if self._admits_tool_results_on_return:
+                log_runtime_event(
+                    logger,
+                    "inbox.read_staged",
+                    agent_id=self.agent_id,
+                    turn_id=active_turn_id,
+                    provider_session_id=provider_session_id,
+                    correlation_key=correlation_key,
+                    notice_generation=page.snapshot_generation,
+                    message_count=len(ids),
+                    remaining_count=remaining_count,
+                    outcome="tool_return",
+                )
+                await self._admit_returned_tool_result(
+                    admit_read,
+                    planning_cycle_key=correlation_key,
+                    provider_session_id=provider_session_id,
+                )
+            else:
+                register = getattr(
+                    self.adapter, "register_continuation_callback", None
+                )
+                if not callable(register):
+                    raise RuntimeError(
+                        "provider cannot correlate Inbox tool results"
+                    )
+                register(
+                    admit_read,
+                    correlation_key,
+                    tool_names=("read_inbox",),
+                    tool_arguments=arguments,
+                    correlation_receipt=correlation_receipt,
+                )
+                log_runtime_event(
+                    logger,
+                    "inbox.read_staged",
+                    agent_id=self.agent_id,
+                    turn_id=active_turn_id,
+                    provider_session_id=provider_session_id,
+                    correlation_key=correlation_key,
+                    notice_generation=page.snapshot_generation,
+                    message_count=len(ids),
+                    remaining_count=remaining_count,
+                    outcome="staged",
+                )
         return {
             "messages": blocks,
             "next_cursor": next_cursor,
@@ -1348,6 +1424,15 @@ class GlobalInboxRuntime:
 
     async def run(self) -> None:
         await self.recover_current_turn()
+        await self.recover_orphaned_turns()
+        if await self.store.rearm_stranded_notice():
+            log_runtime_event(
+                logger,
+                "notice.armed",
+                agent_id=self.agent_id,
+                mode="startup",
+                outcome="rearmed",
+            )
         if self._defer_requeued_resume:
             # Consume the recovery wake without immediately feeding the same
             # failed durable union through the initial-turn path.
@@ -1369,6 +1454,35 @@ class GlobalInboxRuntime:
             if self._stopping:
                 break
             await self.process_once()
+
+    async def recover_orphaned_turns(self) -> int:
+        """Requeue active DB Turns left without a resumable crash join."""
+        recovered = 0
+        for run in await self.store.get_active_turn_runs():
+            if run.message_ids:
+                await self.store.requeue_messages(
+                    run.message_ids,
+                    turn_id=run.turn_id,
+                )
+            else:
+                await self.store.finalize_empty_turn(
+                    turn_id=run.turn_id,
+                    state="requeued",
+                    rearm_notice=True,
+                )
+            log_runtime_event(
+                logger,
+                "turn.requeued",
+                agent_id=self.agent_id,
+                turn_id=run.turn_id,
+                provider_session_id=run.provider_session_id,
+                state="requeued",
+                mode="startup_orphan_recovery",
+                message_count=len(run.message_ids),
+                outcome="requeued",
+            )
+            recovered += 1
+        return recovered
 
     def stop(self) -> None:
         self._stopping = True
@@ -1473,7 +1587,9 @@ class GlobalInboxRuntime:
             )
             summary = json.dumps(
                 {
-                    "version": 2,
+                    "version": 3,
+                    "content_included": False,
+                    "read_tool": "read_inbox",
                     "generation": notice.generation,
                     "message_count": notice.pending_count,
                     "targets": [
@@ -1890,7 +2006,8 @@ class GlobalInboxRuntime:
                         )
                     else:
                         await self.store.finalize_empty_turn(
-                            turn_id=planned.turn_id
+                            turn_id=planned.turn_id,
+                            rearm_notice=True,
                         )
                     for item_id in self.active.message_ids:
                         row = await self.store.get_message_by_envelope(item_id)
@@ -1936,7 +2053,9 @@ class GlobalInboxRuntime:
                         )
                     else:
                         await self.store.finalize_empty_turn(
-                            turn_id=planned.turn_id, state="requeued"
+                            turn_id=planned.turn_id,
+                            state="requeued",
+                            rearm_notice=True,
                         )
                     for item_id in self.active.message_ids:
                         row = await self.store.get_message_by_envelope(item_id)
@@ -1974,7 +2093,9 @@ class GlobalInboxRuntime:
                         )
                     else:
                         await self.store.finalize_empty_turn(
-                            turn_id=planned.turn_id, state="requeued"
+                            turn_id=planned.turn_id,
+                            state="requeued",
+                            rearm_notice=True,
                         )
                     for item_id in self.active.message_ids:
                         row = await self.store.get_message_by_envelope(item_id)
@@ -2208,6 +2329,31 @@ class GlobalInboxRuntime:
                     state="requeued",
                     mode="recovery",
                     message_count=len(exact_ids),
+                    duration_ms=int(
+                        (time.monotonic() - recovery_started) * 1000
+                    ),
+                    error_category=state,
+                )
+                requeued = True
+            elif (
+                run is not None
+                and run.state == ProcessingState.IN_TURN.value
+                and not durable_ids
+            ):
+                await self.store.finalize_empty_turn(
+                    turn_id=run.turn_id,
+                    state="requeued",
+                    rearm_notice=True,
+                )
+                log_runtime_event(
+                    logger,
+                    "turn.requeued",
+                    agent_id=self.agent_id,
+                    turn_id=run.turn_id,
+                    provider_session_id=run.provider_session_id,
+                    state="requeued",
+                    mode="recovery",
+                    message_count=0,
                     duration_ms=int(
                         (time.monotonic() - recovery_started) * 1000
                     ),
