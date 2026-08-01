@@ -39,6 +39,7 @@ class _WsLocalContextAdapter:
     def __init__(self) -> None:
         self._callback = None
         self._planning_cycle_key = ""
+        self._continuations: dict[str, tuple[object, str]] = {}
         self._provider_session_id: str | None = None
 
     async def get_context_snapshot(self):
@@ -64,15 +65,42 @@ class _WsLocalContextAdapter:
         self._callback = callback
         self._planning_cycle_key = planning_cycle_key
 
+    def register_continuation_callback(
+        self,
+        callback,
+        planning_cycle_key="",
+        *,
+        correlation_receipt="",
+        **_metadata,
+    ) -> None:
+        if callback is None:
+            self._continuations.pop(planning_cycle_key, None)
+            return
+        entry = (callback, planning_cycle_key)
+        self._continuations[planning_cycle_key] = entry
+        if correlation_receipt:
+            self._continuations[correlation_receipt] = entry
+
     async def emit_admission(self, *, turn_id: str, correlation_key: str) -> None:
         from ...agent.context_controller import ProviderAdmissionEvent
 
-        if self._callback is None or correlation_key != self._planning_cycle_key:
-            raise RuntimeError("ws-local admission correlation failed")
-        callback, self._callback = self._callback, None
+        if (
+            self._callback is not None
+            and correlation_key == self._planning_cycle_key
+        ):
+            callback, self._callback = self._callback, None
+            planning_cycle_key = correlation_key
+        else:
+            entry = self._continuations.get(correlation_key)
+            if entry is None:
+                raise RuntimeError("ws-local admission correlation failed")
+            callback, planning_cycle_key = entry
+            for key, registered in tuple(self._continuations.items()):
+                if registered == entry:
+                    self._continuations.pop(key, None)
         self._provider_session_id = f"ws-local:{turn_id}"
         await callback(ProviderAdmissionEvent(
-            planning_cycle_key=correlation_key,
+            planning_cycle_key=planning_cycle_key,
             provider_session_id=self._provider_session_id,
             provider_turn_id=turn_id,
             admitted_at=datetime.now(timezone.utc),
@@ -94,6 +122,7 @@ def _build_tool_dispatch(point: AttachPoint):
         workspace=getattr(client, "workspace", None),
         message_client=client,
         send_coordinator=send_coordinator,
+        inbox_runtime=getattr(client, "global_runtime", None),
         # T23: the daemon owns the single per-agent bridge WS, so only
         # the in-process ws-local tools can drive it. None on native
         # agents → send_message keeps the signed-crypto path. The

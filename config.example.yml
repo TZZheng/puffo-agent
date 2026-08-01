@@ -10,6 +10,10 @@
 # agent.yml. Use the keys below only if you want one provider key
 # shared across multiple agents — set them by running
 # `puffo-agent config`, which prompts and writes this file for you.
+#
+# Runtime Events v1 needs no daemon-wide switch. Supported cli-local
+# harnesses use a separate bounded per-agent SQLite outbox automatically;
+# legacy runtime/harness values retain their existing behavior.
 
 # Which provider the chat-local runtime uses by default. Agents can
 # still override this in their own agent.yml via runtime.provider.

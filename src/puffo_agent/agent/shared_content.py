@@ -110,8 +110,9 @@ Two ways, pick one explicitly every turn:
    messages exist beyond this turn's visible boundary. No message was
    sent in that case. Read the returned context and independently
    choose revised content, the same content with `send_anyway=True`,
-   or no message. `send_anyway` is available directly; it is not an
-   automatic retry and does not require a prior held call.
+   or no message. `send_anyway` becomes eligible only after that held
+   watermark is synchronized and inspected in the same Turn; it is
+   never an automatic retry.
 
    **Pick `visibility_level` explicitly**: `"human"` for anything a
    person should read, `"agent_only"` for genuine agent-to-agent
@@ -336,8 +337,8 @@ Post a message to a Puffo.ai channel or DM a user.
   `state="held"` without sending when newer channel messages exist
   beyond the current turn. After considering the returned context,
   independently choose revised content, the same content with
-  `send_anyway=True`, or no message. This option is available directly
-  and does not require a prior held call.
+  `send_anyway=True`, or no message. This option becomes eligible only
+  after a held watermark is synchronized and inspected in the same Turn.
 
 **Cache-validation invariant (PUF-227-A):** the daemon verifies
 your `root_id` points to a parent envelope in your local message

@@ -7,6 +7,7 @@ into runtime.json so the CLI can read live stats without IPC.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
@@ -14,6 +15,7 @@ import re
 import shutil
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
@@ -320,6 +322,151 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
     )
 
 
+async def _promote_supported_local_driver(
+    adapter: Adapter,
+    agent_cfg: AgentConfig,
+    *,
+    system_prompt: str,
+    outbox,
+    logical_session_ref: str,
+) -> Adapter:
+    """Replace a prepared supported local CLI Adapter with its Driver facade.
+
+    ``build_adapter`` intentionally remains the compatibility/configuration
+    entrypoint.  The Worker calls this only after the legacy adapter has
+    installed desired assets and written provider/MCP configuration, and
+    before the global Inbox runtime can plan work.
+    """
+    from ..agent.adapters.local_cli import LocalCLIAdapter
+    from ..agent.harness import UnsupportedDriver, build_driver
+    from ..agent.harness.driver import HarnessEvent, RuntimeSpec, SessionRef, TurnRef
+    from ..agent.harness.runtime_manager import (
+        RuntimeManager,
+        RuntimeManagerAdapter,
+    )
+    from ..agent.runtime_event_outbox import RuntimeEventProjectingSink
+    from ..agent.runtime_events import RuntimeEventProjector, TrustedScope
+
+    harness_name = (agent_cfg.runtime.harness or "claude-code").strip()
+    if (
+        not isinstance(adapter, LocalCLIAdapter)
+        or harness_name not in {"codex", "claude-code"}
+    ):
+        return adapter
+
+    # Preserve the mature legacy setup boundary (credentials, desired assets,
+    # MCP config, per-Agent HOME, binary resolution) without retaining
+    # protocol ownership.
+    adapter._verify()
+    await adapter._install_desired()
+    if harness_name == "codex":
+        prepared = adapter._ensure_codex_session()
+        executable = prepared.argv[0]
+        launch_args = tuple(prepared.argv[1:-1])
+        environment = dict(prepared.env or {})
+        native_session_id = (
+            outbox.state().get("native_session_id")
+            or prepared.get_provider_session_id()
+            or ""
+        )
+        model = adapter.model
+    else:
+        prepared = adapter._ensure_session()
+        argv = prepared.build_command(prepared.extra_args, {})
+        executable = argv[0]
+        launch_args = tuple(argv[1:])
+        environment = dict(prepared.env or {})
+        native_session_id = (
+            outbox.state().get("native_session_id")
+            or prepared.get_provider_session_id()
+            or ""
+        )
+        # The prepared Claude argv already contains any model override.
+        model = ""
+
+    driver = build_driver(harness_name)
+    if isinstance(driver, UnsupportedDriver):
+        return adapter
+
+    projector = RuntimeEventProjector(
+        agent_id=agent_cfg.id,
+        session_ref=logical_session_ref,
+        scope=TrustedScope(),
+    )
+    projecting_sink = RuntimeEventProjectingSink(outbox, projector)
+    manager: RuntimeManager
+
+    def require_initial_capacity() -> None:
+        """Reserve the canonical start/activity pair without consuming IDs."""
+        sizing_projector = RuntimeEventProjector(
+            agent_id=agent_cfg.id,
+            session_ref=projector.session_ref,
+            scope=projector.scope,
+        )
+        sizing_start = HarnessEvent(
+            type="turn.started",
+            driver=harness_name,
+            session_ref=SessionRef(projector.session_ref),
+            turn_ref=TurnRef(f"turn_{'f' * 32}"),
+            # HarnessEvent normally emits this shape when microseconds exist.
+            occurred_at="9999-12-31T23:59:59.999999+00:00",
+        )
+        estimated_start_bytes = sum(
+            len(outbox.canonical_bytes(value))
+            for value in sizing_projector.project_all(sizing_start)
+        )
+        outbox.require_turn_capacity(
+            estimated_start_bytes=estimated_start_bytes
+        )
+
+    async def persist_event(event) -> None:
+        logical_session = str(event.session_ref or manager.session_ref)
+        projector.session_ref = logical_session
+        await projecting_sink(event)
+        event_type = getattr(event.type, "value", event.type)
+        if event_type == "turn.started":
+            outbox.set_active_turn(
+                str(event.turn_ref),
+                session_ref=logical_session,
+                native_session_id=manager.native_session_id,
+            )
+        elif event_type in {"turn.completed", "turn.abandoned"}:
+            outbox.set_active_turn(
+                None,
+                session_ref=logical_session,
+                native_session_id=manager.native_session_id,
+            )
+        elif event_type in {"session.opened", "session.resumed"}:
+            outbox.set_active_turn(
+                outbox.state().get("active_turn_ref") or None,
+                session_ref=logical_session,
+                native_session_id=manager.native_session_id,
+            )
+
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec(
+            workspace_dir=adapter.workspace_dir,
+            model=model,
+            system_prompt=system_prompt,
+            executable=executable,
+            launch_args=launch_args,
+            environment=environment,
+            permission_mode=adapter.permission_mode,
+            sandbox=adapter.sandbox,
+        ),
+        agent_id=agent_cfg.id,
+        session_ref=SessionRef(logical_session_ref),
+        native_session_id=native_session_id,
+        event_sink=persist_event,
+        before_start=require_initial_capacity,
+    )
+    await adapter.aclose()
+    facade = RuntimeManagerAdapter(manager)
+    await facade.warm(system_prompt)
+    return facade
+
+
 def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
     """Anthropic/OpenAI message-completion provider for the
     chat-local adapter. Per-agent fields override daemon defaults."""
@@ -407,13 +554,16 @@ def _build_chat_local_tool_dispatch(client) -> dict:
         space_id=getattr(client, "space_id", None),
         workspace=getattr(client, "workspace", None),
         message_client=client,
+        inbox_runtime=getattr(client, "global_runtime", None),
         # T23: only the daemon-owned bridge WS may drive keyless sends;
         # None on native agents keeps the signed-crypto path.
         bridge_client=getattr(client, "_bridge", None),
     )
     return build_dispatch(
         cfg,
-        allowed=frozenset({"send_message", "send_message_with_attachments"}),
+        allowed=frozenset({
+            "read_inbox", "send_message", "send_message_with_attachments",
+        }),
     )
 
 
@@ -1374,6 +1524,56 @@ class Worker:
                 "agent %s: warm() failed (will retry on first turn): %s",
                 agent_id, exc,
             )
+
+        # Supported local Drivers must be promoted and registered before
+        # ``wait_warm()`` can release callers.  The readiness event is the
+        # daemon's permission to dispatch work, so exposing the warmed legacy
+        # adapter here would race the durable Manager boundary installed
+        # below.
+        runtime_event_outbox = None
+        runtime_session_ref = ""
+        effective_harness = (
+            self.agent_cfg.runtime.harness or "claude-code"
+        ).strip()
+        if (
+            self.agent_cfg.runtime.kind == RUNTIME_CLI_LOCAL
+            and effective_harness in {"codex", "claude-code"}
+        ):
+            from ..agent.runtime_event_outbox import (
+                RuntimeEventOutbox,
+                runtime_event_outbox_path,
+            )
+
+            runtime_event_outbox = RuntimeEventOutbox(
+                runtime_event_outbox_path(agent_dir(agent_id))
+            )
+            persisted_runtime_state = runtime_event_outbox.state()
+            runtime_session_ref = persisted_runtime_state.get(
+                "session_ref", ""
+            ) or f"session_{uuid.uuid4().hex}"
+            runtime_event_outbox.set_active_turn(
+                persisted_runtime_state.get("active_turn_ref") or None,
+                session_ref=runtime_session_ref,
+                native_session_id=(
+                    self._adapter.get_provider_session_id() or ""
+                ),
+            )
+            try:
+                self._adapter = await _promote_supported_local_driver(
+                    self._adapter,
+                    self.agent_cfg,
+                    system_prompt=claude_md,
+                    outbox=runtime_event_outbox,
+                    logical_session_ref=runtime_session_ref,
+                )
+                # PuffoAgent is constructed before the durable runtime boundary
+                # so its memory/message setup remains unchanged. From this
+                # point onward provider turns go exclusively through Manager.
+                puffo.adapter = self._adapter
+            except Exception:
+                runtime_event_outbox.close()
+                raise
+
         if warm_ok:
             await self._run_post_warm_gate(agent_id)
         else:
@@ -1414,9 +1614,187 @@ class Worker:
         from .ws_local.in_process_data_client import InProcessDataClient
 
         global_runtime: GlobalInboxRuntime
+        runtime_event_uploader = None
+        if runtime_event_outbox is not None and hasattr(client, "http"):
+            from ..agent.runtime_event_outbox import RuntimeEventUploader
+
+            async def append_transport(path: str, body: bytes):
+                from ..crypto.http_client import HttpError
+
+                try:
+                    decoded = json.loads(body)
+                    if getattr(client.http, "keyless", False):
+                        response = await client.http.post_unsigned(path, decoded)
+                    else:
+                        response = await client.http.post(path, decoded)
+                    return 200, response
+                except HttpError as exc:
+                    # Never return or log the response body.
+                    return exc.status, {}
+
+            runtime_event_uploader = RuntimeEventUploader(
+                runtime_event_outbox, append_transport
+            )
+
+        class _RuntimeTurnProjection:
+            """Project the Adapter facade's user-visible progress safely.
+
+            Driver-backed adapters ultimately expose the same normalized text
+            stream. Keeping this bridge here lets the existing durable Inbox
+            boundary remain unchanged while public rows still pass through the
+            Runtime Events allowlist/projector.
+            """
+
+            def __init__(self, turn_ref: str):
+                from ..agent.runtime_events import (
+                    DeltaCoalescer,
+                    RuntimeEventProjector,
+                    TrustedScope,
+                )
+
+                self.turn_ref = turn_ref
+                self.projector = RuntimeEventProjector(
+                    agent_id=agent_id,
+                    session_ref=runtime_session_ref,
+                    scope=TrustedScope(),
+                )
+                self.coalescer = DeltaCoalescer()
+                self.saw_text = False
+
+            def _event(self, type_: str, data: dict | None = None):
+                from ..agent.harness.driver import (
+                    HarnessEvent,
+                    SessionRef,
+                    TurnRef,
+                )
+
+                return HarnessEvent(
+                    type=type_,
+                    driver=effective_harness,
+                    session_ref=SessionRef(runtime_session_ref),
+                    turn_ref=TurnRef(self.turn_ref),
+                    data=data or {},
+                )
+
+            async def _persist(self, event) -> None:
+                if runtime_event_outbox is None:
+                    return
+                from ..agent._logging import log_runtime_event
+
+                event_type = getattr(event.type, "value", event.type)
+                log_runtime_event(
+                    logger,
+                    "runtime.normalized_event",
+                    agent_id=agent_id,
+                    session_ref=runtime_session_ref,
+                    turn_ref=self.turn_ref,
+                    event_type=str(event_type),
+                )
+                for projected in self.projector.project_all(event):
+                    log_runtime_event(
+                        logger,
+                        "runtime.projected",
+                        agent_id=agent_id,
+                        session_ref=runtime_session_ref,
+                        turn_ref=self.turn_ref,
+                        event_id=projected.event_id,
+                        event_type=projected.type,
+                    )
+                    await runtime_event_outbox.enqueue(
+                        projected,
+                        terminal=projected.type == "turn.finished",
+                    )
+
+            async def start(self) -> None:
+                await self._persist(self._event("turn.started"))
+
+            async def progress(self, text: str) -> None:
+                if not isinstance(text, str) or not text:
+                    return
+                self.saw_text = True
+                for chunk in self.coalescer.add(text):
+                    await self._persist(self._event(
+                        "turn.assistant_delta",
+                        {"text": chunk, "block_id": "result"},
+                    ))
+
+            async def finish(self, outcome: str, final_text: str = "") -> None:
+                if final_text and not self.saw_text:
+                    await self.progress(final_text)
+                chunks = self.coalescer.flush()
+                for chunk in chunks:
+                    await self._persist(self._event(
+                        "turn.assistant_delta",
+                        {"text": chunk, "block_id": "result"},
+                    ))
+                if self.saw_text:
+                    await self._persist(self._event(
+                        "turn.assistant_completed", {"block_id": "result"}
+                    ))
+                await self._persist(self._event(
+                    "turn.completed", {"outcome": outcome}
+                ))
+
+        async def _runtime_event_start() -> _RuntimeTurnProjection | None:
+            if runtime_event_outbox is None:
+                return None
+            from ..agent.harness.runtime_manager import RuntimeManagerAdapter
+            if isinstance(self._adapter, RuntimeManagerAdapter):
+                # The Manager's normalized-event sink owns projection and
+                # durable lifecycle for Driver-backed turns.
+                return None
+
+            public_turn_ref = f"turn_{uuid.uuid4().hex}"
+            projection = _RuntimeTurnProjection(public_turn_ref)
+            from ..agent.harness.driver import HarnessEvent, SessionRef, TurnRef
+            from ..agent.runtime_events import RuntimeEventProjector, TrustedScope
+
+            sizing_projector = RuntimeEventProjector(
+                agent_id=agent_id,
+                session_ref=runtime_session_ref,
+                scope=TrustedScope(),
+            )
+            sizing_start = HarnessEvent(
+                type="turn.started",
+                driver=effective_harness,
+                session_ref=SessionRef(runtime_session_ref),
+                turn_ref=TurnRef(public_turn_ref),
+                occurred_at="9999-12-31T23:59:59.999999+00:00",
+            )
+            runtime_event_outbox.require_turn_capacity(
+                estimated_start_bytes=sum(
+                    len(runtime_event_outbox.canonical_bytes(value))
+                    for value in sizing_projector.project_all(sizing_start)
+                )
+            )
+            await projection.start()
+            runtime_event_outbox.set_active_turn(
+                public_turn_ref,
+                session_ref=runtime_session_ref,
+                native_session_id=(
+                    self._adapter.get_provider_session_id() or ""
+                ),
+            )
+            return projection
+
+        async def _runtime_event_finish(
+            projection: _RuntimeTurnProjection | None,
+            outcome: str,
+            final_text: str = "",
+        ) -> None:
+            if runtime_event_outbox is None or projection is None:
+                return
+            await projection.finish(outcome, final_text)
+            runtime_event_outbox.set_active_turn(
+                None,
+                session_ref=runtime_session_ref,
+                native_session_id=(
+                    self._adapter.get_provider_session_id() or ""
+                ),
+            )
 
         async def run_global_turn(planned):
-            async def execute_provider_turn():
+            async def execute_provider_turn(on_progress=None):
                 self._turn_active = True
                 try:
                     async with self._reload_lock:
@@ -1454,17 +1832,29 @@ class Worker:
                     Worker._flip_health_in_progress(
                         self.runtime, agent_id, logger
                     )
-                    return await puffo.handle_global_inbox_turn(planned)
+                    return await puffo.handle_global_inbox_turn(
+                        planned, on_progress=on_progress
+                    )
                 finally:
                     self._turn_active = False
 
+            projection = await _runtime_event_start()
             try:
-                reply = await execute_provider_turn()
+                reply = await execute_provider_turn(
+                    projection.progress if projection is not None else None
+                )
             except AgentAPIError as exc:
+                await _runtime_event_finish(projection, "failed")
                 if exc.is_auth:
                     self._enter_auth_failed(agent_id)
                 raise
+            except Exception:
+                await _runtime_event_finish(projection, "failed")
+                raise
             else:
+                await _runtime_event_finish(
+                    projection, "succeeded", reply or ""
+                )
                 Worker._resolve_health_on_success(
                     self.runtime, agent_id, logger
                 )
@@ -1474,20 +1864,21 @@ class Worker:
                 return
             # Plain output has exactly one legal implicit route. Every explicit,
             # failed, attachment, or held attempt suppresses it.
-            if len(planned.targets) != 1 or global_runtime.attempts.attempts:
+            fallback_route = global_runtime.resolve_plain_fallback_route()
+            if fallback_route is None or global_runtime.attempts.attempts:
                 logger.warning(
                     "agent %s: suppressed ambiguous global plain output "
-                    "(targets=%d attempts=%d)",
-                    agent_id, len(planned.targets), global_runtime.attempts.attempts,
+                    "(admitted_routes=%d attempts=%d)",
+                    agent_id, len(global_runtime.active.routes),
+                    global_runtime.attempts.attempts,
                 )
                 return
-            target = planned.targets[0]
-            if target[0] == "dm":
-                destination = f"@{target[1]}"
+            if fallback_route.kind == "dm":
+                destination = f"@{fallback_route.dm_peer}"
                 root_id = ""
             else:
-                destination = target[2]
-                root_id = target[3] if target[0] == "thread" else ""
+                destination = fallback_route.channel_id
+                root_id = fallback_route.thread_root_id
             await global_runtime.send_delegate.send(SemanticSendRequest(
                 destination=destination,
                 text=reply,
@@ -1495,30 +1886,49 @@ class Worker:
             ))
 
         async def retry_global_turn(planned):
+            projection = await _runtime_event_start()
             self._turn_active = True
             try:
                 try:
-                    reply = await puffo.handle_global_inbox_retry(planned)
+                    reply = await puffo.handle_global_inbox_retry(
+                        planned,
+                        on_progress=(
+                            projection.progress
+                            if projection is not None else None
+                        ),
+                    )
                 finally:
                     self._turn_active = False
             except AgentAPIError as exc:
+                await _runtime_event_finish(projection, "failed")
                 if exc.is_auth:
                     self._enter_auth_failed(agent_id)
                 raise
+            except Exception:
+                await _runtime_event_finish(projection, "failed")
+                raise
             else:
+                await _runtime_event_finish(
+                    projection, "succeeded", reply or ""
+                )
                 Worker._resolve_health_on_success(self.runtime, agent_id, logger)
             if not reply:
                 return
-            if len(planned.targets) != 1 or global_runtime.attempts.attempts:
+            fallback_route = global_runtime.resolve_plain_fallback_route()
+            if fallback_route is None or global_runtime.attempts.attempts:
                 logger.warning(
                     "agent %s: suppressed ambiguous global retry output "
                     "(targets=%d attempts=%d)",
-                    agent_id, len(planned.targets), global_runtime.attempts.attempts,
+                    agent_id, len(global_runtime.active.routes),
+                    global_runtime.attempts.attempts,
                 )
                 return
-            target = planned.targets[0]
-            destination = f"@{target[1]}" if target[0] == "dm" else target[2]
-            root_id = target[3] if target[0] == "thread" else ""
+            destination = (
+                f"@{fallback_route.dm_peer}"
+                if fallback_route.kind == "dm"
+                else fallback_route.channel_id
+            )
+            root_id = fallback_route.thread_root_id
             await global_runtime.send_delegate.send(SemanticSendRequest(
                 destination=destination,
                 text=reply,
@@ -1535,6 +1945,7 @@ class Worker:
             held_catchup=client.recover_pending_delivery,
             send_mode_keys=(agent_id, client.slug),
             agent_id=agent_id,
+            runtime_event_outbox=runtime_event_outbox,
         )
         coordinator = SendCoordinator(
             slug=client.slug,
@@ -1563,6 +1974,19 @@ class Worker:
                 self.runtime.save(agent_id)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    pass
+
+        async def upload_runtime_events():
+            if runtime_event_uploader is None:
+                return
+            while not self._stop.is_set():
+                result = await runtime_event_uploader.upload_once()
+                if result.state == "degraded":
+                    return
+                delay = 0.1 if result.state == "uploaded" else 1.0
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
                 except asyncio.TimeoutError:
                     pass
 
@@ -1626,6 +2050,7 @@ class Worker:
         watch_task = asyncio.ensure_future(
             self._refresh_watcher_loop(refresh_flag_paths, apply_refresh)
         )
+        runtime_upload_task = asyncio.ensure_future(upload_runtime_events())
         try:
             while not self._stop.is_set():
                 try:
@@ -1680,13 +2105,18 @@ class Worker:
             hb_task.cancel()
             status_task.cancel()
             watch_task.cancel()
-            for task in (hb_task, status_task, watch_task):
+            runtime_upload_task.cancel()
+            for task in (
+                hb_task, status_task, watch_task, runtime_upload_task,
+            ):
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
             self.runtime.status = "stopped"
             self.runtime.save(agent_id)
+            if runtime_event_outbox is not None:
+                runtime_event_outbox.close()
 
 
 async def _process_refresh_flags(

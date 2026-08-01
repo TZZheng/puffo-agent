@@ -32,6 +32,8 @@ from typing import Any
 import psutil
 import yaml
 
+from ..limits import DEFAULT_CATCHUP_STALE_HOURS
+
 
 # Where daemon.yml, agents/, etc. live.
 def home_dir() -> Path:
@@ -848,6 +850,8 @@ class DaemonConfig:
     # with a verbose primer.
     max_inline_message_chars: int = 4000
     segment_chars: int = 2000
+    # Catch-up older than this is stored but skips the LLM; <= 0 disables.
+    catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
     data_service: "DataServiceConfig" = field(
         default_factory=lambda: DataServiceConfig(),
@@ -874,6 +878,9 @@ class DaemonConfig:
             docker_memory_reservation=raw.get("docker_memory_reservation", "500m"),
             max_inline_message_chars=int(raw.get("max_inline_message_chars", 4000)),
             segment_chars=int(raw.get("segment_chars", 2000)),
+            catchup_stale_hours=float(
+                raw.get("catchup_stale_hours", DEFAULT_CATCHUP_STALE_HOURS)
+            ),
         )
         for name in ("anthropic", "openai", "google"):
             p = raw.get(name) or {}
@@ -918,6 +925,7 @@ class DaemonConfig:
             "docker_memory_reservation": self.docker_memory_reservation,
             "max_inline_message_chars": self.max_inline_message_chars,
             "segment_chars": self.segment_chars,
+            "catchup_stale_hours": self.catchup_stale_hours,
             "anthropic": asdict(self.anthropic),
             "openai": asdict(self.openai),
             "google": asdict(self.google),

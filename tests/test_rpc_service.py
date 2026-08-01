@@ -145,20 +145,23 @@ async def test_install_unexpected_exception_500(app_client_factory, monkeypatch)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("hidden", [
-    {"context_baseline_seq": 1},
-    {"seen_seq": 1},
-    {"unexpected": True},
+@pytest.mark.parametrize("field", [
+    "freshness", "freshness_mode", "mode", "context_baseline_seq",
+    "seen_seq", "synchronized", "transport", "provider_session_id",
+    "session_ref", "turn_id", "turn_ref", "sequence", "seq",
+    "through_seq", "latest_seq", "latest_envelope_id", "held_pair",
+    "client_ref", "admission_receipt", "correlation_receipt",
+    "tool_name", "tool_arguments", "unexpected",
 ])
 async def test_send_message_hidden_or_unknown_rejected_before_resolver(
-    app_client_factory, hidden,
+    app_client_factory, field,
 ):
     resolver_calls = []
     rpc_service.set_rpc_resolver(lambda aid: resolver_calls.append(aid))
     client = await app_client_factory()
     response = await client.post(
         "/v1/rpc/agent_a/send-message",
-        json={"channel": "ch_a", "text": "x", **hidden},
+        json={"channel": "ch_a", "text": "x", field: "forbidden"},
     )
     assert response.status == 400
     assert resolver_calls == []
@@ -203,6 +206,86 @@ async def test_send_message_unavailable_is_structured(app_client_factory):
     body = await response.json()
     assert body["state"] == "failed"
     assert body["attempted"] is True
+
+
+@pytest.mark.asyncio
+async def test_read_inbox_strict_three_field_round_trip(
+    app_client_factory, monkeypatch,
+):
+    captured: dict[str, Any] = {}
+
+    async def _stub_read(ctx, **kwargs):
+        captured.update(ctx=ctx, **kwargs)
+        return {
+            "messages": ["whole message"],
+            "next_cursor": "opaque",
+            "has_more": True,
+            "remaining_count": 61,
+            "snapshot_generation": 4,
+            "correlation_receipt": "receipt",
+        }
+
+    monkeypatch.setattr(rpc_service.host_mcp_handler, "read_inbox", _stub_read)
+    rpc_service.set_rpc_resolver(lambda aid: _stub_ctx(aid))
+    client = await app_client_factory()
+    response = await client.post(
+        "/v1/rpc/agent_a/read-inbox",
+        json={
+            "target": "channel:sp_1:ch_1",
+            "cursor": "cursor",
+            "limit": 17,
+        },
+    )
+    assert response.status == 200
+    assert await response.json() == {
+        "messages": ["whole message"],
+        "next_cursor": "opaque",
+        "has_more": True,
+        "remaining_count": 61,
+        "snapshot_generation": 4,
+        "correlation_receipt": "receipt",
+    }
+    assert captured == {
+        "ctx": captured["ctx"],
+        "target": "channel:sp_1:ch_1",
+        "cursor": "cursor",
+        "limit": 17,
+    }
+    assert captured["ctx"].agent_id == "agent_a"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [
+        *[
+            {field: "forbidden"}
+            for field in (
+                "freshness", "freshness_mode", "mode",
+                "context_baseline_seq", "seen_seq", "synchronized",
+                "transport", "provider_session_id", "session_ref",
+                "turn_id", "turn_ref", "sequence", "seq", "through_seq",
+                "latest_seq", "latest_envelope_id", "held_pair",
+                "client_ref", "admission_receipt", "correlation_receipt",
+                "tool_name", "tool_arguments",
+            )
+        ],
+        {"target": "", "cursor": "", "limit": 51},
+        {"target": [], "cursor": "", "limit": 1},
+    ],
+)
+async def test_read_inbox_rejects_hidden_unknown_or_invalid_fields_before_resolver(
+    app_client_factory, body,
+):
+    resolver_calls = []
+    rpc_service.set_rpc_resolver(lambda aid: resolver_calls.append(aid))
+    client = await app_client_factory()
+    response = await client.post(
+        "/v1/rpc/agent_a/read-inbox",
+        json=body,
+    )
+    assert response.status == 400
+    assert resolver_calls == []
 
 
 @pytest.mark.asyncio

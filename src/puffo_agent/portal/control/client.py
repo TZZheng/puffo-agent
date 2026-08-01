@@ -218,6 +218,23 @@ async def execute_command(
                 }
             return {"ok": False, "error": f"unknown agent {agent_slug!r}"}
 
+    if op in {"runtime.cancel_turn", "runtime.resolve_permission"}:
+        from ...agent.harness.runtime_commands import execute_runtime_command
+
+        command = dict(params)
+        command.update(
+            command_id=str(command_id or ""),
+            agent_id=str(agent_slug or ""),
+            op=op.removeprefix("runtime."),
+        )
+        return await execute_runtime_command(
+            command,
+            expected_agent_id=str(agent_slug or ""),
+            manager_agent_id=str(agent_slug or ""),
+            require_version=False,
+            permission_turn_from_active=False,
+        )
+
     if op == "pause":
         cfg = AgentConfig.load(agent_slug)
         cfg.state = "paused"
@@ -448,7 +465,10 @@ class MachineControlClient:
                 last_caps = caps
 
     async def _handle(self, ws: aiohttp.ClientWebSocketResponse, frame: dict) -> None:
-        command_id = frame.get("command_id")
+        outer_command_id = frame.get("command_id")
+        # Rejected frames retain the transport key only so the server can stop
+        # redelivery. Successful execution replaces this with authenticated ID.
+        command_id = outer_command_id
         operator_slug = frame.get("operator_slug")
         try:
             pairing = load_pairings().get(operator_slug)
@@ -461,6 +481,9 @@ class MachineControlClient:
             decrypted = decrypt_command(
                 envelope, self.machine, pairing.operator_root_pubkey, now_ms()
             )
+            command_id = decrypted["command_id"]
+            if outer_command_id not in {None, command_id}:
+                raise ControlError("outer command_id does not match signed command")
             if nonce:
                 # Bound the replay set: a nonce older than the ts window is
                 # already rejected by decrypt_command, so it's safe to forget.

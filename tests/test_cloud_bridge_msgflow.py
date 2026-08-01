@@ -26,13 +26,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from types import SimpleNamespace
 
 import pytest
 
 import puffo_agent.agent.puffo_core_client as pcc_mod
 import puffo_agent.agent.send_coordinator as sc_mod
 import puffo_agent.mcp.puffo_core_tools as pct_mod
-from puffo_agent.agent.message_store import MessageStore
+from puffo_agent.agent.message_store import MessageStore, ReceiptDisposition
 from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 from puffo_agent.agent.send_coordinator import SendCoordinator
 from puffo_agent.crypto.encoding import base64url_encode
@@ -219,6 +220,23 @@ class FakeHttp:
         self.calls.append(("POST_UNSIGNED", path, body))
         if path in self.responses:
             return self.responses[path]
+        if path == "/v2/cloud-agents/agent-runtime/messages:send":
+            freshness = body["freshness"]
+            return {
+                "state": "sent",
+                "envelope_id": "msg_bridgeack",
+                "seq": freshness["seen_seq"] + 1,
+                "replay": False,
+                "missing_devices": [],
+                "freshness": {
+                    "mode": freshness["mode"],
+                    "context_baseline_seq": (
+                        freshness["context_baseline_seq"]
+                    ),
+                    "seen_seq": freshness["seen_seq"],
+                    "latest_seq_before_send": freshness["seen_seq"],
+                },
+            }
         return {"envelope_id": "msg_bridgeack"}
 
     async def post_bytes_unsigned(self, path, body):
@@ -318,7 +336,7 @@ def _install_native_send_coordinator(cfg: PuffoCoreToolsConfig) -> None:
 
 
 def _http_sends(http):
-    """Bodies of every keyless ``POST /v2/cloud-agents/messages``."""
+    """Bodies of every keyless coordinated channel send."""
     return [b for m, p, b in http.calls if m == "POST_UNSIGNED"]
 
 
@@ -408,6 +426,145 @@ async def test_a_inbound_stores_like_native_without_decrypt(tmp_path, monkeypatc
     root_id, batch, channel_meta = surfaced[0]
     assert any(m["envelope_id"] == ENV_ID for m in batch)
     assert channel_meta["channel_id"] == CHANNEL
+
+
+@pytest.mark.asyncio
+async def test_sequenced_bridge_delivery_is_durable_server_lane_and_idempotent(
+    tmp_path,
+):
+    bridge = FakeBridge()
+    client = _bridge_client(tmp_path, bridge, db="sequenced.db")
+    frame = {
+        "type": "message",
+        "seq": 17,
+        "envelope_id": "env_sequenced",
+        "sender_slug": "alice-0001",
+        "envelope_kind": "channel",
+        "space_id": "sp_1",
+        "channel_id": "ch_1",
+        "sent_at": 1_700_000_000_000,
+        "plaintext": "durable",
+    }
+    await client._dispatch_bridge_frame(frame)
+    await asyncio.gather(*tuple(client._ack_tasks))
+    await client._dispatch_bridge_frame(frame)
+    await asyncio.gather(*tuple(client._ack_tasks))
+    await client.store.close()
+    await client.store.open()
+    row = await client.store.get_message_by_envelope("env_sequenced")
+    assert row is not None
+    assert row.server_seq == 17
+    assert row.receipt_disposition is ReceiptDisposition.ELIGIBLE
+    assert row.local_ordinal is None
+    assert MessageStore.target_projection(row) == "channel:sp_1:ch_1"
+    assert [item.envelope_id for item in await client.store.get_pending()] == [
+        "env_sequenced"
+    ]
+    assert bridge.acked == [["env_sequenced"], ["env_sequenced"]]
+    await client.store.close()
+
+
+@pytest.mark.asyncio
+async def test_sequenced_bridge_preserves_thread_reply_and_dm_projections(tmp_path):
+    bridge = FakeBridge()
+    client = _bridge_client(tmp_path, bridge, db="sequenced-routes.db")
+    await client.store.store({
+        "envelope_id": "thread-root",
+        "envelope_kind": "channel",
+        "sender_slug": "alice-0001",
+        "space_id": "sp_1",
+        "channel_id": "ch_1",
+        "content": "root",
+        "sent_at": 1,
+    })
+    await client._dispatch_bridge_frame({
+        "type": "message",
+        "seq": 18,
+        "envelope_id": "thread-reply",
+        "sender_slug": "alice-0001",
+        "envelope_kind": "channel",
+        "space_id": "sp_1",
+        "channel_id": "ch_1",
+        "thread_root_id": "thread-root",
+        "reply_to_id": "thread-root",
+        "plaintext": "reply",
+    })
+    await client._dispatch_bridge_frame({
+        "type": "message",
+        "seq": 19,
+        "envelope_id": "dm-sequenced",
+        "sender_slug": "alice-0001",
+        "recipient_slug": "bot-0001",
+        "envelope_kind": "dm",
+        "plaintext": "dm",
+    })
+    reply = await client.store.get_message_by_envelope("thread-reply")
+    dm = await client.store.get_message_by_envelope("dm-sequenced")
+    assert reply is not None
+    assert reply.thread_root_id == reply.reply_to_id == "thread-root"
+    assert MessageStore.target_projection(reply) == (
+        "channel:sp_1:ch_1:thread:thread-root"
+    )
+    assert dm is not None
+    assert MessageStore.target_projection(dm) == "dm:alice-0001"
+    await client.store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad_seq", [None, 0, -1, True, "7", 1.0])
+async def test_present_invalid_bridge_sequence_is_rejected_without_ack(
+    tmp_path, bad_seq,
+):
+    bridge = FakeBridge()
+    client = _bridge_client(tmp_path, bridge, db=f"bad-{bad_seq!r}.db")
+    wakes = SimpleNamespace(inbox=0, held=0)
+
+    class RuntimeSpy:
+        def notify(self):
+            wakes.inbox += 1
+
+        def notify_delivery(self):
+            wakes.held += 1
+
+    client.global_runtime = RuntimeSpy()
+    await client._dispatch_bridge_frame({
+        "type": "message",
+        "seq": bad_seq,
+        "envelope_id": "bad-seq",
+        "sender_slug": "alice-0001",
+        "space_id": "sp_1",
+        "channel_id": "ch_1",
+        "plaintext": "must not persist",
+    })
+    assert await client.store.get_message_by_envelope("bad-seq") is None
+    assert bridge.acked == []
+    await client._dispatch_bridge_frame({
+        "type": "message",
+        "envelope_id": "legacy-ok",
+        "sender_slug": "alice-0001",
+        "space_id": "sp_1",
+        "channel_id": "ch_1",
+        "plaintext": "legacy",
+    })
+    await client._dispatch_bridge_frame({
+        "type": "message",
+        "envelope_id": "legacy-ok",
+        "sender_slug": "alice-0001",
+        "space_id": "sp_1",
+        "channel_id": "ch_1",
+        "plaintext": "legacy",
+    })
+    await asyncio.gather(*tuple(client._ack_tasks))
+    legacy = await client.store.get_message_by_envelope("legacy-ok")
+    assert legacy is not None
+    assert legacy.server_seq is None and legacy.local_ordinal is not None
+    assert [row.envelope_id for row in await client.store.get_pending()] == [
+        "legacy-ok"
+    ]
+    assert wakes.inbox == 1
+    assert wakes.held == 0
+    assert bridge.acked == [["legacy-ok"], ["legacy-ok"]]
+    await client.store.close()
 
 
 @pytest.mark.asyncio
@@ -594,27 +751,23 @@ async def test_b_send_message_dm_threads_on_bridge(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_send_fallback_message_threads_on_bridge(tmp_path):
-    """``send_fallback_message`` passes ``root_id`` through as BOTH
-    ``thread_root_id`` and ``reply_to_id`` on the bridge, for the channel
-    route and the DM route (native's fallback path threads unresolved
-    too)."""
+async def test_send_fallback_channel_fails_closed_but_dm_keeps_bridge(tmp_path):
     bridge = FakeBridge()
     client = _bridge_client(tmp_path, bridge, db="fallback_thread.db")
     await client.store.mark_channel_space("ch_a", "sp_1")
 
     # channel route
-    await client.send_fallback_message("ch_a", "chan reply", root_id="msg_root")
+    failed = await client.send_fallback_message(
+        "ch_a", "chan reply", root_id="msg_root"
+    )
     # DM route: stash a DM sender so empty channel_id routes to them.
     client._last_dm_sender = "carol-0001"
     await client.send_fallback_message("", "dm reply", root_id="msg_root2")
 
-    assert len(bridge.sent) == 2
-    chan = bridge.sent[0]
-    assert chan["channel_id"] == "ch_a" and chan["space_id"] == "sp_1"
-    assert chan["thread_root_id"] == "msg_root"
-    assert chan["reply_to_id"] == "msg_root"
-    dm = bridge.sent[1]
+    assert failed["state"] == "failed"
+    assert failed["error_kind"] == "coordinator_unavailable"
+    assert len(bridge.sent) == 1
+    dm = bridge.sent[0]
     assert dm["recipient_slug"] == "carol-0001"
     assert dm["thread_root_id"] == "msg_root2"
     assert dm["reply_to_id"] == "msg_root2"
@@ -807,14 +960,14 @@ async def test_c_connect_drives_one_fetch_pending_and_survives_pending_delivered
     # loop kept running for live delivery after pending_delivered.
     scripted = [
         {
-            "type": "message", "envelope_id": "env_backfill",
+            "type": "message", "seq": 1, "envelope_id": "env_backfill",
             "sender_slug": "alice-0001", "envelope_kind": "channel",
             "space_id": "sp_1", "channel_id": "ch_a",
             "sent_at": 1_700_000_000_010, "plaintext": "backfilled",
         },
         {"type": "pending_delivered", "count": 1},
         {
-            "type": "message", "envelope_id": "env_live",
+            "type": "message", "seq": 2, "envelope_id": "env_live",
             "sender_slug": "alice-0001", "envelope_kind": "channel",
             "space_id": "sp_1", "channel_id": "ch_a",
             "sent_at": 1_700_000_000_020, "plaintext": "live one",
@@ -840,14 +993,35 @@ async def test_c_connect_drives_one_fetch_pending_and_survives_pending_delivered
     # pending_delivered was recognised as backfill completion.
     assert "backfill complete" in caplog.text
     # Both the backfill and the post-terminator live message landed.
-    assert await client.store.get_message_by_envelope("env_backfill") is not None
-    assert await client.store.get_message_by_envelope("env_live") is not None
+    backfill = await client.store.get_message_by_envelope("env_backfill")
+    live = await client.store.get_message_by_envelope("env_live")
+    assert backfill is not None and backfill.server_seq == 1
+    assert live is not None and live.server_seq == 2
 
 
 @pytest.mark.asyncio
 async def test_c_uncorrelated_error_frame_does_not_crash_loop(tmp_path, caplog):
+    sentinels = [
+        "MESSAGE_SENTINEL",
+        "RAW_PROVIDER_FRAME_SENTINEL",
+        "CIPHERTEXT_SENTINEL",
+        "REASONING_SENTINEL",
+        "TOOL_ARGUMENT_SENTINEL",
+        "TOOL_RESULT_SENTINEL",
+        "CREDENTIAL_SENTINEL",
+    ]
     scripted = [
-        {"type": "error", "code": "INTERNAL", "message": "transient blip"},
+        {
+            "type": "error",
+            "code": "INTERNAL",
+            "message": sentinels[0],
+            "raw_frame": sentinels[1],
+            "ciphertext": sentinels[2],
+            "reasoning": sentinels[3],
+            "tool_arguments": sentinels[4],
+            "tool_result": sentinels[5],
+            "credential": sentinels[6],
+        },
         {
             "type": "message", "envelope_id": "env_after_err",
             "sender_slug": "alice-0001", "envelope_kind": "channel",
@@ -865,9 +1039,101 @@ async def test_c_uncorrelated_error_frame_does_not_crash_loop(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.puffo_core_client"):
         await _drive_listen_until(client, on_message=on_message, done=done)
 
-    assert "bridge error frame" in caplog.text
+    assert "bridge error category=INTERNAL" in caplog.text
+    assert all(sentinel not in caplog.text for sentinel in sentinels)
     # The loop survived the error frame and delivered the next message.
     assert await client.store.get_message_by_envelope("env_after_err") is not None
+    await client.store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("code", "category"),
+    [
+        ("NO_SUBKEY", "NO_SUBKEY"),
+        ("NOT_AUTHORIZED", "NOT_AUTHORIZED"),
+        ("DECRYPT_FAILED", "DECRYPT_FAILED"),
+        ("BAD_FRAME", "BAD_FRAME"),
+        ("INTERNAL", "INTERNAL"),
+        ("RAW_UNKNOWN_CODE_SENTINEL", "UNKNOWN_BRIDGE_ERROR"),
+        (17, "UNKNOWN_BRIDGE_ERROR"),
+        (None, "UNKNOWN_BRIDGE_ERROR"),
+    ],
+)
+async def test_bridge_error_codes_are_closed_content_free_categories(
+    tmp_path, caplog, code, category,
+):
+    client = _bridge_client(tmp_path, FakeBridge(), db=f"bridge_{category}.db")
+    with caplog.at_level(
+        logging.WARNING, logger="puffo_agent.agent.puffo_core_client"
+    ):
+        await client._dispatch_bridge_frame({
+            "type": "error",
+            "code": code,
+            "message": "MESSAGE_PLAINTEXT_SENTINEL",
+            "raw_frame": "RAW_PROVIDER_FRAME_SENTINEL",
+            "ciphertext": "CIPHERTEXT_SENTINEL",
+            "reasoning": "REASONING_SENTINEL",
+            "tool_arguments": "TOOL_ARGUMENT_SENTINEL",
+            "tool_result": "TOOL_RESULT_SENTINEL",
+            "credential": "CREDENTIAL_SENTINEL",
+        })
+    assert f"bridge error category={category}" in caplog.text
+    for sentinel in (
+        "MESSAGE_PLAINTEXT_SENTINEL",
+        "RAW_PROVIDER_FRAME_SENTINEL",
+        "CIPHERTEXT_SENTINEL",
+        "REASONING_SENTINEL",
+        "TOOL_ARGUMENT_SENTINEL",
+        "TOOL_RESULT_SENTINEL",
+        "CREDENTIAL_SENTINEL",
+        "RAW_UNKNOWN_CODE_SENTINEL",
+    ):
+        assert sentinel not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_bridge_reconnect_logs_fixed_diagnostics_and_doubles_backoff(
+    tmp_path, monkeypatch, caplog,
+):
+    sentinel = "BRIDGE_EXCEPTION_TEXT_SENTINEL"
+    third_attempt = asyncio.Event()
+
+    class FailingBridge(FakeBridge):
+        async def connect(self):
+            self.connect_count += 1
+            if self.connect_count <= 2:
+                raise RuntimeError(sentinel)
+            third_attempt.set()
+
+    bridge = FailingBridge()
+    client = _bridge_client(tmp_path, bridge, db="bridge_reconnect.db")
+    delays = []
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(pcc_mod.asyncio, "sleep", fake_sleep)
+    with caplog.at_level(
+        logging.WARNING, logger="puffo_agent.agent.puffo_core_client"
+    ):
+        task = asyncio.create_task(client._listen_bridge())
+        await asyncio.wait_for(third_attempt.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert delays == [pcc_mod.INITIAL_BACKOFF, pcc_mod.INITIAL_BACKOFF * 2]
+    assert bridge.connect_count >= 3
+    assert bridge.close_count == bridge.connect_count
+    assert "bot-0001" in caplog.text
+    assert "category=bridge_transport" in caplog.text
+    assert "exception=RuntimeError" in caplog.text
+    assert "retry_delay=1s" in caplog.text
+    assert "retry_delay=2s" in caplog.text
+    assert sentinel not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+    await client.store.close()
 
 
 # --------------------------------------------------------------------------

@@ -5,6 +5,7 @@ import inspect
 import time
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Awaitable, Callable, Iterable
 
 from .message_store import StoredMessage
@@ -12,11 +13,55 @@ from .message_store import StoredMessage
 MAX_MESSAGES = 50
 MAX_ESTIMATED_TOKENS = 32_000
 MAX_FORMATTED_BYTES = 96_000
-COALESCE_SECONDS = 0.100
+COALESCE_SECONDS = 3.0
 
 TargetProjection = tuple[str, ...]
 Formatter = Callable[[StoredMessage], str]
 Estimator = Callable[[str], int]
+
+
+class NoticeDeliveryCapability(str, Enum):
+    DIRECT = "direct"
+    GATED = "gated"
+    NEXT_TURN = "next_turn"
+
+
+class InboxNoticeDelivery:
+    """Inbox-owned busy-input gate; provider implementations stay outside it."""
+
+    def __init__(
+        self,
+        capability: NoticeDeliveryCapability | str = NoticeDeliveryCapability.NEXT_TURN,
+    ) -> None:
+        self.capability = NoticeDeliveryCapability(capability)
+        self._input_ready_turn = ""
+
+    def note_input_ready(self, turn_id: str) -> None:
+        if turn_id:
+            self._input_ready_turn = turn_id
+
+    async def offer(
+        self,
+        *,
+        named_turn_id: str,
+        active_turn_id: str,
+        deliver: Callable[[], bool | Awaitable[bool]],
+    ) -> bool:
+        if not named_turn_id or named_turn_id != active_turn_id:
+            return False
+        if self.capability is NoticeDeliveryCapability.NEXT_TURN:
+            return False
+        if (
+            self.capability is NoticeDeliveryCapability.GATED
+            and self._input_ready_turn != named_turn_id
+        ):
+            return False
+        result = deliver()
+        if inspect.isawaitable(result):
+            result = await result
+        if self.capability is NoticeDeliveryCapability.GATED:
+            self._input_ready_turn = ""
+        return result is True
 
 
 @dataclass(frozen=True)
@@ -186,10 +231,13 @@ class InboxCoalescer:
         self._deadlines: deque[float] = deque()
         self._wait_lock = asyncio.Lock()
 
-    def notify(self) -> None:
+    def notify(self, *, delay_seconds: float | None = None) -> None:
         now = self._monotonic()
         if not self._deadlines or now >= self._deadlines[-1]:
-            self._deadlines.append(now + self._window_seconds)
+            delay = self._window_seconds if delay_seconds is None else max(
+                0.0, delay_seconds
+            )
+            self._deadlines.append(now + delay)
         self._wake.set()
 
     async def wait_for_burst(self) -> None:

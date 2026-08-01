@@ -70,6 +70,11 @@ class TurnContext:
     claude_dir: str = ""
     memory_dir: str = ""
     on_progress: Optional[ProgressCallback] = None
+    # Driver-backed runtimes allocate these logical references. Defaults keep
+    # every legacy Adapter caller source-compatible.
+    session_ref: str = ""
+    turn_ref: str = ""
+    trusted_context_refs: tuple[str, ...] = ()
 
 
 @dataclass
@@ -130,6 +135,9 @@ class Adapter(ABC):
             claude_dir=ctx.claude_dir,
             memory_dir=ctx.memory_dir,
             on_progress=ctx.on_progress,
+            session_ref=ctx.session_ref,
+            turn_ref=ctx.turn_ref,
+            trusted_context_refs=ctx.trusted_context_refs,
         )
         return await self.run_turn(ctx_fallback)
 

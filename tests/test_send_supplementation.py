@@ -235,6 +235,7 @@ async def test_channel_supplementation_uses_v2_and_preserves_freshness():
             "missing_devices": [],
             "freshness": {
                 "mode": "require_current",
+                "context_baseline_seq": 3,
                 "seen_seq": 3,
                 "latest_seq_before_send": 3,
             },

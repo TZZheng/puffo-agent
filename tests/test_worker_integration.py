@@ -8,6 +8,10 @@ import os
 import sys
 import tempfile
 import time
+import asyncio
+import json
+import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -89,6 +93,722 @@ def test_puffo_core_config_in_agent_config():
 def test_agent_config_default_puffo_core():
     cfg = AgentConfig(id="test-agent")
     assert not cfg.puffo_core.is_configured()
+
+
+@pytest.mark.asyncio
+async def test_supported_worker_driver_registers_live_encrypted_controls_and_events(
+    tmp_path, monkeypatch,
+):
+    from puffo_agent.agent.harness.driver import (
+        CancelReceipt,
+        CompactRequest,
+        HarnessDriver,
+        HarnessEvent,
+        PermissionReceipt,
+        RuntimeOpened,
+        RuntimeRef,
+        RuntimeSpec,
+        SessionRef,
+        TurnInput,
+        TurnRef,
+        TurnStarted,
+        UnsupportedCapability,
+    )
+    from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
+    from puffo_agent.agent.runtime_event_outbox import RuntimeEventOutbox
+    from puffo_agent.portal.control.client import execute_command
+    from puffo_agent.portal.state import DaemonConfig, RuntimeConfig
+    from puffo_agent.portal.worker import (
+        _promote_supported_local_driver,
+        build_adapter,
+    )
+
+    class FakeDriver(HarnessDriver):
+        def __init__(self):
+            self.queue = asyncio.Queue()
+            self.driver_turn = TurnRef("driver-turn")
+
+        async def open(self, spec: RuntimeSpec, resume=None):
+            return RuntimeOpened(
+                RuntimeRef("runtime"), SessionRef("native-session"),
+                "native-session", bool(resume), CODEX_CAPABILITIES,
+                SimpleNamespace(),
+            )
+
+        async def start_turn(self, input: TurnInput):
+            return TurnStarted(self.driver_turn, "native-turn")
+
+        async def steer_turn(self, turn, input):
+            return UnsupportedCapability("steer")
+
+        async def cancel_turn(self, turn):
+            return CancelReceipt(True, turn)
+
+        async def context_status(self):
+            return UnsupportedCapability("context_status")
+
+        async def compact(self, request: CompactRequest):
+            return UnsupportedCapability("compact")
+
+        async def resolve_permission(self, request, decision):
+            await self.queue.put(HarnessEvent(
+                type="turn.permission_updated",
+                driver="codex",
+                session_ref=SessionRef("native-session"),
+                turn_ref=self.driver_turn,
+                data={
+                    "permission_ref": str(request),
+                    "state": decision.value,
+                },
+            ))
+            return PermissionReceipt(True, request)
+
+        def events(self):
+            async def iterate():
+                while True:
+                    event = await self.queue.get()
+                    if event is None:
+                        return
+                    yield event
+            return iterate()
+
+        async def close(self):
+            await self.queue.put(None)
+
+    cfg = AgentConfig(
+        id="worker-driver-control",
+        runtime=RuntimeConfig(kind="cli-local", harness="codex"),
+    )
+    adapter = build_adapter(DaemonConfig(), cfg)
+    adapter.workspace_dir = str(tmp_path)
+    adapter._verify = lambda: None
+
+    async def no_install():
+        return None
+
+    adapter._install_desired = no_install
+    adapter._ensure_codex_session = lambda: SimpleNamespace(
+        argv=["codex", "app-server"],
+        env={},
+        get_provider_session_id=lambda: None,
+    )
+    fake = FakeDriver()
+    import puffo_agent.agent.harness as harness_module
+    monkeypatch.setattr(harness_module, "build_driver", lambda _name: fake)
+
+    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    facade = await _promote_supported_local_driver(
+        adapter,
+        cfg,
+        system_prompt="system",
+        outbox=outbox,
+        logical_session_ref="logical-session",
+    )
+    try:
+        started = await facade.manager.start_turn(TurnInput("hello"))
+        await fake.queue.put(HarnessEvent(
+            type="turn.started",
+            driver="codex",
+            session_ref=SessionRef("native-session"),
+            turn_ref=fake.driver_turn,
+        ))
+        await fake.queue.put(HarnessEvent(
+            type="turn.permission_requested",
+            driver="codex",
+            session_ref=SessionRef("native-session"),
+            turn_ref=fake.driver_turn,
+            data={
+                "permission_ref": "permission-one",
+                "state": "pending",
+            },
+        ))
+        for _ in range(20):
+            if any(
+                row.event_type == "permission.updated"
+                and row.event["payload"]["state"] == "pending"
+                for row in outbox.prefix()
+            ):
+                break
+            await asyncio.sleep(0)
+
+        refs = {
+            "session_ref": "logical-session",
+            "turn_ref": str(started.turn_ref),
+        }
+        permission = await execute_command(
+            "runtime.resolve_permission",
+            cfg.id,
+            {
+                **refs,
+                "permission_ref": "permission-one",
+                "decision": "approved",
+            },
+            command_id="worker-permission",
+        )
+        cancelled = await execute_command(
+            "runtime.cancel_turn",
+            cfg.id,
+            refs,
+            command_id="worker-cancel",
+        )
+        assert permission == {
+            "ok": True, "delivered": True, "completed": False,
+        }
+        assert cancelled == {
+            "ok": True, "delivered": True, "completed": False,
+        }
+
+        await fake.queue.put(HarnessEvent(
+            type="turn.completed",
+            driver="codex",
+            session_ref=SessionRef("native-session"),
+            turn_ref=fake.driver_turn,
+            data={"outcome": "cancelled"},
+        ))
+        await facade.manager.wait_terminal(started.turn_ref)
+        rows = [row.event for row in outbox.prefix()]
+        assert rows
+        assert all(row["scope"] == {"kind": "operator"} for row in rows)
+        assert any(
+            row["type"] == "permission.updated"
+            and row["payload"]["state"] == "approved"
+            for row in rows
+        )
+        assert rows[-1]["type"] == "turn.finished"
+        assert rows[-1]["payload"]["outcome"] == "cancelled"
+    finally:
+        await facade.aclose()
+        outbox.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "harness", "provider", "expected"),
+    [
+        ("cli-local", "hermes", "anthropic", "LocalCLIAdapter"),
+        ("cli-docker", "claude-code", "anthropic", "DockerCLIAdapter"),
+        ("cli-docker", "codex", "openai", "DockerCLIAdapter"),
+        ("cli-docker", "hermes", "anthropic", "DockerCLIAdapter"),
+        ("cli-docker", "gemini-cli", "google", "DockerCLIAdapter"),
+        ("sdk-local", "", "anthropic", "SDKAdapter"),
+    ],
+)
+def test_unpromoted_runtime_matrix_retains_legacy_adapter_classes(
+    tmp_path, monkeypatch, kind, harness, provider, expected,
+):
+    import types
+    from puffo_agent.portal.state import DaemonConfig, RuntimeConfig
+    from puffo_agent.portal.worker import build_adapter
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    if kind == "sdk-local":
+        sdk = types.ModuleType("claude_agent_sdk")
+        sdk.query = lambda *_args, **_kwargs: None
+        for name in (
+            "ClaudeAgentOptions", "AssistantMessage", "TextBlock",
+            "ToolUseBlock", "ResultMessage",
+        ):
+            setattr(sdk, name, type(name, (), {}))
+        monkeypatch.setitem(sys.modules, "claude_agent_sdk", sdk)
+    cfg = AgentConfig(
+        id=f"matrix-{kind}-{harness or 'sdk'}",
+        runtime=RuntimeConfig(
+            kind=kind, harness=harness, provider=provider, api_key="test-key",
+        ),
+    )
+    daemon = DaemonConfig()
+    daemon.google.api_key = "test-key"
+    assert type(build_adapter(daemon, cfg)).__name__ == expected
+
+
+def test_local_gemini_retains_existing_rejection(tmp_path, monkeypatch):
+    from puffo_agent.portal.state import DaemonConfig, RuntimeConfig
+    from puffo_agent.portal.worker import build_adapter
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    cfg = AgentConfig(
+        id="local-gemini",
+        runtime=RuntimeConfig(
+            kind="cli-local", harness="gemini-cli",
+            provider="google", api_key="test-key",
+        ),
+    )
+    with pytest.raises(RuntimeError, match="not supported.*cli-local"):
+        build_adapter(DaemonConfig(), cfg)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["codex", "claude-code"])
+async def test_supported_local_promotion_registers_before_return_and_reload_aligns_identity(
+    tmp_path, monkeypatch, harness,
+):
+    from puffo_agent.agent.harness.driver import (
+        CancelReceipt,
+        HarnessDriver,
+        HarnessEvent,
+        RuntimeOpened,
+        RuntimeRef,
+        RuntimeSpec,
+        SessionRef,
+        TurnInput,
+        TurnRef,
+        TurnStarted,
+        UnsupportedCapability,
+    )
+    from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
+    from puffo_agent.agent.harness.runtime_manager import (
+        RuntimeManagerAdapter,
+        get_runtime_manager,
+    )
+    from puffo_agent.agent.runtime_event_outbox import RuntimeEventOutbox
+    from puffo_agent.portal.control.client import execute_command
+    from puffo_agent.portal.state import DaemonConfig, RuntimeConfig
+    from puffo_agent.portal.worker import (
+        Worker,
+        _promote_supported_local_driver,
+        build_adapter,
+    )
+
+    class ReloadableDriver(HarnessDriver):
+        def __init__(self):
+            self.open_count = 0
+            self.start_calls = 0
+            self.queue = asyncio.Queue()
+            self.driver_turn = TurnRef("driver-turn")
+
+        async def open(self, spec: RuntimeSpec, resume=None):
+            self.open_count += 1
+            self.queue = asyncio.Queue()
+            native = f"native-session-{self.open_count}"
+            await self.queue.put(HarnessEvent(
+                type="session.opened",
+                driver=harness,
+                session_ref=SessionRef(native),
+                native_session_id=native,
+            ))
+            return RuntimeOpened(
+                RuntimeRef(f"runtime-{self.open_count}"),
+                SessionRef(native),
+                native,
+                bool(resume),
+                CODEX_CAPABILITIES,
+                SimpleNamespace(),
+            )
+
+        async def start_turn(self, input: TurnInput):
+            self.start_calls += 1
+            self.driver_turn = TurnRef(f"driver-turn-{self.open_count}")
+            return TurnStarted(
+                self.driver_turn, f"native-turn-{self.open_count}"
+            )
+
+        async def steer_turn(self, turn, input):
+            return UnsupportedCapability("steer")
+
+        async def cancel_turn(self, turn):
+            return CancelReceipt(True, turn)
+
+        async def context_status(self):
+            return UnsupportedCapability("context_status")
+
+        async def compact(self, request):
+            return UnsupportedCapability("compact")
+
+        async def resolve_permission(self, request, decision):
+            return UnsupportedCapability("permission")
+
+        def events(self):
+            async def iterate():
+                while True:
+                    event = await self.queue.get()
+                    if event is None:
+                        return
+                    yield event
+            return iterate()
+
+        async def close(self):
+            await self.queue.put(None)
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    cfg = AgentConfig(
+        id=f"promoted-{harness}",
+        puffo_core=PuffoCoreConfig(
+            server_url="https://example.test",
+            slug="agent-test",
+            device_id="device-test",
+            space_id="space-test",
+        ),
+        runtime=RuntimeConfig(kind="cli-local", harness=harness),
+    )
+
+    def make_adapter():
+        adapter = build_adapter(DaemonConfig(), cfg)
+        adapter.workspace_dir = str(tmp_path)
+        adapter._verify = lambda: None
+
+        async def no_install():
+            return None
+
+        async def no_warm(_system_prompt):
+            return None
+
+        adapter._install_desired = no_install
+        adapter.warm = no_warm
+        prepared = SimpleNamespace(
+            argv=[harness, "app-server"],
+            env={},
+            extra_args=[],
+            get_provider_session_id=lambda: None,
+            build_command=lambda *_args: [harness],
+        )
+        adapter._ensure_codex_session = lambda: prepared
+        adapter._ensure_session = lambda: prepared
+        return adapter
+
+    import puffo_agent.agent.harness as harness_module
+    import puffo_agent.portal.worker as worker_module
+
+    # Exercise the real Worker readiness gate. Pause inside the gate after it
+    # sets _warm_done so the assertion observes the exact adapter/registry
+    # state exposed to wait_warm() callers.
+    adapter = make_adapter()
+    driver = ReloadableDriver()
+    monkeypatch.setattr(harness_module, "build_driver", lambda _name: driver)
+    monkeypatch.setattr(worker_module, "build_adapter", lambda *_args: adapter)
+    monkeypatch.setattr(
+        worker_module,
+        "_build_puffo_core_client",
+        lambda *_args, **_kwargs: SimpleNamespace(),
+    )
+    worker = Worker(DaemonConfig(), cfg)
+    gate_pause = asyncio.Event()
+    original_gate = Worker._run_post_warm_gate
+
+    async def pausing_gate(agent_id):
+        await original_gate(worker, agent_id)
+        await gate_pause.wait()
+
+    worker._run_post_warm_gate = pausing_gate
+    worker.start()
+    assert await worker.wait_warm(timeout=1.0) is True
+    assert isinstance(worker._adapter, RuntimeManagerAdapter)
+    assert get_runtime_manager(cfg.id) is worker._adapter.manager
+    await worker.stop()
+
+    adapter = make_adapter()
+    driver = ReloadableDriver()
+    monkeypatch.setattr(harness_module, "build_driver", lambda _name: driver)
+    outbox = RuntimeEventOutbox(tmp_path / f"{harness}.db")
+    facade = await _promote_supported_local_driver(
+        adapter,
+        cfg,
+        system_prompt="system",
+        outbox=outbox,
+        logical_session_ref="logical-session-1",
+    )
+    assert isinstance(facade, RuntimeManagerAdapter)
+    assert get_runtime_manager(cfg.id) is facade.manager
+    for _ in range(100):
+        if outbox.state().get("session_ref") == "logical-session-1":
+            break
+        await asyncio.sleep(0)
+    assert outbox.state()["native_session_id"] == "native-session-1"
+
+    old_session = str(facade.manager.session_ref)
+    await facade.reload("system", with_session=True)
+    new_session = str(facade.manager.session_ref)
+    assert new_session != old_session
+    for _ in range(100):
+        if outbox.state().get("session_ref") == new_session:
+            break
+        await asyncio.sleep(0)
+    assert outbox.state()["session_ref"] == new_session
+    assert outbox.state()["native_session_id"] == "native-session-2"
+
+    started = await facade.manager.start_turn(TurnInput("hello"))
+    await driver.queue.put(HarnessEvent(
+        type="turn.started",
+        driver=harness,
+        session_ref=SessionRef("native-session-2"),
+        turn_ref=driver.driver_turn,
+        native_session_id="native-session-2",
+        native_turn_id="native-turn-2",
+    ))
+    stale = await execute_command(
+        "runtime.cancel_turn",
+        cfg.id,
+        {"session_ref": old_session, "turn_ref": str(started.turn_ref)},
+        command_id=f"stale-{harness}",
+    )
+    current = await execute_command(
+        "runtime.cancel_turn",
+        cfg.id,
+        {"session_ref": new_session, "turn_ref": str(started.turn_ref)},
+        command_id=f"current-{harness}",
+    )
+    assert stale["error_code"] == "stale_session_ref"
+    assert current == {"ok": True, "delivered": True, "completed": False}
+    for _ in range(100):
+        initial = [row.event for row in outbox.prefix()]
+        if [row["type"] for row in initial[:2]] == [
+            "turn.started", "activity.updated",
+        ]:
+            break
+        await asyncio.sleep(0)
+    assert [row["type"] for row in initial[:2]] == [
+        "turn.started", "activity.updated",
+    ]
+    assert initial[1]["payload"] == {"text": "Working"}
+    assert driver.start_calls == 1
+    await facade.aclose()
+    outbox.close()
+
+    # The real RuntimeManager callback must reject before touching the Driver
+    # or durable active-turn state when there are not enough rows for the
+    # required start/activity/terminal lifecycle.
+    blocked_driver = ReloadableDriver()
+    monkeypatch.setattr(
+        harness_module, "build_driver", lambda _name: blocked_driver,
+    )
+    blocked_outbox = RuntimeEventOutbox(
+        tmp_path / f"{harness}-blocked.db", max_rows=2,
+    )
+    blocked = await _promote_supported_local_driver(
+        make_adapter(), cfg, system_prompt="system", outbox=blocked_outbox,
+        logical_session_ref="logical-session-blocked",
+    )
+    try:
+        with pytest.raises(Exception, match="outbox is at capacity"):
+            await blocked.manager.start_turn(TurnInput("blocked"))
+        assert blocked_driver.start_calls == 0
+        assert blocked_outbox.prefix() == []
+        assert blocked_outbox.state().get("active_turn_ref", "") == ""
+    finally:
+        await blocked.aclose()
+        blocked_outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_legacy_worker_global_runtime_projects_and_uploads_start_activity_terminal(
+    tmp_path, monkeypatch,
+):
+    """The UnsupportedDriver fallback retains the Worker-owned projection bridge.
+
+    This intentionally reaches the nested bridge through the same
+    ``client.global_runtime.run_turn`` callback used by the live Inbox rather
+    than extracting or duplicating it in a unit helper.
+    """
+    from puffo_agent.agent.core import PuffoAgent
+    from puffo_agent.agent.harness import UnsupportedDriver
+    from puffo_agent.agent.message_store import MessageStore
+    from puffo_agent.agent.runtime_event_outbox import runtime_event_outbox_path
+    from puffo_agent.portal.state import DaemonConfig, RuntimeConfig
+    from puffo_agent.portal.worker import Worker, build_adapter
+    import puffo_agent.agent.harness as harness_module
+    import puffo_agent.portal.profile_sync as profile_sync
+    import puffo_agent.portal.worker as worker_module
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    cfg = AgentConfig(
+        id="legacy-runtime-events",
+        puffo_core=PuffoCoreConfig(
+            server_url="https://example.test",
+            slug="legacy-agent",
+            device_id="legacy-device",
+            space_id="legacy-space",
+        ),
+        runtime=RuntimeConfig(kind="cli-local", harness="codex"),
+    )
+
+    release_append = asyncio.Event()
+    append_started = asyncio.Event()
+    append_bodies = []
+    provider_calls = []
+
+    class HoldingHttp:
+        keyless = False
+
+        async def post(self, path, body):
+            append_bodies.append((path, body))
+            append_started.set()
+            await release_append.wait()
+            return {
+                "accepted": [
+                    {"event_id": event["event_id"]}
+                    for event in body["events"]
+                ],
+            }
+
+    class Client:
+        slug = "legacy-agent"
+        keystore = SimpleNamespace()
+        http = HoldingHttp()
+
+        def __init__(self, name="legacy-messages"):
+            self.store = MessageStore(str(tmp_path / f"{name}.db"))
+            self.global_runtime = None
+
+        async def listen(self):
+            await asyncio.Event().wait()
+
+        async def recover_pending_delivery(self, *_args, **_kwargs):
+            return None
+
+        async def stop(self):
+            return None
+
+    client = Client()
+
+    def make_adapter():
+        adapter = build_adapter(DaemonConfig(), cfg)
+        adapter.workspace_dir = str(tmp_path)
+        adapter._verify = lambda: None
+
+        async def no_install():
+            return None
+
+        async def no_warm(_system_prompt):
+            return None
+
+        adapter._install_desired = no_install
+        adapter.warm = no_warm
+        adapter._ensure_codex_session = lambda: SimpleNamespace(
+            argv=["codex", "app-server"], env={},
+            get_provider_session_id=lambda: "native-legacy-session",
+        )
+        return adapter
+
+    async def no_profile_sync(*_args, **_kwargs):
+        return None
+
+    async def no_status_loop():
+        return None
+
+    class NoopReporter:
+        async def run_heartbeat_loop(self):
+            await no_status_loop()
+
+        def stop(self):
+            return None
+
+    async def spy_handle_global_inbox_turn(self, planned, on_progress=None):
+        provider_calls.append(planned)
+        if on_progress is not None:
+            await on_progress("safe legacy output")
+        return "safe legacy reply"
+
+    monkeypatch.setattr(harness_module, "build_driver", lambda _name: UnsupportedDriver("codex"))
+    monkeypatch.setattr(worker_module, "build_adapter", lambda *_args: make_adapter())
+    monkeypatch.setattr(worker_module, "_build_puffo_core_client", lambda *_args, **_kwargs: client)
+    monkeypatch.setattr(profile_sync, "sync_full_profile", no_profile_sync)
+    monkeypatch.setattr(PuffoAgent, "handle_global_inbox_turn", spy_handle_global_inbox_turn)
+
+    worker = Worker(DaemonConfig(), cfg)
+    worker._build_status_reporter = lambda _client: NoopReporter()
+    worker.start()
+    try:
+        for _ in range(200):
+            if client.global_runtime is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert client.global_runtime is not None
+
+        await client.global_runtime.run_turn(SimpleNamespace(
+            provider_input="legacy bridge input", targets=(),
+        ))
+        assert len(provider_calls) == 1
+
+        outbox_path = runtime_event_outbox_path(
+            worker_module.agent_dir(cfg.id),
+        )
+        for _ in range(200):
+            if append_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert append_started.is_set()
+
+        # The upload is deliberately held: a second connection observes the
+        # durable start/activity/terminal sequence before acknowledgement may
+        # delete it.
+        with sqlite3.connect(outbox_path) as connection:
+            rows = connection.execute(
+                "SELECT event_json FROM events ORDER BY sequence"
+            ).fetchall()
+        durable = [json.loads(row[0]) for row in rows]
+        assert [event["type"] for event in durable] == [
+            "turn.started", "activity.updated", "output.updated",
+            "output.updated", "output.updated", "turn.finished",
+        ]
+        assert durable[1]["payload"] == {"text": "Working"}
+        assert durable[-1]["payload"]["outcome"] == "succeeded"
+
+        release_append.set()
+        for _ in range(200):
+            if append_bodies:
+                break
+            await asyncio.sleep(0.01)
+        flattened = [
+            event for _path, body in append_bodies
+            for event in body.get("events", [])
+        ]
+        assert [event["type"] for event in flattened] == [
+            "turn.started", "activity.updated", "output.updated",
+            "output.updated", "output.updated", "turn.finished",
+        ]
+        for _ in range(200):
+            with sqlite3.connect(outbox_path) as connection:
+                remaining = connection.execute(
+                    "SELECT COUNT(*) FROM events"
+                ).fetchone()[0]
+            if remaining == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert remaining == 0
+    finally:
+        release_append.set()
+        await worker.stop()
+        await client.store.close()
+
+    # Run the retained bridge a second time with only two rows available.
+    # Admission occurs before the nested Provider call, so no durable row,
+    # append request, or global active-turn state may be created.
+    from puffo_agent.agent import runtime_event_outbox as outbox_module
+
+    original_outbox = outbox_module.RuntimeEventOutbox
+    monkeypatch.setattr(
+        outbox_module,
+        "RuntimeEventOutbox",
+        lambda path: original_outbox(path, max_rows=2),
+    )
+    limited_client = Client("legacy-limited-messages")
+    monkeypatch.setattr(
+        worker_module,
+        "_build_puffo_core_client",
+        lambda *_args, **_kwargs: limited_client,
+    )
+    limited_worker = Worker(DaemonConfig(), cfg)
+    limited_worker._build_status_reporter = lambda _client: NoopReporter()
+    limited_worker.start()
+    try:
+        for _ in range(200):
+            if limited_client.global_runtime is not None:
+                break
+            await asyncio.sleep(0.01)
+        assert limited_client.global_runtime is not None
+        with pytest.raises(Exception, match="outbox is at capacity"):
+            await limited_client.global_runtime.run_turn(SimpleNamespace(
+                provider_input="rejected legacy input", targets=(),
+            ))
+        assert len(provider_calls) == 1
+        assert limited_client.global_runtime.active.turn_id == ""
+        limited_path = runtime_event_outbox_path(
+            worker_module.agent_dir(cfg.id),
+        )
+        with sqlite3.connect(limited_path) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM events").fetchone() == (0,)
+        assert len(append_bodies) == 1
+    finally:
+        await limited_worker.stop()
+        await limited_client.store.close()
 
 
 # ── Config builder tests ───────────────────────────────────────────
@@ -347,39 +1067,23 @@ async def test_puffo_core_client_send_fallback_message_encrypts():
     # cache from inbound envelopes + membership events; the smoke
     # test seeds it directly.
     client._channel_space["ch_abc"] = "sp_test"
-    # E2EE branch: mark the turn's bundle as encrypted (plaintext is
-    # the default otherwise — covered in test_plaintext_send).
-    from puffo_agent.agent import send_mode
-    send_mode.note_turn_bundle(["bot-0001"], True)
-    try:
-        await client.send_fallback_message("ch_abc", "hello world", root_id="")
-    finally:
-        send_mode.note_turn_bundle(["bot-0001"], False)
+    class Delegate:
+        def __init__(self):
+            self.requests = []
 
-    # Channel resolution: members endpoint -> /certs/sync.
-    assert any(
-        m == "GET" and p == "/spaces/sp_test/channels/ch_abc/members"
-        for m, p in http.calls
+        async def send(self, request):
+            self.requests.append(request)
+            return {"state": "sent", "attempted": True, "envelope_id": "coordinated"}
+
+    delegate = Delegate()
+    client.send_delegate = delegate
+    result = await client.send_fallback_message(
+        "ch_abc", "hello world", root_id=""
     )
-    assert any(m == "GET" and p.startswith("/certs/sync") for m, p in http.calls)
-    assert any(("POST", "/messages") == (m, p) for m, p in http.calls)
-
-    assert len(http.post_bodies) == 1
-    # Body IS the envelope; no ``{"envelope": ...}`` wrapper.
-    envelope = http.post_bodies[0]
-    assert envelope["type"] == "message_envelope"
-    assert envelope["version"] == 1
-    assert envelope["envelope_kind"] == "channel"
-    assert envelope["sender_slug"] == "bot-0001"
-    assert envelope["channel_id"] == "ch_abc"
-    assert envelope["space_id"] == "sp_test"
-    assert "content_ciphertext" in envelope
-    assert "content_nonce" in envelope
-    assert len(envelope["recipients"]) == 1
-    r = envelope["recipients"][0]
-    assert r["device_id"] == "dev_recipient"
-    assert "hpke_enc" in r
-    assert "wrapped_content_key" in r
+    assert result["state"] == "sent"
+    assert delegate.requests[0].destination == "ch_abc"
+    assert delegate.requests[0].text == "hello world"
+    assert http.calls == []
     await ms.close()
 
 

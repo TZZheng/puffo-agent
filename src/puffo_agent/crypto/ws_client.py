@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -21,6 +22,7 @@ logger = logging.getLogger(__name__)
 CONNECT_TIMEOUT = 5.0
 MAX_BACKOFF = 30
 INITIAL_BACKOFF = 1
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 def _http_to_ws(url: str) -> str:
@@ -103,11 +105,19 @@ class PuffoCoreWsClient:
         frame = self._build_connect_frame()
         await ws.send(frame)
 
-        raw = await asyncio.wait_for(ws.recv(), timeout=CONNECT_TIMEOUT)
-        resp = json.loads(raw)
-        if resp.get("type") != "connected":
-            raise ConnectionError(f"Unexpected handshake response: {resp}")
-        return resp["session_id"]
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=CONNECT_TIMEOUT)
+            resp = json.loads(raw)
+            if not isinstance(resp, Mapping) or resp.get("type") != "connected":
+                raise ValueError
+            session_id = resp.get("session_id")
+            if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(
+                session_id
+            ):
+                raise ValueError
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise ConnectionError("websocket handshake protocol error") from exc
+        return session_id
 
     async def _catchup(self) -> None:
         """Drain `/messages/pending` — rows the server held while we
@@ -293,24 +303,54 @@ class PuffoCoreWsClient:
             try:
                 await self.connect_once()
                 backoff = INITIAL_BACKOFF
-            except (
-                websockets.exceptions.ConnectionClosed,
-                ConnectionError,
-                OSError,
-                asyncio.TimeoutError,
-            ) as exc:
+            except websockets.exceptions.ConnectionClosed as exc:
                 if not self._running:
                     break
                 logger.warning(
-                    "[%s] WS disconnected (%s: %s), reconnecting in %ds",
-                    self.slug, type(exc).__name__, exc, backoff,
+                    "[%s] WS reconnect category=connection_closed exception=%s "
+                    "retry_delay=%ds",
+                    self.slug, type(exc).__name__, backoff,
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
-            except Exception:
+            except asyncio.TimeoutError as exc:
                 if not self._running:
                     break
-                logger.exception("[%s] WS unexpected error, reconnecting in %ds", self.slug, backoff)
+                logger.warning(
+                    "[%s] WS reconnect category=timeout exception=%s "
+                    "retry_delay=%ds",
+                    self.slug, type(exc).__name__, backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+            except ConnectionError as exc:
+                if not self._running:
+                    break
+                logger.warning(
+                    "[%s] WS reconnect category=protocol exception=%s "
+                    "retry_delay=%ds",
+                    self.slug, type(exc).__name__, backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+            except OSError as exc:
+                if not self._running:
+                    break
+                logger.warning(
+                    "[%s] WS reconnect category=transport exception=%s "
+                    "retry_delay=%ds",
+                    self.slug, type(exc).__name__, backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+            except Exception as exc:
+                if not self._running:
+                    break
+                logger.warning(
+                    "[%s] WS reconnect category=unexpected exception=%s "
+                    "retry_delay=%ds",
+                    self.slug, type(exc).__name__, backoff,
+                )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
         self._ws = None

@@ -14,6 +14,7 @@ import os
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
@@ -27,7 +28,9 @@ from .inbox_scheduler import (
     MAX_ESTIMATED_TOKENS,
     MAX_FORMATTED_BYTES,
     InboxCoalescer,
+    InboxNoticeDelivery,
     InboxPlanner,
+    NoticeDeliveryCapability,
     PlannedBatch,
 )
 from .message_store import MessageStore, ProcessingState, StoredMessage
@@ -124,6 +127,8 @@ class PlannedTurn:
     formatted_bytes: int
     wrapper_overhead_bytes: int
     more_available: bool = False
+    notice_generation: int = 0
+    requires_encryption: bool = False
 
     @property
     def candidate(self) -> AdmissionCandidate:
@@ -339,16 +344,17 @@ class TrackingSendDelegate:
                 self.attempts.destinations, self.attempts.states
             )
         )
+        is_dm = destination.startswith("@")
         transport = (
             "keyless"
             if bool(getattr(getattr(self.coordinator, "http_client", None), "keyless", False))
             else "dm"
-            if destination.startswith("@")
+            if is_dm
             else "channel"
         )
         mode = (
             "send_anyway" if send_anyway else "require_current"
-        ) if transport == "channel" else None
+        ) if not is_dm else None
         attempt_phase = "reconsider" if prior_held else "initial"
         self.attempts.record(destination, "attempting")
         attempt = self.attempts.attempts
@@ -360,10 +366,15 @@ class TrackingSendDelegate:
             else None
         )
         started = time.monotonic()
+        send_attempt_id = (
+            f"{active.turn_id}:{attempt}"
+            if active is not None and active.turn_id
+            else f"unbound:{attempt}"
+        )
         log_runtime_event(
             logger,
             "send.attempted",
-            level=logging.DEBUG,
+            level=logging.INFO,
             agent_id=runtime.agent_id if runtime is not None else None,
             turn_id=active.turn_id if active is not None else None,
             provider_session_id=(
@@ -380,6 +391,7 @@ class TrackingSendDelegate:
             attempt_phase=attempt_phase,
             transport=transport,
             attempt=attempt,
+            send_attempt_id=send_attempt_id,
             state="attempting",
         )
         try:
@@ -406,13 +418,64 @@ class TrackingSendDelegate:
                 attempt_phase=attempt_phase,
                 transport=transport,
                 attempt=attempt,
+                send_attempt_id=send_attempt_id,
                 state="failed",
                 duration_ms=int((time.monotonic() - started) * 1000),
                 error_category="delegate_exception",
             )
             raise
+        reconsideration_audit = result.pop("_reconsideration_audit", {})
+        if not isinstance(reconsideration_audit, Mapping):
+            reconsideration_audit = {}
         state = str(result.get("state", "failed"))
         self.attempts.states[-1] = state
+        if send_anyway:
+            eligible = bool(reconsideration_audit.get("eligible"))
+            if not reconsideration_audit:
+                eligible = (
+                    result.get("error_kind") != "reconsideration_ineligible"
+                )
+            log_runtime_event(
+                logger,
+                (
+                    "reconsideration.blocked"
+                    if not eligible
+                    else "reconsideration.eligible"
+                ),
+                agent_id=runtime.agent_id if runtime is not None else None,
+                turn_id=(
+                    reconsideration_audit.get("turn_id")
+                    or (active.turn_id if active is not None else None)
+                ),
+                provider_session_id=(
+                    reconsideration_audit.get("provider_session_id")
+                    or (
+                        active.provider_session_id
+                        if active is not None else None
+                    )
+                ),
+                provider_turn_id=(
+                    active.provider_turn_id if active is not None else None
+                ),
+                space_id=route.space_id if route is not None else None,
+                channel_id=route.channel_id if route is not None else None,
+                envelope_id=reconsideration_audit.get(
+                    "latest_envelope_id"
+                ),
+                latest_seq=reconsideration_audit.get("latest_seq"),
+                seen_seq=reconsideration_audit.get("admitted_seq"),
+                transport=transport,
+                mode=mode,
+                send_attempt_id=send_attempt_id,
+                outcome="accepted" if eligible else "rejected",
+                decision_reason=(
+                    reconsideration_audit.get("decision_reason")
+                    or (
+                        "synchronized_and_admitted"
+                        if eligible else "reconsideration_ineligible"
+                    )
+                ),
+            )
         if state == "held":
             source = getattr(self.coordinator, "held_recovery_source", None)
             runtime = getattr(source, "runtime", None)
@@ -428,6 +491,20 @@ class TrackingSendDelegate:
                     result["continuation_correlation_key"] = (
                         staging.correlation_key
                     )
+            log_runtime_event(
+                logger,
+                "held.synchronized",
+                agent_id=runtime.agent_id if runtime is not None else None,
+                turn_id=active.turn_id if active is not None else None,
+                provider_session_id=(
+                    active.provider_session_id if active is not None else None
+                ),
+                send_attempt_id=send_attempt_id,
+                latest_seq=result.get("latest_seq"),
+                outcome=(
+                    "available" if result.get("synchronized") else "unavailable"
+                ),
+            )
         event = {
             "held": "send.held",
             "sent": "send.committed",
@@ -463,6 +540,7 @@ class TrackingSendDelegate:
             attempt_phase=attempt_phase,
             transport=transport,
             attempt=attempt,
+            send_attempt_id=send_attempt_id,
             state=state,
             duration_ms=int((time.monotonic() - started) * 1000),
             error_category=result.get("error_kind"),
@@ -613,6 +691,8 @@ class HeldRecoverySource:
             return ()
         staged_ids = planned.message_ids
         correlation_key = planned.planning_cycle_key
+        staged_turn_id = active.turn_id
+        staged_provider_session_id = provider_session_id
         planned_server_seqs = [
             row.server_seq
             for row in planned.items
@@ -632,10 +712,19 @@ class HeldRecoverySource:
             nonlocal fired
             if fired or event.planning_cycle_key != planned.planning_cycle_key:
                 return
+            current = self.runtime.active
+            if (
+                current.turn_id != staged_turn_id
+                or current.provider_session_id != staged_provider_session_id
+                or event.provider_session_id != staged_provider_session_id
+            ):
+                raise RuntimeError(
+                    "held continuation crossed the staged provider Turn"
+                )
             fired = True
             existing_rows = await self.runtime.store.get_in_turn_messages(
-                active.turn_id,
-                provider_session_id,
+                staged_turn_id,
+                staged_provider_session_id,
             )
             existing_ids = {row.envelope_id for row in existing_rows}
             new_ids = tuple(
@@ -646,22 +735,22 @@ class HeldRecoverySource:
             if new_ids:
                 run = await self.runtime.store.admit_messages(
                     new_ids,
-                    turn_id=active.turn_id,
-                    provider_session_id=provider_session_id,
+                    turn_id=staged_turn_id,
+                    provider_session_id=staged_provider_session_id,
                 )
-                active.message_ids[:] = list(run.message_ids)
+                current.message_ids[:] = list(run.message_ids)
             else:
-                active.message_ids[:] = [
+                current.message_ids[:] = [
                     row.envelope_id for row in existing_rows
                 ]
             rows = await self.runtime.store.get_in_turn_messages(
-                active.turn_id,
-                provider_session_id,
+                staged_turn_id,
+                staged_provider_session_id,
             )
             if rows:
                 self.runtime._write_current_turn(
                     self.runtime._reconstruct_exact_turn(
-                        turn_id=active.turn_id,
+                        turn_id=staged_turn_id,
                         rows=rows,
                     )
                 )
@@ -746,6 +835,8 @@ class GlobalInboxRuntime:
         held_catchup: Callable[[str], Awaitable[bool]] | None = None,
         send_mode_keys: Sequence[str] = (),
         agent_id: str = "",
+        notice_delivery: InboxNoticeDelivery | None = None,
+        runtime_event_outbox: Any | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -773,6 +864,10 @@ class GlobalInboxRuntime:
             dict.fromkeys(key for key in send_mode_keys if key)
         )
         self.agent_id = agent_id
+        self.notice_delivery = notice_delivery or InboxNoticeDelivery(
+            NoticeDeliveryCapability.NEXT_TURN
+        )
+        self.runtime_event_outbox = runtime_event_outbox
         self.send_delegate: TrackingSendDelegate | None = None
         self.held_recovery_source = HeldRecoverySource(
             self,
@@ -789,6 +884,40 @@ class GlobalInboxRuntime:
 
     def notify_delivery(self) -> None:
         self.held_recovery_source.notify_delivery()
+
+    def note_input_ready(self, turn_id: str) -> None:
+        self.notice_delivery.note_input_ready(turn_id)
+
+    async def offer_busy_notice(self, *, turn_id: str) -> bool:
+        """Offer metadata-only work to the named active Turn when safe."""
+        if turn_id != self.active.turn_id:
+            return False
+        planned = await self.plan_pending()
+        if planned is None:
+            return False
+        decision = await self.context_controller.decide(
+            planned.candidate, self._replacement_candidate
+        )
+        if decision.outcome is not DecisionOutcome.ADMIT:
+            return False
+        planned = decision.candidate.payload
+        if not isinstance(planned, PlannedTurn):
+            return False
+        offer = getattr(self.adapter, "offer_inbox_notice", None)
+        if not callable(offer):
+            return False
+
+        async def deliver() -> bool:
+            return bool(await offer(turn_id, planned.provider_input))
+
+        accepted = await self.notice_delivery.offer(
+            named_turn_id=turn_id,
+            active_turn_id=self.active.turn_id,
+            deliver=deliver,
+        )
+        if not accepted:
+            return False
+        return await self.store.mark_notice_delivered(planned.notice_generation)
 
     def resolve_active_send_route(
         self,
@@ -819,6 +948,15 @@ class GlobalInboxRuntime:
             if route.kind == "channel":
                 return route
         return None
+
+    def resolve_plain_fallback_route(self) -> MessageRoute | None:
+        """Return an implicit route only when admitted context is unambiguous."""
+        unique: dict[tuple[str, ...], MessageRoute] = {}
+        for route in self.active.routes:
+            unique.setdefault(route.target, route)
+        if len(unique) != 1:
+            return None
+        return next(iter(unique.values()))
 
     @staticmethod
     def _batch_route_projection(planned: PlannedTurn) -> list[dict[str, Any]]:
@@ -1042,6 +1180,172 @@ class GlobalInboxRuntime:
             "through_envelope_id": through_envelope_id,
         }
 
+    async def read_inbox(
+        self,
+        *,
+        target: str = "",
+        cursor: str = "",
+        limit: int = 50,
+        tool_arguments: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Stage one content page; only its matching provider receipt admits it."""
+        active_turn_id = self.active.turn_id
+        provider_session_id = self.active.provider_session_id
+        if not active_turn_id or not provider_session_id:
+            raise RuntimeError("no active provider turn for Inbox read")
+        page = await self.store.read_inbox_page(
+            target=target, cursor=cursor, limit=limit
+        )
+        blocks: list[str] = []
+        selected: list[StoredMessage] = []
+        byte_count = 0
+        for item in page.items:
+            block = self.formatter(item)
+            block_bytes = len(block.encode("utf-8"))
+            if byte_count + block_bytes > MAX_FORMATTED_BYTES:
+                break
+            blocks.append(block)
+            selected.append(item)
+            byte_count += block_bytes
+        truncated = len(selected) < len(page.items)
+        if truncated:
+            # Re-page from the last actually returned item while retaining the
+            # store-pinned ceiling/generation.
+            if not selected:
+                raise RuntimeError("oldest Inbox message exceeds the page byte guard")
+            decoded = self.store._decode_inbox_cursor(
+                page.next_cursor
+                or self.store._encode_inbox_cursor(
+                    {
+                        "v": 1,
+                        "target": page.target,
+                        "generation": page.snapshot_generation,
+                        "ceiling": list(
+                            self.store._inbox_order(page.items[-1])
+                        ),
+                        "last": [-1, -1, -1, ""],
+                    }
+                )
+            )
+            decoded["last"] = list(self.store._inbox_order(selected[-1]))
+            next_cursor = self.store._encode_inbox_cursor(decoded)
+            has_more = True
+            remaining_count = page.remaining_count + len(page.items) - len(selected)
+        else:
+            next_cursor = page.next_cursor
+            has_more = page.has_more
+            remaining_count = page.remaining_count
+
+        correlation_receipt = ""
+        if selected:
+            correlation_key = f"inbox_read_{uuid.uuid4().hex}"
+            correlation_receipt = uuid.uuid4().hex
+            fired = False
+            ids = tuple(item.envelope_id for item in selected)
+            routes = tuple(route_for(item) for item in selected)
+
+            async def admit_read(event: ProviderAdmissionEvent) -> None:
+                nonlocal fired
+                if fired or event.planning_cycle_key != correlation_key:
+                    return
+                if (
+                    self.active.turn_id != active_turn_id
+                    or self.active.provider_session_id != provider_session_id
+                    or event.provider_session_id != provider_session_id
+                ):
+                    raise RuntimeError("Inbox read admission crossed the active Turn")
+                run = await self.store.admit_messages(
+                    ids,
+                    turn_id=active_turn_id,
+                    provider_session_id=provider_session_id,
+                )
+                fired = True
+                self.active.message_ids[:] = list(run.message_ids)
+                self.active.routes.extend(routes)
+                turn_rows = await self.store.get_in_turn_messages(
+                    active_turn_id,
+                    provider_session_id,
+                )
+                if turn_rows:
+                    self._write_current_turn(
+                        self._reconstruct_exact_turn(
+                            turn_id=active_turn_id,
+                            rows=turn_rows,
+                        )
+                    )
+                for item, route in zip(selected, routes):
+                    if item.server_seq is not None and route.kind != "dm":
+                        key = (route.space_id, route.channel_id)
+                        self.active.through_by_channel[key] = max(
+                            self.active.through_by_channel.get(key, 0),
+                            item.server_seq,
+                        )
+                    log_runtime_event(
+                        logger,
+                        "inbox.row_in_turn",
+                        agent_id=self.agent_id,
+                        turn_id=active_turn_id,
+                        provider_session_id=provider_session_id,
+                        provider_turn_id=event.provider_turn_id,
+                        tool_call_id=event.tool_call_id,
+                        correlation_key=correlation_key,
+                        message_id=item.envelope_id,
+                        server_seq=item.server_seq,
+                        target=self.store.target_projection(item),
+                        notice_generation=page.snapshot_generation,
+                        outcome="in_turn",
+                    )
+                log_runtime_event(
+                    logger,
+                    "inbox.read_admitted",
+                    agent_id=self.agent_id,
+                    turn_id=active_turn_id,
+                    provider_session_id=provider_session_id,
+                    provider_turn_id=event.provider_turn_id,
+                    correlation_key=correlation_key,
+                    notice_generation=page.snapshot_generation,
+                    message_count=len(ids),
+                    outcome="admitted",
+                )
+
+            register = getattr(
+                self.adapter, "register_continuation_callback", None
+            )
+            if not callable(register):
+                raise RuntimeError("provider cannot correlate Inbox tool results")
+            arguments = dict(
+                tool_arguments
+                if tool_arguments is not None
+                else {"target": target, "cursor": cursor, "limit": limit}
+            )
+            register(
+                admit_read,
+                correlation_key,
+                tool_names=("read_inbox",),
+                tool_arguments=arguments,
+                correlation_receipt=correlation_receipt,
+            )
+            log_runtime_event(
+                logger,
+                "inbox.read_staged",
+                agent_id=self.agent_id,
+                turn_id=active_turn_id,
+                provider_session_id=provider_session_id,
+                correlation_key=correlation_key,
+                notice_generation=page.snapshot_generation,
+                message_count=len(ids),
+                remaining_count=remaining_count,
+                outcome="staged",
+            )
+        return {
+            "messages": blocks,
+            "next_cursor": next_cursor,
+            "has_more": has_more,
+            "remaining_count": remaining_count,
+            "snapshot_generation": page.snapshot_generation,
+            "correlation_receipt": correlation_receipt,
+        }
+
     async def run(self) -> None:
         await self.recover_current_turn()
         if self._defer_requeued_resume:
@@ -1049,7 +1353,17 @@ class GlobalInboxRuntime:
             # failed durable union through the initial-turn path.
             await self.coalescer.wait_for_burst()
         elif await self.store.get_pending(limit=1):
-            self.notify()
+            notice = await self.store.get_notice_state()
+            remaining = (
+                max(
+                    0.0,
+                    (notice.first_pending_deadline_ms - int(time.time() * 1000))
+                    / 1000,
+                )
+                if notice.first_pending_deadline_ms is not None
+                else 0.0
+            )
+            self.coalescer.notify(delay_seconds=remaining)
         while not self._stopping:
             await self.coalescer.wait_for_burst()
             if self._stopping:
@@ -1134,6 +1448,78 @@ class GlobalInboxRuntime:
         pending_universe = (
             items if items is not None else await self.store.get_pending()
         )
+        if items is None:
+            notice = await self.store.get_notice_state()
+            if not pending_universe or not notice.delivery_pending:
+                return None
+            routes = tuple(route_for(item) for item in pending_universe)
+            targets: list[tuple[str, ...]] = []
+            normalized_counts: dict[str, int] = {}
+            for route in routes:
+                if route.target not in targets:
+                    targets.append(route.target)
+            for item in pending_universe:
+                projection = self.store.target_projection(item)
+                normalized_counts[projection] = (
+                    normalized_counts.get(projection, 0) + 1
+                )
+            latest_seq = max(
+                (
+                    item.server_seq
+                    for item in pending_universe
+                    if item.server_seq is not None
+                ),
+                default=None,
+            )
+            summary = json.dumps(
+                {
+                    "version": 2,
+                    "generation": notice.generation,
+                    "message_count": notice.pending_count,
+                    "targets": [
+                        {"target": target, "count": count}
+                        for target, count in normalized_counts.items()
+                    ],
+                    "latest_seq": latest_seq,
+                },
+                separators=(",", ":"),
+            )
+            provider_input = (
+                "<global_inbox_notice>\n"
+                + summary
+                + "\n</global_inbox_notice>"
+            )
+            log_runtime_event(
+                logger,
+                "notice.due",
+                agent_id=self.agent_id,
+                notice_generation=notice.generation,
+                requires_encryption=any(
+                    item.is_encrypted for item in pending_universe
+                ),
+                message_count=notice.pending_count,
+                target_count=len(targets),
+                latest_seq=latest_seq,
+                outcome="planned",
+            )
+            return PlannedTurn(
+                turn_id=turn_id or f"turn_{uuid.uuid4().hex}",
+                planning_cycle_key=planning_cycle_key or f"notice_{uuid.uuid4().hex}",
+                message_ids=(),
+                items=(),
+                routes=(),
+                targets=tuple(targets),
+                pending_targets=tuple(targets),
+                target_summary=summary,
+                formatted_blocks=(),
+                provider_input=provider_input,
+                formatted_tokens=0,
+                wrapper_overhead_tokens=self.estimator(provider_input),
+                formatted_bytes=0,
+                wrapper_overhead_bytes=len(provider_input.encode("utf-8")),
+                more_available=True,
+                notice_generation=notice.generation,
+            )
         pending = pending_universe
         if max_items is not None:
             pending = pending[:max_items]
@@ -1254,11 +1640,27 @@ class GlobalInboxRuntime:
     ) -> None:
         if event.planning_cycle_key != planned.planning_cycle_key:
             raise RuntimeError("provider admission did not correlate to planned turn")
-        run = await self.store.admit_messages(
-            planned.message_ids,
-            turn_id=planned.turn_id,
-            provider_session_id=event.provider_session_id,
-        )
+        if planned.message_ids:
+            run = await self.store.admit_messages(
+                planned.message_ids,
+                turn_id=planned.turn_id,
+                provider_session_id=event.provider_session_id,
+            )
+        else:
+            state = await self.store.get_notice_state()
+            if (
+                state.generation != planned.notice_generation
+                or state.pending_count == 0
+            ):
+                raise RuntimeError("Inbox notice became stale before admission")
+            run = await self.store.start_turn(
+                turn_id=planned.turn_id,
+                provider_session_id=event.provider_session_id,
+            )
+            if not await self.store.mark_notice_delivered(
+                planned.notice_generation
+            ):
+                raise RuntimeError("Inbox notice generation was already delivered")
         self.active.turn_id = run.turn_id
         self.active.message_ids[:] = list(run.message_ids)
         self.active.provider_session_id = event.provider_session_id
@@ -1280,6 +1682,17 @@ class GlobalInboxRuntime:
             state=run.state,
             message_count=len(run.message_ids),
         )
+        if planned.notice_generation:
+            log_runtime_event(
+                logger,
+                "notice.admitted",
+                agent_id=self.agent_id,
+                turn_id=run.turn_id,
+                provider_session_id=event.provider_session_id,
+                provider_turn_id=event.provider_turn_id,
+                notice_generation=planned.notice_generation,
+                outcome="admitted",
+            )
 
     def _write_current_turn(self, planned: PlannedTurn) -> None:
         path = self.current_turn_path
@@ -1290,8 +1703,17 @@ class GlobalInboxRuntime:
             "message_ids": list(planned.message_ids),
             "targets": [list(target) for target in planned.targets],
             "routes": [asdict(route) for route in planned.routes],
+            "provider_session_id": self.active.provider_session_id,
+            "provider_turn_id": self.active.provider_turn_id,
         }
-        if len(planned.targets) == 1:
+        if self.runtime_event_outbox is not None:
+            outbox_state = self.runtime_event_outbox.state()
+            body.update({
+                "logical_session_ref": outbox_state.get("session_ref", ""),
+                "logical_turn_ref": outbox_state.get("active_turn_ref", ""),
+                "native_session_id": outbox_state.get("native_session_id", ""),
+            })
+        if len(planned.targets) == 1 and planned.routes:
             route = planned.routes[0]
             body["channel_id"] = route.channel_id
             body["root_id"] = route.thread_root_id
@@ -1332,7 +1754,26 @@ class GlobalInboxRuntime:
                 decision = await self.context_controller.decide(
                     planned.candidate, self._replacement_candidate
                 )
+                log_runtime_event(
+                    logger,
+                    "context.checked",
+                    agent_id=self.agent_id,
+                    turn_id=planned.turn_id,
+                    notice_generation=planned.notice_generation,
+                    projected_tokens=decision.projected_tokens,
+                    used_tokens_before=decision.snapshot.used_tokens,
+                    context_window=decision.snapshot.context_window,
+                    outcome=decision.outcome.value,
+                )
                 if decision.outcome is DecisionOutcome.REPLAN:
+                    log_runtime_event(
+                        logger,
+                        "context.compacted",
+                        agent_id=self.agent_id,
+                        turn_id=planned.turn_id,
+                        notice_generation=planned.notice_generation,
+                        outcome="completed",
+                    )
                     replacement = decision.candidate.payload
                     if not isinstance(replacement, PlannedTurn):
                         self.health = RuntimeHealth(
@@ -1356,6 +1797,14 @@ class GlobalInboxRuntime:
                         return False
                     continue
                 if decision.outcome is DecisionOutcome.ROLLOVER:
+                    log_runtime_event(
+                        logger,
+                        "context.rollover",
+                        agent_id=self.agent_id,
+                        turn_id=planned.turn_id,
+                        notice_generation=planned.notice_generation,
+                        outcome="completed",
+                    )
                     if rollover_seen:
                         self.health = RuntimeHealth(
                             "degraded", "provider rollover re-evaluation was exhausted"
@@ -1374,6 +1823,15 @@ class GlobalInboxRuntime:
                     return False
                 break
 
+            if planned.notice_generation:
+                current_notice = await self.store.get_notice_state()
+                if (
+                    current_notice.pending_count == 0
+                    or current_notice.generation != planned.notice_generation
+                    or not current_notice.delivery_pending
+                ):
+                    self.health = RuntimeHealth()
+                    return False
             # The crash join must exist before provider admission is possible.
             self._write_current_turn(planned)
             self.attempts.reset()
@@ -1388,7 +1846,8 @@ class GlobalInboxRuntime:
 
             send_mode.note_turn_bundle(
                 list(self.send_mode_keys),
-                any(item.is_encrypted for item in planned.items),
+                planned.requires_encryption
+                or any(item.is_encrypted for item in planned.items),
             )
             try:
                 retries = 0
@@ -1425,9 +1884,26 @@ class GlobalInboxRuntime:
                         raise
                 admitted = self.active.turn_id == planned.turn_id
                 if admitted:
-                    await self.store.mark_processed(
-                        tuple(self.active.message_ids), turn_id=planned.turn_id
-                    )
+                    if self.active.message_ids:
+                        await self.store.mark_processed(
+                            tuple(self.active.message_ids), turn_id=planned.turn_id
+                        )
+                    else:
+                        await self.store.finalize_empty_turn(
+                            turn_id=planned.turn_id
+                        )
+                    for item_id in self.active.message_ids:
+                        row = await self.store.get_message_by_envelope(item_id)
+                        log_runtime_event(
+                            logger,
+                            "inbox.row_processed",
+                            agent_id=self.agent_id,
+                            turn_id=planned.turn_id,
+                            provider_session_id=self.active.provider_session_id,
+                            message_id=item_id,
+                            server_seq=row.server_seq if row is not None else None,
+                            outcome="processed",
+                        )
                     log_runtime_event(
                         logger,
                         "turn.processed",
@@ -1454,9 +1930,26 @@ class GlobalInboxRuntime:
                     self._degraded = True
             except asyncio.CancelledError:
                 if self.active.turn_id == planned.turn_id:
-                    await self.store.requeue_messages(
-                        tuple(self.active.message_ids), turn_id=planned.turn_id
-                    )
+                    if self.active.message_ids:
+                        await self.store.requeue_messages(
+                            tuple(self.active.message_ids), turn_id=planned.turn_id
+                        )
+                    else:
+                        await self.store.finalize_empty_turn(
+                            turn_id=planned.turn_id, state="requeued"
+                        )
+                    for item_id in self.active.message_ids:
+                        row = await self.store.get_message_by_envelope(item_id)
+                        log_runtime_event(
+                            logger,
+                            "inbox.row_requeued",
+                            agent_id=self.agent_id,
+                            turn_id=planned.turn_id,
+                            provider_session_id=self.active.provider_session_id,
+                            message_id=item_id,
+                            server_seq=row.server_seq if row is not None else None,
+                            outcome="requeued",
+                        )
                     log_runtime_event(
                         logger,
                         "turn.requeued",
@@ -1475,9 +1968,26 @@ class GlobalInboxRuntime:
                 raise
             except Exception:
                 if self.active.turn_id == planned.turn_id:
-                    await self.store.requeue_messages(
-                        tuple(self.active.message_ids), turn_id=planned.turn_id
-                    )
+                    if self.active.message_ids:
+                        await self.store.requeue_messages(
+                            tuple(self.active.message_ids), turn_id=planned.turn_id
+                        )
+                    else:
+                        await self.store.finalize_empty_turn(
+                            turn_id=planned.turn_id, state="requeued"
+                        )
+                    for item_id in self.active.message_ids:
+                        row = await self.store.get_message_by_envelope(item_id)
+                        log_runtime_event(
+                            logger,
+                            "inbox.row_requeued",
+                            agent_id=self.agent_id,
+                            turn_id=planned.turn_id,
+                            provider_session_id=self.active.provider_session_id,
+                            message_id=item_id,
+                            server_seq=row.server_seq if row is not None else None,
+                            outcome="requeued",
+                        )
                     log_runtime_event(
                         logger,
                         "turn.requeued",
@@ -1498,6 +2008,22 @@ class GlobalInboxRuntime:
                 send_mode.clear_turn_bundle(list(self.send_mode_keys))
                 self.adapter.register_admission_callback(None, "")
                 was_active = self.active.turn_id == planned.turn_id
+                if terminal:
+                    log_runtime_event(
+                        logger,
+                        "turn.finalized",
+                        agent_id=self.agent_id,
+                        turn_id=planned.turn_id,
+                        provider_session_id=self.active.provider_session_id,
+                        provider_turn_id=self.active.provider_turn_id,
+                        notice_generation=planned.notice_generation,
+                        message_count=len(self.active.message_ids),
+                        outcome=(
+                            "processed"
+                            if self.health.state == "in_progress"
+                            else "requeued"
+                        ),
+                    )
                 if terminal or not was_active:
                     self.active.clear()
                 if self.coordinator is not None:
@@ -1614,11 +2140,64 @@ class GlobalInboxRuntime:
         ) -> bool:
             requeued = False
             if run is not None and durable_ids:
-                exact_ids = (
-                    tuple(self.active.message_ids)
-                    if self.active.turn_id == run.turn_id
-                    else durable_ids
-                )
+                # Driver-backed harnesses cannot resume an in-flight provider
+                # turn. Persist the terminal boundary before making the exact
+                # Inbox union eligible for a replacement attempt.
+                if self.runtime_event_outbox is not None:
+                    from .runtime_events import RuntimeEvent
+
+                    outbox_state = self.runtime_event_outbox.state()
+                    public_turn_ref = outbox_state.get("active_turn_ref", "")
+                    session_ref = outbox_state.get("session_ref", "")
+                    native_session_id = outbox_state.get(
+                        "native_session_id", ""
+                    )
+                    join_matches_outbox = (
+                        public_turn_ref
+                        and session_ref
+                        and native_session_id == run.provider_session_id
+                        and (
+                            not isinstance(raw, dict)
+                            or (
+                                raw.get("provider_session_id")
+                                in {None, run.provider_session_id}
+                                and raw.get("native_session_id", native_session_id)
+                                == native_session_id
+                                and raw.get("logical_session_ref", session_ref)
+                                == session_ref
+                                and raw.get("logical_turn_ref", public_turn_ref)
+                                == public_turn_ref
+                            )
+                        )
+                    )
+                    if join_matches_outbox:
+                        occurred_at = (
+                            datetime.fromtimestamp(
+                                run.started_at / 1000, tz=timezone.utc
+                            )
+                            .isoformat(timespec="milliseconds")
+                            .replace("+00:00", "Z")
+                        )
+                        await self.runtime_event_outbox.enqueue(RuntimeEvent(
+                            agent_id=self.agent_id,
+                            session_ref=session_ref,
+                            turn_ref=public_turn_ref,
+                            type="turn.finished",
+                            payload={"outcome": "abandoned"},
+                            event_id=(
+                                f"evt_abandoned_{self.agent_id}_"
+                                f"{session_ref}_{public_turn_ref}_{run.turn_id}"
+                            ),
+                            occurred_at=occurred_at,
+                        ), terminal=True)
+                        self.runtime_event_outbox.set_active_turn(
+                            None, session_ref=session_ref,
+                            native_session_id=native_session_id,
+                        )
+                # The MessageStore run is authoritative across restarts.  An
+                # in-memory ActiveExactUnion may be empty or stale after the
+                # process boundary and must never narrow the durable union.
+                exact_ids = durable_ids
                 await self.store.requeue_messages(exact_ids, turn_id=run.turn_id)
                 log_runtime_event(
                     logger,
@@ -1650,6 +2229,35 @@ class GlobalInboxRuntime:
             or not durable_ids
         ):
             return await unwind("invalid or stale crash join")
+
+        if (
+            self.runtime_event_outbox is not None
+            and self.runtime_event_outbox.state().get("active_turn_ref")
+        ):
+            outbox_state = self.runtime_event_outbox.state()
+            if (
+                outbox_state.get("native_session_id")
+                != run.provider_session_id
+                or raw.get(
+                    "provider_session_id", run.provider_session_id
+                ) != run.provider_session_id
+                or raw.get(
+                    "native_session_id",
+                    outbox_state.get("native_session_id"),
+                ) != outbox_state.get("native_session_id")
+                or raw.get(
+                    "logical_session_ref", outbox_state.get("session_ref")
+                ) != outbox_state.get("session_ref")
+                or raw.get(
+                    "logical_turn_ref", outbox_state.get("active_turn_ref")
+                ) != outbox_state.get("active_turn_ref")
+            ):
+                return await unwind(
+                    "crash join and Runtime Event identity mismatch"
+                )
+            return await unwind(
+                "Driver does not support in-flight turn recovery"
+            )
 
         session = run.provider_session_id
         rows = (

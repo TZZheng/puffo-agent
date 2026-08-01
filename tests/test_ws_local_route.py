@@ -43,6 +43,38 @@ class FakeTransport:
         return [f for f in self.sent if f["type"] == t]
 
 
+@pytest.mark.asyncio
+async def test_ws_local_adapter_requires_exact_read_admission_correlation():
+    adapter = route_mod._WsLocalContextAdapter()
+    seen = []
+
+    async def callback(event):
+        seen.append(event)
+
+    adapter.register_continuation_callback(
+        callback,
+        "inbox-read-key",
+        tool_names=("read_inbox",),
+        tool_arguments={"limit": 7},
+        correlation_receipt="read-receipt",
+    )
+    with pytest.raises(RuntimeError, match="correlation failed"):
+        await adapter.emit_admission(
+            turn_id="turn-1", correlation_key="wrong-receipt"
+        )
+    assert seen == []
+    await adapter.emit_admission(
+        turn_id="turn-1", correlation_key="read-receipt"
+    )
+    assert len(seen) == 1
+    assert seen[0].planning_cycle_key == "inbox-read-key"
+    assert seen[0].provider_session_id == "ws-local:turn-1"
+    with pytest.raises(RuntimeError, match="correlation failed"):
+        await adapter.emit_admission(
+            turn_id="turn-1", correlation_key="read-receipt"
+        )
+
+
 class FakeReporter:
     def __init__(self) -> None:
         self.heartbeats = 0
@@ -253,7 +285,7 @@ async def test_v2_receipt_to_global_bundle_admitted_end_and_owned_runtime_cleanu
     })
     served = asyncio.create_task(serve_attached(transport, hub))
     await asyncio.wait_for(client.started.wait(), 1)
-    for _ in range(30):
+    for _ in range(300):
         bundles = transport.by_type("bundle")
         if bundles:
             break

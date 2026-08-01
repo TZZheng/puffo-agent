@@ -14,6 +14,19 @@ from .claude_code import ClaudeCodeHarness
 from .codex import CodexHarness
 from .gemini_cli import GeminiCLIHarness
 from .hermes import HermesHarness
+from .driver import (
+    Driver,
+    HarnessDriver,
+    RuntimeRef,
+    SessionRef,
+    TurnRef,
+    PermissionRef,
+    UnsupportedCapability,
+)
+from .codex_driver import CodexAppServerDriver, CodexDriver
+from .claude_code_driver import ClaudeCodeCliDriver, ClaudeDriver
+from dataclasses import dataclass
+from typing import Any
 
 
 def build_harness(name: str) -> Harness:
@@ -34,6 +47,25 @@ def build_harness(name: str) -> Harness:
     )
 
 
+@dataclass(frozen=True)
+class UnsupportedDriver:
+    harness: str
+    diagnostic: str = "no Driver implementation for this legacy harness"
+
+
+def build_driver(name: str, **kwargs: Any) -> HarnessDriver | UnsupportedDriver:
+    """Construct only the two ratified Driver implementations.
+
+    This factory is deliberately separate from :func:`build_harness`; legacy
+    adapters continue accepting Hermes, Gemini, Docker, SDK, and chat paths.
+    """
+    if name == "codex":
+        return CodexAppServerDriver(**kwargs)
+    if not name or name == "claude-code":
+        return ClaudeCodeCliDriver(**kwargs)
+    return UnsupportedDriver(name)
+
+
 __all__ = [
     "Harness",
     "HarnessTurn",
@@ -42,4 +74,10 @@ __all__ = [
     "GeminiCLIHarness",
     "HermesHarness",
     "build_harness",
+    "Driver", "HarnessDriver",
+    "RuntimeRef", "SessionRef", "TurnRef", "PermissionRef",
+    "UnsupportedCapability", "UnsupportedDriver",
+    "CodexAppServerDriver", "CodexDriver",
+    "ClaudeCodeCliDriver", "ClaudeDriver",
+    "build_driver",
 ]

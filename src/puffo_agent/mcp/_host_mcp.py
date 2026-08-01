@@ -192,6 +192,34 @@ class PuffoRpcClient:
                 f"rpc model-visible-read transport error: {exc}"
             ) from exc
 
+    async def read_inbox(
+        self, *, target: str = "", cursor: str = "", limit: int = 50
+    ) -> dict[str, Any]:
+        path = (
+            f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/read-inbox"
+        )
+        session = await self._get_session()
+        try:
+            async with session.post(
+                f"{self.base_url}{path}",
+                json={"target": target, "cursor": cursor, "limit": limit},
+            ) as resp:
+                try:
+                    data = await resp.json()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"rpc read-inbox returned non-JSON (status {resp.status})"
+                    ) from exc
+                if resp.status >= 400:
+                    raise RuntimeError(
+                        str(data.get("error") or f"rpc read-inbox failed ({resp.status})")
+                    )
+                if not isinstance(data, dict):
+                    raise RuntimeError("rpc read-inbox returned a non-object")
+                return data
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(f"rpc read-inbox transport error: {exc}") from exc
+
     async def install_mcp(
         self,
         *,

@@ -205,8 +205,6 @@ class PuffoAgent:
         on_progress=None,
     ) -> str | None:
         """Run one exact durable global batch without trigger-route inference."""
-        if not planned.message_ids:
-            return None
         self.log.append({"role": "user", "content": planned.provider_input})
         self._truncate_log()
         return await self._run_turn_and_route(

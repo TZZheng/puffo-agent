@@ -249,6 +249,9 @@ class DockerCLIAdapter(Adapter):
                 claude_dir=ctx.claude_dir,
                 memory_dir=ctx.memory_dir,
                 on_progress=ctx.on_progress,
+                session_ref=ctx.session_ref,
+                turn_ref=ctx.turn_ref,
+                trusted_context_refs=ctx.trusted_context_refs,
             )
             return await self.run_turn(ctx_fallback)
         await self._ensure_started()

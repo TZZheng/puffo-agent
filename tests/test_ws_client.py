@@ -178,6 +178,81 @@ async def test_handshake_sends_correct_frame():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [
+        {
+            "type": "rejected",
+            "message": "MESSAGE_PLAINTEXT_SENTINEL",
+            "raw_frame": "RAW_PROVIDER_FRAME_SENTINEL",
+            "ciphertext": "CIPHERTEXT_SENTINEL",
+            "reasoning": "REASONING_SENTINEL",
+            "tool_arguments": "TOOL_ARGUMENT_SENTINEL",
+            "tool_result": "TOOL_RESULT_SENTINEL",
+            "credential": "CREDENTIAL_SENTINEL",
+        },
+        {
+            "type": "connected",
+            "session_id": "INVALID SESSION CREDENTIAL_SENTINEL",
+        },
+    ],
+)
+async def test_handshake_rejects_adversarial_content_without_echo(
+    response, caplog,
+):
+    class Ws:
+        async def send(self, _frame):
+            pass
+
+        async def recv(self):
+            return json.dumps(response)
+
+    ks, _ = _make_keystore()
+    client = PuffoCoreWsClient(
+        "http://localhost:3000", ks, "alice-0001", FakeHttpClient()
+    )
+    with pytest.raises(
+        ConnectionError, match="^websocket handshake protocol error$"
+    ) as error:
+        await client._handshake(Ws())
+    rendered = str(error.value) + caplog.text
+    for sentinel in (
+        "MESSAGE_PLAINTEXT_SENTINEL",
+        "RAW_PROVIDER_FRAME_SENTINEL",
+        "CIPHERTEXT_SENTINEL",
+        "REASONING_SENTINEL",
+        "TOOL_ARGUMENT_SENTINEL",
+        "TOOL_RESULT_SENTINEL",
+        "CREDENTIAL_SENTINEL",
+    ):
+        assert sentinel not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session_id",
+    [
+        "550e8400-e29b-41d4-a716-446655440000",
+        "sess_test",
+        "session-ABC_123",
+    ],
+)
+async def test_handshake_accepts_server_compatible_session_ids(session_id):
+    class Ws:
+        async def send(self, _frame):
+            pass
+
+        async def recv(self):
+            return json.dumps({"type": "connected", "session_id": session_id})
+
+    ks, _ = _make_keystore()
+    client = PuffoCoreWsClient(
+        "http://localhost:3000", ks, "alice-0001", FakeHttpClient()
+    )
+    assert await client._handshake(Ws()) == session_id
+
+
+@pytest.mark.asyncio
 async def test_ping_pong():
     ks, subkey = _make_keystore()
     server = FakeWsServer()
@@ -458,6 +533,65 @@ async def test_reconnect_on_disconnect():
     assert connect_count >= 2
     server.close()
     await server.wait_closed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_type", "category"),
+    [
+        (ConnectionError, "protocol"),
+        (TimeoutError, "timeout"),
+        (OSError, "transport"),
+        (RuntimeError, "unexpected"),
+    ],
+    ids=["expected-protocol", "expected-timeout", "expected-transport", "catch-all"],
+)
+async def test_reconnect_diagnostics_are_type_derived_and_content_free(
+    monkeypatch, caplog, error_type, category,
+):
+    import logging as _stdlib_logging
+
+    sentinel = f"{category.upper()}_EXCEPTION_TEXT_SENTINEL"
+    ks, _ = _make_keystore()
+    client = PuffoCoreWsClient(
+        "http://localhost:3000", ks, "alice-0001", FakeHttpClient()
+    )
+    attempts = 0
+    delays = []
+
+    async def connect_once():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise error_type(sentinel)
+        client.stop()
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(client, "connect_once", connect_once)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    with caplog.at_level(
+        _stdlib_logging.WARNING, logger="puffo_agent.crypto.ws_client"
+    ):
+        await client.run()
+
+    assert attempts == 2
+    assert delays == [INITIAL_BACKOFF]
+    assert f"category={category}" in caplog.text
+    assert f"exception={error_type.__name__}" in caplog.text
+    assert "alice-0001" in caplog.text
+    assert "retry_delay=1s" in caplog.text
+    assert sentinel not in caplog.text
+    assert all(record.exc_info is None for record in caplog.records)
+    categories = {
+        record.getMessage().split("category=", 1)[1].split()[0]
+        for record in caplog.records
+        if "category=" in record.getMessage()
+    }
+    assert categories <= {
+        "connection_closed", "timeout", "protocol", "transport", "unexpected",
+    }
 
 
 @pytest.mark.asyncio

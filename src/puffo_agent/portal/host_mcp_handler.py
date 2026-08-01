@@ -568,6 +568,31 @@ async def stage_model_visible_read(
     )
 
 
+async def read_inbox(
+    ctx: HostMcpContext,
+    *,
+    target: str = "",
+    cursor: str = "",
+    limit: int = 50,
+) -> dict[str, Any]:
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global Inbox runtime is unavailable")
+    arguments: dict[str, object] = {}
+    if target:
+        arguments["target"] = target
+    if cursor:
+        arguments["cursor"] = cursor
+    if limit != 50:
+        arguments["limit"] = limit
+    return await runtime.read_inbox(
+        target=target,
+        cursor=cursor,
+        limit=limit,
+        tool_arguments=arguments,
+    )
+
+
 async def request_command_permission(
     ctx: HostMcpContext,
     *,

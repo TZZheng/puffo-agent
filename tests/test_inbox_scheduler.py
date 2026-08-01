@@ -7,7 +7,12 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.agent.inbox_scheduler import InboxCoalescer, InboxPlanner
+from puffo_agent.agent.inbox_scheduler import (
+    InboxCoalescer,
+    InboxNoticeDelivery,
+    InboxPlanner,
+    NoticeDeliveryCapability,
+)
 from puffo_agent.agent.message_store import ProcessingState, StoredMessage
 
 
@@ -169,7 +174,7 @@ async def test_oversized_head_policy_and_guarded_quarantine_run_at_most_once():
 
 
 @pytest.mark.asyncio
-async def test_coalescer_uses_one_fixed_100ms_metadata_neutral_window():
+async def test_coalescer_uses_one_fixed_three_second_metadata_neutral_window():
     now = 10.0
     sleeps = []
 
@@ -186,7 +191,7 @@ async def test_coalescer_uses_one_fixed_100ms_metadata_neutral_window():
     coalescer = InboxCoalescer(sleep=sleep, monotonic=monotonic)
     coalescer.notify()
     await coalescer.wait_for_burst()
-    assert sleeps == [pytest.approx(0.100)]
+    assert sleeps == [pytest.approx(3.0)]
     with pytest.raises(TypeError):
         coalescer.notify({"sender": "metadata is forbidden"})
 
@@ -209,7 +214,7 @@ async def test_coalescer_deadline_starts_at_notify_before_delayed_waiter():
     now += 0.080
     coalescer.notify()
     await coalescer.wait_for_burst()
-    assert sleeps == [pytest.approx(0.020)]
+    assert sleeps == [pytest.approx(2.920)]
 
 
 @pytest.mark.asyncio
@@ -234,4 +239,56 @@ async def test_coalescer_preserves_notification_for_next_expired_window():
     coalescer.notify()
     await coalescer.wait_for_burst()
     await coalescer.wait_for_burst()
-    assert sleeps == [pytest.approx(0.100), pytest.approx(0.100)]
+    assert sleeps == [pytest.approx(3.0), pytest.approx(3.0)]
+
+
+@pytest.mark.asyncio
+async def test_notice_delivery_capability_matrix_is_turn_guarded_and_gated():
+    delivered: list[str] = []
+
+    async def deliver():
+        delivered.append("delivered")
+        return True
+
+    direct = InboxNoticeDelivery(NoticeDeliveryCapability.DIRECT)
+    assert not await direct.offer(
+        named_turn_id="stale", active_turn_id="active", deliver=deliver
+    )
+    assert await direct.offer(
+        named_turn_id="active", active_turn_id="active", deliver=deliver
+    )
+
+    gated = InboxNoticeDelivery(NoticeDeliveryCapability.GATED)
+    assert not await gated.offer(
+        named_turn_id="active", active_turn_id="active", deliver=deliver
+    )
+    gated.note_input_ready("other")
+    assert not await gated.offer(
+        named_turn_id="active", active_turn_id="active", deliver=deliver
+    )
+    gated.note_input_ready("active")
+    assert await gated.offer(
+        named_turn_id="active", active_turn_id="active", deliver=deliver
+    )
+    # Readiness is one-shot and cannot authorize a later injection.
+    assert not await gated.offer(
+        named_turn_id="active", active_turn_id="active", deliver=deliver
+    )
+
+    next_turn = InboxNoticeDelivery(NoticeDeliveryCapability.NEXT_TURN)
+    assert not await next_turn.offer(
+        named_turn_id="active", active_turn_id="active", deliver=deliver
+    )
+    assert delivered == ["delivered", "delivered"]
+
+
+@pytest.mark.asyncio
+async def test_notice_delivery_rejection_is_not_reported_as_acceptance():
+    delivery = InboxNoticeDelivery(NoticeDeliveryCapability.DIRECT)
+
+    async def reject():
+        return False
+
+    assert not await delivery.offer(
+        named_turn_id="active", active_turn_id="active", deliver=reject
+    )

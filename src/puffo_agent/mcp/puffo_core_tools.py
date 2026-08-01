@@ -262,6 +262,8 @@ class PuffoCoreToolsConfig:
     # at the in-process ws-local site (from ``client._bridge``); the
     # subprocess/RPC MCP path leaves it None.
     bridge_client: Any = None
+    # Live Inbox runtime for in-process tools. Subprocess tools use rpc_client.
+    inbox_runtime: Any = None
 
     @property
     def keyless(self) -> bool:
@@ -273,6 +275,10 @@ async def _dispatch_semantic_send(
     cfg: "PuffoCoreToolsConfig", request: SemanticSendRequest,
 ) -> dict[str, Any]:
     coordinator = getattr(cfg, "send_coordinator", None)
+    if coordinator is None:
+        coordinator = getattr(
+            getattr(cfg, "message_client", None), "send_delegate", None
+        )
     if coordinator is not None:
         try:
             if hasattr(coordinator, "workspace"):
@@ -290,15 +296,6 @@ async def _dispatch_semantic_send(
             "persistent send coordinator returned a malformed result",
             kind="protocol",
         )
-    if cfg.keyless:
-        coordinator = SendCoordinator(
-            slug=cfg.slug,
-            keystore=cfg.keystore,
-            http_client=cfg.http_client,
-            data_client=cfg.data_client,
-            workspace=cfg.workspace,
-        )
-        return await coordinator.send(request)
     rpc = getattr(cfg, "rpc_client", None)
     if rpc is not None:
         try:
@@ -309,6 +306,15 @@ async def _dispatch_semantic_send(
             result.setdefault("attempted", True)
             return result
         return failed_result("send RPC returned a malformed result", kind="protocol")
+    if cfg.keyless:
+        coordinator = SendCoordinator(
+            slug=cfg.slug,
+            keystore=cfg.keystore,
+            http_client=cfg.http_client,
+            data_client=cfg.data_client,
+            workspace=cfg.workspace,
+        )
+        return await coordinator.send(request)
     return failed_result(
         "persistent send coordinator is unavailable",
         kind="coordinator_unavailable",
@@ -550,6 +556,50 @@ async def _resolve_outgoing_root(
 def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
+    async def read_inbox(
+        target: str = "",
+        cursor: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Read one stable pending Inbox page.
+
+        target: optional canonical ``channel:<space>:<channel>[:thread:<root>]``
+            or ``dm:<peer>`` projection.
+        cursor: opaque cursor returned by the preceding page.
+        limit: page size from 1 through 50. Continue with ``next_cursor``;
+            there is no total read-depth cap.
+        """
+        arguments: dict[str, Any] = {}
+        if target:
+            arguments["target"] = target
+        if cursor:
+            arguments["cursor"] = cursor
+        if limit != 50:
+            arguments["limit"] = limit
+        runtime = getattr(cfg, "inbox_runtime", None)
+        if runtime is None:
+            runtime = getattr(getattr(cfg, "message_client", None), "global_runtime", None)
+        if runtime is not None:
+            result = await runtime.read_inbox(
+                target=target,
+                cursor=cursor,
+                limit=limit,
+                tool_arguments=arguments,
+            )
+        elif cfg.rpc_client is not None:
+            result = await cfg.rpc_client.read_inbox(
+                target=target, cursor=cursor, limit=limit
+            )
+        else:
+            raise RuntimeError("global Inbox runtime is unavailable")
+        receipt = result.pop("correlation_receipt", "")
+        if receipt:
+            result["admission_receipt"] = (
+                f"[{MODEL_VISIBLE_READ_RECEIPT_PREFIX}{receipt}]"
+            )
+        return result
+
+    @mcp.tool()
     async def whoami() -> str:
         """Return your own identity: display name, slug, device_id, and
         subkey info."""
@@ -651,10 +701,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
               no human is waiting for this reply. Root-level posts
               are still forced visible (can't fold either way).
         send_anyway: for a channel send, keep the chosen content even
-            when the Server reports that newer channel messages exist.
-            The result exposes the visible and latest boundaries plus
-            any recovered context. You can independently choose revised
-            content, ``send_anyway=True``, or no message.
+            after a prior held result and a correlated same-Turn read has
+            admitted context through the held watermark. The result exposes
+            safe synchronization metadata, never recovered plaintext.
         """
         return await _dispatch_semantic_send(
             cfg,

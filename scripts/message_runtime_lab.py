@@ -232,6 +232,7 @@ class ScriptedAdapter:
         planning_cycle_key: str = "",
         *,
         channel_id: str = "",
+        **_correlation: Any,
     ) -> None:
         del channel_id
         if callback is None:
@@ -263,6 +264,14 @@ class ScriptedAdapter:
                 admitted_at=datetime.now(timezone.utc),
             )
         )
+
+    async def admit_only_continuation(self) -> None:
+        if len(self._continuations) != 1:
+            raise RuntimeError(
+                "expected exactly one staged provider continuation, "
+                f"found {len(self._continuations)}"
+            )
+        await self.admit_continuation(next(iter(self._continuations)))
 
 
 async def store_receipt(
@@ -338,18 +347,36 @@ async def run_batch_scenario(
     planned_turns: list[dict[str, Any]] = []
 
     async def run_turn(planned: Any) -> None:
+        await adapter.admit_initial()
+        page = await runtime.read_inbox(limit=50)
+        await adapter.admit_only_continuation()
+        rows = await store.get_in_turn_messages(planned.turn_id, adapter.session_id)
+        targets_seen: list[tuple[str, ...]] = []
+        for row in rows:
+            if row.envelope_kind == "dm":
+                target = ("dm", row.sender_slug)
+            elif row.thread_root_id:
+                target = (
+                    "thread",
+                    row.space_id,
+                    row.channel_id,
+                    row.thread_root_id,
+                )
+            else:
+                target = ("channel", row.space_id, row.channel_id)
+            if target not in targets_seen:
+                targets_seen.append(target)
         entry = {
             "turn_id": planned.turn_id,
-            "message_ids": list(planned.message_ids),
-            "targets": [list(target) for target in planned.targets],
-            "message_count": len(planned.message_ids),
-            "more_pending": planned.more_available,
+            "message_ids": [row.envelope_id for row in rows],
+            "targets": [list(target) for target in targets_seen],
+            "message_count": len(rows),
+            "more_pending": page["has_more"],
             "byte_length": len(planned.provider_input.encode("utf-8")),
             "sha256": _input_digest(planned.provider_input),
         }
         planned_turns.append(entry)
         events.emit("provider.input", agent_id="agent-batch", **entry)
-        await adapter.admit_initial()
         events.emit(
             "provider.admitted",
             agent_id="agent-batch",
@@ -610,6 +637,8 @@ async def run_count_scenario(
                 sha256=_input_digest(planned.provider_input),
             )
             await current_adapter.admit_initial()
+            await current_holder["agent"].runtime.read_inbox(limit=50)
+            await current_adapter.admit_only_continuation()
             current_ready.set()
             while True:
                 command = await current_commands.get()

@@ -23,19 +23,52 @@ RUNTIME_EVENT_FIELDS = frozenset({
     "used_tokens_after", "context_window", "decision_reason", "error_category",
     "target_count", "envelope_count", "first_seq", "last_seq",
     "envelope_ids", "routes",
+    "target", "server_seq", "message_id", "notice_generation",
+    "send_attempt_id", "outcome", "remaining_count", "snapshot_generation",
+    "runtime_ref", "session_ref", "turn_ref", "permission_ref",
+    "event_id", "event_type", "outbox_sequence", "retry_count",
+    "capability", "capability_decision", "error_code",
+    "first_sequence", "last_sequence", "event_count",
 })
 RUNTIME_EVENT_NAMES = frozenset({
+    "inbox.received",
     "inbox.receipt_committed",
+    "inbox.persisted",
+    "notice.armed",
+    "notice.due",
+    "notice.deferred",
+    "notice.admitted",
+    "inbox.read_staged",
+    "inbox.read_admitted",
+    "inbox.row_in_turn",
+    "inbox.row_processed",
+    "inbox.row_requeued",
     "batch.planned",
     "turn.admitted",
     "history.read_staged",
     "history.read_admitted",
     "send.attempted",
     "send.held",
+    "held.synchronized",
+    "reconsideration.eligible",
+    "reconsideration.blocked",
     "send.committed",
     "send.failed",
+    "context.checked",
+    "context.compacted",
+    "context.rollover",
     "turn.processed",
     "turn.requeued",
+    "turn.finalized",
+    "runtime.command",
+    "runtime.normalized_event",
+    "runtime.projected",
+    "runtime.enqueued",
+    "runtime.batch_attempt",
+    "runtime.acknowledged",
+    "runtime.retry",
+    "runtime.capacity",
+    "runtime.recovery",
 })
 _OBSERVABILITY_WARNED: set[str] = set()
 _MAX_EVENT_ENVELOPE_IDS = 16
@@ -116,7 +149,7 @@ def _warn_observability_once(category: str) -> None:
 
 
 def log_runtime_event(
-    target: logging.Logger | logging.LoggerAdapter,
+    logger_target: logging.Logger | logging.LoggerAdapter,
     event: str,
     *,
     level: int = logging.INFO,
@@ -185,6 +218,8 @@ def log_runtime_event(
             if not isinstance(value, (str, int, float, bool)):
                 _warn_observability_once("unsupported_value")
                 continue
+            if isinstance(value, str):
+                value = _TOKENISH.sub("[REDACTED]", value)[:256]
             json.dumps(value, ensure_ascii=True, allow_nan=False)
             record[key] = value
         except BaseException:
@@ -199,7 +234,7 @@ def log_runtime_event(
             separators=(",", ":"),
             sort_keys=True,
         )
-        target.log(level, "runtime_event=%s", encoded)
+        logger_target.log(level, "runtime_event=%s", encoded)
     except BaseException:
         _warn_observability_once("event_emission_failed")
         return

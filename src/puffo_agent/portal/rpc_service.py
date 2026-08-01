@@ -298,6 +298,43 @@ async def stage_model_visible_read_route(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def read_inbox_route(request: web.Request) -> web.Response:
+    """Strict loopback-only semantic Inbox read RPC."""
+    agent_id = request.match_info["agent_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    if not isinstance(body, dict) or set(body) - {"target", "cursor", "limit"}:
+        return web.json_response(
+            {"error": "read_inbox accepts only target, cursor, and limit"},
+            status=400,
+        )
+    target = body.get("target", "")
+    cursor = body.get("cursor", "")
+    limit = body.get("limit", 50)
+    if not isinstance(target, str) or not isinstance(cursor, str):
+        return web.json_response(
+            {"error": "target and cursor must be strings"}, status=400
+        )
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
+        return web.json_response(
+            {"error": "limit must be between 1 and 50"}, status=400
+        )
+    resolver = _RPC_RESOLVER
+    ctx = resolver(agent_id) if resolver is not None else None
+    if ctx is None:
+        return web.json_response({"error": "no warm worker"}, status=503)
+    try:
+        return web.json_response(
+            await host_mcp_handler.read_inbox(
+                ctx, target=target, cursor=cursor, limit=limit
+            )
+        )
+    except (RuntimeError, ValueError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+
 def build_app(cfg: RpcServiceConfig) -> web.Application:
     app = web.Application()
     app.router.add_post(
@@ -323,6 +360,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/model-visible-read",
         stage_model_visible_read_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/read-inbox",
+        read_inbox_route,
     )
     return app
 

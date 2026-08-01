@@ -18,6 +18,15 @@ The CLI follows a `puffo-agent <resource> <verb>` shape — daemon-level
 commands at the root (`start`, `status`, …), `machine` for portal
 linking, and `agent` for the bots themselves.
 
+For `cli-local`, Codex app-server and Claude Code stream-json also expose the
+provider-neutral Harness Driver boundary. Their safe six-type execution
+lifecycle is durably staged in the daemon-owned per-Agent state directory at
+`runtime_events.db`, beside `messages.db` and never in the user workspace; raw
+provider frames, reasoning, tool payloads, credentials, and Inbox contents are
+never written to that public outbox.
+Hermes, Gemini, Docker, SDK, and chat-local configurations continue through
+their legacy Adapter paths.
+
 ## 1. Prerequisites
 
 - **Python 3.11+**.

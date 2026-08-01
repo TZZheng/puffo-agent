@@ -778,6 +778,17 @@ class PuffoCoreMessageClient:
                 *,
                 content: Any | None = None,
             ) -> TransportOutcome:
+                log_runtime_event(
+                    self._log,
+                    "inbox.received",
+                    agent_id=self.agent_id,
+                    agent_slug=self.slug,
+                    message_id=payload.envelope_id,
+                    server_seq=server_seq,
+                    space_id=payload.space_id,
+                    channel_id=payload.channel_id,
+                    outcome="received",
+                )
                 row = dict(stored_payload)
                 if content is not None:
                     row["content"] = content
@@ -800,16 +811,40 @@ class PuffoCoreMessageClient:
                     log_runtime_event(
                         self._log,
                         "inbox.receipt_committed",
-                        level=logging.DEBUG,
+                        level=logging.INFO,
                         agent_id=self.agent_id,
                         agent_slug=self.slug,
                         envelope_id=payload.envelope_id,
                         space_id=payload.space_id,
                         channel_id=payload.channel_id,
                         seq=server_seq,
+                        server_seq=server_seq,
+                        message_id=payload.envelope_id,
                         mode="transport_receipt",
                         state=result.disposition.value,
                     )
+                    log_runtime_event(
+                        self._log,
+                        "inbox.persisted",
+                        agent_id=self.agent_id,
+                        agent_slug=self.slug,
+                        message_id=payload.envelope_id,
+                        server_seq=server_seq,
+                        space_id=payload.space_id,
+                        channel_id=payload.channel_id,
+                        outcome=result.disposition.value,
+                    )
+                    notice = await self.store.get_notice_state()
+                    if notice.delivery_pending:
+                        log_runtime_event(
+                            self._log,
+                            "notice.armed",
+                            agent_id=self.agent_id,
+                            agent_slug=self.slug,
+                            notice_generation=notice.generation,
+                            message_count=notice.pending_count,
+                            outcome="armed",
+                        )
                 runtime = getattr(self, "global_runtime", None)
                 if runtime is not None:
                     if (
@@ -1172,8 +1207,9 @@ class PuffoCoreMessageClient:
                 raise
             except Exception as exc:
                 self._log.warning(
-                    "bridge WS disconnected (%s: %s), reconnecting in %ds",
-                    type(exc).__name__, exc, backoff,
+                    "agent %s: bridge reconnect category=bridge_transport "
+                    "exception=%s retry_delay=%ds",
+                    self.slug, type(exc).__name__, backoff,
                 )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, MAX_BACKOFF)
@@ -1183,7 +1219,7 @@ class PuffoCoreMessageClient:
         frame: dict,
         *,
         legacy_test_callback: Callable[..., Any] | None = None,
-    ) -> None:
+    ) -> Any:
         """Route one inbound bridge frame off ``frames()``.
 
         ``message`` handling is wrapped so one poison frame logs and is
@@ -1196,6 +1232,21 @@ class PuffoCoreMessageClient:
         kind = frame.get("type", "")
         if kind == "message":
             try:
+                sequence: int | None = None
+                if "seq" in frame:
+                    raw_sequence = frame.get("seq")
+                    if (
+                        isinstance(raw_sequence, bool)
+                        or not isinstance(raw_sequence, int)
+                        or raw_sequence <= 0
+                    ):
+                        self._log.warning(
+                            "bridge message rejected: invalid sequence "
+                            "(envelope_id=%s)",
+                            frame.get("envelope_id"),
+                        )
+                        return
+                    sequence = raw_sequence
                 payload = self._payload_from_bridge_frame(frame)
                 if payload is not None:
                     # Enrichment over the keyless path: the only sender
@@ -1208,8 +1259,10 @@ class PuffoCoreMessageClient:
                     # before. Native frames never carry this, so their
                     # path is untouched.
                     self._preseed_frame_display_name(frame, payload)
-                    await self._store_bridge_payload(
-                        payload, legacy_test_callback=legacy_test_callback,
+                    acknowledge = await self._store_bridge_payload(
+                        payload,
+                        server_seq=sequence,
+                        legacy_test_callback=legacy_test_callback,
                     )
                     # F1: ack the delivered envelope now that it handled
                     # cleanly. A handling exception above skips this (still
@@ -1217,11 +1270,12 @@ class PuffoCoreMessageClient:
                     # async — awaiting send_ack inline would deadlock the
                     # frames() loop, which must keep receiving to deliver the
                     # server's ack_result that resolves send_ack's future.
-                    task = asyncio.create_task(
-                        self._ack_bridge_envelope([payload.envelope_id])
-                    )
-                    self._ack_tasks.add(task)
-                    task.add_done_callback(self._ack_tasks.discard)
+                    if acknowledge:
+                        task = asyncio.create_task(
+                            self._ack_bridge_envelope([payload.envelope_id])
+                        )
+                        self._ack_tasks.add(task)
+                        task.add_done_callback(self._ack_tasks.discard)
             except Exception:
                 self._log.exception(
                     "bridge message frame handling failed (envelope_id=%s)",
@@ -1240,6 +1294,24 @@ class PuffoCoreMessageClient:
             task = asyncio.create_task(self._refresh_bridge_spaces())
             self._ack_tasks.add(task)
             task.add_done_callback(self._ack_tasks.discard)
+        elif kind == "runtime_command":
+            from .harness.runtime_commands import execute_runtime_command
+
+            command = frame.get("command")
+            if not isinstance(command, dict):
+                return {
+                    "ok": False,
+                    "error": "invalid_command",
+                    "error_code": "invalid_command",
+                }
+            return await execute_runtime_command(
+                command,
+                expected_agent_id=self.slug,
+                manager_agent_id=self.agent_id,
+                require_version=True,
+                permission_turn_from_active=True,
+                cloud_wire=True,
+            )
         elif kind == "added_to_space":
             # Server push (AgentServerMsg::AddedToSpace) the moment this
             # agent is added to a Space — refresh the known-spaces view
@@ -1259,9 +1331,21 @@ class PuffoCoreMessageClient:
             self._ack_tasks.add(task)
             task.add_done_callback(self._ack_tasks.discard)
         elif kind == "error":
+            code = frame.get("code")
+            category = (
+                code
+                if isinstance(code, str) and code in {
+                    "NO_SUBKEY",
+                    "NOT_AUTHORIZED",
+                    "DECRYPT_FAILED",
+                    "BAD_FRAME",
+                    "INTERNAL",
+                }
+                else "UNKNOWN_BRIDGE_ERROR"
+            )
             self._log.warning(
-                "bridge error frame: code=%s message=%s",
-                frame.get("code"), frame.get("message"),
+                "agent %s: bridge error category=%s",
+                self.slug, category,
             )
         else:
             self._log.debug("bridge frame ignored: type=%s", kind)
@@ -1391,8 +1475,9 @@ class PuffoCoreMessageClient:
         self,
         payload: MessagePayload,
         *,
+        server_seq: int | None = None,
         legacy_test_callback: Callable[..., Any] | None = None,
-    ) -> None:
+    ) -> bool:
         """Persist one keyless bridge message into the global durable inbox.
 
         The current bridge wire does not carry the native delivery ``seq``.
@@ -1400,10 +1485,12 @@ class PuffoCoreMessageClient:
         of inventing a freshness boundary. Once the bridge exposes a trusted
         server sequence this path can use ``store_receipt`` directly.
         """
-        existing = await self.store.get_message_by_envelope(payload.envelope_id)
-        if existing is not None:
-            return
-
+        if server_seq is None:
+            existing = await self.store.get_message_by_envelope(
+                payload.envelope_id
+            )
+            if existing is not None:
+                return True
         thread_root_id = await self._resolve_incoming_thread_root(
             payload.thread_root_id, payload.channel_id, payload.space_id,
         )
@@ -1428,11 +1515,49 @@ class PuffoCoreMessageClient:
         # Self echoes and stale backfill remain queryable history but must not
         # create provider work.
         if payload.sender_slug == self.slug:
-            await self.store.store(row)
-            return
+            if server_seq is None:
+                await self.store.store(row)
+            else:
+                result = await self.store.store_receipt(
+                    row,
+                    server_seq=server_seq,
+                    disposition=ReceiptDisposition.TERMINAL,
+                    reason="keyless bridge self echo",
+                )
+                runtime = getattr(self, "global_runtime", None)
+                if (
+                    runtime is not None
+                    and payload.envelope_kind == "channel"
+                    and result.status in {
+                        ReceiptWriteStatus.COMMITTED,
+                        ReceiptWriteStatus.IDEMPOTENT,
+                    }
+                ):
+                    runtime.notify_delivery()
+                return result.acknowledge
+            return True
         if self._is_stale_for_catchup(payload.sent_at):
-            await self.store.store(row)
-            return
+            if server_seq is None:
+                await self.store.store(row)
+            else:
+                result = await self.store.store_receipt(
+                    row,
+                    server_seq=server_seq,
+                    disposition=ReceiptDisposition.TERMINAL,
+                    reason="keyless bridge stale history",
+                )
+                runtime = getattr(self, "global_runtime", None)
+                if (
+                    runtime is not None
+                    and payload.envelope_kind == "channel"
+                    and result.status in {
+                        ReceiptWriteStatus.COMMITTED,
+                        ReceiptWriteStatus.IDEMPOTENT,
+                    }
+                ):
+                    runtime.notify_delivery()
+                return result.acknowledge
+            return True
 
         channel_id = payload.channel_id or ""
         space_id = payload.space_id or ""
@@ -1529,12 +1654,27 @@ class PuffoCoreMessageClient:
             "channel_name": channel_name,
             "space_name": space_name,
         }
-        await self.store.store_local_event(
-            row, reason="keyless bridge delivery without server sequence",
-        )
+        committed = True
+        if server_seq is None:
+            await self.store.store_local_event(
+                row, reason="keyless bridge delivery without server sequence",
+            )
+        else:
+            receipt = await self.store.store_receipt(
+                row,
+                server_seq=server_seq,
+                disposition=ReceiptDisposition.ELIGIBLE,
+                reason="keyless bridge sequenced delivery",
+            )
+            if receipt.status is ReceiptWriteStatus.CONFLICT:
+                return False
+            committed = receipt.status is ReceiptWriteStatus.COMMITTED
         runtime = getattr(self, "global_runtime", None)
         if runtime is not None:
-            runtime.notify()
+            if server_seq is not None and payload.envelope_kind == "channel":
+                runtime.notify_delivery()
+            if committed:
+                runtime.notify()
         elif legacy_test_callback is not None:
             content = row["content"]
             root_id = thread_root_id or payload.envelope_id
@@ -1569,6 +1709,7 @@ class PuffoCoreMessageClient:
             )
             if asyncio.iscoroutine(result):
                 await result
+        return True
 
     async def _handle_plaintext_payload(self, payload: MessagePayload) -> None:
         """Persist + surface a decoded message payload to the agent.
@@ -5181,7 +5322,7 @@ class PuffoCoreMessageClient:
 
     async def send_fallback_message(
         self, channel_id: str, text: str, root_id: str = "",
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """Post a reply. Empty ``channel_id`` ⇒ DM back to
         the retired implicit DM peer.
 
@@ -5190,6 +5331,33 @@ class PuffoCoreMessageClient:
         Empty ``channel_id``: DM reply; recipients are me and the peer
         so the agent's other devices see the fan-out.
         """
+        if channel_id:
+            delegate = getattr(self, "send_delegate", None)
+            if delegate is None:
+                self._log.warning(
+                    "send_fallback_message: persistent coordinator unavailable; "
+                    "channel output failed closed"
+                )
+                from .send_coordinator import failed_result
+                return failed_result(
+                    "persistent send coordinator is unavailable",
+                    kind="coordinator_unavailable",
+                )
+            from .send_coordinator import SemanticSendRequest
+            result = await delegate.send(
+                SemanticSendRequest(
+                    destination=channel_id,
+                    text=text,
+                    root_id=root_id,
+                )
+            )
+            if not isinstance(result, dict) or result.get("state") not in (
+                "sent", "held"
+            ):
+                self._log.warning(
+                    "send_fallback_message: coordinated channel output failed"
+                )
+            return result
         if self._bridge is not None:
             # T23 bridge transport: send plaintext; the server holds all
             # crypto and fans out recipients. Empty channel_id ⇒ DM back

@@ -19,6 +19,7 @@ as long as it likes to ack (point 4b); pings keep it counted alive.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
 from typing import Any, Awaitable, Callable, Optional, Protocol
@@ -145,6 +146,14 @@ class WsLocalSession:
                 }
                 for route in planned.routes
             ],
+            notice=(
+                {
+                    "generation": planned.notice_generation,
+                    **json.loads(planned.target_summary),
+                }
+                if planned.notice_generation
+                else {}
+            ),
         )
         await self._pump()
 
@@ -240,6 +249,7 @@ class WsLocalSession:
             turn_id=bundle.turn_id,
             targets=bundle.targets,
             routes=bundle.routes,
+            notice=bundle.notice,
         )))
 
     async def _on_ack(self, bundle_id: str) -> None:

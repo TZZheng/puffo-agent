@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import mimetypes
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
@@ -29,6 +30,7 @@ from ..crypto.primitives import Ed25519KeyPair
 logger = logging.getLogger(__name__)
 
 CHANNEL_SEND_PATH = "/v2/agent-runtime/messages:send"
+KEYLESS_CHANNEL_SEND_PATH = "/v2/cloud-agents/agent-runtime/messages:send"
 _KNOWN_ERROR_STATUSES = {400, 401, 403, 404, 405, 409, 413, 429, 500, 503}
 
 
@@ -96,6 +98,7 @@ class SendResult:
     latest_seq: Optional[int] = None
     latest_envelope_id: Optional[str] = None
     latest_seq_before_send: Optional[int] = None
+    mode: Optional[str] = None
     missing_devices: list[str] = field(default_factory=list)
     recovered_messages: list[dict[str, Any]] = field(default_factory=list)
     error: Optional[str] = None
@@ -106,6 +109,35 @@ class SendResult:
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         return {key: value for key, value in data.items() if value not in (None, [], "")}
+
+
+@dataclass
+class _HeldEvidence:
+    latest_seq: int
+    latest_envelope_id: str
+    synchronized: bool = False
+
+
+@dataclass(frozen=True)
+class _ReconsiderationDecision:
+    eligible: bool
+    reason: str
+    provider_session_id: str
+    turn_id: str
+    latest_seq: int | None = None
+    latest_envelope_id: str | None = None
+    admitted_seq: int | None = None
+
+    def audit_fields(self) -> dict[str, Any]:
+        return {
+            "eligible": self.eligible,
+            "decision_reason": self.reason,
+            "provider_session_id": self.provider_session_id,
+            "turn_id": self.turn_id,
+            "latest_seq": self.latest_seq,
+            "latest_envelope_id": self.latest_envelope_id,
+            "admitted_seq": self.admitted_seq,
+        }
 
 
 @runtime_checkable
@@ -175,7 +207,25 @@ class SendCoordinator:
         self.provider_session_id = provider_session_id
         self._channel_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._held_lock = asyncio.Lock()
-        self._held_watermarks: dict[tuple[str, str], tuple[int, str]] = {}
+        self._held_evidence: dict[
+            tuple[str, str, str, str], _HeldEvidence
+        ] = {}
+
+    def _turn_identity(self) -> tuple[str, str]:
+        active = getattr(self.active_turn_source, "active", None)
+        turn_id = str(getattr(active, "turn_id", "") or "")
+        configured_session_id = str(self.provider_session_id or "")
+        active_session_id = str(
+            getattr(active, "provider_session_id", "") or ""
+        )
+        if (
+            configured_session_id
+            and active_session_id
+            and configured_session_id != active_session_id
+        ):
+            return "", turn_id
+        session_id = configured_session_id or active_session_id
+        return session_id, turn_id
 
     async def send(
         self, request: SemanticSendRequest | Mapping[str, Any] | None = None, **kwargs: Any,
@@ -226,27 +276,35 @@ class SendCoordinator:
         async with lock:
             result = await self._send_channel(request, space_id, destination)
         if result.get("state") == "held":
-            recovered = await self._recover_held(
+            synchronized = await self._recover_held(
                 space_id, destination,
                 result.get("latest_seq"), result.get("latest_envelope_id"),
             )
-            if recovered:
-                result["recovered_messages"] = recovered
+            result["synchronized"] = synchronized
         return result
 
     async def _send_keyless(
         self, request: SemanticSendRequest, destination: str,
     ) -> dict[str, Any]:
-        """Preserve the CloudBridge transport behind the semantic facade.
-
-        The experimental keyless endpoint does not yet implement the native
-        freshness/hold contract. It therefore sends through its existing
-        cloud-agent route and returns a normalized semantic result.
-        """
+        """Use coordinated Runtime-v2 channels and preserve legacy keyless DMs."""
         from ..mcp.puffo_core_tools import (
             _resolve_channel_space,
             _resolve_outgoing_root,
         )
+
+        if not destination.startswith("@"):
+            try:
+                space_id = await _resolve_channel_space(
+                    _CoordinatorConfig(self), destination,
+                )
+            except Exception as exc:
+                return failed_result(str(exc), kind="routing")
+            key = (space_id, destination)
+            lock = self._channel_locks.setdefault(key, asyncio.Lock())
+            async with lock:
+                return await self._send_keyless_channel(
+                    request, space_id, destination
+                )
 
         dm_peer: str | None
         channel_id: str | None
@@ -359,6 +417,251 @@ class SendCoordinator:
         except Exception as exc:
             return failed_result(str(exc), kind="validation")
 
+    async def _send_keyless_channel(
+        self,
+        request: SemanticSendRequest,
+        space_id: str,
+        channel_id: str,
+    ) -> dict[str, Any]:
+        baseline = await self._baseline(space_id, channel_id)
+        if baseline is None:
+            baseline = 0
+        active = await self._active_boundary(space_id, channel_id)
+        if (
+            isinstance(baseline, bool)
+            or not isinstance(baseline, int)
+            or baseline < 0
+            or isinstance(active, bool)
+            or (active is not None and (not isinstance(active, int) or active < 0))
+        ):
+            return failed_result(
+                "channel freshness is unavailable",
+                kind="freshness_unavailable",
+            )
+        reconsideration: _ReconsiderationDecision | None = None
+        if request.send_anyway:
+            reconsideration = await self._reconsideration_decision(
+                space_id, channel_id
+            )
+            if not reconsideration.eligible:
+                result = failed_result(
+                    "send_anyway requires exact held catch-up and an admitted "
+                    "same-Turn read through that boundary",
+                    kind="reconsideration_ineligible",
+                )
+                result["_reconsideration_audit"] = (
+                    reconsideration.audit_fields()
+                )
+                return result
+            active = reconsideration.admitted_seq
+        seen_seq = max(baseline, active if active is not None else baseline)
+        session_id, turn_id = self._turn_identity()
+        held_key = (session_id, turn_id, space_id, channel_id)
+        from ..mcp.puffo_core_tools import _resolve_outgoing_root
+        try:
+            root_id, root_note = await _resolve_outgoing_root(
+                request.root_id,
+                self.data_client,
+                self_slug=self.slug,
+                channel_id=channel_id,
+                space_id=space_id,
+                dm_peer=None,
+            )
+            body: dict[str, Any] = {
+                # One logical model send owns one stable idempotency reference.
+                # _post_keyless_exact retries this exact body, while a later
+                # tool call constructs a fresh reference here.
+                "client_ref": f"send_{uuid.uuid4().hex}",
+                "space_id": space_id,
+                "channel_id": channel_id,
+                "plaintext": (
+                    request.caption if request.attachment_paths else request.text
+                ),
+                "freshness": {
+                    "context_baseline_seq": baseline,
+                    "seen_seq": seen_seq,
+                    "mode": (
+                        "send_anyway"
+                        if request.send_anyway
+                        else "require_current"
+                    ),
+                },
+            }
+            if root_id:
+                body["thread_root_id"] = root_id
+                if request.root_id:
+                    body["reply_to_id"] = request.root_id
+            refs: list[dict[str, Any]] = []
+            for target in self._validate_attachment_targets(request):
+                plaintext = target.read_bytes()
+                upload = await self.http_client.post_bytes_unsigned(
+                    "/v2/cloud-agents/blobs/upload", plaintext
+                )
+                blob_id = upload.get("blob_id") if isinstance(upload, Mapping) else None
+                if not blob_id:
+                    return failed_result(
+                        "keyless attachment upload returned no blob_id",
+                        kind="protocol",
+                    )
+                refs.append(
+                    {
+                        "blob_id": blob_id,
+                        "filename": target.name,
+                        "mime_type": (
+                            mimetypes.guess_type(target.name)[0]
+                            or "application/octet-stream"
+                        ),
+                        "size_bytes": len(plaintext),
+                    }
+                )
+            if refs:
+                body["attachments"] = refs
+            raw = await self._post_keyless_exact(body)
+            result = self._validate_keyless_response(raw, body)
+            if result.state == "held":
+                if result.latest_seq is not None and result.latest_envelope_id:
+                    await self._record_held(
+                        held_key, result.latest_seq, result.latest_envelope_id
+                    )
+                result.note = "No channel message was committed; inspect newer Inbox context."
+                synchronized = await self._recover_held(
+                    space_id,
+                    channel_id,
+                    result.latest_seq,
+                    result.latest_envelope_id,
+                )
+            elif result.state == "sent":
+                await self._consume_held(held_key)
+                result.note = f"posted {result.envelope_id} to {channel_id}{root_note}"
+                if result.latest_seq_before_send == seen_seq and result.seq is not None:
+                    await self._advance(space_id, channel_id, result.seq)
+            output = result.to_dict()
+            if result.state == "held":
+                output["synchronized"] = synchronized
+            if reconsideration is not None:
+                output["_reconsideration_audit"] = (
+                    reconsideration.audit_fields()
+                )
+            return output
+        except HttpError as exc:
+            return failed_result(
+                _http_error_detail(exc.body),
+                kind="freshness_unavailable" if exc.status in (404, 405, 503) else "http",
+                status=exc.status,
+            )
+        except Exception as exc:
+            return failed_result(str(exc), kind="validation")
+
+    async def _post_keyless_exact(self, body: dict[str, Any]) -> Any:
+        for attempt in range(2):
+            try:
+                return await self.http_client.post_unsigned(
+                    KEYLESS_CHANNEL_SEND_PATH, body
+                )
+            except HttpError:
+                raise
+            except (TimeoutError, ConnectionError, OSError):
+                if attempt == 0:
+                    continue
+                return SendResult(
+                    state="failed",
+                    error="coordinated keyless send outcome is unknown",
+                    error_kind="transport_unknown",
+                )
+        raise AssertionError("unreachable")
+
+    def _validate_keyless_response(
+        self, raw: Any, request_body: Mapping[str, Any]
+    ) -> SendResult:
+        if isinstance(raw, SendResult):
+            return raw
+        if not isinstance(raw, Mapping):
+            return SendResult(
+                state="failed", error="malformed coordinated keyless response",
+                error_kind="protocol",
+            )
+        state = raw.get("state")
+        freshness = request_body["freshness"]
+        if state == "sent":
+            envelope_id = raw.get("envelope_id")
+            seq = raw.get("seq")
+            replay = raw.get("replay")
+            missing_devices = raw.get("missing_devices")
+            echoed = raw.get("freshness")
+            if (
+                not isinstance(envelope_id, str)
+                or not envelope_id
+                or isinstance(seq, bool)
+                or not isinstance(seq, int)
+                or seq <= 0
+                or not isinstance(replay, bool)
+                or not isinstance(missing_devices, list)
+                or not all(isinstance(item, str) for item in missing_devices)
+                or not isinstance(echoed, Mapping)
+                or set(echoed) != {
+                    "mode",
+                    "context_baseline_seq",
+                    "seen_seq",
+                    "latest_seq_before_send",
+                }
+                or echoed.get("mode") != freshness["mode"]
+                or echoed.get("seen_seq") != freshness["seen_seq"]
+                or echoed.get("context_baseline_seq")
+                != freshness["context_baseline_seq"]
+                or isinstance(echoed.get("latest_seq_before_send"), bool)
+                or not isinstance(echoed.get("latest_seq_before_send"), int)
+                or echoed["latest_seq_before_send"] < freshness["seen_seq"]
+                or (
+                    freshness["mode"] == "require_current"
+                    and echoed["latest_seq_before_send"] != freshness["seen_seq"]
+                )
+            ):
+                return SendResult(
+                    state="failed", error="invalid coordinated keyless commit",
+                    error_kind="protocol",
+                )
+            return SendResult(
+                state="sent",
+                envelope_id=envelope_id,
+                seq=seq,
+                replay=replay,
+                missing_devices=list(missing_devices),
+                context_baseline_seq=freshness["context_baseline_seq"],
+                seen_seq=freshness["seen_seq"],
+                latest_seq_before_send=echoed["latest_seq_before_send"],
+                mode=echoed["mode"],
+            )
+        if state == "held":
+            latest = raw.get("latest_seq")
+            if (
+                raw.get("seen_seq") != freshness["seen_seq"]
+                or (
+                    raw.get("context_baseline_seq") is not None
+                    and raw.get("context_baseline_seq")
+                    != freshness["context_baseline_seq"]
+                )
+                or isinstance(latest, bool)
+                or not isinstance(latest, int)
+                or latest <= freshness["seen_seq"]
+                or not isinstance(raw.get("latest_envelope_id"), str)
+                or not raw.get("latest_envelope_id")
+            ):
+                return SendResult(
+                    state="failed", error="invalid coordinated keyless hold",
+                    error_kind="protocol",
+                )
+            return SendResult(
+                state="held",
+                context_baseline_seq=freshness["context_baseline_seq"],
+                seen_seq=freshness["seen_seq"],
+                latest_seq=latest,
+                latest_envelope_id=raw["latest_envelope_id"],
+            )
+        return SendResult(
+            state="failed", error="unknown coordinated keyless state",
+            error_kind="protocol",
+        )
+
     async def _baseline(self, space_id: str, channel_id: str) -> Any:
         return await _call_first(
             self.baseline_source,
@@ -400,7 +703,25 @@ class SendCoordinator:
             not isinstance(active, int) or active < 0
         )):
             return failed_result("active-turn boundary is invalid", kind="freshness_unavailable")
+        reconsideration: _ReconsiderationDecision | None = None
+        if request.send_anyway:
+            reconsideration = await self._reconsideration_decision(
+                space_id, channel_id
+            )
+            if not reconsideration.eligible:
+                result = failed_result(
+                    "send_anyway requires exact held catch-up and an admitted "
+                    "same-Turn read through that boundary",
+                    kind="reconsideration_ineligible",
+                )
+                result["_reconsideration_audit"] = (
+                    reconsideration.audit_fields()
+                )
+                return result
+            active = reconsideration.admitted_seq
         seen_seq = max(baseline, active if active is not None else baseline)
+        session_id, turn_id = self._turn_identity()
+        held_key = (session_id, turn_id, space_id, channel_id)
 
         try:
             resolved = await self._resolve_route_and_content(
@@ -428,6 +749,7 @@ class SendCoordinator:
         result = self._validate_channel_response(response, envelope, freshness)
         action = "uploaded" if request.attachment_paths else "posted"
         if result.state == "sent":
+            await self._consume_held(held_key)
             result.note = (
                 f"{action} {envelope.get('envelope_id', '?')} to "
                 f"{request.destination}{resolved['note']}"
@@ -445,6 +767,10 @@ class SendCoordinator:
                     result.missing_devices, freshness,
                 ))
         elif result.state == "held":
+            if result.latest_seq is not None and result.latest_envelope_id:
+                await self._record_held(
+                    held_key, result.latest_seq, result.latest_envelope_id
+                )
             result.note = (
                 "No message was sent because the channel advanced beyond this "
                 "turn's visible boundary. Newer context is returned when "
@@ -452,7 +778,10 @@ class SendCoordinator:
                 "send the chosen content with send_anyway=true, or leave it "
                 f"unsent.{resolved['note']}"
             )
-        return result.to_dict()
+        output = result.to_dict()
+        if reconsideration is not None:
+            output["_reconsideration_audit"] = reconsideration.audit_fields()
+        return output
 
     async def _post_channel_exact(self, body: dict[str, Any]) -> Any:
         # The same object is deliberately reused after an uncertain outcome; the
@@ -498,9 +827,14 @@ class SendCoordinator:
             )
         state = raw.get("state")
         envelope_id = envelope.get("envelope_id")
+        if not isinstance(envelope_id, str) or not envelope_id.strip():
+            return SendResult(
+                state="failed", error="request envelope_id is invalid",
+                error_kind="protocol",
+            )
         if state not in ("sent", "held"):
             return SendResult(
-                state="failed", error=f"unknown channel send state {state!r}",
+                state="failed", error="unknown channel send state",
                 error_kind="protocol",
             )
         if raw.get("envelope_id") != envelope_id:
@@ -510,49 +844,83 @@ class SendCoordinator:
             )
         if state == "sent":
             seq = raw.get("seq")
-            if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+            if isinstance(seq, bool) or not isinstance(seq, int) or seq <= 0:
                 return SendResult(
                     state="failed", error="sent response has invalid seq",
                     error_kind="protocol",
                 )
-            replay = raw.get("replay", False)
+            if "replay" not in raw:
+                return SendResult(
+                    state="failed", error="sent response omitted replay",
+                    error_kind="protocol",
+                )
+            replay = raw["replay"]
             if not isinstance(replay, bool):
                 return SendResult(
                     state="failed", error="sent response has invalid replay",
                     error_kind="protocol",
                 )
+            has_freshness = "freshness" in raw
             response_freshness = raw.get("freshness")
             # The frozen Server contract identifies legacy-created replay by
             # replay=true plus the absence of stored v2 freshness metadata.
-            legacy_replay = replay and response_freshness is None
-            if response_freshness is None and not legacy_replay:
+            legacy_replay = replay is True and not has_freshness
+            if not has_freshness and not legacy_replay:
                 return SendResult(
                     state="failed", error="sent response omitted freshness",
                     error_kind="protocol",
                 )
-            if response_freshness is not None:
+            latest_before = None
+            if has_freshness:
                 if not isinstance(response_freshness, Mapping):
                     return SendResult(
                         state="failed", error="sent response freshness is malformed",
                         error_kind="protocol",
                     )
+                if set(response_freshness) != {
+                    "mode",
+                    "context_baseline_seq",
+                    "seen_seq",
+                    "latest_seq_before_send",
+                }:
+                    return SendResult(
+                        state="failed",
+                        error="sent response freshness fields mismatch",
+                        error_kind="protocol",
+                    )
+                baseline_echo = response_freshness["context_baseline_seq"]
+                seen_echo = response_freshness["seen_seq"]
                 latest_before = response_freshness.get("latest_seq_before_send")
                 if (
                     response_freshness.get("mode") != freshness["mode"]
-                    or response_freshness.get("seen_seq") != freshness["seen_seq"]
+                    or isinstance(baseline_echo, bool)
+                    or not isinstance(baseline_echo, int)
+                    or baseline_echo < 0
+                    or baseline_echo != freshness["context_baseline_seq"]
+                    or isinstance(seen_echo, bool)
+                    or not isinstance(seen_echo, int)
+                    or seen_echo < 0
+                    or seen_echo != freshness["seen_seq"]
                     or isinstance(latest_before, bool)
                     or not isinstance(latest_before, int)
-                    or latest_before < freshness["seen_seq"]
+                    or latest_before < 0
+                    or latest_before < max(baseline_echo, seen_echo)
                     or (
                         freshness["mode"] == "require_current"
-                        and latest_before != freshness["seen_seq"]
+                        and latest_before != seen_echo
                     )
                 ):
                     return SendResult(
                         state="failed", error="sent response freshness mismatch",
                         error_kind="protocol",
                     )
-            missing = raw.get("missing_devices") or []
+            if "missing_devices" not in raw:
+                return SendResult(
+                    state="failed",
+                    error="sent response omitted missing_devices",
+                    error_kind="protocol",
+                )
+            missing = raw["missing_devices"]
             if not isinstance(missing, list) or not all(isinstance(v, str) for v in missing):
                 return SendResult(
                     state="failed", error="sent response has invalid missing_devices",
@@ -563,12 +931,28 @@ class SendCoordinator:
                 context_baseline_seq=freshness["context_baseline_seq"],
                 seen_seq=freshness["seen_seq"],
                 latest_seq_before_send=(
-                    latest_before if response_freshness is not None else None
+                    latest_before if has_freshness else None
                 ),
                 missing_devices=missing,
             )
 
-        values = {"seen_seq": raw.get("seen_seq"), "latest_seq": raw.get("latest_seq")}
+        if set(raw) != {
+            "state",
+            "envelope_id",
+            "context_baseline_seq",
+            "seen_seq",
+            "latest_seq",
+            "latest_envelope_id",
+        }:
+            return SendResult(
+                state="failed", error="held response fields mismatch",
+                error_kind="protocol",
+            )
+        values = {
+            "context_baseline_seq": raw["context_baseline_seq"],
+            "seen_seq": raw["seen_seq"],
+            "latest_seq": raw["latest_seq"],
+        }
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value < 0
             for value in values.values()
@@ -578,9 +962,13 @@ class SendCoordinator:
                 error_kind="protocol",
             )
         if (
-            values["seen_seq"] != freshness["seen_seq"]
+            values["context_baseline_seq"] != freshness["context_baseline_seq"]
+            or values["seen_seq"] != freshness["seen_seq"]
+            or values["latest_seq"] <= max(
+                freshness["context_baseline_seq"], freshness["seen_seq"]
+            )
             or not isinstance(raw.get("latest_envelope_id"), str)
-            or not raw.get("latest_envelope_id")
+            or not raw.get("latest_envelope_id").strip()
         ):
             return SendResult(
                 state="failed", error="held response watermark mismatch",
@@ -778,52 +1166,175 @@ class SendCoordinator:
         except Exception as exc:
             logger.warning("channel supplementation failed: %s", exc)
 
+    async def _record_held(
+        self,
+        key: tuple[str, str, str, str],
+        latest_seq: int,
+        latest_envelope_id: str,
+    ) -> None:
+        async with self._held_lock:
+            old = self._held_evidence.get(key)
+            if (
+                old is None
+                or latest_seq > old.latest_seq
+                or (
+                    latest_seq == old.latest_seq
+                    and latest_envelope_id != old.latest_envelope_id
+                )
+            ):
+                self._held_evidence[key] = _HeldEvidence(
+                    latest_seq=latest_seq,
+                    latest_envelope_id=latest_envelope_id,
+                )
+
+    async def _consume_held(
+        self, key: tuple[str, str, str, str]
+    ) -> None:
+        async with self._held_lock:
+            self._held_evidence.pop(key, None)
+
+    async def _reconsideration_decision(
+        self, space_id: str, channel_id: str
+    ) -> _ReconsiderationDecision:
+        session_id, turn_id = self._turn_identity()
+        if not session_id or not turn_id:
+            return _ReconsiderationDecision(
+                False, "missing_active_identity", session_id, turn_id
+            )
+        key = (session_id, turn_id, space_id, channel_id)
+        async with self._held_lock:
+            held = self._held_evidence.get(key)
+            held_pair = (
+                (held.latest_seq, held.latest_envelope_id)
+                if held is not None
+                else None
+            )
+            synchronized = bool(held and held.synchronized)
+        if held_pair is None:
+            return _ReconsiderationDecision(
+                False, "missing_held_evidence", session_id, turn_id
+            )
+        if not synchronized:
+            await self._recover_held(
+                space_id, channel_id, held_pair[0], held_pair[1]
+            )
+        async with self._held_lock:
+            current = self._held_evidence.get(key)
+            if current is None:
+                return _ReconsiderationDecision(
+                    False, "missing_held_evidence", session_id, turn_id
+                )
+            latest_seq = current.latest_seq
+            latest_envelope_id = current.latest_envelope_id
+            synchronized = current.synchronized
+        admitted = await self._active_boundary(space_id, channel_id)
+        if isinstance(admitted, bool) or (
+            admitted is not None
+            and (not isinstance(admitted, int) or admitted < 0)
+        ):
+            admitted = None
+        if not synchronized:
+            reason = (
+                "held_boundary_superseded"
+                if (latest_seq, latest_envelope_id) != held_pair
+                else "held_not_synchronized"
+            )
+            return _ReconsiderationDecision(
+                False, reason, session_id, turn_id,
+                latest_seq, latest_envelope_id, admitted,
+            )
+        if admitted is None:
+            return _ReconsiderationDecision(
+                False, "admission_unavailable", session_id, turn_id,
+                latest_seq, latest_envelope_id,
+            )
+        if admitted < latest_seq:
+            return _ReconsiderationDecision(
+                False, "admission_before_held", session_id, turn_id,
+                latest_seq, latest_envelope_id, admitted,
+            )
+        if self._turn_identity() != (session_id, turn_id):
+            return _ReconsiderationDecision(
+                False, "active_identity_changed", session_id, turn_id,
+                latest_seq, latest_envelope_id, admitted,
+            )
+        return _ReconsiderationDecision(
+            True, "synchronized_and_admitted", session_id, turn_id,
+            latest_seq, latest_envelope_id, admitted,
+        )
+
     async def _recover_held(
         self, space_id: str, channel_id: str,
         latest_seq: int | None, latest_envelope_id: str | None,
-    ) -> list[dict[str, Any]]:
+    ) -> bool:
         if latest_seq is None or not latest_envelope_id or self.held_recovery_source is None:
-            return []
-        key = (space_id, channel_id)
+            return False
+        session_id, turn_id = self._turn_identity()
+        if not session_id or not turn_id:
+            return False
+        key = (session_id, turn_id, space_id, channel_id)
         async with self._held_lock:
-            old = self._held_watermarks.get(key)
-            if old is None or latest_seq >= old[0]:
-                self._held_watermarks[key] = (latest_seq, latest_envelope_id)
-            seq, envelope_id = self._held_watermarks[key]
-        waited = await _call_first(
-            self.held_recovery_source,
-            ("wait_for_held_delivery", "wait_for_delivery", "wait"),
-            space_id, channel_id, seq, envelope_id,
-        )
-        if waited is False:
-            return []
-        # Another held call may have published a newer proven watermark while
-        # this waiter was blocked. Query only the coalesced head.
-        async with self._held_lock:
-            seq, envelope_id = self._held_watermarks[key]
-        if self.provider_session_id is None:
-            return []
-        rows = await _call_first(
-            self.held_recovery_source,
-            ("query_held_messages", "query_recovered_messages", "query"),
-            space_id, channel_id, seq, envelope_id, self.provider_session_id,
-        )
-        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
-            return []
-        concrete: list[dict[str, Any]] = []
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
+            current = self._held_evidence.get(key)
             if (
-                row.get("latest_seq") != seq
-                or row.get("latest_envelope_id") != envelope_id
+                current is None
+                or current.latest_seq != latest_seq
+                or current.latest_envelope_id != latest_envelope_id
             ):
-                continue
-            session = row.get("provider_session_id")
-            if self.provider_session_id is not None and session != self.provider_session_id:
-                continue
-            concrete.append(dict(row))
-        return concrete
+                return False
+        try:
+            waited = await _call_first(
+                self.held_recovery_source,
+                ("wait_for_held_delivery", "wait_for_delivery", "wait"),
+                space_id, channel_id, latest_seq, latest_envelope_id,
+            )
+        except Exception:
+            return False
+        if waited is not True:
+            return False
+        async with self._held_lock:
+            current = self._held_evidence.get(key)
+            if (
+                current is None
+                or current.latest_seq != latest_seq
+                or current.latest_envelope_id != latest_envelope_id
+            ):
+                return False
+        if self.provider_session_id is None:
+            return False
+        try:
+            rows = await _call_first(
+                self.held_recovery_source,
+                ("query_held_messages", "query_recovered_messages", "query"),
+                space_id, channel_id, latest_seq, latest_envelope_id,
+                self.provider_session_id,
+            )
+        except Exception:
+            return False
+        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+            return False
+        synchronized = any(
+            isinstance(row, Mapping)
+            and row.get("envelope_id") == latest_envelope_id
+            and row.get("server_seq") == latest_seq
+            and row.get("latest_seq") == latest_seq
+            and row.get("latest_envelope_id") == latest_envelope_id
+            and row.get("provider_session_id") == session_id
+            for row in rows
+        )
+        if not synchronized or self._turn_identity() != (session_id, turn_id):
+            return False
+        # Exact-pair compare-and-set: a stale recovery completion cannot bless
+        # a superseding held head or resurrect consumed evidence.
+        async with self._held_lock:
+            current = self._held_evidence.get(key)
+            if (
+                current is None
+                or current.latest_seq != latest_seq
+                or current.latest_envelope_id != latest_envelope_id
+            ):
+                return False
+            current.synchronized = True
+        return True
 
 
 class _CoordinatorConfig:

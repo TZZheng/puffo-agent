@@ -761,6 +761,88 @@ async def test_legacy_sequence_backfill_does_not_activate_history_row():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "lifecycle",
+    [ProcessingState.PENDING, ProcessingState.IN_TURN, ProcessingState.PROCESSED],
+)
+async def test_local_runtime_redelivery_promotes_in_place_and_preserves_lifecycle(
+    lifecycle,
+):
+    store = _temp_store()
+    await store.store_local_event(
+        _channel_payload("rollout"), reason="legacy bridge",
+    )
+    if lifecycle is not ProcessingState.PENDING:
+        await store.admit_messages(
+            ["rollout"], turn_id="turn-1", provider_session_id="session-1",
+        )
+    if lifecycle is ProcessingState.PROCESSED:
+        await store.mark_processed(["rollout"], turn_id="turn-1")
+    before = await store.get_message_by_envelope("rollout")
+    notice_before = await store.get_notice_state()
+    work_before = tuple(
+        item.envelope_id for item in await store.get_pending()
+    )
+    result = await store.store_receipt(
+        _channel_payload("rollout"),
+        server_seq=42,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="trusted bridge replay",
+    )
+    assert result.status is ReceiptWriteStatus.COMMITTED
+    await store.close()
+    await store.open()
+    row = await store.get_message_by_envelope("rollout")
+    assert row is not None and before is not None
+    assert row.server_seq == 42
+    assert row.receipt_disposition is ReceiptDisposition.ELIGIBLE
+    assert row.processing_state is lifecycle
+    assert row.processing_turn_id == before.processing_turn_id
+    assert row.local_ordinal is None and row.after_server_seq is None
+    notice_after = await store.get_notice_state()
+    work_after = tuple(item.envelope_id for item in await store.get_pending())
+    assert notice_after == notice_before
+    assert work_after == work_before
+    replay = await store.store_receipt(
+        _channel_payload("rollout"),
+        server_seq=42,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="trusted bridge replay",
+    )
+    assert replay.status is ReceiptWriteStatus.IDEMPOTENT
+    assert await store.get_notice_state() == notice_before
+    assert tuple(
+        item.envelope_id for item in await store.get_pending()
+    ) == work_before
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_local_runtime_promotion_sequence_collision_is_non_mutating():
+    store = _temp_store()
+    await store.store_local_event(_channel_payload("local"), reason="legacy")
+    await store.store_receipt(
+        _channel_payload("server"),
+        server_seq=7,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="server",
+    )
+    result = await store.store_receipt(
+        _channel_payload("local"),
+        server_seq=7,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="collision",
+    )
+    assert result.status is ReceiptWriteStatus.CONFLICT
+    row = await store.get_message_by_envelope("local")
+    assert row is not None
+    assert row.server_seq is None
+    assert row.receipt_disposition is ReceiptDisposition.LOCAL_RUNTIME
+    assert row.local_ordinal is not None
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_legacy_gated_dm_backfill_stays_deferred_until_promotion():
     store = _temp_store()
     await store.store(_dm_payload("legacy-gated", "foreign", "agent"))
@@ -1145,4 +1227,112 @@ async def test_legacy_writer_waits_for_active_inbox_transaction(monkeypatch):
     assert receipt.acknowledge
     assert await store.has_message("locked-receipt")
     assert await store.has_message("legacy-write")
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_durable_notice_deadline_is_fixed_and_survives_reopen(tmp_path):
+    now = [1_000]
+    path = tmp_path / "notice.db"
+    store = MessageStore(path, now_ms=lambda: now[0])
+    await store.store_receipt(
+        _channel_payload("n1"),
+        server_seq=1,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+        received_at=now[0],
+    )
+    first = await store.get_notice_state()
+    assert first.first_pending_deadline_ms == 4_000
+    now[0] = 2_500
+    await store.store_receipt(
+        _channel_payload("n2"),
+        server_seq=2,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+        received_at=now[0],
+    )
+    later = await store.get_notice_state()
+    assert later.first_pending_deadline_ms == 4_000
+    assert later.generation > first.generation
+    await store.close()
+
+    reopened = MessageStore(path, now_ms=lambda: 20_000)
+    assert (await reopened.get_notice_state()).first_pending_deadline_ms == 4_000
+    assert await reopened.mark_notice_delivered(later.generation)
+    assert not await reopened.mark_notice_delivered(later.generation)
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_page_snapshot_excludes_concurrent_arrival_and_is_read_only(tmp_path):
+    store = MessageStore(tmp_path / "pages.db")
+    for seq in range(1, 4):
+        await store.store_receipt(
+            _channel_payload(f"page-{seq}", channel_id="ch_1"),
+            server_seq=seq,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="test",
+        )
+    first = await store.read_inbox_page(limit=2)
+    assert [item.envelope_id for item in first.items] == ["page-1", "page-2"]
+    assert first.has_more and first.remaining_count == 1
+    await store.store_receipt(
+        _channel_payload("page-4", channel_id="ch_1"),
+        server_seq=4,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    second = await store.read_inbox_page(cursor=first.next_cursor, limit=2)
+    assert [item.envelope_id for item in second.items] == ["page-3"]
+    assert all(
+        item.processing_state is ProcessingState.PENDING
+        for item in await store.get_pending()
+    )
+    with pytest.raises(ValueError, match="another target"):
+        await store.read_inbox_page(
+            target="channel:sp_1:ch_1",
+            cursor=first.next_cursor,
+            limit=2,
+        )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_inbox_page_traverses_more_than_fifty_with_complete_metadata(tmp_path):
+    store = MessageStore(tmp_path / "deep-pages.db")
+    for seq in range(1, 74):
+        await store.store_receipt(
+            _channel_payload(f"deep-{seq:03d}", channel_id="ch_deep"),
+            server_seq=seq,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="test",
+        )
+
+    ids: list[str] = []
+    cursor = ""
+    generation = None
+    remaining = []
+    while True:
+        page = await store.read_inbox_page(
+            target="channel:sp_1:ch_deep",
+            cursor=cursor,
+            limit=17,
+        )
+        ids.extend(item.envelope_id for item in page.items)
+        generation = page.snapshot_generation if generation is None else generation
+        assert page.snapshot_generation == generation
+        assert isinstance(page.next_cursor, str)
+        assert isinstance(page.has_more, bool)
+        assert isinstance(page.remaining_count, int)
+        remaining.append(page.remaining_count)
+        if not page.has_more:
+            assert page.next_cursor == ""
+            break
+        assert page.next_cursor
+        cursor = page.next_cursor
+
+    assert ids == [f"deep-{seq:03d}" for seq in range(1, 74)]
+    assert remaining == [56, 39, 22, 5, 0]
+    assert len(await store.get_pending()) == 73
     await store.close()

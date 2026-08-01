@@ -38,6 +38,7 @@ class Bundle:
     turn_id: str = ""
     targets: list[list[str]] = field(default_factory=list)
     routes: list[dict[str, Any]] = field(default_factory=list)
+    notice: dict[str, Any] = field(default_factory=dict)
 
     def envelope_ids(self) -> list[str]:
         return [m.get("envelope_id", "") for m in self.messages]
@@ -86,6 +87,7 @@ class BundleQueue:
         messages: list[dict[str, Any]],
         targets: list[list[str]],
         routes: list[dict[str, Any]],
+        notice: dict[str, Any] | None = None,
     ) -> Bundle:
         """Freeze one global v2 batch; never collapse it by root."""
         if self._inflight is not None or self._receiving:
@@ -99,6 +101,7 @@ class BundleQueue:
             turn_id=turn_id,
             targets=[list(target) for target in targets],
             routes=[dict(route) for route in routes],
+            notice=dict(notice or {}),
         )
         self._receiving[turn_id] = bundle
         return bundle

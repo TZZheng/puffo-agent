@@ -78,6 +78,9 @@ class FakeHttpClient:
                 "missing_devices": [],
                 "freshness": {
                     "mode": freshness["mode"],
+                    "context_baseline_seq": (
+                        freshness["context_baseline_seq"]
+                    ),
                     "seen_seq": freshness["seen_seq"],
                     "latest_seq_before_send": freshness["seen_seq"],
                 },
@@ -188,6 +191,23 @@ class KeylessFakeHttpClient:
         self.calls.append(("POST_UNSIGNED", path, body))
         if path in self.responses:
             return self.responses[path]
+        if path == "/v2/cloud-agents/agent-runtime/messages:send":
+            freshness = body["freshness"]
+            return {
+                "state": "sent",
+                "envelope_id": "msg_keyless",
+                "seq": freshness["seen_seq"] + 1,
+                "replay": False,
+                "missing_devices": [],
+                "freshness": {
+                    "mode": freshness["mode"],
+                    "context_baseline_seq": (
+                        freshness["context_baseline_seq"]
+                    ),
+                    "seen_seq": freshness["seen_seq"],
+                    "latest_seq_before_send": freshness["seen_seq"],
+                },
+            }
         return {"envelope_id": "msg_keyless"}
 
     async def post_bytes_unsigned(self, path, body):
@@ -292,12 +312,82 @@ async def test_whoami_includes_display_name():
 async def test_hidden_schema_semantic_send_fields_only():
     cfg, _, _ = _setup()
     tools = {tool.name: tool for tool in await _build_tools(cfg).list_tools()}
-    for name in ("send_message", "send_message_with_attachments"):
-        schema = tools[name].inputSchema
-        properties = schema["properties"]
-        assert "send_anyway" in properties
-        assert "context_baseline_seq" not in properties
-        assert "seen_seq" not in properties
+    expected = {
+        "send_message": {
+            "channel", "text", "root_id", "visibility_level", "send_anyway",
+        },
+        "send_message_with_attachments": {
+            "paths", "channel", "caption", "root_id",
+            "visibility_level", "send_anyway",
+        },
+    }
+    forbidden = {
+        "freshness", "freshness_mode", "mode", "context_baseline_seq",
+        "seen_seq", "synchronized", "transport", "provider_session_id",
+        "session_ref", "turn_id", "turn_ref", "sequence", "seq",
+        "through_seq", "latest_seq", "latest_envelope_id", "held_pair",
+        "client_ref", "admission_receipt", "correlation_receipt",
+        "tool_name", "tool_arguments",
+    }
+    for name, property_set in expected.items():
+        properties = set(tools[name].inputSchema["properties"])
+        assert properties == property_set
+        assert properties.isdisjoint(forbidden)
+
+
+@pytest.mark.asyncio
+async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
+    cfg, _, _ = _setup()
+    calls = []
+
+    class Runtime:
+        async def read_inbox(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "messages": ["message"],
+                "next_cursor": "cursor-2",
+                "has_more": True,
+                "remaining_count": 72,
+                "snapshot_generation": 9,
+                "correlation_receipt": "receipt-9",
+            }
+
+    cfg.inbox_runtime = Runtime()
+    mcp = _build_tools(cfg)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    schema = tools["read_inbox"].inputSchema
+    assert set(schema["properties"]) == {"target", "cursor", "limit"}
+    assert set(schema["properties"]).isdisjoint({
+        "freshness", "freshness_mode", "mode", "context_baseline_seq",
+        "seen_seq", "synchronized", "transport", "provider_session_id",
+        "session_ref", "turn_id", "turn_ref", "sequence", "seq",
+        "through_seq", "latest_seq", "latest_envelope_id", "held_pair",
+        "client_ref", "admission_receipt", "correlation_receipt",
+        "message_ids", "tool_name", "tool_arguments",
+    })
+    result = await mcp.call_tool(
+        "read_inbox",
+        {"target": "channel:sp_1:ch_1", "cursor": "opaque", "limit": 17},
+    )
+    structured = result[1]
+    assert structured == {
+        "messages": ["message"],
+        "next_cursor": "cursor-2",
+        "has_more": True,
+        "remaining_count": 72,
+        "snapshot_generation": 9,
+        "admission_receipt": "[puffo:model-visible-read:receipt-9]",
+    }
+    assert calls == [{
+        "target": "channel:sp_1:ch_1",
+        "cursor": "opaque",
+        "limit": 17,
+        "tool_arguments": {
+            "target": "channel:sp_1:ch_1",
+            "cursor": "opaque",
+            "limit": 17,
+        },
+    }]
 
 
 @pytest.mark.asyncio
@@ -356,6 +446,51 @@ async def test_semantic_out_of_process_uses_structured_rpc_client():
         "send_anyway": True,
         "text": "x",
     }]
+
+
+@pytest.mark.asyncio
+async def test_keyless_configured_rpc_precedes_direct_unsigned_coordinator():
+    cfg, http, _store = _setup_keyless()
+    bodies = []
+
+    class Rpc:
+        async def send_message(self, **body):
+            bodies.append(body)
+            return {"state": "sent", "attempted": True, "seq": 3}
+
+    cfg.send_coordinator = None
+    cfg.rpc_client = Rpc()
+    result = await _build_tools(cfg).call_tool(
+        "send_message",
+        {
+            "channel": "ch_a",
+            "text": "x",
+            "visibility_level": "human",
+            "send_anyway": True,
+        },
+    )
+    assert result[1]["state"] == "sent"
+    assert len(bodies) == 1
+    assert bodies[0]["visibility_level"] == "human"
+    assert bodies[0]["send_anyway"] is True
+    assert not [call for call in http.calls if call[0] == "POST_UNSIGNED"]
+
+
+@pytest.mark.asyncio
+async def test_keyless_configured_rpc_failure_does_not_fall_back_to_http():
+    cfg, http, _store = _setup_keyless()
+
+    class Rpc:
+        async def send_message(self, **_body):
+            raise ConnectionError("daemon unavailable")
+
+    cfg.send_coordinator = None
+    cfg.rpc_client = Rpc()
+    result = await _build_tools(cfg).call_tool(
+        "send_message", {"channel": "ch_a", "text": "x"},
+    )
+    assert result[1]["error_kind"] == "rpc_unavailable"
+    assert not [call for call in http.calls if call[0] == "POST_UNSIGNED"]
 
 
 @pytest.mark.asyncio
@@ -2520,7 +2655,7 @@ async def test_f5_keyless_attachments_happy_path_uploads_all_and_sends_once():
     assert body["plaintext"] == "hi"
     assert [r["filename"] for r in body["attachments"]] == ["a.txt", "b.txt"]
     assert [r["blob_id"] for r in body["attachments"]] == ["blob_0001", "blob_0002"]
-    assert "uploaded 2 file" in result
+    assert "msg_keyless" in result
 
 
 # ── keyless reads → /v2/cloud-agents/* (unsigned) ───────────────────
@@ -2665,11 +2800,16 @@ async def test_keyless_send_message_channel_posts_unsigned():
     sends = [(p, b) for m, p, b in http.calls if m == "POST_UNSIGNED"]
     assert len(sends) == 1
     path, body = sends[0]
-    assert path == "/v2/cloud-agents/messages"
-    assert body == {
-        "plaintext": "hello channel",
-        "space_id": "sp_test",
-        "channel_id": "ch_abc",
+    assert path == "/v2/cloud-agents/agent-runtime/messages:send"
+    assert body["plaintext"] == "hello channel"
+    assert body["space_id"] == "sp_test"
+    assert body["channel_id"] == "ch_abc"
+    assert isinstance(body["client_ref"], str) and body["client_ref"]
+    assert "client_request_id" not in body
+    assert body["freshness"] == {
+        "context_baseline_seq": 0,
+        "seen_seq": 0,
+        "mode": "require_current",
     }
 
 
@@ -2737,6 +2877,8 @@ async def test_keyless_attachments_bypasses_bridge():
     assert bridge.uploaded == []
     assert http.uploaded == [b"aaa"]
     assert len(_keyless_sends(http)) == 1
+    assert _keyless_sends(http)[0]["client_ref"]
+    assert "client_request_id" not in _keyless_sends(http)[0]
 
 
 # ── build_server(transport="bridge") is keyless-self-sufficient ─────

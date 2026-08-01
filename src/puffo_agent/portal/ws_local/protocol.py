@@ -101,6 +101,7 @@ class SendBundle:
     turn_id: str = ""
     targets: list[list[str]] = field(default_factory=list)
     routes: list[dict[str, Any]] = field(default_factory=list)
+    notice: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,7 @@ def encode(frame: _Outbound) -> str:
             "targets": frame.targets,
             "routes": frame.routes,
             "messages": frame.messages,
+            "notice": frame.notice,
         }
         # Compatibility route fields are safe only for one destination.
         if len(frame.targets) <= 1:
