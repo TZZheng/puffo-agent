@@ -51,6 +51,14 @@ pending content. With no `target`, it returns the oldest pending messages
 across spaces, channels, threads, and DMs in stable order. Continue with
 `next_cursor` when more of the same snapshot is relevant.
 
+A content-bearing `read_inbox` result includes `messages` for the exact
+pending page and a bounded `prior_context` list of earlier durable
+`<inbox_message>` blocks from the same selected conversation route(s).
+`prior_context` is supplementary, read-only evidence: it is already
+processed or terminally classified, is strictly earlier than the returned
+page, and does not admit or acknowledge those rows. Future or still-pending
+work is not substituted into it.
+
 Each `read_inbox` page item uses the same structured envelope format:
 
 ```
@@ -583,6 +591,11 @@ message bodies and is not enough context for a reply.
 - The returned page contains structured `<inbox_message>` blocks with
   `envelope_id`, `server_seq`, and nested `route` metadata, followed by
   each raw message body.
+- `prior_context` contains a bounded supplementary slice of earlier durable
+  `<inbox_message>` blocks from the same selected conversation route(s).
+  It is read-only evidence, strictly earlier than the returned page, and includes
+  only processed or terminally classified rows; it does not admit or
+  acknowledge those rows or replace the exact pending `messages` page.
 - A notice or held result is metadata only. It never substitutes for a
   content-bearing Inbox or history read.
 
@@ -1127,7 +1140,7 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
         DEFAULT_SKILL_CHANNEL_HISTORY,
     ),
     "read-inbox": (
-        "Read and acknowledge pending Puffo Inbox work after a metadata notice.",
+        "Read pending Puffo Inbox work and supplementary route context after a metadata notice.",
         DEFAULT_SKILL_READ_INBOX,
     ),
     "channel-members": (

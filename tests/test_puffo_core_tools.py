@@ -384,6 +384,7 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
             calls.append(kwargs)
             return {
                 "messages": ["message"],
+                "prior_context": ["prior"],
                 "next_cursor": "cursor-2",
                 "has_more": True,
                 "remaining_count": 72,
@@ -411,6 +412,7 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
     structured = result[1]
     assert structured == {
         "messages": ["message"],
+        "prior_context": ["prior"],
         "next_cursor": "cursor-2",
         "has_more": True,
         "remaining_count": 72,
@@ -427,6 +429,18 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
             "limit": 17,
         },
     }]
+
+    description = " ".join(tools["read_inbox"].description.lower().split())
+    for phrase in (
+        "prior_context",
+        "exact pending",
+        "page plus bounded",
+        "bounded, read-only",
+        "same conversation route(s)",
+        "strictly earlier than that page",
+        "not admitted or acknowledged",
+    ):
+        assert phrase.lower() in description, (phrase, description)
 
 
 @pytest.mark.asyncio

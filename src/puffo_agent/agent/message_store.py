@@ -19,6 +19,12 @@ _SCHEMA_INIT_LOCKS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
 ] = weakref.WeakKeyDictionary()
 
+# Supplementary context is deliberately smaller than a content-bearing Inbox
+# page.  The runtime applies the formatted-byte guard as well; these bounds
+# keep the durable lookup itself finite before formatting adds metadata.
+PRIOR_CONTEXT_MAX_ITEMS = 20
+PRIOR_CONTEXT_MAX_BYTES = 48_000
+
 
 def _schema_init_lock(db_path: Path) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
@@ -1221,6 +1227,105 @@ class MessageStore:
             ),
             int(row["last_delivered_generation"]),
         )
+
+    async def get_prior_context(
+        self,
+        anchor: StoredMessage,
+        *,
+        limit: int = PRIOR_CONTEXT_MAX_ITEMS,
+        max_bytes: int = PRIOR_CONTEXT_MAX_BYTES,
+    ) -> tuple[StoredMessage, ...]:
+        """Return a bounded, read-only slice before an Inbox page anchor.
+
+        The route is derived from the durable row itself.  Only rows already
+        completed or terminally classified are eligible, so pending and
+        in-turn work can never be smuggled into a later provider decision.
+        Ordering uses the same durable Inbox tuple as paging and local-event
+        frontiers; ``sent_at`` and provider-session state are not authority.
+        """
+        if not isinstance(anchor, StoredMessage):
+            raise TypeError("anchor must be a StoredMessage")
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be non-negative")
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+            raise ValueError("max_bytes must be non-negative")
+        limit = min(limit, PRIOR_CONTEXT_MAX_ITEMS)
+        max_bytes = min(max_bytes, PRIOR_CONTEXT_MAX_BYTES)
+        if not limit or not max_bytes:
+            return ()
+
+        position = self._inbox_order(anchor)
+        order_sql = (
+            "COALESCE(m.server_seq, m.after_server_seq, 0)",
+            "CASE WHEN m.server_seq IS NOT NULL THEN 0 ELSE 1 END",
+            "COALESCE(m.local_ordinal, 0)",
+            "m.envelope_id",
+        )
+        clauses = [
+            f"({', '.join(order_sql)}) < (?, ?, ?, ?)",
+            "(m.processing_state = ? OR m.receipt_disposition = ?)",
+        ]
+        params: list[Any] = [
+            *position,
+            ProcessingState.PROCESSED.value,
+            ReceiptDisposition.TERMINAL.value,
+        ]
+
+        if anchor.envelope_kind == "dm":
+            peer = anchor.sender_slug or anchor.recipient_slug or ""
+            if not peer:
+                return ()
+            clauses.extend([
+                "m.envelope_kind = 'dm'",
+                "(m.sender_slug = ? OR m.recipient_slug = ?)",
+            ])
+            params.extend((peer, peer))
+        else:
+            clauses.extend([
+                "m.envelope_kind != 'dm'",
+                "m.space_id = ?",
+                "m.channel_id = ?",
+            ])
+            params.extend((anchor.space_id, anchor.channel_id))
+            is_intro_prompt = (
+                anchor.sender_slug == "system"
+                and anchor.envelope_id.startswith("intro-prompt-")
+                and anchor.thread_root_id == anchor.envelope_id
+            )
+            if anchor.thread_root_id and not is_intro_prompt:
+                clauses.append("(m.envelope_id = ? OR m.thread_root_id = ?)")
+                params.extend((anchor.thread_root_id, anchor.thread_root_id))
+            else:
+                clauses.append("m.thread_root_id IS NULL")
+
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            sql = (
+                "SELECT m.* FROM messages m WHERE "
+                + " AND ".join(clauses)
+                + f" ORDER BY {', '.join(expression + ' DESC' for expression in order_sql)}"
+                + " LIMIT ?"
+            )
+            params.append(limit)
+            async with db.execute(sql, tuple(params)) as cursor:
+                rows = await cursor.fetchall()
+
+            # The query selects newest-before-anchor first so the bounded
+            # slice retains the newest rows, then returns them chronological
+            # to match every other history/context read. Count durable body
+            # bytes here; GlobalInboxRuntime applies the exact formatter-byte
+            # bound before exposing the result.
+            selected_rows: list[aiosqlite.Row] = []
+            used_bytes = 0
+            for row in rows:
+                body_bytes = len(str(row["content"]).encode("utf-8"))
+                if used_bytes + body_bytes > max_bytes:
+                    continue
+                selected_rows.append(row)
+                used_bytes += body_bytes
+            return tuple(
+                self._row_to_msg(row) for row in reversed(selected_rows)
+            )
 
     async def get_channel_pending(
         self,

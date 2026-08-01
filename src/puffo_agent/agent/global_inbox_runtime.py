@@ -33,7 +33,13 @@ from .inbox_scheduler import (
     NoticeDeliveryCapability,
     PlannedBatch,
 )
-from .message_store import MessageStore, ProcessingState, StoredMessage
+from .message_store import (
+    PRIOR_CONTEXT_MAX_BYTES,
+    PRIOR_CONTEXT_MAX_ITEMS,
+    MessageStore,
+    ProcessingState,
+    StoredMessage,
+)
 from ._logging import log_runtime_event
 
 logger = logging.getLogger(__name__)
@@ -1163,6 +1169,31 @@ class GlobalInboxRuntime:
             has_more = page.has_more
             remaining_count = page.remaining_count
 
+        prior_context: list[str] = []
+        if selected:
+            anchors: dict[tuple[str, ...], StoredMessage] = {}
+            for item in selected:
+                anchors.setdefault(route_for(item).target, item)
+            prior_rows: dict[str, StoredMessage] = {}
+            for anchor in anchors.values():
+                for item in await self.store.get_prior_context(
+                    anchor,
+                    limit=PRIOR_CONTEXT_MAX_ITEMS,
+                    max_bytes=PRIOR_CONTEXT_MAX_BYTES,
+                ):
+                    prior_rows.setdefault(item.envelope_id, item)
+            prior_byte_count = 0
+            for item in sorted(prior_rows.values(), key=self.store._inbox_order):
+                block = self.formatter(item)
+                block_bytes = len(block.encode("utf-8"))
+                if (
+                    len(prior_context) >= PRIOR_CONTEXT_MAX_ITEMS
+                    or prior_byte_count + block_bytes > PRIOR_CONTEXT_MAX_BYTES
+                ):
+                    continue
+                prior_context.append(block)
+                prior_byte_count += block_bytes
+
         correlation_receipt = ""
         if selected:
             correlation_key = f"inbox_read_{uuid.uuid4().hex}"
@@ -1287,6 +1318,7 @@ class GlobalInboxRuntime:
                 )
         return {
             "messages": blocks,
+            "prior_context": prior_context,
             "next_cursor": next_cursor,
             "has_more": has_more,
             "remaining_count": remaining_count,

@@ -1369,6 +1369,169 @@ async def test_inbox_page_snapshot_excludes_concurrent_arrival_and_is_read_only(
 
 
 @pytest.mark.asyncio
+async def test_prior_context_is_bounded_ordered_and_lifecycle_filtered(tmp_path):
+    store = MessageStore(tmp_path / "prior-context.db")
+
+    await store.store_receipt(
+        _channel_payload("prior-human", channel_id="ch_context", content="human"),
+        server_seq=1,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    await store.admit_messages(
+        ["prior-human"], turn_id="prior-human-turn", provider_session_id="provider"
+    )
+    await store.mark_processed(["prior-human"], turn_id="prior-human-turn")
+    await store.store_receipt(
+        _channel_payload(
+            "prior-self-echo",
+            channel_id="ch_context",
+            sender_slug="agent",
+            content="agent contribution",
+        ),
+        server_seq=2,
+        disposition=ReceiptDisposition.TERMINAL,
+        reason="self echo",
+    )
+    await store.store_receipt(
+        _channel_payload(
+            "prior-in-turn",
+            channel_id="ch_context",
+            content="still in turn",
+        ),
+        server_seq=3,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    await store.admit_messages(
+        ["prior-in-turn"], turn_id="prior-in-turn-turn", provider_session_id="provider"
+    )
+    await store.store_receipt(
+        _channel_payload(
+            "prior-page",
+            channel_id="ch_context",
+            content="newly admitted page",
+        ),
+        server_seq=4,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    await store.store_receipt(
+        _channel_payload(
+            "prior-future",
+            channel_id="ch_context",
+            content="future pending work",
+        ),
+        server_seq=5,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    await store.store_receipt(
+        _channel_payload(
+            "prior-other-channel",
+            channel_id="ch_other",
+            content="other channel",
+        ),
+        server_seq=6,
+        disposition=ReceiptDisposition.TERMINAL,
+        reason="test",
+    )
+    await store.store_receipt(
+        _channel_payload(
+            "prior-other-thread",
+            channel_id="ch_context",
+            thread_root_id="other-root",
+            content="other thread",
+        ),
+        server_seq=7,
+        disposition=ReceiptDisposition.TERMINAL,
+        reason="test",
+    )
+
+    anchor = await store.get_message_by_envelope("prior-page")
+    assert anchor is not None
+    context = await store.get_prior_context(anchor)
+    assert [item.envelope_id for item in context] == [
+        "prior-human",
+        "prior-self-echo",
+    ]
+    assert all(item.server_seq < anchor.server_seq for item in context)
+    assert all(
+        item.processing_state is ProcessingState.PROCESSED
+        or item.receipt_disposition is ReceiptDisposition.TERMINAL
+        for item in context
+    )
+
+    limited = await store.get_prior_context(anchor, limit=1)
+    assert [item.envelope_id for item in limited] == ["prior-self-echo"]
+    bounded = await store.get_prior_context(
+        anchor, limit=20, max_bytes=len("agent contribution")
+    )
+    assert [item.envelope_id for item in bounded] == ["prior-self-echo"]
+    assert sum(len(str(item.content).encode("utf-8")) for item in bounded) <= len(
+        "agent contribution"
+    )
+
+    in_turn = await store.get_message_by_envelope("prior-in-turn")
+    future = await store.get_message_by_envelope("prior-future")
+    assert in_turn is not None and in_turn.processing_state is ProcessingState.IN_TURN
+    assert future is not None and future.processing_state is ProcessingState.PENDING
+    await store.requeue_messages(
+        ["prior-in-turn"], turn_id="prior-in-turn-turn"
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_prior_context_dm_route_excludes_other_peers_and_future_rows(tmp_path):
+    store = MessageStore(tmp_path / "prior-context-dm.db")
+    await store.store_receipt(
+        _dm_payload(
+            "dm-prior", "peer-1", "agent", content="earlier DM"
+        ),
+        server_seq=1,
+        disposition=ReceiptDisposition.TERMINAL,
+        reason="test",
+    )
+    await store.store_receipt(
+        _dm_payload(
+            "dm-other", "peer-2", "agent", content="other DM"
+        ),
+        server_seq=2,
+        disposition=ReceiptDisposition.TERMINAL,
+        reason="test",
+    )
+    await store.store_receipt(
+        _dm_payload(
+            "dm-page", "peer-1", "agent", content="current DM"
+        ),
+        server_seq=3,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    await store.store_receipt(
+        _dm_payload(
+            "dm-future", "peer-1", "agent", content="future DM"
+        ),
+        server_seq=4,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+
+    anchor = await store.get_message_by_envelope("dm-page")
+    assert anchor is not None
+    context = await store.get_prior_context(anchor)
+    assert [item.envelope_id for item in context] == ["dm-prior"]
+    assert all(item.envelope_kind == "dm" for item in context)
+    assert all(item.sender_slug == "peer-1" or item.recipient_slug == "peer-1" for item in context)
+    assert [item.envelope_id for item in await store.get_pending()] == [
+        "dm-page",
+        "dm-future",
+    ]
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_inbox_page_traverses_more_than_fifty_with_complete_metadata(tmp_path):
     store = MessageStore(tmp_path / "deep-pages.db")
     for seq in range(1, 74):

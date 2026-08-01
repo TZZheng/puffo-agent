@@ -35,6 +35,8 @@ from puffo_agent.agent.inbox_scheduler import (
     NoticeDeliveryCapability,
 )
 from puffo_agent.agent.message_store import (
+    PRIOR_CONTEXT_MAX_BYTES,
+    PRIOR_CONTEXT_MAX_ITEMS,
     MessageStore,
     ProcessingState,
     ReceiptDisposition,
@@ -44,7 +46,6 @@ from puffo_agent.agent.message_store import (
 from puffo_agent.agent._logging import log_runtime_event
 from puffo_agent.agent.runtime_event_outbox import RuntimeEventOutbox
 from puffo_agent.agent.runtime_events import RuntimeEvent
-from puffo_agent.agent.shared_content import ensure_shared_primer
 from puffo_agent.crypto.message import MessagePayload
 from puffo_agent.crypto.ws_client import TransportOutcome
 
@@ -2821,18 +2822,39 @@ async def test_notice_then_correlated_read_admits_and_processes_exact_page(tmp_p
 
 @pytest.mark.asyncio
 async def test_peer_progress_starts_grounded_followup_turn(tmp_path):
+    result = await _run_composed_peer_progress_case(
+        tmp_path,
+        peer_body="The current task has progressed to the next dependency.",
+        second_send_text=None,
+    )
+    assert result["provider_turns"] == 2
+    assert result["decisions"] == ["send", "[SILENT]"]
+    assert result["transport_calls"] == 1
+    assert result["peer_state"] is ProcessingState.PROCESSED
+    second_input = json.dumps(result["provider_inputs"][1], sort_keys=True)
+    for expected in (
+        result["human_body"],
+        result["first_contribution"],
+        result["peer_body"],
+    ):
+        assert expected in second_input
+    assert result["prior_ids"] == ["human-origin", "agent-contribution"]
+    assert result["future_state"] is ProcessingState.PENDING
+
+
+async def _run_composed_peer_progress_case(
+    tmp_path,
+    *,
+    peer_body: str,
+    second_send_text: str | None,
+):
+    """Run two fresh provider Turns against only durable/tool-return input."""
     store = await make_store(tmp_path)
     human_body = "Please outline the current task."
-    peer_body = "The current task has progressed to the next dependency."
+    first_contribution = "I mapped the current dependency."
     await receipt(store, "human-origin", 1, sender="human", content=human_body)
 
-    shared_dir = tmp_path / "shared"
-    ensure_shared_primer(shared_dir)
-    shared_decision_instruction = (shared_dir / "CLAUDE.md").read_text(
-        encoding="utf-8"
-    )
-
-    class SessionAdapter(Adapter):
+    class ProviderAdapter(Adapter):
         def __init__(self):
             super().__init__()
             self.continuation = None
@@ -2857,14 +2879,42 @@ async def test_peer_progress_starts_grounded_followup_turn(tmp_path):
                 admitted_at=datetime.now(timezone.utc),
             ))
 
-    adapter = SessionAdapter()
-    session_transcript = []
-    captured_inputs = []
-    completed_turns = []
+    class FakeServerTransport:
+        def __init__(self):
+            self.calls = []
+
+        async def send(self, request=None, **kwargs):
+            request = dict(request or kwargs)
+            self.calls.append(request)
+            number = len(self.calls)
+            return {
+                "state": "sent",
+                "envelope_id": (
+                    "agent-contribution" if number == 1 else "agent-followup"
+                ),
+                "seq": 2 if number == 1 else 5,
+            }
+
+    class FakeCoordinator:
+        provider_session_id = None
+
+        def __init__(self, transport):
+            self.http_client = SimpleNamespace(keyless=False)
+            self.transport = transport
+
+        async def send(self, request=None, **kwargs):
+            return await self.transport.send(request, **kwargs)
+
+    adapter = ProviderAdapter()
+    transport = FakeServerTransport()
+    coordinator = FakeCoordinator(transport)
+    provider_inputs = []
+    decisions = []
     runtime = None
 
     async def run(planned):
-        turn_number = len(captured_inputs) + 1
+        turn_number = len(provider_inputs) + 1
+        # Each invocation intentionally has no provider-session transcript.
         await adapter.admit(provider_turn_id=f"provider-turn-{turn_number}")
         page = await runtime.read_inbox(
             limit=1,
@@ -2874,88 +2924,232 @@ async def test_peer_progress_starts_grounded_followup_turn(tmp_path):
         await adapter.admit_continuation(
             provider_turn_id=f"provider-read-{turn_number}"
         )
+        provider_input = {
+            "fresh_notice": planned.provider_input,
+            "read_inbox_result": page,
+        }
+        provider_inputs.append(provider_input)
 
         if turn_number == 1:
             assert human_body in page["messages"][0]
-            session_transcript.extend([
-                f"human origin: {human_body}",
-                "assistant prior contribution: I mapped the current dependency.",
-            ])
-            decision_input = "\n".join([
-                "originating human intent:",
-                human_body,
-                "shared action-decision instruction:",
-                shared_decision_instruction,
-            ])
-        else:
-            assert peer_body in page["messages"][0]
-            decision_input = "\n".join([
-                "retained provider-session transcript:",
-                *session_transcript,
-                "new peer progress:",
-                peer_body,
-                "shared action-decision instruction:",
-                shared_decision_instruction,
-            ])
+            assert page["prior_context"] == []
+            decisions.append("send")
+            sent = await runtime.send_delegate.send({
+                "destination": "ch-1",
+                "text": first_contribution,
+                "visibility_level": "human",
+            })
+            assert sent["state"] == "sent"
+            await receipt(
+                store,
+                "agent-contribution",
+                2,
+                sender="agent",
+                disposition=ReceiptDisposition.TERMINAL,
+                content=first_contribution,
+            )
+            return
 
-        captured_inputs.append((adapter.session, planned.provider_input, decision_input))
-        in_turn = await store.get_message_by_envelope(
-            "human-origin" if turn_number == 1 else "peer-progress"
+        decision_input = json.dumps(page, sort_keys=True)
+        assert peer_body in page["messages"][0]
+        assert human_body in decision_input
+        assert first_contribution in decision_input
+        if second_send_text is None:
+            decisions.append("[SILENT]")
+            return
+        decisions.append("send")
+        sent = await runtime.send_delegate.send({
+            "destination": "ch-1",
+            "text": second_send_text,
+            "visibility_level": "human",
+        })
+        assert sent["state"] == "sent"
+        await receipt(
+            store,
+            "agent-followup",
+            5,
+            sender="agent",
+            disposition=ReceiptDisposition.TERMINAL,
+            content=second_send_text,
         )
-        assert in_turn is not None
-        assert in_turn.processing_state is ProcessingState.IN_TURN
-        completed_turns.append(turn_number)
 
     runtime = GlobalInboxRuntime(
         store=store,
         adapter=adapter,
         run_turn=run,
         workspace=tmp_path,
+        coordinator=coordinator,
+    )
+    runtime.send_delegate = TrackingSendDelegate(
+        coordinator, runtime.attempts, runtime
     )
 
     assert await runtime.process_once()
     first = await store.get_message_by_envelope("human-origin")
-    assert first is not None
-    assert first.processing_state is ProcessingState.PROCESSED
-    assert completed_turns == [1]
+    contribution = await store.get_message_by_envelope("agent-contribution")
+    assert first is not None and first.processing_state is ProcessingState.PROCESSED
+    assert contribution is not None
+    assert contribution.processing_state is None
+    assert contribution.receipt_disposition is ReceiptDisposition.TERMINAL
 
-    before_peer_notice = await store.get_notice_state()
     await receipt(
         store,
         "peer-progress",
-        2,
+        3,
         sender="peer-agent",
         content=peer_body,
     )
-    pending_peer = await store.get_pending()
-    assert [row.envelope_id for row in pending_peer] == ["peer-progress"]
-    assert peer_body == pending_peer[0].content
-    after_peer_notice = await store.get_notice_state()
-    assert after_peer_notice.generation > before_peer_notice.generation
-    assert after_peer_notice.delivery_pending
-
+    await receipt(
+        store,
+        "future-pending",
+        4,
+        sender="peer-agent",
+        content="future pending work must not leak",
+    )
     assert await runtime.process_once()
-    second = await store.get_message_by_envelope("peer-progress")
-    assert second is not None
-    assert second.processing_state is ProcessingState.PROCESSED
-    assert completed_turns == [1, 2]
+    peer = await store.get_message_by_envelope("peer-progress")
+    future = await store.get_message_by_envelope("future-pending")
+    assert peer is not None and peer.processing_state is ProcessingState.PROCESSED
+    assert future is not None and future.processing_state is ProcessingState.PENDING
     assert len(adapter.continuation_calls) == 2
-    assert [session for session, _notice, _input in captured_inputs] == [
-        adapter.session,
-        adapter.session,
+    prior_ids = [
+        json.loads(block.splitlines()[1])["envelope_id"]
+        for block in provider_inputs[1]["read_inbox_result"]["prior_context"]
     ]
-    _session, _notice, second_input = captured_inputs[1]
-    normalized_second_input = " ".join(second_input.split()).lower()
-    for expected in (
-        human_body,
-        "assistant prior contribution: I mapped the current dependency.",
-        peer_body,
-        "recover the originating human intent",
-        "inspect this agent's relevant prior contribution",
-        "classify newly observed peer progress",
-        "decide whether a new unresolved action belongs to this agent",
-    ):
-        assert expected.lower() in normalized_second_input
+    prior_blocks = provider_inputs[1]["read_inbox_result"]["prior_context"]
+    assert len(prior_blocks) <= PRIOR_CONTEXT_MAX_ITEMS
+    assert sum(len(block.encode("utf-8")) for block in prior_blocks) <= (
+        PRIOR_CONTEXT_MAX_BYTES
+    )
+    result = {
+        "provider_turns": len(provider_inputs),
+        "provider_inputs": provider_inputs,
+        "decisions": decisions,
+        "transport_calls": len(transport.calls),
+        "peer_state": peer.processing_state,
+        "future_state": future.processing_state,
+        "prior_ids": prior_ids,
+        "human_body": human_body,
+        "first_contribution": first_contribution,
+        "peer_body": peer_body,
+    }
+    await store.close()
+    return result
+
+
+@pytest.mark.asyncio
+async def test_followup_after_prior_contribution(tmp_path):
+    result = await _run_composed_peer_progress_case(
+        tmp_path,
+        peer_body="A follow-up asks for the next concrete step.",
+        second_send_text="Here is the next concrete step.",
+    )
+    assert result["decisions"] == ["send", "send"]
+    assert result["transport_calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_correction_after_prior_contribution(tmp_path):
+    result = await _run_composed_peer_progress_case(
+        tmp_path,
+        peer_body="Correction: the dependency is on the other branch.",
+        second_send_text="Thanks, I corrected the dependency mapping.",
+    )
+    assert result["decisions"] == ["send", "send"]
+    assert result["transport_calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_mention_after_prior_contribution(tmp_path):
+    result = await _run_composed_peer_progress_case(
+        tmp_path,
+        peer_body="@you(agent) please verify the current dependency.",
+        second_send_text="I verified the current dependency.",
+    )
+    assert result["decisions"] == ["send", "send"]
+    assert result["transport_calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_dependency_after_prior_contribution(tmp_path):
+    result = await _run_composed_peer_progress_case(
+        tmp_path,
+        peer_body="New dependency exposed: the release checklist needs approval.",
+        second_send_text="I will handle the release approval dependency.",
+    )
+    assert result["decisions"] == ["send", "send"]
+    assert result["transport_calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_read_inbox_prior_context_preserves_paging_and_exact_admission(
+    tmp_path,
+):
+    store = await make_store(tmp_path)
+    await receipt(
+        store,
+        "prior-page-context",
+        1,
+        content="durable prior context",
+    )
+    await store.admit_messages(
+        ["prior-page-context"],
+        turn_id="prior-page-context-turn",
+        provider_session_id="provider-1",
+    )
+    await store.mark_processed(
+        ["prior-page-context"], turn_id="prior-page-context-turn"
+    )
+    await receipt(store, "page-context-1", 2, content="page one")
+    await receipt(store, "page-context-2", 3, content="page two")
+    await store.start_turn(
+        turn_id="paging-turn",
+        provider_session_id="provider-1",
+    )
+    adapter = ToolReturnAdapter()
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.active.turn_id = "paging-turn"
+    runtime.active.provider_session_id = adapter.session
+    runtime.active.provider_turn_id = "provider-turn"
+
+    first = await runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
+    second = await runtime.read_inbox(
+        cursor=first["next_cursor"],
+        limit=1,
+        tool_arguments={"cursor": first["next_cursor"], "limit": 1},
+    )
+    assert "page one" in first["messages"][0]
+    assert "page two" in second["messages"][0]
+    assert [
+        json.loads(block.splitlines()[1])["envelope_id"]
+        for block in first["prior_context"]
+    ] == ["prior-page-context"]
+    assert [
+        json.loads(block.splitlines()[1])["envelope_id"]
+        for block in second["prior_context"]
+    ] == ["prior-page-context"]
+    assert first["has_more"] is True
+    assert second["has_more"] is False
+    assert second["next_cursor"] == ""
+    assert runtime.active.message_ids == ["page-context-1", "page-context-2"]
+    prior = await store.get_message_by_envelope("prior-page-context")
+    page_rows = await asyncio.gather(
+        store.get_message_by_envelope("page-context-1"),
+        store.get_message_by_envelope("page-context-2"),
+    )
+    assert prior is not None and prior.processing_state is ProcessingState.PROCESSED
+    assert all(
+        row is not None and row.processing_state is ProcessingState.IN_TURN
+        for row in page_rows
+    )
+    await store.mark_processed(
+        ["page-context-1", "page-context-2"], turn_id="paging-turn"
+    )
     await store.close()
 
 
@@ -3473,6 +3667,7 @@ async def test_read_inbox_byte_guard_repaginates_without_lifecycle_mutation(
     assert page["remaining_count"] == 1
     assert set(page) == {
         "messages",
+        "prior_context",
         "next_cursor",
         "has_more",
         "remaining_count",

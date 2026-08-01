@@ -568,6 +568,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         cursor: opaque cursor returned by the preceding page.
         limit: page size from 1 through 50. Continue with ``next_cursor``;
             there is no total read-depth cap.
+        result: content-bearing results include the exact pending ``messages``
+            page plus bounded, read-only ``prior_context`` blocks from the
+            same conversation route(s), strictly earlier than that page;
+            prior rows are not admitted or acknowledged.
         """
         arguments: dict[str, Any] = {}
         if target:

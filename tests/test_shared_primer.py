@@ -3,6 +3,7 @@ from pathlib import Path
 
 from puffo_agent.agent.shared_content import (
     DEFAULT_SHARED_CLAUDE_MD,
+    DEFAULT_SKILL_READ_INBOX,
     ensure_shared_primer,
     rebuild_agent_claude_md,
     rebuild_agent_codex_md,
@@ -244,6 +245,71 @@ def test_followup_decision_context_is_shared_across_managed_prompts():
     assert "mcp__puffo__" in claude
     assert "mcp__puffo__" not in codex
     assert "send_message" in codex
+
+
+def test_read_inbox_prior_context_contract_is_shared_across_claude_codex_and_skills():
+    root = _tmp()
+    shared = root / "shared"
+    profile = root / "profile.md"
+    profile.write_text("# Soul\nI am a context test agent.", encoding="utf-8")
+    memory = root / "memory"
+    memory.mkdir()
+    workspace = root / "workspace"
+    workspace.mkdir()
+
+    claude = rebuild_agent_claude_md(
+        shared_dir=shared,
+        profile_path=profile,
+        memory_dir=memory,
+        workspace_dir=workspace,
+        claude_user_dir=root / ".claude",
+        gemini_user_dir=root / ".gemini",
+        agent_id="context-0001",
+    )
+    codex = rebuild_agent_codex_md(
+        shared_dir=shared,
+        profile_path=profile,
+        memory_dir=memory,
+        workspace_dir=workspace,
+        codex_user_dir=root / ".codex",
+        agent_id="context-0001",
+    )
+    codex_skill = (workspace / ".agents" / "skills" / "read-inbox" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    claude_skill = (workspace / ".claude" / "skills" / "read-inbox" / "SKILL.md").read_text(
+        encoding="utf-8"
+    )
+
+    for prompt in (
+        DEFAULT_SHARED_CLAUDE_MD,
+        DEFAULT_SKILL_READ_INBOX,
+        claude,
+        codex,
+        claude_skill,
+        codex_skill,
+    ):
+        lowered = " ".join(prompt.lower().split())
+        for phrase in (
+            "prior_context",
+            "bounded",
+            "read-only",
+            "same selected conversation route",
+            "strictly earlier",
+            "does not admit",
+        ):
+            assert phrase in lowered, (phrase, prompt)
+        for forbidden in (
+            "call this first for every",
+            "first action after every",
+            "participant count",
+            "one reply per",
+            "sender-wide",
+        ):
+            assert forbidden not in lowered
+
+    assert "mcp__puffo__" in claude_skill
+    assert "mcp__puffo__" not in codex_skill
 
 
 def test_sync_shared_skills_codex_strips_prefix_in_skill_bodies():
