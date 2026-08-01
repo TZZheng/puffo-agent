@@ -280,10 +280,14 @@ def test_primer_metadata_example_matches_builder():
     assert '"read_tool":"read_inbox"' in DEFAULT_SHARED_CLAUDE_MD
     assert "mcp__puffo__read_inbox" in DEFAULT_SHARED_CLAUDE_MD
     assert "synchronization metadata" in DEFAULT_SHARED_CLAUDE_MD
-    assert "content inspection" in DEFAULT_SHARED_CLAUDE_MD
-    assert "provider-visible result" in DEFAULT_SHARED_CLAUDE_MD
-    assert "History tools add" in DEFAULT_SHARED_CLAUDE_MD
-    assert "substitute for reading" in DEFAULT_SHARED_CLAUDE_MD
+    assert "exposes the actual" in DEFAULT_SHARED_CLAUDE_MD
+    assert "pending content" in DEFAULT_SHARED_CLAUDE_MD
+    assert "non-urgent index" in DEFAULT_SHARED_CLAUDE_MD
+    assert "context-independent" in DEFAULT_SHARED_CLAUDE_MD
+    assert "provider-visible result" not in DEFAULT_SHARED_CLAUDE_MD
+    assert "admission receipt" not in DEFAULT_SHARED_CLAUDE_MD
+    assert "First action after every" not in DEFAULT_SHARED_CLAUDE_MD
+    assert "Reply to the `message:`" not in DEFAULT_SHARED_CLAUDE_MD
     assert "followup_messages_since" not in DEFAULT_SHARED_CLAUDE_MD
     assert ".puffo/inbox/<envelope_id>/<filename>" in DEFAULT_SHARED_CLAUDE_MD
     # The old, wrong relative form must be gone.

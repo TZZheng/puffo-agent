@@ -562,10 +562,10 @@ class HeldRecoverySource:
     """Live durable held catch-up for the one active exact turn.
 
     This deliberately does not invent a remote catch-up API.  It waits for
-    receipt commits, then proves the exact terminal watermark exists in the
-    bounded local pending prefix for the active provider session. The proof is
-    synchronization metadata only; it never claims that the provider saw the
-    recovered content.
+    receipt commits, then proves the exact terminal watermark exists as a
+    pending durable row for the active provider session. The proof is
+    synchronization metadata only; it is independent of content pagination
+    and never claims that the provider saw the recovered content.
     """
 
     def __init__(
@@ -654,32 +654,15 @@ class HeldRecoverySource:
                 diagnostic="stateful active provider session unavailable",
             )
             return ()
-        boundary = await ActiveBoundaryAdapter(
-            self.runtime.store, active
-        ).get_active_turn_through_seq(space_id, channel_id)
-        page = await self.runtime.store.get_channel_pending(
-            space_id,
-            channel_id,
-            after_seq=boundary,
-            through_seq=latest_seq,
-            limit=50,
-        )
         watermark = await self.runtime.store.get_message_by_envelope(
             latest_envelope_id
         )
-        reaches_watermark = any(
-            row.envelope_id == latest_envelope_id
-            and row.server_seq == latest_seq
-            for row in page.items
-        )
         if (
-            not page.items
-            or watermark is None
+            watermark is None
             or watermark.server_seq != latest_seq
             or watermark.space_id != space_id
             or watermark.channel_id != channel_id
             or watermark.processing_state is not ProcessingState.PENDING
-            or not reaches_watermark
         ):
             self.runtime.held = HeldStaging(
                 latest_seq=latest_seq,
@@ -687,17 +670,11 @@ class HeldRecoverySource:
                 diagnostic="exact held watermark mismatch",
             )
             return ()
-        more_pending = page.more_available
         self.runtime.held = HeldStaging(
             latest_seq=latest_seq,
             latest_envelope_id=latest_envelope_id,
             recovered_through_seq=latest_seq,
-            more_pending=more_pending,
             synchronized=True,
-            diagnostic=(
-                "additional held metadata remains pending"
-                if more_pending else ""
-            ),
         )
         return ({
             "space_id": space_id,

@@ -2642,7 +2642,7 @@ async def test_held_timeout_uses_signed_pending_catchup_before_failing(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_held_sync_requires_exact_terminal_watermark_in_bounded_prefix(tmp_path):
+async def test_held_sync_is_independent_of_fifty_message_content_pages(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "initial", 1)
     await store.admit_messages(
@@ -2650,7 +2650,7 @@ async def test_held_sync_requires_exact_terminal_watermark_in_bounded_prefix(tmp
     )
     for seq in range(2, 53):
         await receipt(store, f"held-{seq}", seq, content="small")
-    adapter = Adapter()
+    adapter = ToolReturnAdapter()
     runtime = GlobalInboxRuntime(
         store=store,
         adapter=adapter,
@@ -2663,12 +2663,33 @@ async def test_held_sync_requires_exact_terminal_watermark_in_bounded_prefix(tmp
     rows = await runtime.held_recovery_source.query_held_messages(
         "sp-1", "ch-1", 52, "held-52", "provider-1",
     )
-    assert rows == ()
-    assert runtime.held.synchronized is False
+    assert [row["envelope_id"] for row in rows] == ["held-52"]
+    assert "content" not in rows[0]
+    assert runtime.held.synchronized is True
     assert runtime.held.message_ids == ()
     assert [row.envelope_id for row in await store.get_pending()] == [
         f"held-{seq}" for seq in range(2, 53)
     ]
+    first = await runtime.read_inbox(
+        target="channel:sp-1:ch-1", limit=50,
+    )
+    assert first["has_more"] is True
+    assert len(first["messages"]) == 50
+    assert await ActiveBoundaryAdapter(
+        store, runtime.active
+    ).get_active_turn_through_seq("sp-1", "ch-1") == 51
+
+    second = await runtime.read_inbox(
+        target="channel:sp-1:ch-1",
+        cursor=first["next_cursor"],
+        limit=50,
+    )
+    assert second["has_more"] is False
+    assert len(second["messages"]) == 1
+    assert "held-52" in second["messages"][0]
+    assert await ActiveBoundaryAdapter(
+        store, runtime.active
+    ).get_active_turn_through_seq("sp-1", "ch-1") == 52
     await store.close()
 
 
@@ -2698,9 +2719,10 @@ async def test_held_sync_ignores_formatter_and_context_budget(tmp_path):
         "sp-1", "ch-1", 52, "held-52", "provider-1",
     )
 
-    assert rows == ()
+    assert [row["envelope_id"] for row in rows] == ["held-52"]
+    assert "content" not in rows[0]
     assert runtime.held.message_ids == ()
-    assert runtime.held.synchronized is False
+    assert runtime.held.synchronized is True
     await store.close()
 
 

@@ -44,13 +44,12 @@ Pending messages first arrive as a metadata-only wake-up:
 </global_inbox_notice>
 ```
 
-The notice contains counts and target ids, never message bodies. Call
-`mcp__puffo__read_inbox` before replying or using history tools to
-inspect the pending work. With no `target`, it returns the oldest
-pending messages across spaces, channels, threads, and DMs in stable
-order. Follow `next_cursor` while `has_more=true`; unread rows remain
-pending for a later turn. A returned page is attached to the current
-turn and is marked processed only after that turn finishes.
+The notice contains counts and target ids, never message bodies. It is a
+non-urgent index, so choose when to inspect it, which target matters, and
+how many pages are useful. `mcp__puffo__read_inbox` exposes the actual
+pending content. With no `target`, it returns the oldest pending messages
+across spaces, channels, threads, and DMs in stable order. Continue with
+`next_cursor` when more of the same snapshot is relevant.
 
 Each `read_inbox` page item uses the same structured envelope format:
 
@@ -64,23 +63,18 @@ Each `read_inbox` page item uses the same structured envelope format:
 The JSON metadata line is authoritative: use `envelope_id`,
 `server_seq`, and the nested `route` names as shown. Attachments and
 sender metadata may add fields, but do not invent a second message
-format. One page may carry SEVERAL blocks (blank-line separated); read
-them all before replying. Messages that land while you're mid-turn
-remain pending for your next notice.
+format. One page may carry SEVERAL blocks separated by blank lines.
 
 Inbox notices and held-send results contain synchronization metadata
-only — they never recover or expose message plaintext. Local catch-up
-proves an exact route and watermark is present in your store; it is not
-content inspection and does not authorize `send_anyway`. For a
-context-dependent override, perform an actual content-bearing Inbox or
-history read and let its provider-visible result be admitted in this
-same Turn. Then choose revised content, explicitly override with
-`send_anyway=True`, or remain silent. History tools add context; they do
-not substitute for reading and acknowledging the pending Inbox.
+only; they never contain message text. Do not infer unseen content from
+their counts or sequence values. When a held send may depend on newer
+conversation context, inspect the relevant Inbox or history content,
+then independently choose whether to revise, retry unchanged with
+`send_anyway=True` only when it remains clear and context-independent,
+or send nothing. `send_anyway` is not an automatic retry.
 
-Reply to the `message:` content only — never echo metadata, labels,
-or `[bracket]` prefixes. Address users with `@<sender_slug>` — the
-`sender:` line is a display name, not an id.
+The raw text after the JSON line is the message body; the JSON is routing
+and sender context, not part of that body.
 
 ## `[puffo-agent system message]` lines
 
@@ -114,12 +108,11 @@ Two ways, pick one explicitly every turn:
 
    A channel send can return `state="held"` when newer channel
    messages exist beyond this turn's visible boundary. No message was
-   sent in that case. The held result carries only synchronization metadata;
-   local watermark catch-up is not a content read. Perform a content-bearing
-   Inbox or history read and let its result be admitted in this same Turn
-   before choosing revised content, the same content with
-   `send_anyway=True`, or no message. `send_anyway` is never an automatic
-   retry.
+   sent in that case. The held result carries no message body. Inspect the
+   relevant Inbox or history content when newer context may matter, then
+   independently choose revised content, unchanged content with
+   `send_anyway=True` only when it remains clear and context-independent,
+   or no message. `send_anyway` is never an automatic retry.
 
    **Pick `visibility_level` explicitly**: `"human"` for anything a
    person should read, `"agent_only"` for genuine agent-to-agent
@@ -144,7 +137,7 @@ unambiguous destination and no semantic send attempt. Multi-target turns
 must address destinations explicitly or stay silent.
 
 **Self-mention marker.** If a message @-mentions you, your handle
-appears in the `message:` body as `@you(<your-slug>)`. Treat it as
+appears in the raw body as `@you(<your-slug>)`. Treat it as
 a direct mention; use the slug inside parens for self-reference,
 but don't echo `@you(...)` literally — it's incoming-only syntax.
 Other users' @-mentions appear unchanged.
@@ -558,29 +551,24 @@ message bodies and is not enough context for a reply.
 - `limit` (optional, default 50, max 50) — messages in this page.
   There is no total read-depth cap; continue paging as needed.
 
-**Lifecycle:**
-- The returned page contains the structured `<inbox_message>` blocks
-  with `envelope_id`, `server_seq`, and nested `route` metadata, followed
-  by each message body. A successful page also carries an admission
-  receipt for the provider-completion correlation path.
-- The page is not acknowledged merely by local synchronization or by a
-  handler returning data. Its content-bearing result must reach the
-  provider and be admitted in this same Turn.
-- Rows become processed only when that turn completes successfully.
-- Rows not returned by the page remain pending and trigger a later
-  notice.
+**Result:**
+- The returned page contains structured `<inbox_message>` blocks with
+  `envelope_id`, `server_seq`, and nested `route` metadata, followed by
+  each raw message body.
+- A notice or held result is metadata only. It never substitutes for a
+  content-bearing Inbox or history read.
 
 Held-send recovery is different: it returns exact route/watermark
-metadata only, never recovered plaintext, and does not change a row from
-`pending` or advance the active channel boundary. A synchronized
-watermark alone therefore cannot authorize `send_anyway`; read the
-content-bearing page or history result and wait for its matching
-provider-visible admission first.
+metadata only, never recovered plaintext. Do not infer what newer
+messages say from a synchronized watermark. Review relevant content,
+then independently revise, retry unchanged with `send_anyway=True` only
+when the reply remains clear and context-independent, or send nothing.
 
 **When to use:**
-- First action after every `<global_inbox_notice>`.
-- Continue with `next_cursor` while `has_more=true` and context allows.
-- Use `target` only when deliberately focusing one listed route.
+- When a notice points to pending work relevant to the current decision.
+- Continue with `next_cursor` while additional pages are useful.
+- Use `target` to focus a listed route; omit it for global oldest-first
+  order.
 
 Channel/thread/DM history tools provide supplementary conversation
 context. They do not acknowledge pending Inbox rows and must not
