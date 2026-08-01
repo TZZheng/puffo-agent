@@ -174,8 +174,9 @@ below is the authoritative reference.
 
 **Read / discovery:**
 - `read_inbox(target="", cursor="", limit=50)` — read one stable page
-  of pending work. Call this first for every `<global_inbox_notice>`;
-  follow `next_cursor` while `has_more=true`. `target` is an optional
+  of pending work when the notice points to context relevant to the current
+  decision; choose the target and timing, then follow `next_cursor` while
+  `has_more=true`. `target` is an optional
   canonical target id copied from the notice.
 - `list_spaces()` — your space memberships.
 - `list_channels_in_space(space_id)` — channels in one space.

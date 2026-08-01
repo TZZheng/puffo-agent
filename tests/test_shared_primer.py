@@ -287,6 +287,7 @@ def test_primer_metadata_example_matches_builder():
     assert "provider-visible result" not in DEFAULT_SHARED_CLAUDE_MD
     assert "admission receipt" not in DEFAULT_SHARED_CLAUDE_MD
     assert "First action after every" not in DEFAULT_SHARED_CLAUDE_MD
+    assert "Call this first for every" not in DEFAULT_SHARED_CLAUDE_MD
     assert "Reply to the `message:`" not in DEFAULT_SHARED_CLAUDE_MD
     assert "followup_messages_since" not in DEFAULT_SHARED_CLAUDE_MD
     assert ".puffo/inbox/<envelope_id>/<filename>" in DEFAULT_SHARED_CLAUDE_MD

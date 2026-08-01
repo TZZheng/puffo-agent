@@ -14,6 +14,7 @@ from mcp.server.fastmcp import FastMCP
 from puffo_agent.agent.adapters.base import TurnContext
 from puffo_agent.agent.global_inbox_runtime import (
     ActiveBoundaryAdapter,
+    BaselineAdapter,
     GlobalInboxRuntime,
 )
 from puffo_agent.agent.harness.driver import (
@@ -35,6 +36,10 @@ from puffo_agent.agent.harness.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
     RuntimeStateError,
+)
+from puffo_agent.agent.send_coordinator import (
+    KEYLESS_CHANNEL_SEND_PATH,
+    SendCoordinator,
 )
 from puffo_agent.agent.message_store import (
     MessageStore,
@@ -134,6 +139,44 @@ async def _seed(store: MessageStore, *, envelope_id: str, channel_id: str, seq: 
     )
 
 
+class HeldTransport:
+    """Keyless transport that exposes one held send, then one commit."""
+
+    keyless = True
+
+    def __init__(self, *, held_envelope_id: str, held_seq: int) -> None:
+        self.held_envelope_id = held_envelope_id
+        self.held_seq = held_seq
+        self.calls: list[tuple[str, dict]] = []
+
+    async def post_unsigned(self, path: str, body: dict) -> dict:
+        self.calls.append((path, body))
+        assert path == KEYLESS_CHANNEL_SEND_PATH
+        freshness = body["freshness"]
+        if len(self.calls) == 1:
+            return {
+                "state": "held",
+                "envelope_id": "held-send-attempt",
+                "context_baseline_seq": freshness["context_baseline_seq"],
+                "seen_seq": freshness["seen_seq"],
+                "latest_seq": self.held_seq,
+                "latest_envelope_id": self.held_envelope_id,
+            }
+        return {
+            "state": "sent",
+            "envelope_id": "send-anyway-result",
+            "seq": freshness["seen_seq"] + 1,
+            "replay": False,
+            "missing_devices": [],
+            "freshness": {
+                "mode": freshness["mode"],
+                "context_baseline_seq": freshness["context_baseline_seq"],
+                "seen_seq": freshness["seen_seq"],
+                "latest_seq_before_send": freshness["seen_seq"],
+            },
+        }
+
+
 class BoundaryHarness:
     def __init__(
         self,
@@ -147,6 +190,7 @@ class BoundaryHarness:
         mcp: FastMCP,
         turn_task: asyncio.Task,
         staged_responses: list[dict],
+        transport: HeldTransport,
     ):
         self.store = store
         self.driver = driver
@@ -157,6 +201,7 @@ class BoundaryHarness:
         self.mcp = mcp
         self.turn_task = turn_task
         self.staged_responses = staged_responses
+        self.transport = transport
 
     @property
     def session_id(self) -> str:
@@ -242,6 +287,13 @@ async def boundary_harness(tmp_path: Path):
         seq=3,
         text="inbox peer body",
     )
+    await _seed(
+        store,
+        envelope_id="held-peer",
+        channel_id="ch-held",
+        seq=4,
+        text="held peer body",
+    )
 
     driver = ContractDriver()
     manager = RuntimeManager(driver, RuntimeSpec(str(tmp_path)))
@@ -262,6 +314,19 @@ async def boundary_harness(tmp_path: Path):
     runtime.active.provider_session_id = adapter.get_provider_session_id()
     runtime.active.provider_turn_id = manager.native_turn_id
 
+    transport = HeldTransport(held_envelope_id="held-peer", held_seq=4)
+    coordinator = SendCoordinator(
+        slug="agent-contract",
+        keystore=None,
+        http_client=transport,
+        data_client=store,
+        baseline_source=BaselineAdapter(store),
+        active_turn_source=ActiveBoundaryAdapter(store, runtime.active),
+        held_recovery_source=runtime.held_recovery_source,
+        provider_session_id=runtime.active.provider_session_id,
+    )
+    runtime.coordinator = coordinator
+
     ctx = HostMcpContext(
         agent_id="agent-contract",
         slug="agent-contract",
@@ -272,6 +337,7 @@ async def boundary_harness(tmp_path: Path):
         keystore=None,
         http_client=None,
         message_client=SimpleNamespace(global_runtime=runtime),
+        send_coordinator=coordinator,
     )
     rpc_service.set_rpc_resolver(
         lambda agent_id: ctx if agent_id == "agent-contract" else None
@@ -312,6 +378,7 @@ async def boundary_harness(tmp_path: Path):
         mcp=mcp,
         turn_task=turn_task,
         staged_responses=staged_responses,
+        transport=transport,
     )
     try:
         yield harness
@@ -393,6 +460,90 @@ async def test_real_rpc_history_and_inbox_admission_wait_for_provider_completion
 
 
 @pytest.mark.asyncio
+async def test_exact_held_chain_stays_unseen_until_rpc_read_then_allows_send_anyway(
+    boundary_harness: BoundaryHarness,
+):
+    h = boundary_harness
+    target = "channel:sp_1:ch-held"
+    send_arguments = {"channel": "ch-held", "text": "held draft"}
+
+    held_call = await h.mcp.call_tool("send_message", send_arguments)
+    held_result = held_call[1]
+    assert held_result["state"] == "held"
+    assert held_result["synchronized"] is True
+    assert held_result["latest_seq"] == 4
+    assert held_result["latest_envelope_id"] == "held-peer"
+    assert len(h.transport.calls) == 1
+
+    row = await h.store.get_message_by_envelope("held-peer")
+    assert row is not None
+    assert row.processing_state is ProcessingState.PENDING
+    assert await h.active_boundary("ch-held") is None
+
+    # A successful send_message result is content-free evidence. It cannot
+    # admit the exact held route or authorize an override.
+    await h.emit_tool_result(
+        tool_name="send_message",
+        arguments=send_arguments,
+        result=held_result,
+    )
+    await asyncio.sleep(0)
+    row = await h.store.get_message_by_envelope("held-peer")
+    assert row.processing_state is ProcessingState.PENDING
+    assert await h.active_boundary("ch-held") is None
+
+    blocked_call = await h.mcp.call_tool(
+        "send_message",
+        {**send_arguments, "send_anyway": True},
+    )
+    blocked = blocked_call[1]
+    assert blocked["state"] == "failed"
+    assert blocked["error_kind"] == "reconsideration_ineligible"
+    assert len(h.transport.calls) == 1
+
+    inbox_call = await h.mcp.call_tool(
+        "read_inbox", {"target": target, "limit": 1}
+    )
+    inbox_page = inbox_call[1]
+    assert "held peer body" in inbox_page["messages"][0]
+    assert inbox_page["admission_receipt"].startswith(
+        "[puffo:model-visible-read:"
+    )
+    row = await h.store.get_message_by_envelope("held-peer")
+    assert row.processing_state is ProcessingState.PENDING
+    assert await h.active_boundary("ch-held") is None
+
+    await h.emit_tool_result(
+        tool_name="read_inbox",
+        arguments={"target": target, "limit": 1},
+        result=json.dumps(inbox_page),
+    )
+    await _wait_until(
+        lambda: h.runtime.active.through_by_channel.get(
+            ("sp_1", "ch-held")
+        ) == 4
+    )
+    row = await h.store.get_message_by_envelope("held-peer")
+    assert row.processing_state is ProcessingState.IN_TURN
+    assert await h.active_boundary("ch-held") == 4
+
+    sent_call = await h.mcp.call_tool(
+        "send_message",
+        {**send_arguments, "send_anyway": True},
+    )
+    sent = sent_call[1]
+    assert sent["state"] == "sent"
+    assert len(h.transport.calls) == 2
+    assert h.transport.calls[-1][1]["freshness"] == {
+        "context_baseline_seq": 0,
+        "seen_seq": 4,
+        "mode": "send_anyway",
+    }
+
+    await h.finish()
+
+
+@pytest.mark.asyncio
 async def test_rpc_response_without_provider_completion_keeps_pending_and_unseen(
     boundary_harness: BoundaryHarness,
 ):
@@ -426,10 +577,18 @@ async def test_real_provider_correlation_rejects_empty_failed_and_mismatched_res
         r"(\[puffo:model-visible-read:[^]]+\])", history_text
     ).group(1)
     arguments = {"channel": "ch-history", "limit": 50}
+    wrong_receipt = "[puffo:model-visible-read:wrong-receipt-marker]"
     cases = [
         ("get_thread_history", arguments, history_text, "native-session", "native-turn", False),
         ("get_channel_history", {"channel": "wrong"}, history_text, "native-session", "native-turn", False),
-        ("get_channel_history", arguments, "content without receipt", "native-session", "native-turn", False),
+        (
+            "get_channel_history",
+            arguments,
+            f"history peer body\n{wrong_receipt}",
+            "native-session",
+            "native-turn",
+            False,
+        ),
         ("get_channel_history", arguments, history_text, "native-session", "wrong-turn", False),
         ("get_channel_history", arguments, history_text, "wrong-session", "native-turn", False),
         ("get_channel_history", arguments, history_text, "native-session", "native-turn", True),
@@ -447,6 +606,18 @@ async def test_real_provider_correlation_rejects_empty_failed_and_mismatched_res
         assert await h.active_boundary("ch-history") is None
         row = await h.store.get_message_by_envelope("history-peer")
         assert row.processing_state is ProcessingState.PENDING
+        blocked_call = await h.mcp.call_tool(
+            "send_message",
+            {
+                "channel": "ch-history",
+                "text": "negative-case override",
+                "send_anyway": True,
+            },
+        )
+        blocked = blocked_call[1]
+        assert blocked["state"] == "failed"
+        assert blocked["error_kind"] == "reconsideration_ineligible"
+        assert not h.transport.calls
 
     await h.emit_tool_result(
         tool_name="get_channel_history",
