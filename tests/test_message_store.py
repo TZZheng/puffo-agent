@@ -418,6 +418,72 @@ async def test_channel_roots_since_envelope_id_filters_by_sent_at():
     )
     # Strictly after root_old's sent_at, so root_mid + root_new.
     assert [r.message.envelope_id for r in roots] == ["root_mid", "root_new"]
+
+
+@pytest.mark.asyncio
+async def test_equal_timestamp_envelope_cursor_pages_both_directions(tmp_path):
+    """Envelope-id cursors retain the composite timestamp/id ordering.
+
+    All roots and replies deliberately share a timestamp: a timestamp-only
+    cursor would skip the second and third records on the next page.
+    """
+    store = MessageStore(str(tmp_path / "equal-cursor.db"))
+    await store.open()
+    try:
+        for envelope_id in ("aaa_root", "root_b", "root_c"):
+            await store.store(_channel_payload(envelope_id, sent_at=123))
+        for envelope_id in ("reply_a", "reply_b", "reply_c"):
+            await store.store(_channel_payload(
+                envelope_id, sent_at=123, thread_root_id="aaa_root",
+            ))
+        forward = ["aaa_root"]
+        cursor = "aaa_root"
+        while True:
+            page = await store.get_channel_roots(
+                "ch_1", limit=1, since_envelope_id=cursor,
+            )
+            if not page:
+                break
+            forward.extend(value.message.envelope_id for value in page)
+            cursor = page[-1].message.envelope_id
+        thread_forward = ["aaa_root"]
+        cursor = "aaa_root"
+        while True:
+            page = await store.get_thread_messages(
+                "aaa_root", limit=1, since_envelope_id=cursor,
+            )
+            if not page:
+                break
+            thread_forward.extend(value.envelope_id for value in page)
+            cursor = page[-1].envelope_id
+        assert forward == ["aaa_root", "root_b", "root_c"]
+        assert thread_forward == ["aaa_root", "reply_a", "reply_b", "reply_c"]
+        backward = []
+        cursor = None
+        while True:
+            page = await store.get_channel_roots(
+                "ch_1", limit=1, before_envelope_id=cursor,
+            )
+            if not page:
+                break
+            backward.extend(value.message.envelope_id for value in page)
+            cursor = page[0].message.envelope_id
+        thread_backward = []
+        cursor = None
+        while True:
+            page = await store.get_thread_messages(
+                "aaa_root", limit=1, before_envelope_id=cursor,
+            )
+            if not page:
+                break
+            thread_backward.extend(value.envelope_id for value in page)
+            cursor = page[0].envelope_id
+        assert backward == ["root_c", "root_b", "aaa_root"]
+        assert thread_backward == ["reply_c", "reply_b", "reply_a", "aaa_root"]
+        assert list(reversed(backward)) == forward
+        assert list(reversed(thread_backward)) == thread_forward
+    finally:
+        await store.close()
     await store.close()
 
 

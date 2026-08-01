@@ -309,7 +309,69 @@ async def test_malformed_head_is_discarded_so_later_sequence_can_progress(tmp_pa
     assert [row.event_id for row in outbox.prefix()] == [
         "evt_2_turn.started",
     ]
+    accepted = []
+
+    async def accept(_path, body):
+        accepted.extend(value["event_id"] for value in json.loads(body)["events"])
+        return 200, {"accepted": [{"event_id": value} for value in accepted]}
+
+    uploader = RuntimeEventUploader(outbox, accept)
+    assert (await uploader.upload_once()).state == "uploaded"
+    assert accepted == ["evt_2_turn.started"]
+    assert outbox.prefix() == []
     outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_event_transport_enforces_complete_body_limits_and_progress(tmp_path):
+    """The actual bytes handed to transport, rather than a row estimate,
+    are bounded; bad heads cannot strand valid followers."""
+    outbox = RuntimeEventOutbox(tmp_path / "transport.db")
+    for index in range(51):
+        await outbox.enqueue(event(index))
+    bodies = []
+
+    async def accept(_path, body):
+        bodies.append(body)
+        return 200, {"accepted": [
+            {"event_id": value["event_id"]}
+            for value in json.loads(body)["events"]
+        ]}
+
+    uploader = RuntimeEventUploader(outbox, accept)
+    assert (await uploader.upload_once()).state == "uploaded"
+    assert (await uploader.upload_once()).state == "uploaded"
+    assert [len(json.loads(body)["events"]) for body in bodies] == [50, 1]
+    assert all(len(body) <= 256 * 1024 for body in bodies)
+    outbox.close()
+
+    # Wrapper bytes make a two-row prefix too large although either row fits.
+    wrapped = RuntimeEventOutbox(tmp_path / "wrapped.db")
+    await wrapped.enqueue(event(1))
+    await wrapped.enqueue(event(2))
+    one = len(b'{"events":[' + wrapped.prefix(max_rows=1)[0].event_json + b']}')
+    wrapped_bodies = []
+    async def capture(_path, body):
+        wrapped_bodies.append(body)
+        return 200, {"accepted": [{"event_id": json.loads(body)["events"][0]["event_id"]}]}
+    narrowed = RuntimeEventUploader(wrapped, capture, batch_rows=50, batch_bytes=one)
+    assert (await narrowed.upload_once()).state == "uploaded"
+    assert len(json.loads(wrapped_bodies[0])["events"]) == 1
+    wrapped.close()
+
+    # A singleton over the complete-frame cap is quarantined without a call.
+    oversized = RuntimeEventOutbox(tmp_path / "oversized.db")
+    huge = RuntimeEvent(agent_id="agent", session_ref="session", turn_ref="turn",
+                        type="output.updated", payload={"block_id": "out", "kind": "result", "phase": "delta", "delta": "x" * (256 * 1024)},
+                        event_id="huge")
+    await oversized.enqueue(huge)
+    calls = []
+    async def never(_path, body):
+        calls.append(body)
+        return 200, {"accepted": []}
+    assert (await RuntimeEventUploader(oversized, never).upload_once()).state == "discarded"
+    assert calls == [] and oversized.prefix() == []
+    oversized.close()
 
 
 @pytest.mark.asyncio

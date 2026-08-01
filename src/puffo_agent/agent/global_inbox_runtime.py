@@ -335,7 +335,12 @@ class ActiveBoundaryAdapter:
         # With no locally-known rows there is no local blocker to prove; this
         # preserves the stateless boundary adapter contract used before the
         # receipt path has populated the Store.
-        self.active.through_by_channel[key] = proven if proven is not None else seq
+        if proven is not None:
+            self.active.through_by_channel[key] = proven
+        elif not await self.store.has_known_channel_rows_above_baseline(
+            space_id, channel_id,
+        ):
+            self.active.through_by_channel[key] = seq
 
 
 class TrackingSendDelegate:

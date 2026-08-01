@@ -1857,6 +1857,19 @@ class MessageStore:
         """
         async with self._inbox_lock:
             db = await self._ensure_db()
+            # The persisted context baseline is a separate, already trusted
+            # history boundary.  It must not be re-proven by (or blocked on)
+            # old locally retained Inbox rows.
+            async with db.execute(
+                "SELECT context_baseline_seq FROM channel_context_state "
+                "WHERE space_id = ? AND channel_id = ?",
+                (space_id, channel_id),
+            ) as cursor:
+                baseline_row = await cursor.fetchone()
+            baseline = (
+                int(baseline_row["context_baseline_seq"])
+                if baseline_row is not None else None
+            )
             async with db.execute(
                 """SELECT server_seq, processing_turn_id, processing_state,
                           model_visible_at
@@ -1872,11 +1885,19 @@ class MessageStore:
                 rows = await cursor.fetchall()
             safe: int | None = None
             for row in rows:
+                sequence = int(row["server_seq"])
+                if baseline is not None and sequence <= baseline:
+                    continue
+                # A history candidate proves at most itself.  In particular,
+                # a later active-turn row cannot turn that read into an
+                # unbounded freshness advance.
+                if candidate_seq is not None and sequence > candidate_seq:
+                    break
                 state = row["processing_state"]
                 # A history tool's just-admitted watermark is model-visible
                 # even though it is not moved into the Inbox turn.  It is
                 # still bounded by every earlier locally-known blocker.
-                is_candidate = candidate_seq is not None and int(row["server_seq"]) == candidate_seq
+                is_candidate = candidate_seq is not None and sequence == candidate_seq
                 is_visible = row["model_visible_at"] is not None or is_candidate
                 is_this_turn = row["processing_turn_id"] == turn_id
                 terminal = state == ProcessingState.PROCESSED.value
@@ -1886,8 +1907,27 @@ class MessageStore:
                 if not admissible:
                     # This is a known same-channel blocker; do not leapfrog it.
                     break
-                safe = int(row["server_seq"])
+                safe = sequence
             return safe
+
+    async def has_known_channel_rows_above_baseline(
+        self, space_id: str, channel_id: str,
+    ) -> bool:
+        """Whether a candidate advance has local channel evidence to respect."""
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            async with db.execute(
+                """SELECT 1 FROM messages
+                   WHERE space_id = ? AND channel_id = ?
+                     AND envelope_kind != 'dm' AND server_seq IS NOT NULL
+                     AND server_seq > COALESCE((
+                       SELECT context_baseline_seq FROM channel_context_state
+                       WHERE space_id = ? AND channel_id = ?
+                     ), -1)
+                   LIMIT 1""",
+                (space_id, channel_id, space_id, channel_id),
+            ) as cursor:
+                return await cursor.fetchone() is not None
 
     async def channel_exists(self, channel_id: str) -> bool:
         """True iff the store has ever recorded a message in
@@ -2122,6 +2162,7 @@ class MessageStore:
         channel_id: str,
         limit: int = 20,
         since_envelope_id: str | None = None,
+        before_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
     ) -> list[ChannelRoot]:
@@ -2136,6 +2177,9 @@ class MessageStore:
         - ``since_envelope_id`` — return roots whose ``sent_at`` is
           strictly greater than that envelope's. Convenient when
           the agent already knows the latest root it processed.
+        - ``before_envelope_id`` — return roots strictly before that
+          composite ``(sent_at, envelope_id)`` cursor. This permits stable
+          reverse pagination when several envelopes share a timestamp.
         - ``after_ts`` (ms-epoch) — exclusive lower bound on
           ``sent_at``. Combined with ``since`` we take the larger.
         - ``before_ts`` (ms-epoch) — exclusive upper bound on
@@ -2150,6 +2194,7 @@ class MessageStore:
             raise DataNotFound(f"channel not found: {channel_id}")
         db = await self._ensure_db()
         since_resolved = await self._resolve_since_sent_at(since_envelope_id)
+        before_resolved = await self._resolve_since_sent_at(before_envelope_id)
 
         # ``reply_count`` is a correlated subquery on the same
         # ``messages`` table; the WAL writer is the only producer, so
@@ -2159,6 +2204,9 @@ class MessageStore:
         if since_resolved is not None:
             clauses.append("(m.sent_at > ? OR (m.sent_at = ? AND m.envelope_id > ?))")
             params.extend([since_resolved[0], since_resolved[0], since_resolved[1]])
+        if before_resolved is not None:
+            clauses.append("(m.sent_at < ? OR (m.sent_at = ? AND m.envelope_id < ?))")
+            params.extend([before_resolved[0], before_resolved[0], before_resolved[1]])
         if after_ts is not None:
             clauses.append("m.sent_at > ?")
             params.append(int(after_ts))
@@ -2166,24 +2214,26 @@ class MessageStore:
             clauses.append("m.sent_at < ?")
             params.append(int(before_ts))
         where = " AND ".join(clauses)
+        ascending_cursor = since_resolved is not None and before_resolved is None
+        order = "m.sent_at ASC, m.envelope_id ASC" if ascending_cursor else "m.sent_at DESC, m.envelope_id DESC"
         sql = (
             "SELECT m.*, "
             "(SELECT COUNT(*) FROM messages r "
             " WHERE r.thread_root_id = m.envelope_id) AS reply_count "
-            f"FROM messages m WHERE {where} "
-            "ORDER BY m.sent_at DESC, m.envelope_id DESC LIMIT ?"
+            f"FROM messages m WHERE {where} ORDER BY {order} LIMIT ?"
         )
         params.append(max(1, min(int(limit), 200)))
 
         async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
-        # Reverse so callers see oldest-first inside the window.
+        # Cursor pages already select oldest-first; uncursorred history is
+        # selected newest-first then reversed for the public oldest-first view.
         return [
             ChannelRoot(
                 message=self._row_to_msg(r),
                 reply_count=int(r["reply_count"]),
             )
-            for r in reversed(rows)
+            for r in (rows if ascending_cursor else reversed(rows))
         ]
 
     async def get_thread_messages(
@@ -2191,6 +2241,7 @@ class MessageStore:
         root_id: str,
         limit: int = 50,
         since_envelope_id: str | None = None,
+        before_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
     ) -> list[StoredMessage]:
@@ -2209,12 +2260,16 @@ class MessageStore:
             raise DataNotFound(f"thread root not found: {root_id}")
         db = await self._ensure_db()
         since_resolved = await self._resolve_since_sent_at(since_envelope_id)
+        before_resolved = await self._resolve_since_sent_at(before_envelope_id)
 
         clauses = ["(envelope_id = ? OR thread_root_id = ?)"]
         params: list = [root_id, root_id]
         if since_resolved is not None:
             clauses.append("(sent_at > ? OR (sent_at = ? AND envelope_id > ?))")
             params.extend([since_resolved[0], since_resolved[0], since_resolved[1]])
+        if before_resolved is not None:
+            clauses.append("(sent_at < ? OR (sent_at = ? AND envelope_id < ?))")
+            params.extend([before_resolved[0], before_resolved[0], before_resolved[1]])
         if after_ts is not None:
             clauses.append("sent_at > ?")
             params.append(int(after_ts))
@@ -2222,15 +2277,14 @@ class MessageStore:
             clauses.append("sent_at < ?")
             params.append(int(before_ts))
         where = " AND ".join(clauses)
-        sql = (
-            f"SELECT * FROM messages WHERE {where} "
-            "ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"
-        )
+        ascending_cursor = since_resolved is not None and before_resolved is None
+        order = "sent_at ASC, envelope_id ASC" if ascending_cursor else "sent_at DESC, envelope_id DESC"
+        sql = f"SELECT * FROM messages WHERE {where} ORDER BY {order} LIMIT ?"
         params.append(max(1, min(int(limit), 200)))
 
         async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
-        return [self._row_to_msg(r) for r in reversed(rows)]
+        return [self._row_to_msg(r) for r in (rows if ascending_cursor else reversed(rows))]
 
     async def get_last_processed_sent_at(self, root_id: str) -> int:
         """``sent_at`` of the last message in the most recently

@@ -115,7 +115,7 @@ async def test_missing_baseline_defaults_to_zero_and_active_turn_advances_seen()
     result = await coordinator.send(
         SemanticSendRequest(destination="ch_a", text="hello"),
     )
-    assert result["state"] == "sent"
+    assert result["state"] == "sent", result
     body = [
         body for method, path, body in http.calls
         if method == "POST" and path == CHANNEL_SEND_PATH
@@ -595,6 +595,76 @@ async def test_plaintext_dm_route_has_no_freshness():
     path, body = [(p, b) for m, p, b in http.calls if m == "POST"][-1]
     assert path == "/v2/messages/plaintext"
     assert "freshness" not in body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["encrypted", "plaintext", "keyless"])
+@pytest.mark.parametrize("include_metadata", [True, False])
+async def test_legacy_dm_transports_preserve_optional_metadata(
+    transport, include_metadata, monkeypatch,
+):
+    """All three legacy DM routes keep optional commit metadata optional."""
+    captured = []
+    original_to_dict = sc_mod.SendResult.to_dict
+
+    def capture_before_serialization(value):
+        captured.append(value)
+        return original_to_dict(value)
+
+    monkeypatch.setattr(sc_mod.SendResult, "to_dict", capture_before_serialization)
+    metadata = {
+        "seq": 17,
+        "replay": True,
+        "devices_queued": 2,
+        "missing_devices": ["missing-device"],
+    } if include_metadata else {}
+    if transport == "keyless":
+        cfg, http, store = _setup_keyless()
+        http.responses["/v2/cloud-agents/messages"] = {
+            "envelope_id": "keyless-dm", **metadata,
+        }
+        coordinator = SendCoordinator(
+            slug=cfg.slug, keystore=cfg.keystore, http_client=http,
+            data_client=store,
+        )
+    else:
+        coordinator, _, http = await coordinator_fixture()
+        if transport == "plaintext":
+            async def plaintext(_slug, _root):
+                return False
+            coordinator.data_client.get_send_encryption = plaintext
+        else:
+            device = KemKeyPair.generate()
+            http.responses["/certs/sync?slugs=agent-0001,alice-1"] = {
+                "entries": [{
+                    "seq": 1, "kind": "device_cert",
+                    "cert": {
+                        "device_id": "metadata-device",
+                        "kem_public_key": base64url_encode(device.public_key_bytes()),
+                    },
+                }],
+                "has_more": False,
+            }
+
+        async def post(_path, _body):
+            return metadata
+        http.post = post
+
+    result = await coordinator.send(SemanticSendRequest(
+        destination="@alice-1", text="metadata",
+    ))
+    assert result["state"] == "sent", result
+    sent = next(value for value in reversed(captured) if value.state == "sent")
+    for name, value in metadata.items():
+        assert result[name] == value
+        assert getattr(sent, name) == value
+    for name in {"seq", "replay", "devices_queued", "missing_devices"} - set(metadata):
+        assert name not in result
+    if not include_metadata:
+        assert sent.seq is None
+        assert sent.replay is None
+        assert sent.devices_queued is None
+        assert sent.missing_devices == []
 
 
 @pytest.mark.asyncio

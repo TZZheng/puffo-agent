@@ -45,7 +45,92 @@ from puffo_agent.agent.harness.runtime_manager import (
     register_runtime_manager,
     unregister_runtime_manager,
 )
+from puffo_agent.agent.runtime_event_outbox import RuntimeEventOutbox, RuntimeEventProjectingSink
+from puffo_agent.agent.runtime_events import RuntimeEventProjector
 from puffo_agent.portal.control.client import execute_command
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("driver_name, shape", [
+    ("codex", "failed_tool"),
+    ("codex", "empty_assistant"),
+    ("claude", "failed_tool"),
+    ("claude", "empty_assistant"),
+])
+async def test_provider_events_project_valid_terminal(tmp_path, driver_name, shape):
+    """Real provider frames must produce a valid durable terminal stream."""
+    outbox = RuntimeEventOutbox(tmp_path / f"{driver_name}-{shape}.db")
+    sink = RuntimeEventProjectingSink(
+        outbox, RuntimeEventProjector(agent_id="agent", session_ref="session"),
+    )
+    turn = TurnRef(f"{driver_name}-{shape}-turn")
+    if driver_name == "codex":
+        driver = CodexAppServerDriver()
+        driver._session_ref = SessionRef("native")
+        driver._active = turn
+        driver._active_native_turn_id = "native-turn"
+        await driver._notification({"method": "turn/started", "params": {}})
+        if shape == "failed_tool":
+            await driver._notification({
+                "method": "item/completed",
+                "params": {"item": {
+                    "id": "tool", "type": "mcpToolCall", "name": "read",
+                    "status": "failed", "error": "provider failure",
+                }},
+            })
+        else:
+            await driver._notification({
+                "method": "item/agentMessage/completed",
+                "params": {"item": {"id": "empty", "type": "agentMessage"}},
+            })
+        await driver._notification({
+            "method": "turn/completed",
+            "params": {"turn": {"status": "failed" if shape == "failed_tool" else "completed"}},
+        })
+        expected_outcome = "failed" if shape == "failed_tool" else "succeeded"
+    else:
+        driver = ClaudeCodeCliDriver()
+        driver._session_ref = SessionRef("native")
+        driver._native_session_id = "native-session"
+        driver._active = turn
+        driver._active_native_turn_id = "replay-id"
+        driver._pending_content = "start"
+        driver._pending_uuid = "replay-id"
+        driver._pending_replay = asyncio.get_running_loop().create_future()
+        await driver._handle({
+            "type": "user", "isReplay": True, "session_id": "native-session",
+            "parent_tool_use_id": None, "uuid": "replay-id",
+            "message": {"content": [{"type": "text", "text": "start"}]},
+        })
+        if shape == "failed_tool":
+            await driver._handle({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "tool", "name": "read", "input": {}},
+            ]}})
+            await driver._handle({"type": "user", "message": {"content": [
+                {"type": "tool_result", "tool_use_id": "tool", "is_error": True, "content": "failed"},
+            ]}})
+        else:
+            await driver._handle({"type": "assistant", "message": {"content": []}})
+        await driver._handle({
+            "type": "result", "subtype": "error" if shape == "failed_tool" else "success",
+            "message": {},
+        })
+        expected_outcome = "failed" if shape == "failed_tool" else "succeeded"
+
+    events = []
+    while not driver._events.empty():
+        events.append(driver._events.get_nowait())
+    for value in events:
+        await sink(value)
+    rows = [row.event for row in outbox.prefix()]
+    terminals = [row for row in rows if row["type"] == "turn.finished"]
+    assert len(terminals) == 1
+    assert terminals[0]["payload"]["outcome"] == expected_outcome
+    if shape == "failed_tool":
+        assert any(row["type"] == "tool.updated" and row["payload"].get("state") == "failed" for row in rows)
+    else:
+        assert not any(row["type"] == "output.updated" for row in rows)
+    outbox.close()
 
 
 class _FakeStdin:

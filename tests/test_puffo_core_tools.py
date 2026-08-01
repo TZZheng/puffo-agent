@@ -1157,6 +1157,45 @@ async def test_get_channel_history_from_local():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("content, expected", [
+    ({"text": "structured text", "caption": "unused caption"}, "structured text"),
+    ({"caption": "caption fallback"}, "caption fallback"),
+])
+async def test_structured_content_read_boundaries(content, expected):
+    """Every local read surface renders structured content as text, never
+    the Python representation of the dict."""
+    cfg, _, ms = _setup()
+    await ms.open()
+    try:
+        base = _now_ms()
+        rows = [
+            {"envelope_id": "root", "envelope_kind": "channel", "sender_slug": "alice",
+             "channel_id": "ch_struct", "space_id": "sp_test", "content": content,
+             "content_type": "puffo/message+attachments/v1", "sent_at": base},
+            {"envelope_id": "reply", "envelope_kind": "channel", "sender_slug": "alice",
+             "channel_id": "ch_struct", "space_id": "sp_test", "content": content,
+             "content_type": "puffo/message+attachments/v1", "thread_root_id": "root", "sent_at": base + 1},
+            {"envelope_id": "dm", "envelope_kind": "dm", "sender_slug": "alice",
+             "recipient_slug": "agent-0001", "content": content,
+             "content_type": "puffo/message+attachments/v1", "sent_at": base + 2},
+        ]
+        for row in rows:
+            await ms.store(row)
+        mcp = _build_tools(cfg)
+        outputs = [
+            await _call(mcp, "get_channel_history", {"channel": "ch_struct"}),
+            await _call(mcp, "get_dm_history", {"peer": "alice"}),
+            await _call(mcp, "get_thread_history", {"root_id": "root"}),
+            await _call(mcp, "get_post", {"post_ref": "root"}),
+            await _call(mcp, "get_post_segment", {"envelope_id": "root", "segment": 0}),
+        ]
+        assert all(expected in output for output in outputs)
+        assert all("{'text':" not in output and "{'caption':" not in output for output in outputs)
+    finally:
+        await ms.close()
+
+
+@pytest.mark.asyncio
 async def test_message_read_tools_stage_highest_model_visible_server_sequence():
     cfg, _, ms = _setup()
     base = _now_ms()

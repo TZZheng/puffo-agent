@@ -1043,7 +1043,8 @@ class SendCoordinator:
                     inp, resolved["signing_key"],
                 )
                 raw = await self.http_client.post("/messages", envelope) or {}
-                missing = raw.get("missing_devices") if isinstance(raw, Mapping) else []
+                metadata = self._legacy_dm_metadata(raw)
+                missing = metadata[3]
                 if missing:
                     from ..mcp.puffo_core_tools import _supplement_missing_devices
                     asyncio.create_task(_supplement_missing_devices(
@@ -1052,9 +1053,12 @@ class SendCoordinator:
                     ))
             else:
                 envelope = build_plaintext_message(inp, resolved["signing_key"])
-                await self.http_client.post("/v2/messages/plaintext", envelope)
+                raw = await self.http_client.post("/v2/messages/plaintext", envelope) or {}
+                metadata = self._legacy_dm_metadata(raw)
             return SendResult(
                 state="sent", envelope_id=envelope.get("envelope_id"),
+                seq=metadata[0], replay=metadata[1], devices_queued=metadata[2],
+                missing_devices=metadata[3],
                 note=(
                     f"{'uploaded' if request.attachment_paths else 'posted'} "
                     f"{envelope.get('envelope_id', '?')} to {request.destination}"
@@ -1068,6 +1072,26 @@ class SendCoordinator:
             ).to_dict()
         except Exception as exc:
             return failed_result(str(exc), kind="validation")
+
+    @staticmethod
+    def _legacy_dm_metadata(raw: Any) -> tuple[int | None, bool | None, int | None, list[str]]:
+        """Validate optional legacy-DM commit metadata without requiring it."""
+        if not isinstance(raw, Mapping):
+            return None, None, None, []
+        def optional_int(name: str) -> int | None:
+            value = raw.get(name)
+            if value is None:
+                return None
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"DM response has invalid {name}")
+            return value
+        replay = raw.get("replay")
+        if replay is not None and not isinstance(replay, bool):
+            raise ValueError("DM response has invalid replay")
+        missing = raw.get("missing_devices", [])
+        if not isinstance(missing, list) or not all(isinstance(value, str) for value in missing):
+            raise ValueError("DM response has invalid missing_devices")
+        return optional_int("seq"), replay, optional_int("devices_queued"), list(missing)
 
     async def _resolve_route_and_content(
         self, request: SemanticSendRequest, *, space_id: str | None,

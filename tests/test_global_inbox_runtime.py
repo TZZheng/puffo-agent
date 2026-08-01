@@ -1280,6 +1280,72 @@ async def test_baseline_boundary_stateless_and_same_channel_advance(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_active_boundary_safe_prefix_matrix(tmp_path):
+    """The active proof is current-turn scoped and independent of baseline."""
+    async def visible(case, setup):
+        store = await make_store(tmp_path / case)
+        try:
+            active = ActiveExactUnion(turn_id="active")
+            boundary = ActiveBoundaryAdapter(store, active)
+            return await setup(store, boundary)
+        finally:
+            await store.close()
+
+    async def lower_pending(store, boundary):
+        await receipt(store, "pending", 11)
+        await receipt(store, "current", 30)
+        await store.admit_messages(["current"], turn_id="active", provider_session_id=None)
+        # A lower same-channel pending row blocks a later current-turn row.
+        assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") is None
+    await visible("lower-pending", lower_pending)
+
+    async def foreign_turn(store, boundary):
+        await receipt(store, "foreign", 11)
+        await receipt(store, "current", 30)
+        await store.admit_messages(["foreign"], turn_id="foreign", provider_session_id=None)
+        await store.admit_messages(["current"], turn_id="active", provider_session_id=None)
+        # A foreign turn likewise cannot establish this active boundary.
+        assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") is None
+    await visible("foreign-turn", foreign_turn)
+
+    async def sparse_other_channel(store, boundary):
+        await receipt(store, "other-sparse", 12, channel="other")
+        await receipt(store, "current", 30)
+        await store.admit_messages(["current"], turn_id="active", provider_session_id=None)
+        # Globally sparse sequences in another channel are irrelevant.
+        assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 30
+    await visible("sparse-other-channel", sparse_other_channel)
+
+    async def resolution(store, boundary):
+        await receipt(store, "earlier", 11)
+        await receipt(store, "current", 30)
+        await store.admit_messages(["current"], turn_id="active", provider_session_id=None)
+        assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") is None
+        await store.admit_messages(["earlier"], turn_id="active", provider_session_id=None)
+        # Resolving the blocker advances by observed sequence, not N+1 adjacency.
+        assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 30
+    await visible("resolution", resolution)
+
+    async def candidate_ceiling(store, boundary):
+        await receipt(store, "history", 12)
+        await receipt(store, "current", 30)
+        await store.admit_messages(["current"], turn_id="active", provider_session_id=None)
+        await boundary.advance_active_turn_through_seq("sp-1", "ch-1", 12)
+        # Candidate N is exact history evidence and cannot prove > N.
+        assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 12
+    await visible("candidate-ceiling", candidate_ceiling)
+
+    async def trusted_baseline(store, boundary):
+        await store.set_context_baseline("sp-1", "ch-1", 10)
+        await receipt(store, "old-pending", 5)
+        await receipt(store, "current", 30)
+        await store.admit_messages(["current"], turn_id="active", provider_session_id=None)
+        # Retained pending/history rows at or below baseline never block again.
+        assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 30
+    await visible("trusted-baseline", trusted_baseline)
+
+
+@pytest.mark.asyncio
 async def test_model_visible_read_advances_only_after_exact_tool_result_admission(
     tmp_path, caplog,
 ):

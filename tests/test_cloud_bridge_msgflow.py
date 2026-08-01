@@ -633,6 +633,80 @@ async def test_pending_pages_continue_without_progress_loop(tmp_path):
     assert bridge.fetch_pending_count == 1
 
 
+@pytest.mark.asyncio
+async def test_canonical_bridge_contract_and_malformed_frame_followed_by_valid(tmp_path):
+    """The wire parser, dispatcher and durable history agree on the
+    canonical additive fields; one bad frame cannot poison the next one."""
+    bridge = FakeBridge()
+    client = await _open_dispatch_client(tmp_path, bridge, db="canonical.db")
+    bad = {"type": "message", "envelope_id": "bad", "sender_slug": "alice", "seq": 0}
+    canonical = {
+        "type": "message", "envelope_id": "canonical", "sender_slug": "bot",
+        "sender_owner_slug": "owner", "sender_type": "agent",
+        "envelope_kind": "channel", "space_id": "sp_1", "channel_id": "ch_1",
+        "sent_at": 100, "content_type": "puffo/message+attachments/v1",
+        "content": {"caption": "caption fallback", "attachments": []},
+        "is_visible_to_human": False, "future_additive_field": {"ignored": True},
+    }
+    await client._dispatch_bridge_frame(bad)
+    await client._dispatch_bridge_frame(canonical)
+    await client._dispatch_bridge_frame({
+        "type": "message", "envelope_id": "legacy", "sender_slug": "alice",
+        "space_id": "sp_1", "channel_id": "ch_1", "plaintext": "legacy text",
+    })
+    await asyncio.gather(*tuple(client._ack_tasks))
+    row = await client.store.get_message_by_envelope("canonical")
+    legacy = await client.store.get_message_by_envelope("legacy")
+    history = await client.store.get_channel_history("ch_1")
+    assert row is not None and legacy is not None
+    assert row.content["original_content"] == canonical["content"]
+    assert row.content["text"] == "caption fallback"
+    assert row.content_type == canonical["content_type"]
+    assert row.content["is_visible_to_human"] is False
+    assert row.content["sender_owner_slug"] == "owner"
+    assert row.content["sender_type"] == "agent"
+    assert legacy.content["original_content"] == "legacy text"
+    assert legacy.content_type == "text/plain"
+    assert [value.envelope_id for value in history] == ["canonical", "legacy"]
+    projected = history[0]
+    assert projected.content["text"] == "caption fallback"
+    assert projected.content["original_content"] == canonical["content"]
+    assert projected.content_type == canonical["content_type"]
+    assert projected.content["is_visible_to_human"] is False
+    assert projected.content["sender_owner_slug"] == "owner"
+    assert projected.content["sender_type"] == "agent"
+    assert bridge.acked == [["canonical"], ["legacy"]]
+    await client.store.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_stream_101_drains_same_connection_stores_once_and_acks(tmp_path):
+    ids = [f"pending-{index:03d}" for index in range(101)]
+    frames = [_bridge_message_frame(envelope_id) for envelope_id in ids[:50]]
+    frames += [{"type": "pending_delivered", "count": 50, "more": True}]
+    frames += [_bridge_message_frame(envelope_id) for envelope_id in ids[50:100]]
+    frames += [{"type": "pending_delivered", "count": 50, "more": True}]
+    frames += [_bridge_message_frame(ids[-1]), {"type": "pending_delivered", "count": 1, "more": False}]
+    bridge = FakeBridge(scripted=frames)
+    client = _bridge_client(tmp_path, bridge, db="pending-101.db")
+    done = asyncio.Event()
+
+    async def on_message(*_args):
+        if len(await client.store.get_channel_history("ch_a", limit=200)) == 101:
+            done.set()
+
+    await _drive_listen_until(client, on_message=on_message, done=done)
+    if client._ack_tasks:
+        await asyncio.gather(*tuple(client._ack_tasks))
+    stored = await client.store.get_channel_history("ch_a", limit=200)
+    assert {row.envelope_id for row in stored} == set(ids)
+    assert len(stored) == 101
+    assert {item for batch in bridge.acked for item in batch} == set(ids)
+    assert len(bridge.acked) == 101
+    assert bridge.connect_count == 1 and bridge.fetch_pending_count >= 3
+    await client.store.close()
+
+
 # --------------------------------------------------------------------------
 # (b) bridge send, no encrypt
 # --------------------------------------------------------------------------
