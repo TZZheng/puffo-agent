@@ -49,6 +49,17 @@ from ._host_mcp import PuffoRpcClient
 logger = logging.getLogger(__name__)
 
 
+def _history_text(content: Any) -> str:
+    """Render the human text/caption portion of stored structured content."""
+    if isinstance(content, dict):
+        value = content.get("text")
+        if isinstance(value, str) and value:
+            return value
+        caption = content.get("caption")
+        return caption if isinstance(caption, str) else ""
+    return content if isinstance(content, str) else ""
+
+
 async def _send_encryption_required(cfg, resolved_root):
     """Daemon-level send-mode decision. Data-client shims without the
     method (older harnesses) fail safe to E2EE."""
@@ -200,13 +211,10 @@ async def _read_space_channels(cfg: Any, space_id: str) -> Any:
 async def _read_channel_members(
     cfg: Any, space_id: str, channel_id: str,
 ) -> Any:
-    """Keyless degrades to the space roster: the server exposes no
-    keyless *channel*-members route, only ``/spaces/{id}/members``, so
-    the keyless branch reads that (``channel_id`` is unused). Native
-    keeps its channel-scoped route."""
+    """Read the exact channel roster on both transports."""
     if cfg.keyless:
         return await cfg.http_client.get_unsigned(
-            f"/v2/cloud-agents/spaces/{space_id}/members"
+            f"/v2/cloud-agents/spaces/{space_id}/channels/{channel_id}/members"
         )
     return await cfg.http_client.get(
         f"/spaces/{space_id}/channels/{channel_id}/members"
@@ -1002,7 +1010,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         for entry in roots:
             m = entry.message
             ts = _ts_to_iso(m.sent_at)
-            text = str(m.content).replace("\n", " ") if m.content else ""
+            text = _history_text(m.content).replace("\n", " ")
             suffix = (
                 f"  ({entry.reply_count} repl{'y' if entry.reply_count == 1 else 'ies'})"
                 if entry.reply_count > 0 else ""
@@ -1040,7 +1048,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         lines = []
         for m in msgs:
             ts = _ts_to_iso(m.sent_at)
-            text = str(m.content).replace("\n", " ") if m.content else ""
+            text = _history_text(m.content).replace("\n", " ")
             lines.append(f"{ts}  {_enc_tag(m)}  msg:{m.envelope_id}  @{m.sender_slug}: {text}")
         return "\n".join(lines)
 
@@ -1100,7 +1108,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         lines = []
         for m in msgs:
             ts = _ts_to_iso(m.sent_at)
-            text = str(m.content).replace("\n", " ") if m.content else ""
+            text = _history_text(m.content).replace("\n", " ")
             lines.append(
                 f"{ts}  {_enc_tag(m)}  post:{m.envelope_id}  @{m.sender_slug}: {text}"
             )
@@ -1300,7 +1308,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
 
         ts = _ts_to_iso(msg.sent_at)
-        content_str = str(msg.content) if msg.content else ""
+        content_str = _history_text(msg.content)
         lines = [
             f"envelope_id: {msg.envelope_id}",
             f"sender: @{msg.sender_slug}",
@@ -1363,10 +1371,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         # the text out of the latter so segmenting works on the
         # human-readable portion in both cases.
         content = msg.content
-        if isinstance(content, dict):
-            text = str(content.get("text") or "")
-        else:
-            text = str(content) if content else ""
+        text = _history_text(content)
 
         if not text:
             return f"message {envelope_id} has no text body"

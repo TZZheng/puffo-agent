@@ -134,16 +134,19 @@ async def test_bridge_releases_held_wait_only_after_exact_durable_pair(tmp_path)
         tool_arguments={"channel": "ch_1"},
     )
     assert read["state"] == "admitted"
-    assert await boundary.get_active_turn_through_seq("sp_1", "ch_1") == 5
+    # The selective history read cannot leapfrog the locally-known pending
+    # seq=4 receipt; the safe channel prefix remains the admitted seq=2.
+    assert await boundary.get_active_turn_through_seq("sp_1", "ch_1") == 2
     sent = await coordinator.send(SemanticSendRequest(
         destination="ch_1", text="explicit retry", send_anyway=True,
     ))
-    assert sent["state"] == "sent"
-    assert len(calls) == 2
+    # The pending seq=4 receipt also keeps reconsideration ineligible.
+    assert sent["state"] == "failed"
+    assert len(calls) == 1
     assert calls[-1][1]["freshness"] == {
         "context_baseline_seq": 2,
-        "seen_seq": 5,
-        "mode": "send_anyway",
+        "seen_seq": 2,
+        "mode": "require_current",
     }
     await _unused_store.close()
     await client.store.close()

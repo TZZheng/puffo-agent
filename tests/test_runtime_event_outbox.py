@@ -293,7 +293,7 @@ async def test_order_uses_sequence_not_occurred_at(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_malformed_head_blocks_later_sequence(tmp_path):
+async def test_malformed_head_is_discarded_so_later_sequence_can_progress(tmp_path):
     outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
     await outbox.enqueue(event(1))
     await outbox.enqueue(event(2))
@@ -301,10 +301,13 @@ async def test_malformed_head_blocks_later_sequence(tmp_path):
     async def malformed(_path, _body):
         return 200, {"accepted": [{"event_id": "evt_2"}]}
 
-    result = await RuntimeEventUploader(outbox, malformed).upload_once()
-    assert result.state == "degraded"
+    uploader = RuntimeEventUploader(outbox, malformed)
+    # A rejected multi-row batch isolates its head before any discard.
+    assert (await uploader.upload_once()).state == "retry"
+    result = await uploader.upload_once()
+    assert result.state == "discarded"
     assert [row.event_id for row in outbox.prefix()] == [
-        "evt_1_turn.started", "evt_2_turn.started",
+        "evt_2_turn.started",
     ]
     outbox.close()
 

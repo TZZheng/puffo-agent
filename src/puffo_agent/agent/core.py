@@ -182,6 +182,7 @@ class PuffoAgent:
                 sender_display_name=msg.get("sender_display_name", ""),
                 is_visible_to_human=msg.get("is_visible_to_human", True),
                 sender_owner_slug=msg.get("sender_owner_slug", ""),
+                sender_type=msg.get("sender_type"),
                 is_from_operator=msg.get("is_from_operator", False),
                 is_encrypted=msg.get("is_encrypted", True),
             )
@@ -467,6 +468,7 @@ class PuffoAgent:
         sender_display_name: str = "",
         is_visible_to_human: bool = True,
         sender_owner_slug: str = "",
+        sender_type: str | None = None,
         is_from_operator: bool = False,
         is_encrypted: bool = True,
     ):
@@ -512,6 +514,7 @@ class PuffoAgent:
         sender_display_name: str = "",
         is_visible_to_human: bool = True,
         sender_owner_slug: str = "",
+        sender_type: str | None = None,
         is_from_operator: bool = False,
         is_encrypted: bool = True,
     ) -> str:
@@ -552,8 +555,10 @@ class PuffoAgent:
         # ``owner_slug`` exists only for agents, so it doubles as the
         # agent signal here. Display-only — priority banding still
         # runs on the upstream ``sender_is_agent`` flag.
-        sender_type = "agent" if (sender_is_agent or sender_owner_slug) else "human"
-        lines.append(f"- sender_type: {sender_type}")
+        projected_sender_type = sender_type if sender_type in {"human", "agent"} else (
+            "agent" if (sender_is_agent or sender_owner_slug) else "unknown"
+        )
+        lines.append(f"- sender_type: {projected_sender_type}")
         # ``sender_owner_slug`` fires only for agent senders (their
         # operator); ``is_from_operator`` only when the sender IS the
         # agent's own operator. Emit conditionally so older agents

@@ -177,26 +177,29 @@ class RuntimeEventOutbox:
             return sequence
 
     def prefix(
-        self, *, max_rows: int = 100, max_bytes: int = 256 * 1024
+        self, *, max_rows: int = 50, max_bytes: int = 256 * 1024
     ) -> list[OutboxRow]:
         result: list[OutboxRow] = []
-        total = 0
+        # Account for the complete JSON envelope, including wrapper and commas.
+        total = len(b'{"events":[]}')
         for row in self._db.execute(
             "SELECT sequence,event_id,event_type,event_json,retry_count "
             "FROM events ORDER BY sequence LIMIT ?", (max_rows,)
         ):
             encoded = bytes(row["event_json"])
-            if result and total + len(encoded) > max_bytes:
+            added = len(encoded) + (1 if result else 0)
+            if result and total + added > max_bytes:
                 break
-            if not result and len(encoded) > max_bytes:
-                # Always make progress on the head; server may reject it
-                # permanently, which correctly blocks later rows.
-                pass
+            if not result and total + added > max_bytes:
+                # Return the oversized head alone so the uploader can
+                # deterministically quarantine it and unblock later rows.
+                result.append(OutboxRow(int(row["sequence"]), str(row["event_id"]), str(row["event_type"]), encoded, int(row["retry_count"])))
+                break
             result.append(OutboxRow(
                 int(row["sequence"]), str(row["event_id"]),
                 str(row["event_type"]), encoded, int(row["retry_count"]),
             ))
-            total += len(encoded)
+            total += added
         return result
 
     def increment_retries(self, sequences: Iterable[int]) -> None:
@@ -229,6 +232,13 @@ class RuntimeEventOutbox:
         )
         self._db.commit()
 
+    def discard(self, row: OutboxRow, *, error_code: str) -> None:
+        """Quarantine a permanently rejected head by removing it from FIFO."""
+        self._db.execute("DELETE FROM events WHERE sequence = ?", (row.sequence,))
+        self._db.commit()
+        self._log("runtime.discarded", outbox_sequence=row.sequence,
+                  event_id=row.event_id, error_code=error_code)
+
     def set_active_turn(
         self, turn_ref: str | None, *, session_ref: str = "",
         native_session_id: str = "",
@@ -258,14 +268,14 @@ class RuntimeEventOutbox:
 
 
 class RuntimeEventUploader:
-    """Serial uploader. Permanent/malformed head failures degrade and stop."""
+    """Serial uploader which lets a permanent bad head unblock later rows."""
 
     def __init__(
         self,
         outbox: RuntimeEventOutbox,
         transport: Callable[..., Awaitable[Any]],
         *,
-        batch_rows: int = 100,
+        batch_rows: int = 50,
         batch_bytes: int = 256 * 1024,
     ):
         self.outbox = outbox
@@ -274,17 +284,25 @@ class RuntimeEventUploader:
         self.batch_bytes = batch_bytes
         self.degraded_error = ""
         self._lock = asyncio.Lock()
+        self._isolate_head = False
 
     async def upload_once(self) -> UploadResult:
         async with self._lock:
             rows = self.outbox.prefix(
-                max_rows=self.batch_rows, max_bytes=self.batch_bytes
+                max_rows=1 if self._isolate_head else self.batch_rows,
+                max_bytes=self.batch_bytes
             )
             if not rows:
                 return UploadResult("idle")
             body = b'{"events":[' + b",".join(
                 row.event_json for row in rows
             ) + b"]}"
+            # An oversized singleton is quarantined locally; it must never be
+            # sent as an over-limit HTTP request.
+            if len(body) > self.batch_bytes:
+                self.degraded_error = "body_too_large"
+                self.outbox.discard(rows[0], error_code=self.degraded_error)
+                return UploadResult("discarded", error_code=self.degraded_error)
             self.outbox._log(
                 "runtime.batch_attempt",
                 first_sequence=rows[0].sequence,
@@ -314,13 +332,22 @@ class RuntimeEventUploader:
                 )
                 return UploadResult("retry", error_code=f"http_{status}")
             if status < 200 or status >= 300:
+                # A batch rejection does not identify its bad member.  Retry
+                # its head alone before discarding anything, preserving FIFO
+                # evidence and letting valid followers progress.
+                if len(rows) > 1:
+                    self.degraded_error = f"http_{status}"
+                    self._isolate_head = True
+                    return UploadResult("retry", error_code=self.degraded_error)
                 self.degraded_error = f"http_{status}"
                 self.outbox._log(
                     "runtime.retry", outbox_sequence=rows[0].sequence,
                     retry_count=rows[0].retry_count,
                     state="degraded", error_code=self.degraded_error,
                 )
-                return UploadResult("degraded", error_code=self.degraded_error)
+                self.outbox.discard(rows[0], error_code=self.degraded_error)
+                self._isolate_head = False
+                return UploadResult("discarded", error_code=self.degraded_error)
             try:
                 accepted = payload["accepted"]
                 accepted_ids = [str(item["event_id"]) for item in accepted]
@@ -328,17 +355,24 @@ class RuntimeEventUploader:
                     raise ValueError("partial acknowledgement")
                 self.outbox.acknowledge(rows, accepted_ids)
             except (KeyError, TypeError, ValueError):
+                if len(rows) > 1:
+                    self.degraded_error = "malformed_response"
+                    self._isolate_head = True
+                    return UploadResult("retry", error_code=self.degraded_error)
                 self.degraded_error = "malformed_response"
                 self.outbox._log(
                     "runtime.retry", outbox_sequence=rows[0].sequence,
                     retry_count=rows[0].retry_count,
                     state="degraded", error_code=self.degraded_error,
                 )
-                return UploadResult("degraded", error_code=self.degraded_error)
+                self.outbox.discard(rows[0], error_code=self.degraded_error)
+                self._isolate_head = False
+                return UploadResult("discarded", error_code=self.degraded_error)
             self.outbox._log(
                 "runtime.acknowledged", first_sequence=rows[0].sequence,
                 last_sequence=rows[-1].sequence, event_count=len(rows),
             )
+            self._isolate_head = False
             return UploadResult("uploaded", len(rows))
 
 

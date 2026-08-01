@@ -707,7 +707,7 @@ async def test_keyless_real_http_serializes_exact_server_dto(
         body = json.loads(raw)
         allowed = {
             "client_ref", "space_id", "channel_id", "plaintext",
-            "freshness", "thread_root_id", "reply_to_id", "attachments",
+            "is_visible_to_human", "freshness", "thread_root_id", "reply_to_id", "attachments",
         }
         if set(body) - allowed or set(body.get("freshness", {})) != {
             "context_baseline_seq", "seen_seq", "mode",
@@ -792,6 +792,7 @@ async def test_keyless_real_http_serializes_exact_server_dto(
             "space_id": "sp_test",
             "channel_id": "ch_abc",
             "plaintext": "caption",
+            "is_visible_to_human": True,
             "freshness": {
                 "context_baseline_seq": 0,
                 "seen_seq": 0,

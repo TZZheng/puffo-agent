@@ -93,6 +93,7 @@ class SendResult:
     envelope_id: Optional[str] = None
     seq: Optional[int] = None
     replay: Optional[bool] = None
+    devices_queued: Optional[int] = None
     context_baseline_seq: Optional[int] = None
     seen_seq: Optional[int] = None
     latest_seq: Optional[int] = None
@@ -291,6 +292,7 @@ class SendCoordinator:
             _resolve_channel_space,
             _resolve_outgoing_root,
         )
+        from ._visibility import resolve_visibility
 
         if not destination.startswith("@"):
             try:
@@ -336,10 +338,20 @@ class SendCoordinator:
                 space_id=space_id,
                 dm_peer=dm_peer,
             )
+            visible, visibility_note = await resolve_visibility(
+                request.visibility_level,
+                destination,
+                request.caption if request.attachment_paths else request.text,
+                root_id or "",
+                self.http_client,
+            )
             body: dict[str, Any] = {
                 "plaintext": (
                     request.caption if request.attachment_paths else request.text
                 ),
+                # Keyless envelopes have no signed payload from which the
+                # server can recover this policy; always send it explicitly.
+                "is_visible_to_human": visible,
             }
             if dm_peer is not None:
                 body["recipient_slug"] = dm_peer
@@ -395,6 +407,21 @@ class SendCoordinator:
                     "keyless message send returned no envelope_id",
                     kind="protocol",
                 )
+            def optional_int(name: str) -> int | None:
+                value = raw.get(name) if isinstance(raw, Mapping) else None
+                if value is None:
+                    return None
+                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                    raise ValueError(f"keyless response has invalid {name}")
+                return value
+            seq = optional_int("seq")
+            devices_queued = optional_int("devices_queued")
+            missing_devices = raw.get("missing_devices", []) if isinstance(raw, Mapping) else []
+            if not isinstance(missing_devices, list) or not all(isinstance(v, str) for v in missing_devices):
+                raise ValueError("keyless response has invalid missing_devices")
+            replay = raw.get("replay") if isinstance(raw, Mapping) else None
+            if replay is not None and not isinstance(replay, bool):
+                raise ValueError("keyless response has invalid replay")
             attachment_note = (
                 f"\nuploaded {len(refs)} file(s) ({total_bytes} bytes total)"
                 if refs else ""
@@ -402,9 +429,13 @@ class SendCoordinator:
             return SendResult(
                 state="sent",
                 envelope_id=str(envelope_id),
+                seq=seq,
+                replay=replay,
+                devices_queued=devices_queued,
+                missing_devices=list(missing_devices),
                 note=(
                     f"{'uploaded' if refs else 'posted'} {envelope_id} "
-                    f"to {destination}{root_note}{attachment_note}"
+                    f"to {destination}{root_note}{visibility_note}{attachment_note}"
                 ),
             ).to_dict()
         except HttpError as exc:
@@ -467,6 +498,12 @@ class SendCoordinator:
                 space_id=space_id,
                 dm_peer=None,
             )
+            from ._visibility import resolve_visibility
+            visible, _ = await resolve_visibility(
+                request.visibility_level, channel_id,
+                request.caption if request.attachment_paths else request.text,
+                root_id or "", self.http_client,
+            )
             body: dict[str, Any] = {
                 # One logical model send owns one stable idempotency reference.
                 # _post_keyless_exact retries this exact body, while a later
@@ -477,6 +514,7 @@ class SendCoordinator:
                 "plaintext": (
                     request.caption if request.attachment_paths else request.text
                 ),
+                "is_visible_to_human": visible,
                 "freshness": {
                     "context_baseline_seq": baseline,
                     "seen_seq": seen_seq,
@@ -587,6 +625,7 @@ class SendCoordinator:
             seq = raw.get("seq")
             replay = raw.get("replay")
             missing_devices = raw.get("missing_devices")
+            devices_queued = raw.get("devices_queued")
             echoed = raw.get("freshness")
             if (
                 not isinstance(envelope_id, str)
@@ -597,6 +636,7 @@ class SendCoordinator:
                 or not isinstance(replay, bool)
                 or not isinstance(missing_devices, list)
                 or not all(isinstance(item, str) for item in missing_devices)
+                or (devices_queued is not None and (isinstance(devices_queued, bool) or not isinstance(devices_queued, int) or devices_queued < 0))
                 or not isinstance(echoed, Mapping)
                 or set(echoed) != {
                     "mode",
@@ -625,6 +665,7 @@ class SendCoordinator:
                 envelope_id=envelope_id,
                 seq=seq,
                 replay=replay,
+                devices_queued=devices_queued,
                 missing_devices=list(missing_devices),
                 context_baseline_seq=freshness["context_baseline_seq"],
                 seen_seq=freshness["seen_seq"],
@@ -926,8 +967,15 @@ class SendCoordinator:
                     state="failed", error="sent response has invalid missing_devices",
                     error_kind="protocol",
                 )
+            devices_queued = raw.get("devices_queued")
+            if devices_queued is not None and (isinstance(devices_queued, bool) or not isinstance(devices_queued, int) or devices_queued < 0):
+                return SendResult(
+                    state="failed", error="sent response has invalid devices_queued",
+                    error_kind="protocol",
+                )
             return SendResult(
                 state="sent", envelope_id=str(envelope_id), seq=seq, replay=replay,
+                devices_queued=devices_queued,
                 context_baseline_seq=freshness["context_baseline_seq"],
                 seen_seq=freshness["seen_seq"],
                 latest_seq_before_send=(

@@ -601,6 +601,38 @@ def test_payload_from_bridge_frame_skips_missing_envelope_id(tmp_path):
     assert client._payload_from_bridge_frame({"plaintext": "x"}) is None
 
 
+def test_bridge_additive_fields_preserve_json_false_visibility_and_sender(tmp_path):
+    """Canonical bridge fields are additive: old plaintext defaults remain."""
+    client = _bridge_client(tmp_path, FakeBridge(), db="additive.db")
+    payload = client._payload_from_bridge_frame({
+        "type": "message", "envelope_id": "env_additive",
+        "sender_slug": "build-bot", "sender_owner_slug": "alice",
+        "sender_type": "agent", "space_id": "sp_1", "channel_id": "ch_1",
+        "content": {"text": "caption", "attachments": [{"blob_id": "b1"}]},
+        "plaintext": "must not win", "content_type": "puffo/message+attachments/v1",
+        "is_visible_to_human": False,
+    })
+    assert payload is not None
+    assert payload.content == {"text": "caption", "attachments": [{"blob_id": "b1"}]}
+    assert payload.content_type == "puffo/message+attachments/v1"
+    assert payload.is_visible_to_human is False
+    assert payload.sender_owner_slug == "alice"
+    assert payload.sender_type == "agent"
+
+
+@pytest.mark.asyncio
+async def test_pending_pages_continue_without_progress_loop(tmp_path):
+    bridge = FakeBridge()
+    client = _bridge_client(tmp_path, bridge, db="pages.db")
+    await client._dispatch_bridge_frame({"type": "pending_delivered", "count": 50, "more": True})
+    await asyncio.sleep(0)
+    await client._dispatch_bridge_frame({"type": "pending_delivered", "count": 0, "more": True})
+    await asyncio.sleep(0)
+    await client._dispatch_bridge_frame({"type": "pending_delivered", "count": 0, "more": True})
+    await asyncio.sleep(0)
+    assert bridge.fetch_pending_count == 1
+
+
 # --------------------------------------------------------------------------
 # (b) bridge send, no encrypt
 # --------------------------------------------------------------------------

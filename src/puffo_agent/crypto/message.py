@@ -80,6 +80,10 @@ class MessagePayload:
     # keys off ``content_type`` and never reads this field, so it stays
     # ``None`` on that path.
     attachments: Optional[list] = None
+    # Additive bridge identity fields. They intentionally never enter the
+    # signed native payload serialization below.
+    sender_owner_slug: Optional[str] = None
+    sender_type: Optional[str] = None
 
     def to_payload_dict(self) -> dict:
         """JSON shape matching the server's ``MessagePayload``.

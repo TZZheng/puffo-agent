@@ -298,6 +298,10 @@ class RuntimeEventProjector:
                 "delta": text,
             })
         if kind == "turn.assistant_completed":
+            # Empty native assistant blocks are suppressed wholesale; emitting
+            # an end without a prior delta is invalid lifecycle output.
+            if (str(event.turn_ref), str(data.get("block_id") or "result")) not in self._block_refs:
+                return None
             return self._make(event, "output.updated", {
                 "block_id": self._block_ref(event),
                 "kind": (
@@ -310,9 +314,10 @@ class RuntimeEventProjector:
         if kind == "turn.tool_started":
             return self._tool(event, "running")
         if kind == "turn.tool_completed":
-            return self._tool(
-                event, "failed" if data.get("failed") else "succeeded"
-            )
+            outcome = data.get("outcome", "succeeded")
+            if outcome not in {"succeeded", "failed"}:
+                return None
+            return self._tool(event, str(outcome))
         if kind in {"turn.permission_requested", "turn.permission_updated"}:
             state = str(data.get("state") or "pending")
             if state not in PERMISSION_STATES:

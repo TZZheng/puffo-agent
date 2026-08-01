@@ -2815,13 +2815,11 @@ async def test_keyless_list_channels_in_all_spaces_hits_cloud_agents_routes():
 
 
 @pytest.mark.asyncio
-async def test_keyless_list_channel_members_degrades_to_space_roster():
-    """No keyless channel-members route exists; the keyless tool reads
-    the space roster ``/v2/cloud-agents/spaces/<sp>/members`` after
-    resolving channel→space from the cache."""
+async def test_keyless_list_channel_members_uses_private_channel_roster():
+    """Keyless reads the exact private-channel roster, not the space roster."""
     cfg, http, ms = _setup_keyless()
     await ms.mark_channel_space("ch_abc", "sp_test")
-    http.responses["/v2/cloud-agents/spaces/sp_test/members"] = {
+    http.responses["/v2/cloud-agents/spaces/sp_test/channels/ch_abc/members"] = {
         "members": [
             {"slug": "alice-0001", "role": "owner"},
             {"slug": "agent-0001", "role": "member"},
@@ -2832,10 +2830,9 @@ async def test_keyless_list_channel_members_degrades_to_space_roster():
     assert "alice-0001" in result and "(owner)" in result
     assert "agent-0001" in result and "(member)" in result
     assert (
-        "GET_UNSIGNED", "/v2/cloud-agents/spaces/sp_test/members", None,
+        "GET_UNSIGNED", "/v2/cloud-agents/spaces/sp_test/channels/ch_abc/members", None,
     ) in http.calls
-    # NEVER the native channel-scoped route.
-    assert not any("channels/ch_abc/members" in p for _, p, _ in http.calls)
+    assert not any(p.endswith("/spaces/sp_test/members") for _, p, _ in http.calls)
 
 
 @pytest.mark.asyncio
@@ -2894,7 +2891,7 @@ async def test_keyless_send_message_dm_posts_unsigned():
     assert len(sends) == 1
     path, body = sends[0]
     assert path == "/v2/cloud-agents/messages"
-    assert body == {"plaintext": "hi there", "recipient_slug": "alice-0001"}
+    assert body == {"plaintext": "hi there", "recipient_slug": "alice-0001", "is_visible_to_human": True}
 
 
 @pytest.mark.asyncio
@@ -2966,7 +2963,7 @@ async def test_keyless_send_message_bypasses_bridge():
     assert bridge.sent == []
     assert bridge.uploaded == []
     assert _keyless_sends(http) == [
-        {"plaintext": "yo", "recipient_slug": "bob-0001"},
+        {"plaintext": "yo", "recipient_slug": "bob-0001", "is_visible_to_human": True},
     ]
 
 

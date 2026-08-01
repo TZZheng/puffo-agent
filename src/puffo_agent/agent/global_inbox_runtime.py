@@ -316,6 +316,9 @@ class ActiveBoundaryAdapter:
         persisted = await self.store.get_model_visible_through_seq(
             self.active.turn_id, space_id, channel_id
         )
+        # ``through_by_channel`` contains only Store-proven values written by
+        # ``advance`` below (including a history-tool candidate), never raw
+        # selected rows.
         advanced = self.active.through_by_channel.get((space_id, channel_id))
         values = [value for value in (persisted, advanced) if value is not None]
         return max(values) if values else None
@@ -326,9 +329,13 @@ class ActiveBoundaryAdapter:
         if not self.active.turn_id:
             return
         key = (space_id, channel_id)
-        self.active.through_by_channel[key] = max(
-            seq, self.active.through_by_channel.get(key, seq)
+        proven = await self.store.get_model_visible_through_seq(
+            self.active.turn_id, space_id, channel_id, candidate_seq=seq,
         )
+        # With no locally-known rows there is no local blocker to prove; this
+        # preserves the stateless boundary adapter contract used before the
+        # receipt path has populated the Store.
+        self.active.through_by_channel[key] = proven if proven is not None else seq
 
 
 class TrackingSendDelegate:
@@ -1268,10 +1275,11 @@ class GlobalInboxRuntime:
                 for item, route in zip(selected, routes):
                     if item.server_seq is not None and route.kind != "dm":
                         key = (route.space_id, route.channel_id)
-                        self.active.through_by_channel[key] = max(
-                            self.active.through_by_channel.get(key, 0),
-                            item.server_seq,
+                        proven = await self.store.get_model_visible_through_seq(
+                            active_turn_id, route.space_id, route.channel_id
                         )
+                        if proven is not None:
+                            self.active.through_by_channel[key] = proven
                     log_runtime_event(
                         logger,
                         "inbox.row_in_turn",
@@ -1694,6 +1702,11 @@ class GlobalInboxRuntime:
     ) -> None:
         if event.planning_cycle_key != planned.planning_cycle_key:
             raise RuntimeError("provider admission did not correlate to planned turn")
+        # Durable Inbox recovery is keyed by the provider session.  Stateless
+        # local adapters must not create a run that can never be authenticated
+        # on recovery (or expose identity-required MCP history tools).
+        if not event.provider_session_id:
+            raise RuntimeError("provider does not support durable Inbox admission")
         if planned.message_ids:
             run = await self.store.admit_messages(
                 planned.message_ids,

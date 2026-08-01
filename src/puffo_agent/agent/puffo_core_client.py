@@ -511,6 +511,7 @@ class PuffoCoreMessageClient:
         # itself via a done-callback. Native transport never populates
         # this — both producers live only in the bridge dispatcher.
         self._ack_tasks: set[asyncio.Task] = set()
+        self._bridge_pending_nonprogress = False
         # Most recent DM sender. ``send_fallback_message(channel_id="")`` means
         # "reply to whoever just DMed me". Single-slot is fine since
         # the worker handles one envelope at a time; concurrent DM
@@ -1294,6 +1295,19 @@ class PuffoCoreMessageClient:
             task = asyncio.create_task(self._refresh_bridge_spaces())
             self._ack_tasks.add(task)
             task.add_done_callback(self._ack_tasks.discard)
+            # Keep draining pages on this connection. Awaiting a correlated
+            # request here would deadlock frames(), so it is deliberately a
+            # tracked background task.
+            more, count = frame.get("more", False), frame.get("count", 0)
+            if more is True and isinstance(count, int) and not isinstance(count, bool):
+                if count > 0:
+                    self._bridge_pending_nonprogress = False
+                    task = asyncio.create_task(self._bridge.send_fetch_pending())
+                    self._ack_tasks.add(task)
+                    task.add_done_callback(self._ack_tasks.discard)
+                elif not self._bridge_pending_nonprogress:
+                    self._bridge_pending_nonprogress = True
+                    self._log.warning("bridge pending delivery made no progress; stopping drain")
         elif kind == "runtime_command":
             from .harness.runtime_commands import execute_runtime_command
 
@@ -1566,15 +1580,27 @@ class PuffoCoreMessageClient:
         if payload.content_type == "puffo/message+attachments/v1" and isinstance(
             payload.content, dict,
         ):
-            raw_text = str(payload.content.get("text") or "")
+            candidate_text = payload.content.get("text")
+            candidate_caption = payload.content.get("caption")
+            raw_text = candidate_text if isinstance(candidate_text, str) else (
+                candidate_caption if isinstance(candidate_caption, str) else ""
+            )
             metas_raw = payload.content.get("attachments") or []
             if isinstance(metas_raw, list):
                 attachment_paths = await self._save_inbound_attachments(
                     envelope_id=payload.envelope_id,
                     metas_raw=metas_raw,
                 )
+        elif isinstance(payload.content, str):
+            raw_text = payload.content
+        elif isinstance(payload.content, dict):
+            candidate_text = payload.content.get("text")
+            candidate_caption = payload.content.get("caption")
+            raw_text = candidate_text if isinstance(candidate_text, str) else (
+                candidate_caption if isinstance(candidate_caption, str) else ""
+            )
         else:
-            raw_text = str(payload.content) if payload.content else ""
+            raw_text = ""
         if isinstance(payload.attachments, list) and payload.attachments:
             attachment_paths.extend(
                 await self._save_inbound_bridge_attachments(
@@ -1630,7 +1656,9 @@ class PuffoCoreMessageClient:
         else:
             channel_name = ""
         sender_display_name = await self._fetch_display_name(payload.sender_slug)
-        sender_owner_slug = await self._fetch_owner_slug(payload.sender_slug)
+        sender_owner_slug = payload.sender_owner_slug
+        if sender_owner_slug is None:
+            sender_owner_slug = await self._fetch_owner_slug(payload.sender_slug)
         llm_text = _maybe_redact_long_text(
             clean_text,
             envelope_id=payload.envelope_id,
@@ -1642,6 +1670,10 @@ class PuffoCoreMessageClient:
         )
         row["content"] = {
             "text": llm_text,
+            # Keep bridge JSON losslessly available to history consumers while
+            # exposing only intended text to model-facing projections.
+            "original_content": payload.content,
+            "content_type": payload.content_type,
             "attachment_paths": attachment_paths,
             "mentions": mentions,
             "sender_display_name": sender_display_name,
@@ -1649,7 +1681,8 @@ class PuffoCoreMessageClient:
             "is_from_operator": bool(
                 self.operator_slug and payload.sender_slug == self.operator_slug
             ),
-            "sender_is_agent": bool(sender_owner_slug),
+            "sender_is_agent": payload.sender_type == "agent" or bool(sender_owner_slug),
+            "sender_type": payload.sender_type,
             "is_visible_to_human": payload.is_visible_to_human,
             "channel_name": channel_name,
             "space_name": space_name,
@@ -1690,7 +1723,9 @@ class PuffoCoreMessageClient:
                 "root_id": thread_root_id or "",
                 "is_dm": is_dm,
                 "attachments": content["attachment_paths"],
-                "sender_is_bot": bool(sender_owner_slug),
+                "sender_is_bot": payload.sender_type == "agent" or bool(sender_owner_slug),
+                "sender_owner_slug": sender_owner_slug,
+                "sender_type": payload.sender_type,
                 "mentions": mentions,
                 "envelope_id": payload.envelope_id,
                 "sent_at": payload.sent_at,
@@ -2020,9 +2055,20 @@ class PuffoCoreMessageClient:
         envelope_kind = frame.get("envelope_kind") or (
             "dm" if recipient_slug else "channel"
         )
-        content = frame.get("plaintext")
-        if content is None:
-            content = frame.get("content", "")
+        # The additive content member wins by presence, including falsey JSON.
+        content = frame["content"] if "content" in frame else frame.get("plaintext", "")
+        content_type = frame.get("content_type", "text/plain")
+        visible = frame.get("is_visible_to_human", True)
+        owner = frame.get("sender_owner_slug")
+        sender_type = frame.get("sender_type")
+        if (
+            not isinstance(content_type, str)
+            or not isinstance(visible, bool)
+            or (owner is not None and not isinstance(owner, str))
+            or (sender_type is not None and sender_type not in {"human", "agent"})
+        ):
+            self._log.warning("bridge message rejected: invalid additive field types (envelope_id=%s)", envelope_id)
+            return None
         return MessagePayload(
             payload_type=frame.get("payload_type", "message"),
             version=frame.get("version", 1),
@@ -2032,9 +2078,9 @@ class PuffoCoreMessageClient:
             sender_subkey_id=frame.get("sender_subkey_id", ""),
             sent_at=frame.get("sent_at") or int(time.time() * 1000),
             message_nonce=frame.get("message_nonce", ""),
-            content_type=frame.get("content_type", "text/plain"),
+            content_type=content_type,
             content=content,
-            is_visible_to_human=frame.get("is_visible_to_human", True),
+            is_visible_to_human=visible,
             space_id=frame.get("space_id"),
             channel_id=frame.get("channel_id"),
             recipient_slug=recipient_slug,
@@ -2045,6 +2091,8 @@ class PuffoCoreMessageClient:
             # shared inbound tail downloads each blob by id (no decrypt).
             # Native frames never carry this key, so it stays None there.
             attachments=frame.get("attachments"),
+            sender_owner_slug=owner,
+            sender_type=sender_type,
         )
 
     async def _admit_thread_message(
