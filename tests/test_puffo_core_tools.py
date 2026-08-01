@@ -342,6 +342,11 @@ async def test_send_tool_descriptions_require_semantic_inspection_before_context
     for name in ("send_message", "send_message_with_attachments"):
         description = " ".join(tools[name].description.lower().split())
         for phrase in (
+            "revised or derived from conversation progress is context-dependent",
+            "must use normal freshness",
+            "after a held send of that content, reread the relevant route",
+            "fresh send-or-silence decision",
+            "switching targets does not make that content context-independent",
             "actual newer message content",
             "successfully synchronized",
             "returned and inspected",
@@ -363,11 +368,13 @@ async def test_send_tool_descriptions_preserve_context_independent_override():
         description = " ".join(tools[name].description.lower().split())
         description_without_markup = description.replace("`", "")
         for phrase in (
-            "after existing same-turn technical eligibility checks",
+            "after the existing same-turn held/read technical eligibility checks",
             "explicit send_anyway=true remains available",
+            "model-owned choice only",
             "genuinely context-independent",
             "deliberate judgment",
             "not an automatic retry",
+            "not a way to bypass normal freshness for context-dependent content",
         ):
             assert phrase in description_without_markup, (
                 name, phrase, description,

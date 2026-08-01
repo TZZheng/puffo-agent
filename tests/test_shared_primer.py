@@ -4,6 +4,8 @@ from pathlib import Path
 from puffo_agent.agent.shared_content import (
     DEFAULT_SHARED_CLAUDE_MD,
     DEFAULT_SKILL_READ_INBOX,
+    DEFAULT_SKILL_SEND_MESSAGE,
+    DEFAULT_SKILL_SEND_MESSAGE_WITH_ATTACHMENTS,
     ensure_shared_primer,
     rebuild_agent_claude_md,
     rebuild_agent_codex_md,
@@ -252,6 +254,115 @@ def test_followup_decision_context_is_shared_across_managed_prompts():
     assert "mcp__puffo__" in claude
     assert "mcp__puffo__" not in codex
     assert "send_message" in codex
+
+
+def _assert_context_dependent_send_contract(text: str) -> None:
+    lowered = " ".join(text.lower().split())
+    for phrase in (
+        "revised or derived from conversation progress is context-dependent",
+        "must use normal freshness",
+        "after a held send of that content, reread the relevant route",
+        "fresh send-or-silence decision",
+        "switching targets does not make that content context-independent",
+        "after the existing same-turn held/read technical eligibility checks",
+        "send_anyway=true",
+        "model-owned choice only",
+        "genuinely context-independent",
+        "not an automatic retry",
+    ):
+        assert phrase in lowered, (phrase, text)
+
+
+def _assert_reply_eligibility_controls(text: str) -> None:
+    lowered = " ".join(text.lower().split())
+    for phrase in (
+        "follow-up",
+        "correction",
+        "direct mention",
+        "newly exposed dependency",
+        "otherwise changed work",
+        "new work exposed by peer progress",
+        "permit another reply",
+        "multi-target turns must address destinations explicitly",
+        "choose a send or `[silent]`",
+        "final send-or-silence decision model-owned",
+        "independently choose whether to revise",
+    ):
+        assert phrase in lowered, (phrase, text)
+
+
+def test_context_dependent_send_contract_is_shared_across_guidance_and_skills():
+    root = _tmp()
+    shared = root / "shared"
+    profile = root / "profile.md"
+    profile.write_text("# Soul\nI am a context-dependent test agent.", encoding="utf-8")
+    memory = root / "memory"
+    memory.mkdir()
+    workspace = root / "workspace"
+    workspace.mkdir()
+    claude_user = root / ".claude"
+    gemini_user = root / ".gemini"
+    codex_user = root / ".codex"
+
+    claude = rebuild_agent_claude_md(
+        shared_dir=shared,
+        profile_path=profile,
+        memory_dir=memory,
+        workspace_dir=workspace,
+        claude_user_dir=claude_user,
+        gemini_user_dir=gemini_user,
+        agent_id="context-dependent-0001",
+    )
+    codex = rebuild_agent_codex_md(
+        shared_dir=shared,
+        profile_path=profile,
+        memory_dir=memory,
+        workspace_dir=workspace,
+        codex_user_dir=codex_user,
+        agent_id="context-dependent-0001",
+    )
+
+    guidance_surfaces = (
+        DEFAULT_SHARED_CLAUDE_MD,
+        claude,
+        (claude_user / "CLAUDE.md").read_text(encoding="utf-8"),
+        (gemini_user / "GEMINI.md").read_text(encoding="utf-8"),
+        codex,
+        (codex_user / "AGENTS.md").read_text(encoding="utf-8"),
+    )
+    for prompt in guidance_surfaces:
+        _assert_context_dependent_send_contract(prompt)
+        _assert_reply_eligibility_controls(prompt)
+
+    send_skill_surfaces = (
+        DEFAULT_SKILL_SEND_MESSAGE,
+        DEFAULT_SKILL_SEND_MESSAGE_WITH_ATTACHMENTS,
+        (workspace / ".claude" / "skills" / "send-message" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ),
+        (
+            workspace
+            / ".claude"
+            / "skills"
+            / "send-message-with-attachments"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8"),
+        (workspace / ".agents" / "skills" / "send-message" / "SKILL.md").read_text(
+            encoding="utf-8"
+        ),
+        (
+            workspace
+            / ".agents"
+            / "skills"
+            / "send-message-with-attachments"
+            / "SKILL.md"
+        ).read_text(encoding="utf-8"),
+    )
+    for skill in send_skill_surfaces:
+        _assert_context_dependent_send_contract(skill)
+
+    assert "mcp__puffo__" in claude
+    assert "mcp__puffo__" not in codex
 
 
 def test_read_inbox_prior_context_contract_is_shared_across_claude_codex_and_skills():
