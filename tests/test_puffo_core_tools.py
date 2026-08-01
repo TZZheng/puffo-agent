@@ -439,6 +439,13 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
         "same conversation route(s)",
         "strictly earlier than that page",
         "not admitted or acknowledged",
+        "is_self",
+        "same originating assignment",
+        "no unresolved action",
+        "follow-up",
+        "correction",
+        "direct mention",
+        "newly exposed dependency",
     ):
         assert phrase.lower() in description, (phrase, description)
 

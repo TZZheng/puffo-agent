@@ -28,8 +28,10 @@ from puffo_agent.agent.global_inbox_runtime import (
     SendAttemptState,
     TrackingSendDelegate,
     await_listener_with_runtime,
+    format_stored_message,
     route_for,
 )
+from puffo_agent.agent.shared_content import DEFAULT_SHARED_CLAUDE_MD
 from puffo_agent.agent.inbox_scheduler import (
     InboxNoticeDelivery,
     NoticeDeliveryCapability,
@@ -42,6 +44,7 @@ from puffo_agent.agent.message_store import (
     ReceiptDisposition,
     ReceiptResult,
     ReceiptWriteStatus,
+    StoredMessage,
 )
 from puffo_agent.agent._logging import log_runtime_event
 from puffo_agent.agent.runtime_event_outbox import RuntimeEventOutbox
@@ -2820,12 +2823,83 @@ async def test_notice_then_correlated_read_admits_and_processes_exact_page(tmp_p
     await store.close()
 
 
+def test_format_stored_message_marks_only_runtime_identity_aliases(tmp_path):
+    def stored(envelope_id, sender):
+        return StoredMessage(
+            envelope_id=envelope_id,
+            envelope_kind="channel",
+            sender_slug=sender,
+            channel_id="ch-1",
+            space_id="sp-1",
+            recipient_slug=None,
+            content_type="text/plain",
+            content="same body regardless of sender",
+            sent_at=1,
+            received_at=1,
+            server_seq=1,
+        )
+
+    def metadata(block):
+        return json.loads(block.splitlines()[1])
+
+    human = stored("human", "human")
+    peer = stored("peer", "peer-agent")
+    self_echo = stored("self", "wire-agent")
+
+    assert metadata(format_stored_message(human))["is_self"] is False
+    assert metadata(format_stored_message(peer))["is_self"] is False
+    assert metadata(format_stored_message(self_echo))["is_self"] is False
+    assert metadata(
+        format_stored_message(self_echo, current_agent_aliases=("wire-agent",))
+    )["is_self"] is True
+
+    runtime = GlobalInboxRuntime(
+        store=SimpleNamespace(),
+        adapter=SimpleNamespace(slug="wire-agent"),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+        send_mode_keys=("runtime-agent-id",),
+    )
+    assert metadata(runtime.formatter(self_echo))["is_self"] is True
+    assert metadata(runtime.formatter(stored("alias", "runtime-agent-id")))[
+        "is_self"
+    ] is True
+    assert metadata(runtime.formatter(human))["is_self"] is False
+
+    no_identity = GlobalInboxRuntime(
+        store=SimpleNamespace(),
+        adapter=SimpleNamespace(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    assert metadata(no_identity.formatter(self_echo))["is_self"] is False
+
+    custom_calls = []
+
+    def custom_formatter(item):
+        custom_calls.append(item.envelope_id)
+        return f"custom:{item.envelope_id}"
+
+    custom = GlobalInboxRuntime(
+        store=SimpleNamespace(),
+        adapter=SimpleNamespace(slug="wire-agent"),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+        formatter=custom_formatter,
+        agent_id="wire-agent",
+    )
+    assert custom.formatter(self_echo) == "custom:self"
+    assert custom_calls == ["self"]
+
+
 @pytest.mark.asyncio
 async def test_peer_progress_starts_grounded_followup_turn(tmp_path):
     result = await _run_composed_peer_progress_case(
         tmp_path,
-        peer_body="The current task has progressed to the next dependency.",
-        second_send_text=None,
+        peer_body=(
+            "The current task has progressed to the next dependency; "
+            "the requested outline is complete."
+        ),
     )
     assert result["provider_turns"] == 2
     assert result["decisions"] == ["send", "[SILENT]"]
@@ -2838,6 +2912,8 @@ async def test_peer_progress_starts_grounded_followup_turn(tmp_path):
         result["peer_body"],
     ):
         assert expected in second_input
+    assert result["self_metadata"]["sender_slug"] == "agent"
+    assert result["self_metadata"]["is_self"] is True
     assert result["prior_ids"] == ["human-origin", "agent-contribution"]
     assert result["future_state"] is ProcessingState.PENDING
 
@@ -2846,13 +2922,65 @@ async def _run_composed_peer_progress_case(
     tmp_path,
     *,
     peer_body: str,
-    second_send_text: str | None,
 ):
     """Run two fresh provider Turns against only durable/tool-return input."""
     store = await make_store(tmp_path)
     human_body = "Please outline the current task."
     first_contribution = "I mapped the current dependency."
     await receipt(store, "human-origin", 1, sender="human", content=human_body)
+
+    class DeterministicProvider:
+        """Small provider double that reasons from the real tool result only."""
+
+        def __init__(self, instructions):
+            self.instructions = instructions
+            self.turn_inputs = []
+
+        @staticmethod
+        def parse(block):
+            lines = block.splitlines()
+            return json.loads(lines[1]), "\n".join(lines[2:-1])
+
+        def decide(self, read_inbox_result):
+            self.turn_inputs.append(read_inbox_result)
+            lowered_instructions = " ".join(self.instructions.lower().split())
+            for phrase in (
+                "prior contribution",
+                "[silent]",
+                "follow-up",
+                "correction",
+                "mention",
+                "dependency",
+            ):
+                assert phrase in lowered_instructions
+
+            messages = [self.parse(block) for block in read_inbox_result["messages"]]
+            prior_context = [
+                self.parse(block) for block in read_inbox_result["prior_context"]
+            ]
+            if not prior_context:
+                return "send", "I will take the requested action."
+
+            prior_self = [
+                (metadata, body)
+                for metadata, body in prior_context
+                if metadata.get("is_self") is True
+            ]
+            peer_text = " ".join(body.lower() for _metadata, body in messages)
+            new_action = any(
+                marker in peer_text
+                for marker in (
+                    "follow-up",
+                    "correction",
+                    "@you(",
+                    "new dependency",
+                    "please verify",
+                )
+            )
+            same_assignment_satisfied = bool(prior_self) and not new_action
+            if same_assignment_satisfied:
+                return "[SILENT]", None
+            return "send", "I will take the newly identified action."
 
     class ProviderAdapter(Adapter):
         def __init__(self):
@@ -2908,6 +3036,7 @@ async def _run_composed_peer_progress_case(
     adapter = ProviderAdapter()
     transport = FakeServerTransport()
     coordinator = FakeCoordinator(transport)
+    provider = DeterministicProvider(DEFAULT_SHARED_CLAUDE_MD)
     provider_inputs = []
     decisions = []
     runtime = None
@@ -2921,6 +3050,15 @@ async def _run_composed_peer_progress_case(
             tool_arguments={"limit": 1},
         )
         assert len(page["messages"]) == 1
+        assert set(page) == {
+            "messages",
+            "prior_context",
+            "next_cursor",
+            "has_more",
+            "remaining_count",
+            "snapshot_generation",
+            "correlation_receipt",
+        }
         await adapter.admit_continuation(
             provider_turn_id=f"provider-read-{turn_number}"
         )
@@ -2933,7 +3071,10 @@ async def _run_composed_peer_progress_case(
         if turn_number == 1:
             assert human_body in page["messages"][0]
             assert page["prior_context"] == []
-            decisions.append("send")
+            decision, reply = provider.decide(page)
+            assert decision == "send"
+            assert reply
+            decisions.append(decision)
             sent = await runtime.send_delegate.send({
                 "destination": "ch-1",
                 "text": first_contribution,
@@ -2954,24 +3095,37 @@ async def _run_composed_peer_progress_case(
         assert peer_body in page["messages"][0]
         assert human_body in decision_input
         assert first_contribution in decision_input
-        if second_send_text is None:
-            decisions.append("[SILENT]")
-            return
-        decisions.append("send")
-        sent = await runtime.send_delegate.send({
-            "destination": "ch-1",
-            "text": second_send_text,
-            "visibility_level": "human",
-        })
-        assert sent["state"] == "sent"
-        await receipt(
-            store,
-            "agent-followup",
-            5,
-            sender="agent",
-            disposition=ReceiptDisposition.TERMINAL,
-            content=second_send_text,
+        prior_metadata = [
+            json.loads(block.splitlines()[1]) for block in page["prior_context"]
+        ]
+        self_metadata = next(
+            metadata
+            for metadata in prior_metadata
+            if metadata["envelope_id"] == "agent-contribution"
         )
+        assert self_metadata["sender_slug"] == "agent"
+        assert self_metadata["is_self"] is True
+        decision, reply = provider.decide(page)
+        decisions.append(decision)
+        if decision == "send":
+            assert reply
+            sent = await runtime.send_delegate.send({
+                "destination": "ch-1",
+                "text": reply,
+                "visibility_level": "human",
+            })
+            assert sent["state"] == "sent"
+            await receipt(
+                store,
+                "agent-followup",
+                5,
+                sender="agent",
+                disposition=ReceiptDisposition.TERMINAL,
+                content=reply,
+            )
+        else:
+            assert decision == "[SILENT]"
+            assert reply is None
 
     runtime = GlobalInboxRuntime(
         store=store,
@@ -2979,6 +3133,8 @@ async def _run_composed_peer_progress_case(
         run_turn=run,
         workspace=tmp_path,
         coordinator=coordinator,
+        agent_id="current-agent-id",
+        send_mode_keys=("current-agent-id", "agent"),
     )
     runtime.send_delegate = TrackingSendDelegate(
         coordinator, runtime.attempts, runtime
@@ -3006,6 +3162,15 @@ async def _run_composed_peer_progress_case(
         sender="peer-agent",
         content="future pending work must not leak",
     )
+    prior_lifecycle_before = {}
+    for envelope_id in ("human-origin", "agent-contribution"):
+        row = await store.get_message_by_envelope(envelope_id)
+        assert row is not None
+        prior_lifecycle_before[envelope_id] = (
+            row.processing_state,
+            row.receipt_disposition,
+            row.model_visible_at,
+        )
     assert await runtime.process_once()
     peer = await store.get_message_by_envelope("peer-progress")
     future = await store.get_message_by_envelope("future-pending")
@@ -3017,6 +3182,35 @@ async def _run_composed_peer_progress_case(
         for block in provider_inputs[1]["read_inbox_result"]["prior_context"]
     ]
     prior_blocks = provider_inputs[1]["read_inbox_result"]["prior_context"]
+    second_result = provider_inputs[1]["read_inbox_result"]
+    message_metadata = [
+        json.loads(block.splitlines()[1]) for block in second_result["messages"]
+    ]
+    prior_metadata = [json.loads(block.splitlines()[1]) for block in prior_blocks]
+    assert [metadata["envelope_id"] for metadata in message_metadata] == [
+        "peer-progress"
+    ]
+    assert [metadata["envelope_id"] for metadata in prior_metadata] == [
+        "human-origin",
+        "agent-contribution",
+    ]
+    assert message_metadata[0]["is_self"] is False
+    assert prior_metadata[0]["is_self"] is False
+    self_metadata = next(
+        metadata
+        for metadata in prior_metadata
+        if metadata["envelope_id"] == "agent-contribution"
+    )
+    prior_lifecycle_after = {}
+    for envelope_id in ("human-origin", "agent-contribution"):
+        row = await store.get_message_by_envelope(envelope_id)
+        assert row is not None
+        prior_lifecycle_after[envelope_id] = (
+            row.processing_state,
+            row.receipt_disposition,
+            row.model_visible_at,
+        )
+    assert prior_lifecycle_after == prior_lifecycle_before
     assert len(prior_blocks) <= PRIOR_CONTEXT_MAX_ITEMS
     assert sum(len(block.encode("utf-8")) for block in prior_blocks) <= (
         PRIOR_CONTEXT_MAX_BYTES
@@ -3032,6 +3226,9 @@ async def _run_composed_peer_progress_case(
         "human_body": human_body,
         "first_contribution": first_contribution,
         "peer_body": peer_body,
+        "self_metadata": self_metadata,
+        "prior_lifecycle": prior_lifecycle_after,
+        "provider_turn_inputs": provider.turn_inputs,
     }
     await store.close()
     return result
@@ -3042,7 +3239,6 @@ async def test_followup_after_prior_contribution(tmp_path):
     result = await _run_composed_peer_progress_case(
         tmp_path,
         peer_body="A follow-up asks for the next concrete step.",
-        second_send_text="Here is the next concrete step.",
     )
     assert result["decisions"] == ["send", "send"]
     assert result["transport_calls"] == 2
@@ -3053,7 +3249,6 @@ async def test_correction_after_prior_contribution(tmp_path):
     result = await _run_composed_peer_progress_case(
         tmp_path,
         peer_body="Correction: the dependency is on the other branch.",
-        second_send_text="Thanks, I corrected the dependency mapping.",
     )
     assert result["decisions"] == ["send", "send"]
     assert result["transport_calls"] == 2
@@ -3064,7 +3259,6 @@ async def test_mention_after_prior_contribution(tmp_path):
     result = await _run_composed_peer_progress_case(
         tmp_path,
         peer_body="@you(agent) please verify the current dependency.",
-        second_send_text="I verified the current dependency.",
     )
     assert result["decisions"] == ["send", "send"]
     assert result["transport_calls"] == 2
@@ -3075,7 +3269,6 @@ async def test_dependency_after_prior_contribution(tmp_path):
     result = await _run_composed_peer_progress_case(
         tmp_path,
         peer_body="New dependency exposed: the release checklist needs approval.",
-        second_send_text="I will handle the release approval dependency.",
     )
     assert result["decisions"] == ["send", "send"]
     assert result["transport_calls"] == 2

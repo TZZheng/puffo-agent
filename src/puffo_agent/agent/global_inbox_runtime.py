@@ -233,8 +233,12 @@ def route_for(item: StoredMessage) -> MessageRoute:
     )
 
 
-def format_stored_message(item: StoredMessage) -> str:
-    """Exact per-message model view; no target or speaker policy."""
+def format_stored_message(
+    item: StoredMessage,
+    *,
+    current_agent_aliases: Sequence[str] = (),
+) -> str:
+    """Exact per-message model view with optional current-Agent attribution."""
     route = route_for(item)
     content = item.content
     attachments: list[str] = []
@@ -266,6 +270,12 @@ def format_stored_message(item: StoredMessage) -> str:
         "server_seq": item.server_seq,
         "route": asdict(route),
         "sender_slug": item.sender_slug,
+        "is_self": bool(
+            item.sender_slug
+            and item.sender_slug in {
+                str(alias) for alias in current_agent_aliases if alias
+            }
+        ),
         "recipient_slug": item.recipient_slug,
         "sent_at": item.sent_at,
         "is_encrypted": item.is_encrypted,
@@ -730,7 +740,7 @@ class GlobalInboxRuntime:
         self.context_controller = context_controller or ContextController(adapter)
         self.planner = planner or InboxPlanner()
         self.coalescer = coalescer or InboxCoalescer()
-        self.formatter = formatter
+        self._configured_formatter = formatter
         self.estimator = estimator
         self.unfit_policy = unfit_policy or (lambda *_args, **_kwargs: True)
         self.coordinator = coordinator
@@ -749,6 +759,11 @@ class GlobalInboxRuntime:
             dict.fromkeys(key for key in send_mode_keys if key)
         )
         self.agent_id = agent_id
+        # ``send_mode_keys`` is the existing runtime identity-alias set used
+        # by the send-mode guard (normally the configured agent id and the
+        # wire slug).  Inbox attribution is derived from the same identities;
+        # no durable or provider state is introduced.
+        self.formatter = self._format_for_provider
         self.notice_delivery = notice_delivery or InboxNoticeDelivery(
             NoticeDeliveryCapability.NEXT_TURN
         )
@@ -758,6 +773,25 @@ class GlobalInboxRuntime:
             self,
             catchup_pending=held_catchup,
         )
+
+    def _current_agent_identity_aliases(self) -> tuple[str, ...]:
+        """Return only runtime-owned identities usable for self attribution."""
+        values: list[str] = [self.agent_id, *self.send_mode_keys]
+        for owner in (self.adapter, self.coordinator):
+            for name in ("slug", "agent_id", "agent_slug", "self_slug"):
+                value = getattr(owner, name, "")
+                if value:
+                    values.append(str(value))
+        return tuple(dict.fromkeys(value for value in values if value))
+
+    def _format_for_provider(self, item: StoredMessage) -> str:
+        """Apply current-Agent attribution only to the production formatter."""
+        if self._configured_formatter is format_stored_message:
+            return format_stored_message(
+                item,
+                current_agent_aliases=self._current_agent_identity_aliases(),
+            )
+        return self._configured_formatter(item)
 
     @property
     def current_turn_path(self) -> Path:

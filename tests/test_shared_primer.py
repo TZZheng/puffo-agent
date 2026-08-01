@@ -171,14 +171,22 @@ def test_rebuild_agent_codex_md_strips_mcp_puffo_prefix():
 
 def _assert_followup_decision_contract(text: str) -> None:
     lowered = " ".join(text.lower().split())
-    required = (
+    ordered = (
         "recover the originating human intent",
         "inspect this agent's relevant prior contribution",
         "classify newly observed peer progress",
         "decide whether a new unresolved action belongs to this agent",
     )
-    positions = [lowered.index(phrase) for phrase in required]
+    positions = [lowered.index(phrase) for phrase in ordered]
     assert positions == sorted(positions)
+
+    required = (
+        "is_self: true",
+        "same originating assignment",
+        "no unresolved action for this agent",
+    )
+    for phrase in required:
+        assert phrase in lowered
     assert "arrival or peer progress alone does not require speech" in lowered
     assert "[silent]" in lowered
     for phrase in (
@@ -186,9 +194,8 @@ def _assert_followup_decision_contract(text: str) -> None:
         "correction",
         "mention",
         "dependency",
-        "evolving task",
+        "evolving assignment",
         "another reply",
-        "prior send does not discharge a new turn",
         "agent-authored message is not an automatic silence condition",
     ):
         assert phrase in lowered
@@ -297,6 +304,12 @@ def test_read_inbox_prior_context_contract_is_shared_across_claude_codex_and_ski
             "same selected conversation route",
             "strictly earlier",
             "does not admit",
+            "is_self: true",
+            "same originating assignment",
+            "follow-up",
+            "correction",
+            "direct mention",
+            "newly exposed dependency",
         ):
             assert phrase in lowered, (phrase, prompt)
         for forbidden in (
@@ -417,6 +430,7 @@ def test_primer_metadata_example_matches_builder():
     paths, and the metadata-notice/read-Inbox contract."""
     assert '"envelope_id":"msg_<uuid>"' in DEFAULT_SHARED_CLAUDE_MD
     assert '"server_seq":42' in DEFAULT_SHARED_CLAUDE_MD
+    assert '"is_self":false' in DEFAULT_SHARED_CLAUDE_MD
     assert '"route":{"channel_id"' in DEFAULT_SHARED_CLAUDE_MD
     assert "post_id:" not in DEFAULT_SHARED_CLAUDE_MD
     assert "<global_inbox_notice>" in DEFAULT_SHARED_CLAUDE_MD

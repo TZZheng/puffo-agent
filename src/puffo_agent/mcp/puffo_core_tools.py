@@ -571,7 +571,14 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         result: content-bearing results include the exact pending ``messages``
             page plus bounded, read-only ``prior_context`` blocks from the
             same conversation route(s), strictly earlier than that page;
-            prior rows are not admitted or acknowledged.
+            prior rows are not admitted or acknowledged. Each message block's
+            ``is_self`` metadata is true only when its durable ``sender_slug``
+            matches this Agent's current runtime identity; a true prior row is
+            evidence of an earlier contribution. If that contribution already
+            completed the same originating assignment and the new page adds no
+            unresolved action for this Agent, choose ``[SILENT]``. Send again
+            for a follow-up, correction, direct mention, newly exposed
+            dependency, or otherwise changed assignment.
         """
         arguments: dict[str, Any] = {}
         if target:
