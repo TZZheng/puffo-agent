@@ -283,7 +283,13 @@ class RuntimeManager:
     async def _admit_matching_tool_result(self, event: HarnessEvent) -> None:
         fact = event.native_diagnostic
         if (
-            not isinstance(fact, dict)
+            event.type not in {
+                HarnessEventType.TOOL_COMPLETED,
+                "turn.tool_completed",
+            }
+            or event.native_session_id != self.native_session_id
+            or event.native_turn_id != self.native_turn_id
+            or not isinstance(fact, dict)
             or fact.get("_puffo_internal") != "tool_result"
             or fact.get("is_error") is True
         ):
@@ -301,24 +307,6 @@ class RuntimeManager:
             and admission.receipt_marker in repr(fact.get("result"))
         ]
         candidates = exact_candidates
-        if not candidates:
-            candidates = [
-                (index, admission)
-                for index, admission in enumerate(self._continuation_admissions)
-                if admission.provider_turn_id == event.native_turn_id
-                and not admission.correlation_receipt
-                and admission.matches(tool_name, arguments)
-            ]
-        if not candidates:
-            receipt_candidates = [
-                (index, admission)
-                for index, admission in enumerate(self._continuation_admissions)
-                if admission.provider_turn_id == event.native_turn_id
-                and admission.correlation_receipt
-                and admission.matches(tool_name, arguments)
-            ]
-            if len(receipt_candidates) == 1:
-                candidates = receipt_candidates
         if not candidates:
             logger.warning(
                 "provider tool result did not match an admission "
@@ -348,8 +336,6 @@ class RuntimeManager:
 
 class RuntimeManagerAdapter(Adapter):
     """Blocking compatibility facade over the event-driven Runtime Manager."""
-
-    tool_result_admission_boundary = "tool_return"
 
     def __init__(self, manager: RuntimeManager):
         self.manager = manager

@@ -562,9 +562,10 @@ class HeldRecoverySource:
     """Live durable held catch-up for the one active exact turn.
 
     This deliberately does not invent a remote catch-up API.  It waits for
-    receipt commits, proves the exact terminal watermark exists locally, plans
-    a bounded whole-message channel prefix, and stages that prefix behind a
-    correlated continuation admission callback.
+    receipt commits, then proves the exact terminal watermark exists in the
+    bounded local pending prefix for the active provider session. The proof is
+    synchronization metadata only; it never claims that the provider saw the
+    recovered content.
     """
 
     def __init__(
@@ -666,12 +667,19 @@ class HeldRecoverySource:
         watermark = await self.runtime.store.get_message_by_envelope(
             latest_envelope_id
         )
+        reaches_watermark = any(
+            row.envelope_id == latest_envelope_id
+            and row.server_seq == latest_seq
+            for row in page.items
+        )
         if (
             not page.items
             or watermark is None
             or watermark.server_seq != latest_seq
             or watermark.space_id != space_id
             or watermark.channel_id != channel_id
+            or watermark.processing_state is not ProcessingState.PENDING
+            or not reaches_watermark
         ):
             self.runtime.held = HeldStaging(
                 latest_seq=latest_seq,
@@ -679,140 +687,27 @@ class HeldRecoverySource:
                 diagnostic="exact held watermark mismatch",
             )
             return ()
-        planned = await self.runtime.plan_pending(
-            items=page.items,
-            turn_id=active.turn_id,
-            planning_cycle_key=f"continuation_{uuid.uuid4().hex}",
-        )
-        if planned is None:
-            return ()
-        decision = await self.runtime.context_controller.decide(
-            planned.candidate, self.runtime._replacement_candidate
-        )
-        if decision.outcome is not DecisionOutcome.ADMIT:
-            self.runtime.held = HeldStaging(
-                latest_seq=latest_seq,
-                latest_envelope_id=latest_envelope_id,
-                diagnostic=f"held context admission unavailable: {decision.outcome.value}",
-            )
-            return ()
-        staged_ids = planned.message_ids
-        correlation_key = planned.planning_cycle_key
-        staged_turn_id = active.turn_id
-        staged_provider_session_id = provider_session_id
-        planned_server_seqs = [
-            row.server_seq
-            for row in planned.items
-            if row.server_seq is not None
-        ]
-        recovered_through_seq = (
-            max(planned_server_seqs) if planned_server_seqs else None
-        )
-        reached_latest = any(
-            row.envelope_id == latest_envelope_id and row.server_seq == latest_seq
-            for row in planned.items
-        )
-        more_pending = page.more_available or not reached_latest
-        fired = False
-
-        async def admit_continuation(event: ProviderAdmissionEvent) -> None:
-            nonlocal fired
-            if fired or event.planning_cycle_key != planned.planning_cycle_key:
-                return
-            current = self.runtime.active
-            if (
-                current.turn_id != staged_turn_id
-                or current.provider_session_id != staged_provider_session_id
-                or event.provider_session_id != staged_provider_session_id
-            ):
-                raise RuntimeError(
-                    "held continuation crossed the staged provider Turn"
-                )
-            fired = True
-            existing_rows = await self.runtime.store.get_in_turn_messages(
-                staged_turn_id,
-                staged_provider_session_id,
-            )
-            existing_ids = {row.envelope_id for row in existing_rows}
-            new_ids = tuple(
-                envelope_id
-                for envelope_id in staged_ids
-                if envelope_id not in existing_ids
-            )
-            if new_ids:
-                run = await self.runtime.store.admit_messages(
-                    new_ids,
-                    turn_id=staged_turn_id,
-                    provider_session_id=staged_provider_session_id,
-                )
-                current.message_ids[:] = list(run.message_ids)
-            else:
-                current.message_ids[:] = [
-                    row.envelope_id for row in existing_rows
-                ]
-            rows = await self.runtime.store.get_in_turn_messages(
-                staged_turn_id,
-                staged_provider_session_id,
-            )
-            if rows:
-                self.runtime._write_current_turn(
-                    self.runtime._reconstruct_exact_turn(
-                        turn_id=staged_turn_id,
-                        rows=rows,
-                    )
-                )
-            self.runtime.held = HeldStaging(
-                message_ids=staged_ids,
-                latest_seq=latest_seq,
-                latest_envelope_id=latest_envelope_id,
-                recovered_through_seq=recovered_through_seq,
-                more_pending=more_pending,
-                synchronized=reached_latest,
-                diagnostic=(
-                    "additional held context remains pending"
-                    if more_pending
-                    else ""
-                ),
-                correlation_key=correlation_key,
-            )
-
-        register_continuation = getattr(
-            self.runtime.adapter, "register_continuation_callback", None
-        )
-        if callable(register_continuation):
-            register_continuation(
-                admit_continuation,
-                planned.planning_cycle_key,
-                channel_id=channel_id,
-            )
-        else:
-            self.runtime.adapter.register_admission_callback(
-                admit_continuation, planned.planning_cycle_key
-            )
+        more_pending = page.more_available
         self.runtime.held = HeldStaging(
-            message_ids=staged_ids,
             latest_seq=latest_seq,
             latest_envelope_id=latest_envelope_id,
-            recovered_through_seq=recovered_through_seq,
+            recovered_through_seq=latest_seq,
             more_pending=more_pending,
-            diagnostic="continuation staged; awaiting correlated admission",
-            correlation_key=correlation_key,
+            synchronized=True,
+            diagnostic=(
+                "additional held metadata remains pending"
+                if more_pending else ""
+            ),
         )
-        return tuple(
-            {
-                "envelope_id": row.envelope_id,
-                "server_seq": row.server_seq,
-                "content": row.content,
-                "latest_seq": latest_seq,
-                "latest_envelope_id": latest_envelope_id,
-                "recovered_through_seq": recovered_through_seq,
-                "more_pending": more_pending,
-                "provider_session_id": provider_session_id,
-                "synchronized": False,
-                "continuation_correlation_key": correlation_key,
-            }
-            for row in planned.items
-        )
+        return ({
+            "space_id": space_id,
+            "channel_id": channel_id,
+            "envelope_id": latest_envelope_id,
+            "server_seq": latest_seq,
+            "latest_seq": latest_seq,
+            "latest_envelope_id": latest_envelope_id,
+            "provider_session_id": provider_session_id,
+        },)
 
 
 TurnRunner = Callable[[PlannedTurn], Awaitable[Any]]

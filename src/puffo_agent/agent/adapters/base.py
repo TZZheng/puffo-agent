@@ -92,9 +92,10 @@ class TurnResult:
 class Adapter(ABC):
     """Base class for all runtime adapters."""
 
-    # Legacy adapters correlate a returned tool result with a later provider
-    # completion event. Runtime-manager adapters can commit the durable read at
-    # the local tool-return boundary because crash recovery owns the active Turn.
+    # Durable reads become model-visible only after the adapter's provider
+    # completion correlation proves that the returned content reached the
+    # active Turn. A genuinely in-process adapter may override this with its
+    # local tool-return boundary when the handler and model share one process.
     tool_result_admission_boundary = "provider_completion"
 
     @abstractmethod

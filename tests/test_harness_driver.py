@@ -364,8 +364,58 @@ async def test_runtime_manager_correlates_private_tool_result_and_rejects_termin
         if admitted:
             break
         await asyncio.sleep(0)
+    assert admitted == []
+
+    adapter.register_continuation_callback(
+        admit,
+        "read-page-foreign-session",
+        tool_names=("read_inbox",),
+        tool_arguments={"cursor": "foreign"},
+        correlation_receipt="receipt-2",
+    )
+    await driver.queue.put(HarnessEvent.normalized(
+        type="turn.tool_completed", driver="fake",
+        session_ref=SessionRef("foreign-session"), turn_ref=driver.turn,
+        native_session_id="foreign-session", native_turn_id="native-turn",
+        data={
+            "tool_call_ref": "call-foreign", "label": "read_inbox",
+            "outcome": "succeeded",
+        },
+        native_payload={
+            "_puffo_internal": "tool_result",
+            "tool_call_id": "call-foreign",
+            "tool_name": "read_inbox",
+            "arguments": {"cursor": "foreign"},
+            "result": "[puffo:model-visible-read:receipt-2]",
+            "is_error": False,
+        },
+    ))
+    await asyncio.sleep(0)
+    assert admitted == []
+
+    await driver.queue.put(HarnessEvent.normalized(
+        type="turn.tool_completed", driver="fake",
+        session_ref=SessionRef("native-session"), turn_ref=driver.turn,
+        native_session_id="native-session", native_turn_id="native-turn",
+        data={
+            "tool_call_ref": "call-2", "label": "read_inbox",
+            "outcome": "succeeded",
+        },
+        native_payload={
+            "_puffo_internal": "tool_result",
+            "tool_call_id": "call-2",
+            "tool_name": "read_inbox",
+            "arguments": {"cursor": "foreign"},
+            "result": "[puffo:model-visible-read:receipt-2]",
+            "is_error": False,
+        },
+    ))
+    for _ in range(20):
+        if admitted:
+            break
+        await asyncio.sleep(0)
     assert len(admitted) == 1
-    assert admitted[0].planning_cycle_key == "read-page-without-result"
+    assert admitted[0].planning_cycle_key == "read-page-foreign-session"
     assert admitted[0].tool_call_id == "call-2"
 
     await driver.queue.put(HarnessEvent(

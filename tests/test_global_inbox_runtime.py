@@ -2488,7 +2488,7 @@ async def test_silence_without_correlated_admission_degrades_without_self_wake(
 
 
 @pytest.mark.asyncio
-async def test_held_watermark_waits_through_unrelated_notification_and_continuation(
+async def test_held_watermark_sync_proof_does_not_admit_or_expose_content(
     tmp_path,
 ):
     store = await make_store(tmp_path)
@@ -2520,18 +2520,27 @@ async def test_held_watermark_waits_through_unrelated_notification_and_continuat
         "sp-1", "ch-1", 3, "watermark", "provider-1",
     )
     assert [row["envelope_id"] for row in rows] == ["watermark"]
-    assert rows[0]["continuation_correlation_key"]
+    assert rows[0] == {
+        "space_id": "sp-1",
+        "channel_id": "ch-1",
+        "envelope_id": "watermark",
+        "server_seq": 3,
+        "latest_seq": 3,
+        "latest_envelope_id": "watermark",
+        "provider_session_id": "provider-1",
+    }
+    assert "content" not in rows[0]
     assert [row.envelope_id for row in await store.get_pending()] == ["watermark"]
-    await adapter.admit("provider-1")
-    assert await store.get_pending() == ()
-    in_turn = await store.get_in_turn_messages("turn", "provider-1")
-    assert [row.envelope_id for row in in_turn] == ["initial", "watermark"]
     assert runtime.held.synchronized
+    assert runtime.held.message_ids == ()
+    assert await ActiveBoundaryAdapter(
+        store, runtime.active
+    ).get_active_turn_through_seq("sp-1", "ch-1") == 1
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_late_held_continuation_cannot_mutate_a_replacement_turn(tmp_path):
+async def test_held_sync_proof_cannot_mutate_a_replacement_turn(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "initial", 1)
     await receipt(store, "held", 2)
@@ -2558,12 +2567,6 @@ async def test_late_held_continuation_cannot_mutate_a_replacement_turn(tmp_path)
     runtime.active.turn_id = "new-turn"
     runtime.active.provider_session_id = "provider-2"
     runtime.active.provider_turn_id = "new-provider-turn"
-    with pytest.raises(
-        RuntimeError, match="crossed the staged provider Turn"
-    ):
-        await adapter.admit(
-            "provider-1", provider_turn_id="old-provider-turn"
-        )
 
     assert runtime.active.turn_id == "new-turn"
     assert runtime.active.message_ids == []
@@ -2574,11 +2577,12 @@ async def test_late_held_continuation_cannot_mutate_a_replacement_turn(tmp_path)
             "old-turn", "provider-1"
         )
     ] == ["initial"]
+    assert not runtime.current_turn_path.exists()
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_held_timeout_mismatch_stateless_and_context_rejection_stage_nothing(
+async def test_held_timeout_mismatch_and_context_pressure_stage_nothing(
     tmp_path,
 ):
     store = await make_store(tmp_path)
@@ -2599,13 +2603,13 @@ async def test_held_timeout_mismatch_stateless_and_context_rejection_stage_nothi
     assert runtime.held.message_ids == ()
     await receipt(store, "rejected", 10)
     runtime.active.provider_session_id = "provider-1"
-    runtime.context_controller = ScriptedContext(
-        adapter, [DecisionOutcome.DEGRADED],
-    )
-    assert await source.query_held_messages(
+    metadata = await source.query_held_messages(
         "sp-1", "ch-1", 10, "rejected", "provider-1",
-    ) == ()
+    )
+    assert metadata
+    assert runtime.held.synchronized is True
     assert runtime.held.message_ids == ()
+    assert [row.envelope_id for row in await store.get_pending()] == ["rejected"]
     await store.close()
 
 
@@ -2638,7 +2642,7 @@ async def test_held_timeout_uses_signed_pending_catchup_before_failing(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_held_continuation_uses_whole_message_fifty_item_limit(tmp_path):
+async def test_held_sync_requires_exact_terminal_watermark_in_bounded_prefix(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "initial", 1)
     await store.admit_messages(
@@ -2659,20 +2663,17 @@ async def test_held_continuation_uses_whole_message_fifty_item_limit(tmp_path):
     rows = await runtime.held_recovery_source.query_held_messages(
         "sp-1", "ch-1", 52, "held-52", "provider-1",
     )
-    assert len(rows) == 50
-    assert rows[0]["envelope_id"] == "held-2"
-    assert rows[-1]["envelope_id"] == "held-51"
-    assert rows[-1]["recovered_through_seq"] == 51
-    assert rows[-1]["more_pending"] is True
-    assert "held-52" not in runtime.held.message_ids
-    await adapter.admit("provider-1")
+    assert rows == ()
     assert runtime.held.synchronized is False
-    assert runtime.held.more_pending is True
+    assert runtime.held.message_ids == ()
+    assert [row.envelope_id for row in await store.get_pending()] == [
+        f"held-{seq}" for seq in range(2, 53)
+    ]
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_held_recovered_through_reports_only_budget_admitted_items(tmp_path):
+async def test_held_sync_ignores_formatter_and_context_budget(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "initial", 1)
     await store.admit_messages(
@@ -2697,15 +2698,14 @@ async def test_held_recovered_through_reports_only_budget_admitted_items(tmp_pat
         "sp-1", "ch-1", 52, "held-52", "provider-1",
     )
 
-    assert len(rows) == 4
-    assert rows[-1]["envelope_id"] == "held-5"
-    assert rows[-1]["recovered_through_seq"] == 5
-    assert rows[-1]["more_pending"] is True
+    assert rows == ()
+    assert runtime.held.message_ids == ()
+    assert runtime.held.synchronized is False
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_parallel_same_channel_held_admissions_append_union_idempotently(
+async def test_repeated_held_sync_proof_is_metadata_only(
     tmp_path,
 ):
     store = await make_store(tmp_path)
@@ -2715,26 +2715,7 @@ async def test_parallel_same_channel_held_admissions_append_union_idempotently(
         ["initial"], turn_id="turn", provider_session_id="provider-1",
     )
 
-    class QueuedAdapter(Adapter):
-        def __init__(self):
-            super().__init__()
-            self.continuations = {}
-
-        def register_continuation_callback(
-            self, callback, planning_cycle_key="", *, channel_id="",
-        ):
-            self.continuations[planning_cycle_key] = callback
-
-        async def admit_continuation(self, key):
-            callback = self.continuations.pop(key)
-            await callback(ProviderAdmissionEvent(
-                planning_cycle_key=key,
-                provider_session_id="provider-1",
-                provider_turn_id="provider-turn",
-                admitted_at=datetime.now(timezone.utc),
-            ))
-
-    adapter = QueuedAdapter()
+    adapter = Adapter()
     runtime = GlobalInboxRuntime(
         store=store,
         adapter=adapter,
@@ -2751,16 +2732,13 @@ async def test_parallel_same_channel_held_admissions_append_union_idempotently(
     second = await runtime.held_recovery_source.query_held_messages(
         "sp-1", "ch-1", 2, "held", "provider-1",
     )
-    first_key = first[0]["continuation_correlation_key"]
-    second_key = second[0]["continuation_correlation_key"]
-    assert first_key != second_key
-
-    await adapter.admit_continuation(second_key)
-    await adapter.admit_continuation(first_key)
+    assert first == second
+    assert "content" not in first[0]
 
     in_turn = await store.get_in_turn_messages("turn", "provider-1")
-    assert [row.envelope_id for row in in_turn] == ["initial", "held"]
-    assert runtime.active.message_ids == ["initial", "held"]
+    assert [row.envelope_id for row in in_turn] == ["initial"]
+    assert runtime.active.message_ids == ["initial"]
+    assert [row.envelope_id for row in await store.get_pending()] == ["held"]
     await store.close()
 
 

@@ -612,6 +612,10 @@ async def run_count_scenario(
             sender="operator",
         )
         adapter = ScriptedAdapter(f"provider-{agent_id}")
+        # This lab adapter is genuinely in-process: the scripted provider and
+        # tool handler share one event loop. Keep its immediate boundary
+        # explicit; daemon/provider adapters use provider-completion below.
+        adapter.tool_result_admission_boundary = "tool_return"
         commands: asyncio.Queue[str] = asyncio.Queue()
         results: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         ready = asyncio.Event()
@@ -638,7 +642,6 @@ async def run_count_scenario(
             )
             await current_adapter.admit_initial()
             await current_holder["agent"].runtime.read_inbox(limit=50)
-            await current_adapter.admit_only_continuation()
             current_ready.set()
             while True:
                 command = await current_commands.get()
@@ -690,8 +693,10 @@ async def run_count_scenario(
                 )
                 if not recovered:
                     raise RuntimeError("held continuation produced no context")
-                key = recovered[0]["continuation_correlation_key"]
-                await current_adapter.admit_continuation(key)
+                # Local held synchronization is not a content read. The
+                # in-process lab must perform the explicit content-bearing
+                # read that admits the pending row at its immediate boundary.
+                await current_holder["agent"].runtime.read_inbox(limit=50)
                 if not current_holder["agent"].runtime.held.synchronized:
                     raise RuntimeError("held continuation did not synchronize")
                 await current_results.put(result)

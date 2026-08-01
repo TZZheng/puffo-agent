@@ -20,7 +20,7 @@ async def test_bridge_releases_held_wait_only_after_exact_durable_pair(tmp_path)
         GlobalInboxRuntime,
     )
     from .test_cloud_bridge_msgflow import FakeBridge, _bridge_client
-    from .test_global_inbox_runtime import Adapter
+    from .test_global_inbox_runtime import ToolReturnAdapter
 
     bridge = FakeBridge()
     client = _bridge_client(tmp_path, bridge, db="held-bridge.db")
@@ -39,7 +39,7 @@ async def test_bridge_releases_held_wait_only_after_exact_durable_pair(tmp_path)
         turn_id="turn-a",
         provider_session_id="session-a",
     )
-    adapter = Adapter()
+    adapter = ToolReturnAdapter()
     adapter.session = "session-a"
     runtime = GlobalInboxRuntime(
         store=client.store,
@@ -125,7 +125,15 @@ async def test_bridge_releases_held_wait_only_after_exact_durable_pair(tmp_path)
     ))
     assert staged["error_kind"] == "reconsideration_ineligible"
     assert len(calls) == 1
-    await adapter.admit(session="session-a")
+    read = await runtime.stage_model_visible_read(
+        space_id="sp_1",
+        channel_id="ch_1",
+        through_seq=5,
+        through_envelope_id="held-exact",
+        tool_name="get_channel_history",
+        tool_arguments={"channel": "ch_1"},
+    )
+    assert read["state"] == "admitted"
     assert await boundary.get_active_turn_through_seq("sp_1", "ch_1") == 5
     sent = await coordinator.send(SemanticSendRequest(
         destination="ch_1", text="explicit retry", send_anyway=True,
@@ -434,7 +442,6 @@ async def test_durable_recovery_same_provider_session_only():
         {
             "envelope_id": "msg_latest", "latest_seq": 5,
             "latest_envelope_id": "msg_latest", "provider_session_id": "session-a",
-            "content": "new",
         },
         {
             "envelope_id": "wrong-session", "latest_seq": 5,

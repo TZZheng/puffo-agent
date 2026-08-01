@@ -263,8 +263,7 @@ def test_primer_dm_reply_rule_lives_in_how_to_reply():
     end = DEFAULT_SHARED_CLAUDE_MD.index("## Spaces, channels, DMs")
     how_to_reply = DEFAULT_SHARED_CLAUDE_MD[start:end]
     assert "@<sender_slug>" in how_to_reply
-    metadata_block = DEFAULT_SHARED_CLAUDE_MD[:start]
-    assert 'channel="@<sender_slug>"' in metadata_block
+    assert "DMs have no `channel_id`" in how_to_reply
 
 
 def test_primer_metadata_example_matches_builder():
@@ -272,13 +271,19 @@ def test_primer_metadata_example_matches_builder():
     ``agent/core.py`` actually emits: display-name ``sender`` +
     separate ``sender_slug``, absolute ``.puffo/inbox`` attachment
     paths, and the metadata-notice/read-Inbox contract."""
-    assert "- sender_slug: <slug>" in DEFAULT_SHARED_CLAUDE_MD
+    assert '"envelope_id":"msg_<uuid>"' in DEFAULT_SHARED_CLAUDE_MD
+    assert '"server_seq":42' in DEFAULT_SHARED_CLAUDE_MD
+    assert '"route":{"channel_id"' in DEFAULT_SHARED_CLAUDE_MD
+    assert "post_id:" not in DEFAULT_SHARED_CLAUDE_MD
     assert "<global_inbox_notice>" in DEFAULT_SHARED_CLAUDE_MD
     assert '"content_included":false' in DEFAULT_SHARED_CLAUDE_MD
     assert '"read_tool":"read_inbox"' in DEFAULT_SHARED_CLAUDE_MD
     assert "mcp__puffo__read_inbox" in DEFAULT_SHARED_CLAUDE_MD
+    assert "synchronization metadata" in DEFAULT_SHARED_CLAUDE_MD
+    assert "content inspection" in DEFAULT_SHARED_CLAUDE_MD
+    assert "provider-visible result" in DEFAULT_SHARED_CLAUDE_MD
     assert "History tools add" in DEFAULT_SHARED_CLAUDE_MD
-    assert "not a substitute" in DEFAULT_SHARED_CLAUDE_MD
+    assert "substitute for reading" in DEFAULT_SHARED_CLAUDE_MD
     assert "followup_messages_since" not in DEFAULT_SHARED_CLAUDE_MD
     assert ".puffo/inbox/<envelope_id>/<filename>" in DEFAULT_SHARED_CLAUDE_MD
     # The old, wrong relative form must be gone.
