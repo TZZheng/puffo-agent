@@ -51,6 +51,6 @@ def test_the_end_anchor_is_newline_tight():
 
 
 def test_pattern_matches_the_sql_check_verbatim():
-    """Migration 038 can't import this, and sqlx checksums forbid editing it —
-    so pin the charset here and fail loudly if either side drifts."""
-    assert SKILL_ID_RE.pattern == r"^[a-z0-9][a-z0-9-]{0,63}\Z"
+    assert SKILL_ID_RE.pattern == r"^[a-z0-9][a-z0-9-]{0,63}\Z", (
+        "charset drifted from the CHECK in puffo-server migration 038"
+    )
