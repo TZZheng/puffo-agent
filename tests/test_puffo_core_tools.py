@@ -336,6 +336,45 @@ async def test_hidden_schema_semantic_send_fields_only():
 
 
 @pytest.mark.asyncio
+async def test_send_tool_descriptions_require_semantic_inspection_before_context_dependent_override():
+    cfg, _, _ = _setup()
+    tools = {tool.name: tool for tool in await _build_tools(cfg).list_tools()}
+    for name in ("send_message", "send_message_with_attachments"):
+        description = " ".join(tools[name].description.lower().split())
+        for phrase in (
+            "actual newer message content",
+            "successfully synchronized",
+            "returned and inspected",
+            "newer watermark or sequence advance alone",
+            "empty recovery/read result",
+            "failed history lookup",
+            "not semantic inspection",
+            "do not infer unseen content",
+            "do not infer unseen content or force a stale context-dependent draft",
+        ):
+            assert phrase in description, (name, phrase, description)
+
+
+@pytest.mark.asyncio
+async def test_send_tool_descriptions_preserve_context_independent_override():
+    cfg, _, _ = _setup()
+    tools = {tool.name: tool for tool in await _build_tools(cfg).list_tools()}
+    for name in ("send_message", "send_message_with_attachments"):
+        description = " ".join(tools[name].description.lower().split())
+        description_without_markup = description.replace("`", "")
+        for phrase in (
+            "after existing same-turn technical eligibility checks",
+            "explicit send_anyway=true remains available",
+            "genuinely context-independent",
+            "deliberate judgment",
+            "not an automatic retry",
+        ):
+            assert phrase in description_without_markup, (
+                name, phrase, description,
+            )
+
+
+@pytest.mark.asyncio
 async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
     cfg, _, _ = _setup()
     calls = []

@@ -168,6 +168,84 @@ def test_rebuild_agent_codex_md_strips_mcp_puffo_prefix():
     assert (codex_user / "AGENTS.md").read_text(encoding="utf-8") == out
 
 
+def _assert_followup_decision_contract(text: str) -> None:
+    lowered = " ".join(text.lower().split())
+    required = (
+        "recover the originating human intent",
+        "inspect this agent's relevant prior contribution",
+        "classify newly observed peer progress",
+        "decide whether a new unresolved action belongs to this agent",
+    )
+    positions = [lowered.index(phrase) for phrase in required]
+    assert positions == sorted(positions)
+    assert "arrival or peer progress alone does not require speech" in lowered
+    assert "[silent]" in lowered
+    for phrase in (
+        "follow-up",
+        "correction",
+        "mention",
+        "dependency",
+        "evolving task",
+        "another reply",
+        "prior send does not discharge a new turn",
+        "agent-authored message is not an automatic silence condition",
+    ):
+        assert phrase in lowered
+    for forbidden in (
+        "only one reply",
+        "one reply per",
+        "must stay silent after replying",
+        "ignore agent-authored messages",
+    ):
+        assert forbidden not in lowered
+
+
+def test_followup_decision_context_is_shared_across_managed_prompts():
+    root = _tmp()
+    shared = root / "shared"
+    profile = root / "profile.md"
+    profile.write_text("# Soul\nI am a follow-up test agent.", encoding="utf-8")
+    memory = root / "memory"
+    memory.mkdir()
+    workspace = root / "workspace"
+    workspace.mkdir()
+    claude_user = root / ".claude"
+    gemini_user = root / ".gemini"
+    codex_user = root / ".codex"
+
+    claude = rebuild_agent_claude_md(
+        shared_dir=shared,
+        profile_path=profile,
+        memory_dir=memory,
+        workspace_dir=workspace,
+        claude_user_dir=claude_user,
+        gemini_user_dir=gemini_user,
+        agent_id="follow-up-0001",
+    )
+    codex = rebuild_agent_codex_md(
+        shared_dir=shared,
+        profile_path=profile,
+        memory_dir=memory,
+        workspace_dir=workspace,
+        codex_user_dir=codex_user,
+        agent_id="follow-up-0001",
+    )
+
+    for prompt in (
+        DEFAULT_SHARED_CLAUDE_MD,
+        claude,
+        (claude_user / "CLAUDE.md").read_text(encoding="utf-8"),
+        (gemini_user / "GEMINI.md").read_text(encoding="utf-8"),
+        codex,
+        (codex_user / "AGENTS.md").read_text(encoding="utf-8"),
+    ):
+        _assert_followup_decision_contract(prompt)
+
+    assert "mcp__puffo__" in claude
+    assert "mcp__puffo__" not in codex
+    assert "send_message" in codex
+
+
 def test_sync_shared_skills_codex_strips_prefix_in_skill_bodies():
     """Skill bodies mirror the same convention as the primer —
     codex needs them prefix-free."""

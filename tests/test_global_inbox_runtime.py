@@ -44,6 +44,7 @@ from puffo_agent.agent.message_store import (
 from puffo_agent.agent._logging import log_runtime_event
 from puffo_agent.agent.runtime_event_outbox import RuntimeEventOutbox
 from puffo_agent.agent.runtime_events import RuntimeEvent
+from puffo_agent.agent.shared_content import ensure_shared_primer
 from puffo_agent.crypto.message import MessagePayload
 from puffo_agent.crypto.ws_client import TransportOutcome
 
@@ -2815,6 +2816,146 @@ async def test_notice_then_correlated_read_admits_and_processes_exact_page(tmp_p
     assert (await store.get_message_by_envelope("pull-2")).processing_state is (
         ProcessingState.PENDING
     )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_peer_progress_starts_grounded_followup_turn(tmp_path):
+    store = await make_store(tmp_path)
+    human_body = "Please outline the current task."
+    peer_body = "The current task has progressed to the next dependency."
+    await receipt(store, "human-origin", 1, sender="human", content=human_body)
+
+    shared_dir = tmp_path / "shared"
+    ensure_shared_primer(shared_dir)
+    shared_decision_instruction = (shared_dir / "CLAUDE.md").read_text(
+        encoding="utf-8"
+    )
+
+    class SessionAdapter(Adapter):
+        def __init__(self):
+            super().__init__()
+            self.continuation = None
+            self.continuation_key = ""
+            self.continuation_calls = []
+
+        def register_continuation_callback(
+            self, callback, planning_cycle_key, **_kwargs
+        ):
+            self.continuation = callback
+            self.continuation_key = planning_cycle_key
+
+        async def admit_continuation(self, provider_turn_id):
+            callback, self.continuation = self.continuation, None
+            assert callback is not None
+            self.continuation_calls.append(self.continuation_key)
+            await callback(ProviderAdmissionEvent(
+                planning_cycle_key=self.continuation_key,
+                provider_session_id=self.session,
+                provider_turn_id=provider_turn_id,
+                tool_call_id=f"read-{provider_turn_id}",
+                admitted_at=datetime.now(timezone.utc),
+            ))
+
+    adapter = SessionAdapter()
+    session_transcript = []
+    captured_inputs = []
+    completed_turns = []
+    runtime = None
+
+    async def run(planned):
+        turn_number = len(captured_inputs) + 1
+        await adapter.admit(provider_turn_id=f"provider-turn-{turn_number}")
+        page = await runtime.read_inbox(
+            limit=1,
+            tool_arguments={"limit": 1},
+        )
+        assert len(page["messages"]) == 1
+        await adapter.admit_continuation(
+            provider_turn_id=f"provider-read-{turn_number}"
+        )
+
+        if turn_number == 1:
+            assert human_body in page["messages"][0]
+            session_transcript.extend([
+                f"human origin: {human_body}",
+                "assistant prior contribution: I mapped the current dependency.",
+            ])
+            decision_input = "\n".join([
+                "originating human intent:",
+                human_body,
+                "shared action-decision instruction:",
+                shared_decision_instruction,
+            ])
+        else:
+            assert peer_body in page["messages"][0]
+            decision_input = "\n".join([
+                "retained provider-session transcript:",
+                *session_transcript,
+                "new peer progress:",
+                peer_body,
+                "shared action-decision instruction:",
+                shared_decision_instruction,
+            ])
+
+        captured_inputs.append((adapter.session, planned.provider_input, decision_input))
+        in_turn = await store.get_message_by_envelope(
+            "human-origin" if turn_number == 1 else "peer-progress"
+        )
+        assert in_turn is not None
+        assert in_turn.processing_state is ProcessingState.IN_TURN
+        completed_turns.append(turn_number)
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=run,
+        workspace=tmp_path,
+    )
+
+    assert await runtime.process_once()
+    first = await store.get_message_by_envelope("human-origin")
+    assert first is not None
+    assert first.processing_state is ProcessingState.PROCESSED
+    assert completed_turns == [1]
+
+    before_peer_notice = await store.get_notice_state()
+    await receipt(
+        store,
+        "peer-progress",
+        2,
+        sender="peer-agent",
+        content=peer_body,
+    )
+    pending_peer = await store.get_pending()
+    assert [row.envelope_id for row in pending_peer] == ["peer-progress"]
+    assert peer_body == pending_peer[0].content
+    after_peer_notice = await store.get_notice_state()
+    assert after_peer_notice.generation > before_peer_notice.generation
+    assert after_peer_notice.delivery_pending
+
+    assert await runtime.process_once()
+    second = await store.get_message_by_envelope("peer-progress")
+    assert second is not None
+    assert second.processing_state is ProcessingState.PROCESSED
+    assert completed_turns == [1, 2]
+    assert len(adapter.continuation_calls) == 2
+    assert [session for session, _notice, _input in captured_inputs] == [
+        adapter.session,
+        adapter.session,
+    ]
+    _session, _notice, second_input = captured_inputs[1]
+    normalized_second_input = " ".join(second_input.split()).lower()
+    for expected in (
+        human_body,
+        "assistant prior contribution: I mapped the current dependency.",
+        peer_body,
+        "recover the originating human intent",
+        "inspect this agent's relevant prior contribution",
+        "classify newly observed peer progress",
+        "decide whether a new unresolved action belongs to this agent",
+    ):
+        assert expected.lower() in normalized_second_input
     await store.close()
 
 

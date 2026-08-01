@@ -702,8 +702,17 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
               are still forced visible (can't fold either way).
         send_anyway: for a channel send, keep the chosen content even
             after a prior held result and a correlated same-Turn read has
-            admitted context through the held watermark. The result exposes
-            safe synchronization metadata, never recovered plaintext.
+            admitted context through the held watermark. For
+            context-dependent content, actual newer message content must be
+            successfully synchronized, returned and inspected before choosing
+            ``send_anyway``. A newer watermark or sequence advance alone, an
+            empty recovery/read result, or a failed history lookup is not
+            semantic inspection. Do not infer unseen content or force a stale
+            context-dependent draft. After existing same-turn technical
+            eligibility checks, explicit ``send_anyway=True`` remains
+            available when the chosen content is genuinely
+            context-independent; this is a deliberate judgment, not an
+            automatic retry.
         """
         return await _dispatch_semantic_send(
             cfg,
@@ -1373,8 +1382,16 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             ``"human"`` | ``"default"`` | ``"agent_only"``, default
             ``"default"``. The @-mention floor keys off ``caption``.
         send_anyway: same channel-freshness override as
-            ``send_message``. It is an available judgment choice, not
-            an automatic retry.
+            ``send_message``. For context-dependent content, actual newer
+            message content must be successfully synchronized, returned and
+            inspected before choosing ``send_anyway``. A newer watermark or
+            sequence advance alone, an empty recovery/read result, or a
+            failed history lookup is not semantic inspection. Do not infer
+            unseen content or force a stale context-dependent draft. After
+            existing same-turn technical eligibility checks, explicit
+            ``send_anyway=True`` remains available when the chosen content
+            is genuinely context-independent; this is a deliberate judgment,
+            not an automatic retry.
         """
         return await _dispatch_semantic_send(
             cfg,
