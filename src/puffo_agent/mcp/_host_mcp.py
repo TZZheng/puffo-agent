@@ -149,6 +149,7 @@ class PuffoRpcClient:
         through_envelope_id: str,
         tool_name: str,
         tool_arguments: dict[str, object],
+        visible_message_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         body = {
             "space_id": space_id,
@@ -158,6 +159,8 @@ class PuffoRpcClient:
             "tool_name": tool_name,
             "tool_arguments": tool_arguments,
         }
+        if visible_message_ids is not None:
+            body["visible_message_ids"] = visible_message_ids
         path = (
             f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/"
             "model-visible-read"

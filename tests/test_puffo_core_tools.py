@@ -1276,6 +1276,10 @@ async def test_message_read_tools_stage_highest_model_visible_server_sequence():
         {"post_ref": "env_reply"},
         {"envelope_id": "env_reply", "segment": 0},
     ]
+    assert [call["visible_message_ids"] for call in rpc.calls] == [
+        ["env_root"], ["env_root"], ["env_root", "env_reply"],
+        ["env_reply"], ["env_reply"],
+    ]
     assert "[puffo:model-visible-read:receipt-1]" in channel_result
     assert "[puffo:model-visible-read:receipt-2]" in clamped_result
     await ms.close()

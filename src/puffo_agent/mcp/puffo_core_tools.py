@@ -170,6 +170,16 @@ async def _stage_model_visible_messages(
         )
         return ""
     watermark = max(candidates, key=lambda message: message.server_seq)
+    if any(
+        message.space_id != watermark.space_id
+        or message.channel_id != watermark.channel_id
+        for message in candidates
+    ):
+        # One continuation has one channel watermark; do not claim partial
+        # visibility for a mixed-channel presentation.
+        return ""
+    # Only stage the exact local rows that are represented in this response.
+    visible = [message.envelope_id for message in candidates]
     staged = await rpc.stage_model_visible_read(
         space_id=watermark.space_id,
         channel_id=watermark.channel_id,
@@ -177,6 +187,7 @@ async def _stage_model_visible_messages(
         through_envelope_id=watermark.envelope_id,
         tool_name=tool_name,
         tool_arguments=tool_arguments,
+        visible_message_ids=visible,
     )
     receipt = staged.get("correlation_receipt")
     if not isinstance(receipt, str) or not receipt:

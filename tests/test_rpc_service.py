@@ -316,6 +316,7 @@ async def test_model_visible_read_structured_round_trip(
         "through_envelope_id": "msg_9",
         "tool_name": "get_channel_history",
         "tool_arguments": {"channel": "ch_1"},
+        "visible_message_ids": ["msg_8", "msg_9"],
     }
     response = await client.post(
         "/v1/rpc/agent_a/model-visible-read",
@@ -330,6 +331,7 @@ async def test_model_visible_read_structured_round_trip(
     }
     assert captured["ctx"].agent_id == "agent_a"
     assert captured["tool_arguments"] == {"channel": "ch_1"}
+    assert captured["visible_message_ids"] == ["msg_8", "msg_9"]
 
 
 @pytest.mark.asyncio

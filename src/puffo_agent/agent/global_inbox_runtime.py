@@ -158,6 +158,8 @@ class PlannedTurn:
 class ActiveExactUnion:
     turn_id: str = ""
     message_ids: list[str] = field(default_factory=list)
+    # In-memory only: rows whose plaintext has crossed a provider boundary.
+    visible_message_ids: list[str] = field(default_factory=list)
     provider_session_id: str | None = None
     provider_turn_id: str | None = None
     routes: list[MessageRoute] = field(default_factory=list)
@@ -166,6 +168,7 @@ class ActiveExactUnion:
     def clear(self) -> None:
         self.turn_id = ""
         self.message_ids.clear()
+        self.visible_message_ids.clear()
         self.provider_session_id = None
         self.provider_turn_id = None
         self.routes.clear()
@@ -927,6 +930,7 @@ class GlobalInboxRuntime:
         through_envelope_id: str,
         tool_name: str,
         tool_arguments: Mapping[str, Any],
+        visible_message_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         """Advance freshness at the adapter's proven model-visible boundary."""
         if through_seq < 0:
@@ -972,6 +976,14 @@ class GlobalInboxRuntime:
                 state="no_active_turn",
             )
             raise RuntimeError("no active provider turn for model-visible read")
+        visible_ids = list(visible_message_ids or ())
+        await self._add_visible_message_ids(
+            visible_ids,
+            space_id=space_id,
+            channel_id=channel_id,
+            through_seq=through_seq,
+            mutate=False,
+        )
         correlation_key = f"visible_read_{uuid.uuid4().hex}"
         correlation_receipt = uuid.uuid4().hex
         fired = False
@@ -990,6 +1002,12 @@ class GlobalInboxRuntime:
                 )
             fired = True
             try:
+                await self._add_visible_message_ids(
+                    visible_ids,
+                    space_id=space_id,
+                    channel_id=channel_id,
+                    through_seq=through_seq,
+                )
                 await ActiveBoundaryAdapter(
                     self.store, self.active
                 ).advance_active_turn_through_seq(
@@ -1124,6 +1142,36 @@ class GlobalInboxRuntime:
             "through_envelope_id": through_envelope_id,
         }
 
+    async def _add_visible_message_ids(
+        self,
+        envelope_ids: list[str] | tuple[str, ...],
+        *,
+        space_id: str | None = None,
+        channel_id: str | None = None,
+        through_seq: int | None = None,
+        mutate: bool = True,
+    ) -> None:
+        """Validate local rows first, then append first-seen IDs in order."""
+        ids = list(envelope_ids)
+        if any(not isinstance(item, str) or not item for item in ids):
+            raise RuntimeError("visible message IDs must be non-empty strings")
+        rows = [await self.store.get_message_by_envelope(item) for item in ids]
+        for row in rows:
+            if row is None:
+                raise RuntimeError("visible message ID does not resolve locally")
+            if space_id is not None and (
+                row.envelope_kind == "dm" or row.space_id != space_id
+                or row.channel_id != channel_id or not isinstance(row.server_seq, int)
+                or isinstance(row.server_seq, bool) or through_seq is None
+                or row.server_seq > through_seq
+            ):
+                raise RuntimeError("visible message ID is incompatible with watermark")
+        if mutate:
+            seen = set(self.active.visible_message_ids)
+            self.active.visible_message_ids.extend(
+                item for item in ids if not (item in seen or seen.add(item))
+            )
+
     async def read_inbox(
         self,
         *,
@@ -1181,6 +1229,7 @@ class GlobalInboxRuntime:
             remaining_count = page.remaining_count
 
         prior_context: list[str] = []
+        prior_context_ids: list[str] = []
         if selected:
             anchors: dict[tuple[str, ...], StoredMessage] = {}
             for item in selected:
@@ -1203,6 +1252,7 @@ class GlobalInboxRuntime:
                 ):
                     continue
                 prior_context.append(block)
+                prior_context_ids.append(item.envelope_id)
                 prior_byte_count += block_bytes
 
         correlation_receipt = ""
@@ -1230,6 +1280,7 @@ class GlobalInboxRuntime:
                 )
                 fired = True
                 self.active.message_ids[:] = list(run.message_ids)
+                await self._add_visible_message_ids(list(ids) + prior_context_ids)
                 self.active.routes.extend(routes)
                 turn_rows = await self.store.get_in_turn_messages(
                     active_turn_id,
@@ -1700,6 +1751,7 @@ class GlobalInboxRuntime:
                 raise RuntimeError("Inbox notice generation was already delivered")
         self.active.turn_id = run.turn_id
         self.active.message_ids[:] = list(run.message_ids)
+        await self._add_visible_message_ids(list(run.message_ids))
         self.active.provider_session_id = event.provider_session_id
         self.active.provider_turn_id = event.provider_turn_id
         self.active.routes[:] = list(planned.routes)

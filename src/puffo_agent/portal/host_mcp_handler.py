@@ -553,6 +553,7 @@ async def stage_model_visible_read(
     through_envelope_id: str,
     tool_name: str,
     tool_arguments: dict[str, object],
+    visible_message_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Correlate a local-history tool result with the live provider turn."""
     runtime = getattr(ctx.message_client, "global_runtime", None)
@@ -565,6 +566,7 @@ async def stage_model_visible_read(
         through_envelope_id=through_envelope_id,
         tool_name=tool_name,
         tool_arguments=tool_arguments,
+        visible_message_ids=visible_message_ids,
     )
 
 

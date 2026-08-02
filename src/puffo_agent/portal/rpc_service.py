@@ -125,6 +125,7 @@ _MODEL_VISIBLE_READ_BODY_KEYS = frozenset({
     "through_envelope_id",
     "tool_name",
     "tool_arguments",
+    "visible_message_ids",
 })
 _MODEL_VISIBLE_READ_TOOLS = frozenset({
     "get_channel_history",
@@ -266,6 +267,17 @@ async def stage_model_visible_read_route(request: web.Request) -> web.Response:
             {"error": "tool_arguments must contain scalar JSON values"},
             status=400,
         )
+    visible_message_ids = body.get("visible_message_ids")
+    if visible_message_ids is not None and (
+        not isinstance(visible_message_ids, list)
+        or len(visible_message_ids) > 200
+        or any(not isinstance(item, str) or not item for item in visible_message_ids)
+        or len(set(visible_message_ids)) != len(visible_message_ids)
+    ):
+        return web.json_response(
+            {"error": "visible_message_ids must be at most 200 unique non-empty strings"},
+            status=400,
+        )
 
     resolver = _RPC_RESOLVER
     if resolver is None:
@@ -284,6 +296,7 @@ async def stage_model_visible_read_route(request: web.Request) -> web.Response:
             through_envelope_id=body["through_envelope_id"],
             tool_name=body["tool_name"],
             tool_arguments=tool_arguments,
+            visible_message_ids=visible_message_ids,
         )
     except RuntimeError as exc:
         return web.json_response({"error": str(exc)}, status=400)

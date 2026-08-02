@@ -1429,10 +1429,12 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
         through_envelope_id="history-2",
         tool_name="get_channel_history",
         tool_arguments={"channel": "ch-1"},
+        visible_message_ids=["history-2"],
     )
 
     assert result["state"] == "staged"
     assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") is None
+    assert runtime.active.visible_message_ids == []
     assert adapter.continuations[0][3] == ("get_channel_history",)
     assert adapter.continuations[0][4] == {"channel": "ch-1"}
     assert adapter.continuations[0][5] == result["correlation_receipt"]
@@ -1445,6 +1447,7 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
     )
 
     await adapter.admit_continuation()
+    assert runtime.active.visible_message_ids == ["history-2"]
     assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 2
     history_events = [
         event for event in runtime_events(caplog)
@@ -1540,10 +1543,12 @@ async def test_model_visible_read_admits_at_runtime_tool_return(tmp_path, caplog
         through_envelope_id="history-tool-return",
         tool_name="get_channel_history",
         tool_arguments={"channel": "ch-1"},
+        visible_message_ids=["history-tool-return"],
     )
 
     assert result["state"] == "admitted"
     assert runtime.active.through_by_channel[("sp-1", "ch-1")] == 7
+    assert runtime.active.visible_message_ids == ["history-tool-return"]
     history_events = [
         event for event in runtime_events(caplog)
         if event["event"].startswith("history.")
