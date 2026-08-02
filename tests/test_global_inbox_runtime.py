@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -61,6 +62,22 @@ def runtime_events(caplog):
         if marker in message:
             events.append(json.loads(message.split(marker, 1)[1]))
     return events
+
+
+def projection_metadata(block: str) -> dict[str, object]:
+    """Extract the legacy assertions' stable facts from a semantic row."""
+    row = next(line for line in block.splitlines() if line.startswith("[seq="))
+    return {
+        "envelope_id": re.search(r"\bid=([^ ]+)", row).group(1),
+        "sender_slug": re.search(r"\] @([^ :]+)", row).group(1),
+        "is_self": " self=true" in row,
+    }
+
+
+def projection_body(block: str) -> str:
+    lines = block.splitlines()
+    row_index = next(index for index, line in enumerate(lines) if line.startswith("[seq="))
+    return "\n".join(lines[row_index + 1:])
 
 
 def test_runtime_event_helper_fails_open_and_omits_unavailable(
@@ -2905,17 +2922,14 @@ def test_format_stored_message_marks_only_runtime_identity_aliases(tmp_path):
             server_seq=1,
         )
 
-    def metadata(block):
-        return json.loads(block.splitlines()[1])
-
     human = stored("human", "human")
     peer = stored("peer", "peer-agent")
     self_echo = stored("self", "wire-agent")
 
-    assert metadata(format_stored_message(human))["is_self"] is False
-    assert metadata(format_stored_message(peer))["is_self"] is False
-    assert metadata(format_stored_message(self_echo))["is_self"] is False
-    assert metadata(
+    assert projection_metadata(format_stored_message(human))["is_self"] is False
+    assert projection_metadata(format_stored_message(peer))["is_self"] is False
+    assert projection_metadata(format_stored_message(self_echo))["is_self"] is False
+    assert projection_metadata(
         format_stored_message(self_echo, current_agent_aliases=("wire-agent",))
     )["is_self"] is True
 
@@ -2926,11 +2940,11 @@ def test_format_stored_message_marks_only_runtime_identity_aliases(tmp_path):
         workspace=tmp_path,
         send_mode_keys=("runtime-agent-id",),
     )
-    assert metadata(runtime.formatter(self_echo))["is_self"] is True
-    assert metadata(runtime.formatter(stored("alias", "runtime-agent-id")))[
+    assert projection_metadata(runtime.formatter(self_echo))["is_self"] is True
+    assert projection_metadata(runtime.formatter(stored("alias", "runtime-agent-id")))[
         "is_self"
     ] is True
-    assert metadata(runtime.formatter(human))["is_self"] is False
+    assert projection_metadata(runtime.formatter(human))["is_self"] is False
 
     no_identity = GlobalInboxRuntime(
         store=SimpleNamespace(),
@@ -2938,7 +2952,7 @@ def test_format_stored_message_marks_only_runtime_identity_aliases(tmp_path):
         run_turn=lambda _planned: None,
         workspace=tmp_path,
     )
-    assert metadata(no_identity.formatter(self_echo))["is_self"] is False
+    assert projection_metadata(no_identity.formatter(self_echo))["is_self"] is False
 
     custom_calls = []
 
@@ -3004,8 +3018,7 @@ async def _run_composed_peer_progress_case(
 
         @staticmethod
         def parse(block):
-            lines = block.splitlines()
-            return json.loads(lines[1]), "\n".join(lines[2:-1])
+            return projection_metadata(block), projection_body(block)
 
         def decide(self, read_inbox_result):
             self.turn_inputs.append(read_inbox_result)
@@ -3161,9 +3174,7 @@ async def _run_composed_peer_progress_case(
         assert peer_body in page["messages"][0]
         assert human_body in decision_input
         assert first_contribution in decision_input
-        prior_metadata = [
-            json.loads(block.splitlines()[1]) for block in page["prior_context"]
-        ]
+        prior_metadata = [projection_metadata(block) for block in page["prior_context"]]
         self_metadata = next(
             metadata
             for metadata in prior_metadata
@@ -3244,15 +3255,13 @@ async def _run_composed_peer_progress_case(
     assert future is not None and future.processing_state is ProcessingState.PENDING
     assert len(adapter.continuation_calls) == 2
     prior_ids = [
-        json.loads(block.splitlines()[1])["envelope_id"]
+        projection_metadata(block)["envelope_id"]
         for block in provider_inputs[1]["read_inbox_result"]["prior_context"]
     ]
     prior_blocks = provider_inputs[1]["read_inbox_result"]["prior_context"]
     second_result = provider_inputs[1]["read_inbox_result"]
-    message_metadata = [
-        json.loads(block.splitlines()[1]) for block in second_result["messages"]
-    ]
-    prior_metadata = [json.loads(block.splitlines()[1]) for block in prior_blocks]
+    message_metadata = [projection_metadata(block) for block in second_result["messages"]]
+    prior_metadata = [projection_metadata(block) for block in prior_blocks]
     assert [metadata["envelope_id"] for metadata in message_metadata] == [
         "peer-progress"
     ]
@@ -3385,11 +3394,11 @@ async def test_read_inbox_prior_context_preserves_paging_and_exact_admission(
     assert "page one" in first["messages"][0]
     assert "page two" in second["messages"][0]
     assert [
-        json.loads(block.splitlines()[1])["envelope_id"]
+        projection_metadata(block)["envelope_id"]
         for block in first["prior_context"]
     ] == ["prior-page-context"]
     assert [
-        json.loads(block.splitlines()[1])["envelope_id"]
+        projection_metadata(block)["envelope_id"]
         for block in second["prior_context"]
     ] == ["prior-page-context"]
     assert first["has_more"] is True

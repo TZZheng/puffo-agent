@@ -240,58 +240,7 @@ def format_stored_message(
     current_agent_aliases: Sequence[str] = (),
 ) -> str:
     """Readable per-message model view (legacy entry point for callers)."""
-    return format_message_group((item,))
-    # Historical structured envelope retained below for source compatibility.
-    route = route_for(item)
-    content = item.content
-    attachments: list[str] = []
-    if isinstance(content, Mapping):
-        text = str(content.get("text") or "")
-        raw_attachments = content.get("attachment_paths", content.get("attachments", ()))
-        if isinstance(raw_attachments, Sequence) and not isinstance(
-            raw_attachments, (str, bytes)
-        ):
-            attachments = [str(value) for value in raw_attachments]
-        content_metadata = {
-            key: content.get(key)
-            for key in (
-                "mentions",
-                "sender_display_name",
-                "sender_owner_slug",
-                "is_from_operator",
-                "sender_is_agent",
-                "is_visible_to_human",
-                "space_name",
-                "channel_name",
-            )
-        }
-    else:
-        text = str(content or "")
-        content_metadata = {}
-    metadata = {
-        "envelope_id": item.envelope_id,
-        "server_seq": item.server_seq,
-        "route": asdict(route),
-        "sender_slug": item.sender_slug,
-        "is_self": bool(
-            item.sender_slug
-            and item.sender_slug in {
-                str(alias) for alias in current_agent_aliases if alias
-            }
-        ),
-        "recipient_slug": item.recipient_slug,
-        "sent_at": item.sent_at,
-        "is_encrypted": item.is_encrypted,
-        "attachments": attachments,
-        "reply_to_id": item.reply_to_id,
-        **content_metadata,
-    }
-    return (
-        "<inbox_message>\n"
-        f"{json.dumps(metadata, separators=(',', ':'), sort_keys=True)}\n"
-        f"{text}\n"
-        "</inbox_message>"
-    )
+    return format_message_group((item,), current_agent_aliases=current_agent_aliases)
 
 
 class BaselineAdapter:

@@ -963,9 +963,9 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         - ``after`` — ms-epoch timestamp; exclusive lower bound.
         - ``before`` — ms-epoch timestamp; exclusive upper bound.
 
-        Output lines: ``<ts>  @<sender>: <text>  (N replies)`` where
-        ``N`` is the current reply count (omitted for 0). Oldest-
-        first inside the returned window. Channel id is a raw
+        Output uses semantic target headers and message rows; root rows include
+        their current reply count. Oldest-first inside the returned window.
+        Channel id is a raw
         ``ch_<uuid>`` (no ``#name`` shortcut)."""
         limit = max(1, min(int(limit), 200))
         channel_ref = channel.strip()
@@ -1023,8 +1023,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         same slug you'd DM with ``send_message``. ``before`` is an
         optional ms-epoch upper bound (exclusive) for paging back.
 
-        Output lines: ``<ts>  msg:<envelope_id>  @<sender>: <text>``,
-        oldest-first."""
+        Output uses semantic target headers and message rows, oldest-first."""
         limit = max(1, min(int(limit), 200))
         peer_slug = peer.strip().lstrip("@")
         if not peer_slug:
@@ -1057,8 +1056,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         For a top-level post that has no replies, this returns just
         that post.
 
-        Output lines: ``<ts>  post:<envelope_id>  @<sender>: <text>``,
-        oldest-first."""
+        Output uses semantic target headers and message rows, oldest-first."""
         if not root_id.strip():
             raise RuntimeError("root_id required")
         limit = max(1, min(int(limit), 200))

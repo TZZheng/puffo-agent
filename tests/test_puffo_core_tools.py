@@ -2439,7 +2439,7 @@ async def test_get_post_shows_is_encrypted():
     cfg, _, ms = _setup()
     await _store_msg(ms, "msg_plain", is_encrypted=False)
     result = await _call(_build_tools(cfg), "get_post", {"post_ref": "msg_plain"})
-    assert "is_encrypted: false" in result
+    assert "encrypted=false" in result
 
 
 @pytest.mark.asyncio
@@ -2448,7 +2448,7 @@ async def test_get_channel_history_tags_encryption():
     await _store_msg(ms, "msg_enc", is_encrypted=True)
     await _store_msg(ms, "msg_plain", is_encrypted=False)
     result = await _call(_build_tools(cfg), "get_channel_history", {"channel": "ch_1"})
-    assert "[encrypted]" in result and "[plaintext]" in result
+    assert "encrypted=true" in result and "encrypted=false" in result
 
 
 @pytest.mark.asyncio
@@ -2457,7 +2457,7 @@ async def test_get_thread_history_tags_encryption():
     await _store_msg(ms, "msg_root", is_encrypted=True)
     await _store_msg(ms, "msg_reply", is_encrypted=False, thread_root_id="msg_root")
     result = await _call(_build_tools(cfg), "get_thread_history", {"root_id": "msg_root"})
-    assert "[plaintext]" in result
+    assert "encrypted=false" in result
 
 # Send-side thread-root rules, end to end through the send_message tool.
 
