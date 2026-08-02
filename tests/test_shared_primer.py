@@ -113,6 +113,9 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         "reconsider the originating request, that draft, and newer context",
         "context-dependent", "sequence position", "shared-state coordination",
         "do not use `send_anyway`", "use the unchanged draft", "or send nothing",
+        "asks multiple participants to contribute separately",
+        "another participant's overlapping contribution does not satisfy this agent's own contribution",
+        "recompute it from the latest ordered context",
         "send_anyway=true", "is rare",
         "model-owned", "may be held again", "sequence watermark alone is not semantic context",
     ):
@@ -246,6 +249,9 @@ def test_held_send_reconsiders_an_attempted_existing_contribution():
         "correctness, sequence position, target, necessity, or interpretation",
         "revise against the latest context and send with normal freshness",
         "do not use `send_anyway`",
+        "asks multiple participants to contribute separately",
+        "another participant's overlapping contribution does not satisfy this Agent's own contribution",
+        "recompute it from the latest ordered context",
         "use the unchanged draft with `send_anyway=True` only after confirming newer context",
         "or send nothing",
     )

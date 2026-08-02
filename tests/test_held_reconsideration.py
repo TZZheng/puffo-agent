@@ -278,6 +278,8 @@ async def test_held_thread_basis_overrides_only_its_presentation_target():
         "correctness, sequence position, target, necessity, or interpretation",
         "for a context-dependent draft, revise against the latest context",
         "do not use send_anyway",
+        "another participant's overlapping contribution does not satisfy",
+        "recompute it from the latest ordered context",
         "only after confirming newer context cannot affect those semantics",
         "send nothing only when current context actually satisfies or cancels",
     ):

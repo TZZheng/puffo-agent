@@ -228,7 +228,10 @@ because peers advanced the conversation or produced overlapping content. Then
 judge whether the draft is context-dependent: can newer messages change its
 correctness, sequence position, target, necessity, or interpretation? This
 includes turn-taking and shared-state coordination. If so, revise against the
-latest context and send with normal freshness; do not use `send_anyway`. Use the
+latest context and send with normal freshness; do not use `send_anyway`. When
+the originating request asks multiple participants to contribute separately,
+another participant's overlapping contribution does not satisfy this Agent's
+own contribution; recompute it from the latest ordered context. Use the
 unchanged draft with `send_anyway=True` only after confirming newer context
 cannot affect those semantics, or send nothing. `send_anyway=True` is rare and
 model-owned, never automatic; technical eligibility is not a recommendation.
