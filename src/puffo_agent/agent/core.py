@@ -212,6 +212,7 @@ class PuffoAgent:
             channel_name="global inbox",
             sender="multiple" if len(planned.targets) > 1 else "",
             on_progress=on_progress,
+            allow_plain_fallback=False,
         )
 
     async def handle_global_inbox_retry(
@@ -252,9 +253,11 @@ class PuffoAgent:
             )
         if not text_parts and not result.reply:
             return None
-        fallback = _format_assistant_fallback(text_parts, result.reply)
-        self._append_assistant("global inbox", fallback)
-        return fallback
+        self.logger.info(
+            "[no-send] [global inbox retry]: ignoring plain assistant output; "
+            "outbound chat requires send_message"
+        )
+        return None
 
     async def handle_api_error_retry(
         self,
@@ -355,6 +358,7 @@ class PuffoAgent:
         channel_name: str,
         sender: str,
         on_progress=None,
+        allow_plain_fallback: bool = True,
     ) -> str | None:
         """Shared tail for ``handle_message`` and ``handle_message_batch``.
         Runs one adapter turn against the current ``self.log`` and
@@ -432,6 +436,13 @@ class PuffoAgent:
             )
 
         if not text_parts and not result.reply:
+            return None
+
+        if not allow_plain_fallback:
+            self.logger.info(
+                f"[no-send] [{channel_name}] @{sender}: ignoring plain "
+                "assistant output; outbound chat requires send_message"
+            )
             return None
 
         # Fallback: agent skipped send_message and [SILENT]; assemble

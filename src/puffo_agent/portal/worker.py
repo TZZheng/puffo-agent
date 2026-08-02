@@ -1610,7 +1610,7 @@ class Worker:
             TrackingSendDelegate,
             await_listener_with_runtime,
         )
-        from ..agent.send_coordinator import SemanticSendRequest, SendCoordinator
+        from ..agent.send_coordinator import SendCoordinator
         from .ws_local.in_process_data_client import InProcessDataClient
 
         global_runtime: GlobalInboxRuntime
@@ -1862,28 +1862,11 @@ class Worker:
             self.runtime.last_event_at = int(time.time())
             if not reply:
                 return
-            # Plain output has exactly one legal implicit route. Every explicit,
-            # failed, attachment, or held attempt suppresses it.
-            fallback_route = global_runtime.resolve_plain_fallback_route()
-            if fallback_route is None or global_runtime.attempts.attempts:
-                logger.warning(
-                    "agent %s: suppressed ambiguous global plain output "
-                    "(admitted_routes=%d attempts=%d)",
-                    agent_id, len(global_runtime.active.routes),
-                    global_runtime.attempts.attempts,
-                )
-                return
-            if fallback_route.kind == "dm":
-                destination = f"@{fallback_route.dm_peer}"
-                root_id = ""
-            else:
-                destination = fallback_route.channel_id
-                root_id = fallback_route.thread_root_id
-            await global_runtime.send_delegate.send(SemanticSendRequest(
-                destination=destination,
-                text=reply,
-                root_id=root_id,
-            ))
+            logger.warning(
+                "agent %s: suppressed global plain output; outbound chat "
+                "requires send_message",
+                agent_id,
+            )
 
         async def retry_global_turn(planned):
             projection = await _runtime_event_start()
@@ -1914,26 +1897,11 @@ class Worker:
                 Worker._resolve_health_on_success(self.runtime, agent_id, logger)
             if not reply:
                 return
-            fallback_route = global_runtime.resolve_plain_fallback_route()
-            if fallback_route is None or global_runtime.attempts.attempts:
-                logger.warning(
-                    "agent %s: suppressed ambiguous global retry output "
-                    "(targets=%d attempts=%d)",
-                    agent_id, len(global_runtime.active.routes),
-                    global_runtime.attempts.attempts,
-                )
-                return
-            destination = (
-                f"@{fallback_route.dm_peer}"
-                if fallback_route.kind == "dm"
-                else fallback_route.channel_id
+            logger.warning(
+                "agent %s: suppressed global retry plain output; outbound "
+                "chat requires send_message",
+                agent_id,
             )
-            root_id = fallback_route.thread_root_id
-            await global_runtime.send_delegate.send(SemanticSendRequest(
-                destination=destination,
-                text=reply,
-                root_id=root_id,
-            ))
 
         run_global_turn.handle_global_inbox_retry = retry_global_turn
 

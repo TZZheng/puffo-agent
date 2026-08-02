@@ -2596,6 +2596,54 @@ async def test_retry_core_uses_exact_provider_input_without_duplicate_log_append
 
 
 @pytest.mark.asyncio
+async def test_global_turn_plain_output_is_internal_not_an_implicit_message(tmp_path):
+    class PlainAdapter:
+        async def run_turn(self, _ctx):
+            return TurnResult(
+                reply="No further reply is needed.",
+                metadata={"assistant_text_parts": ["No further reply is needed."]},
+            )
+
+    planned = SimpleNamespace(
+        provider_input="<exact-global-input>",
+        targets=(object(),),
+    )
+    agent = PuffoAgent(
+        adapter=PlainAdapter(),
+        system_prompt="system",
+        memory_dir=str(tmp_path / "memory"),
+    )
+
+    reply = await agent.handle_global_inbox_turn(planned)
+
+    assert reply is None
+    assert all(entry["role"] != "assistant" for entry in agent.log)
+
+
+@pytest.mark.asyncio
+async def test_global_retry_plain_output_is_internal_not_an_implicit_message(tmp_path):
+    class PlainRetryAdapter:
+        async def run_retry_turn(self, _kick, _fallback, _ctx):
+            return TurnResult(
+                reply="No further reply is needed.",
+                metadata={"assistant_text_parts": ["No further reply is needed."]},
+            )
+
+    planned = SimpleNamespace(provider_input="<exact-global-input>")
+    agent = PuffoAgent(
+        adapter=PlainRetryAdapter(),
+        system_prompt="system",
+        memory_dir=str(tmp_path / "memory"),
+    )
+    agent.log.append({"role": "user", "content": "<exact-global-input>"})
+
+    reply = await agent.handle_global_inbox_retry(planned)
+
+    assert reply is None
+    assert all(entry["role"] != "assistant" for entry in agent.log)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error",
     [
