@@ -486,6 +486,7 @@ def test_history_continuation_matches_exact_claude_tool_result(tmp_path):
                 for call_id, arguments in (
                     ("read-a", {"channel": "ch-a"}),
                     ("read-b", {"channel": "ch-a"}),
+                    ("read-b-wrong-arguments", {"channel": "ch-other"}),
                     ("read-failed", {"channel": "ch-a"}),
                     ("read-clamped", {"channel": "ch-a", "limit": 200}),
                 )
@@ -506,6 +507,9 @@ def test_history_continuation_matches_exact_claude_tool_result(tmp_path):
             }]},
         }),
         encode(result("wrong-tool", "receipt-b")),
+        # A matching receipt alone must not consume the continuation: this
+        # otherwise-valid history call has a different semantic target.
+        encode(result("read-b-wrong-arguments", "receipt-b")),
         encode(result("read-b", "receipt-b")),
         encode(result("read-failed", "receipt-failed", is_error=True)),
         encode(result("read-clamped", "receipt-clamped")),
@@ -548,6 +552,48 @@ def test_history_continuation_matches_exact_claude_tool_result(tmp_path):
             tool_arguments={"channel": "ch-a"},
             correlation_receipt="receipt-late",
         )
+
+
+def test_claude_receipt_continuation_rejects_wrong_arguments_before_exact_result(
+    tmp_path,
+):
+    session = _make_session(tmp_path, audit=False)
+    admitted = []
+
+    async def callback(event):
+        admitted.append(event.tool_call_id)
+
+    def result(tool_use_id):
+        return {
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": "history\n[puffo:model-visible-read:receipt-a]",
+            }]},
+        }
+
+    async def drive():
+        provider_turn_id = "claude-turn-held"
+        session._active_provider_turn_id = provider_turn_id
+        session.register_continuation_callback(
+            callback,
+            "held-a",
+            tool_names=("get_channel_history",),
+            tool_arguments={"channel": "ch-a"},
+            correlation_receipt="receipt-a",
+        )
+        session._active_puffo_tool_calls.update({
+            "wrong": ("get_channel_history", {"channel": "ch-other"}),
+            "exact": ("get_channel_history", {"channel": "ch-a"}),
+        })
+        await session._fire_matching_continuations(result("wrong"), provider_turn_id)
+        assert admitted == []
+        assert len(session._continuation_admissions) == 1
+        await session._fire_matching_continuations(result("exact"), provider_turn_id)
+
+    asyncio.run(drive())
+    assert admitted == ["exact"]
 
 
 def test_claude_turn_end_discards_old_history_continuation(tmp_path):

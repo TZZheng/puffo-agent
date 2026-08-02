@@ -635,10 +635,11 @@ class ClaudeSession:
                     and admission.receipt_marker
                     and admission.receipt_marker in serialized
                     and tool_call is not None
-                    and (
-                        not admission.tool_names
-                        or tool_name in admission.tool_names
-                    )
+                    # A receipt proves that the model saw this result, but it
+                    # does not by itself prove which semantic call produced
+                    # it.  Keep the same tool/argument contract as every
+                    # other provider boundary before admitting held rows.
+                    and admission.matches(tool_name, tool_arguments)
                 ),
                 None,
             )

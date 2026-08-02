@@ -208,6 +208,16 @@ def normalize_tool_arguments(
         name = str(key)
         if name in optional_defaults and value == optional_defaults[name]:
             continue
+        # Local history tools cap their public ``limit`` at 200 before
+        # staging their receipt.  Claude reports the requested tool input,
+        # while other adapters can report the applied value; compare the
+        # shared semantic value so legacy history continuations retain their
+        # established matching contract.
+        if name == "limit":
+            try:
+                value = max(1, min(int(value), 200))
+            except (TypeError, ValueError):
+                pass
         normalized[name] = value
     return tuple(sorted(
         (key, json.dumps(value, sort_keys=True, separators=(",", ":"), default=str))
