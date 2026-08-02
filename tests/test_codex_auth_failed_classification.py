@@ -24,6 +24,8 @@ from puffo_agent.agent.adapters.codex_session import (
     "codex turn failed: websocket /responses returned 401 Unauthorized",
     "codex turn failed: 401 Unauthorized from /responses",  # reversed order
     "codex turn failed: {error: {code: 401, path: /responses}}",
+    "Your access token could not be refreshed because you have since logged out "
+    "or signed in to another account. Please sign in again.",
 ])
 def test_verbatim_d2d2_auth_strings_classify_as_auth(err_text):
     """The four pattern families anchored to msg_2237ad78's d2d2-case
@@ -35,6 +37,9 @@ def test_verbatim_d2d2_auth_strings_classify_as_auth(err_text):
     "codex turn failed: invalid thread id: invalid length: expected 32, found 0",
     "codex turn failed: model not supported",
     "codex turn failed: thread limit reached",
+    "codex turn failed: quota exceeded",
+    "codex turn failed: refresh failed due to a transient network error",
+    "codex turn failed: unauthorized model request",
     "codex turn failed: connection reset by peer",
     "codex turn failed: TimeoutError",
     "agent thread limit reached",

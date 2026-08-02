@@ -472,6 +472,70 @@ def test_compact_timeout_cleans_state_without_rotation(tmp_path, monkeypatch):
     assert cs._consecutive_thread_failures == 0
 
 
+def test_completed_failure_normalizes_terminal_shapes_and_preserves_cleanup(tmp_path):
+    """Terminal errors reject once after absorbing usage and clearing tools."""
+    from puffo_agent.agent.adapters.codex_session import _PendingTurn
+
+    async def drive():
+        cs = CodexSession("completed-failure", tmp_path / "session.json", ["true"])
+        cs._conversation_id = "thread-current"
+        turn = _PendingTurn(1, time.time())
+        turn.provider_turn_id = "user-turn"
+        cs._active_turn = turn
+
+        async def admitted(_event):
+            pass
+
+        cs.register_continuation_callback(admitted, "continuation")
+        await cs._handle_notification("turn/completed", {
+            "turn": {
+                "status": "completed",
+                "error": {"message": "nested completion failure"},
+                "usage": {"input_tokens": 12, "output_tokens": 34},
+            },
+        })
+        assert turn.completed.done()
+        assert isinstance(turn.completed.exception(), RuntimeError)
+        assert "nested completion failure" in str(turn.completed.exception())
+        assert (turn.input_tokens, turn.output_tokens) == (12, 34)
+        assert cs._continuation_admissions == []
+
+        # A late terminal frame must not overwrite the original exception.
+        await cs._handle_notification("turn/completed", {
+            "error": {"message": "late completion failure"},
+        })
+        assert "nested completion failure" in str(turn.completed.exception())
+
+        for params, expected in (
+            ({"turn": {"status": "failed"}}, "status failed"),
+            ({"turn": {"status": "error"}}, "status error"),
+            ({"error": {"message": "top-level completion failure"}},
+             "top-level completion failure"),
+        ):
+            candidate = _PendingTurn(2, time.time())
+            cs._active_turn = candidate
+            await cs._handle_notification("turn/completed", params)
+            assert isinstance(candidate.completed.exception(), RuntimeError)
+            assert expected in str(candidate.completed.exception())
+
+    asyncio.run(drive())
+
+
+def test_completed_sparse_and_nested_success_remain_compatible(tmp_path):
+    from puffo_agent.agent.adapters.codex_session import _PendingTurn
+
+    async def drive():
+        cs = CodexSession("completed-success", tmp_path / "session.json", ["true"])
+        for params in ({}, {"turn": {"status": "completed"}}):
+            turn = _PendingTurn(1, time.time())
+            cs._active_turn = turn
+            await cs._handle_notification("turn/completed", params)
+            assert turn.completed.done()
+            assert turn.completed.exception() is None
+
+    asyncio.run(drive())
+
+
 def test_admission_fires_only_on_correlated_user_turn_started(tmp_path):
     from puffo_agent.agent.adapters.codex_session import _PendingTurn
 
