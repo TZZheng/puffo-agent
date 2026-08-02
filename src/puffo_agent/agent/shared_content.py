@@ -177,7 +177,51 @@ an agent to force).
 # ── Default skill markdowns ───────────────────────────────────────────────────
 
 
-DEFAULT_SKILL_SEND_MESSAGE = """\
+PARTICIPATION_AND_CONTINUATION_GUIDANCE = """\
+Determine whether the interaction expects distinct participation from each
+addressed participant or a shared result that any participant can satisfy. In
+distinct-participation mode, another participant's response does not substitute
+for yours. In shared-result mode, an existing result may satisfy the request,
+so do not duplicate it.
+
+Agent messages may legitimately trigger further Agent work or replies. When
+your next action would continue a recurring interaction, judge whether another
+iteration remains meaningful: whether it adds information, changes shared
+state, resolves uncertainty, advances work, or moves toward a useful outcome.
+Continue meaningful or converging interaction. If it would only repeat,
+oscillate, or self-propagate without meaningful progress, stop, wait, or remain
+silent. Explicitly requested repetition follows its intended scope and stopping
+condition.
+
+Use earlier `self=true` rows as evidence of what you already attempted or
+completed; they do not by themselves force either another reply or silence. If
+the participation mode or value of continuing is materially ambiguous and the
+available context cannot resolve it, ask one concise human clarification. First
+check whether an equivalent clarification is already present; if so, wait for
+its answer instead of asking again."""
+
+
+HELD_SEND_RECONSIDERATION_GUIDANCE = f"""\
+Treat a held draft as evidence of an attempted response, not as permission or
+an obligation to send it. Reconsider the originating interaction, the exact
+draft, its visible basis, and the latest context together. Separate the draft
+text from its purpose: newer context can make it wrong, redundant, unnecessary,
+or still needed.
+
+{PARTICIPATION_AND_CONTINUATION_GUIDANCE}
+
+Then judge whether the draft is context-dependent: can newer messages change
+its correctness, sequence position, target, necessity, interpretation,
+participation mode, or continuation value? This includes turn-taking and
+shared-state coordination. If so, revise against the latest context and send
+with normal freshness; do not use `send_anyway`. Use the unchanged draft with
+`send_anyway=True` only after confirming newer context cannot affect those
+semantics. Otherwise send nothing. `send_anyway=True` is rare and model-owned,
+never automatic; technical eligibility is not a recommendation. Revised or
+context-derived content uses normal freshness and may be held again."""
+
+
+DEFAULT_SKILL_SEND_MESSAGE = f"""\
 # Skill: send_message
 
 Post a message to a Puffo.ai channel or DM a user.
@@ -222,31 +266,10 @@ across channel switches.
 A held channel result preserves evidence, not permission to override: it
 returns `state="held"`, the exact target, the unchanged draft, the draft
 boundary/latest pair, `visible_draft_basis`, and, when `context_ready=true`,
-`new_channel_context`. Inspect that returned context carefully. Treat the held
-draft as evidence of an attempted contribution: reconsider the originating
-request, that draft, and newer context together, plus any Inbox or history
-context you decide is useful, to decide whether its underlying contribution is
-still needed, should be revised to fit the current conversation, has genuinely
-been satisfied or cancelled, or should remain unsent. Separate the exact draft
-text from that underlying contribution: newer context may invalidate the draft
-while leaving the contribution unresolved. Treat it as satisfied or cancelled
-only when current context actually resolves its underlying purpose, not merely
-because peers advanced the conversation or produced overlapping content. Then
-judge whether the draft is context-dependent: can newer messages change its
-correctness, sequence position, target, necessity, or interpretation? This
-includes turn-taking and shared-state coordination. If so, revise against the
-latest context and send with normal freshness; do not use `send_anyway`. When
-the originating request asks multiple participants to contribute separately,
-another participant's overlapping contribution does not satisfy this Agent's
-own contribution; recompute it from the latest ordered context. Use the
-earlier `self=true` context as completion evidence too: if it already fulfills
-this Agent's part of the same originating request, peer progress does not
-reopen that part, so leave a later draft unsent unless current context genuinely
-changes or renews it. Use the
-unchanged draft with `send_anyway=True` only after confirming newer context
-cannot affect those semantics, or send nothing. `send_anyway=True` is rare and
-model-owned, never automatic; technical eligibility is not a recommendation.
-Revised or context-derived content uses normal freshness and may be held again.
+`new_channel_context`. Inspect that returned context carefully.
+
+{HELD_SEND_RECONSIDERATION_GUIDANCE}
+
 When `context_ready=false`,
 do not infer unseen messages: read the relevant tools if more context is needed
 or choose silence. A sequence watermark alone is not semantic context.
@@ -412,7 +435,7 @@ was offline, are not in local storage and won't appear here.
 """
 
 
-DEFAULT_SKILL_READ_INBOX = """\
+DEFAULT_SKILL_READ_INBOX = f"""\
 # Skill: read_inbox
 
 Read pending Puffo messages after the runtime sends a
@@ -445,18 +468,14 @@ message bodies and is not enough context for a reply.
 - A notice is metadata only. It never substitutes for a content-bearing
   Inbox or history read. Use the `send-message` skill for held-send guidance.
 
-**Contribution decision:** Reconstruct the originating request and conversation
-intent from the pending page and relevant `prior_context`. First inspect relevant
-earlier `self=true` rows: when one already fulfills this Agent's part of the same
-originating request, that part stays fulfilled and peer progress does not reopen
-it. Distinguish content that newly creates or changes unresolved work for this
-Agent from peers merely progressing the unchanged request. Peer progress alone
-does not create a new obligation. If no earlier self contribution fulfills the
-part, an originating request or earlier model-owned decision may still leave
-this Agent with an unresolved existing contribution. Use your
-judgment for a genuine follow-up, correction, direct request, changed objective,
-scope, constraint, deliverable, or newly exposed dependency. The final choice
-to send, remain silent, revise, or use `send_anyway` is model-owned.
+**Participation and continuation judgment:** Reconstruct the interaction from
+the pending page and relevant `prior_context`, including relevant `self=true`
+rows.
+
+{PARTICIPATION_AND_CONTINUATION_GUIDANCE}
+
+The final choice to send, remain silent, revise, clarify, or use `send_anyway`
+is model-owned.
 
 **When to use:**
 - When a notice points to pending work relevant to the current decision.

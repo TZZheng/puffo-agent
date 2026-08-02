@@ -6,6 +6,8 @@ from puffo_agent.mcp.puffo_core_tools import register_core_tools
 from puffo_agent.agent.shared_content import (
     DEFAULT_SHARED_CLAUDE_MD,
     DEFAULT_SKILLS,
+    HELD_SEND_RECONSIDERATION_GUIDANCE,
+    PARTICIPATION_AND_CONTINUATION_GUIDANCE,
     ensure_shared_primer,
     rebuild_agent_claude_md,
     rebuild_agent_codex_md,
@@ -88,19 +90,19 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     normalized_read = " ".join(read.split())
     assert "messages" in read and "prior_context" in read and "strictly earlier" in normalized_read
     assert "do not acknowledge pending Inbox rows" in read
-    contribution_guidance = (
-        "Reconstruct the originating request and conversation intent from the pending "
-        "page and relevant `prior_context`."
+    decision_guidance = " ".join(
+        PARTICIPATION_AND_CONTINUATION_GUIDANCE.split()
     )
     all_prompt_surfaces = " ".join(
         " ".join(body.split())
         for body in (DEFAULT_SHARED_CLAUDE_MD, *[body for _, body in DEFAULT_SKILLS.values()])
     )
-    assert normalized_read.count(contribution_guidance) == 1
-    assert all_prompt_surfaces.count(contribution_guidance) == 1
-    assert "Peer progress alone does not create a new obligation." in normalized_read
-    assert "when one already fulfills this Agent's part of the same originating request" in normalized_read
-    assert "that part stays fulfilled and peer progress does not reopen it" in normalized_read
+    assert normalized_read.count(decision_guidance) == 1
+    assert all_prompt_surfaces.count(decision_guidance) == 2
+    assert "distinct participation" in normalized_read
+    assert "shared result" in normalized_read
+    assert "Agent messages may legitimately trigger" in normalized_read
+    assert "ask one concise human clarification" in normalized_read
     assert "For conversation decisions, use the `read-inbox` skill." in DEFAULT_SHARED_CLAUDE_MD
     normalized_primer = " ".join(DEFAULT_SHARED_CLAUDE_MD.split())
     assert "a `target=channel` route uses its `channel_id` without `root_id`" in normalized_primer
@@ -114,15 +116,15 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         "visible_draft_basis", "new_channel_context", "context_ready=true",
         "context_ready=false", "inspect", "revise against the latest context",
         "send with normal freshness",
-        "evidence of an attempted contribution",
-        "reconsider the originating request, that draft, and newer context",
+        "evidence of an attempted response",
+        "reconsider the originating interaction",
         "context-dependent", "sequence position", "shared-state coordination",
-        "do not use `send_anyway`", "use the unchanged draft", "or send nothing",
-        "asks multiple participants to contribute separately",
-        "another participant's overlapping contribution does not satisfy this agent's own contribution",
-        "recompute it from the latest ordered context",
-        "if it already fulfills this agent's part of the same originating request",
-        "peer progress does not reopen that part",
+        "do not use `send_anyway`", "use the unchanged draft", "otherwise send nothing",
+        "distinct-participation mode",
+        "shared-result mode",
+        "meaningful or converging interaction",
+        "self-propagate without meaningful progress",
+        "one concise human clarification",
         "send_anyway=true", "is rare",
         "model-owned", "may be held again", "sequence watermark alone is not semantic context",
         "preserve the `read_inbox` target by default",
@@ -146,6 +148,12 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         "runtime policy",
     ):
         assert forbidden not in read.lower()
+    for obsolete in (
+        "peer progress alone does not create a new obligation",
+        "part stays fulfilled and peer progress does not reopen",
+        "another participant's overlapping contribution does not satisfy",
+    ):
+        assert obsolete not in all_prompt_surfaces.lower()
     send_policy_text = "\n".join((send, DEFAULT_SKILLS["send-message-with-attachments"][1])).lower()
     for forbidden in (
         "**when to use:**", "**when not to use:**", "prefer this over",
@@ -154,10 +162,9 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         assert forbidden not in send_policy_text
 
 
-def test_contribution_guidance_is_absent_from_mcp_descriptions_and_profiles():
-    contribution_guidance = (
-        "Reconstruct the originating request and conversation intent from the pending "
-        "page and relevant `prior_context`."
+def test_conversation_judgment_is_absent_from_mcp_descriptions_and_profiles():
+    decision_guidance = " ".join(
+        PARTICIPATION_AND_CONTINUATION_GUIDANCE.split()
     )
 
     class CapturingMCP:
@@ -172,42 +179,43 @@ def test_contribution_guidance_is_absent_from_mcp_descriptions_and_profiles():
 
     mcp = CapturingMCP()
     register_core_tools(mcp, SimpleNamespace(bridge_client=None))
-    mcp_descriptions = "\n".join(tool.__doc__ or "" for tool in mcp.tools)
-    assert contribution_guidance not in mcp_descriptions
-    assert "originating request and conversation intent" not in mcp_descriptions
+    mcp_descriptions = " ".join(
+        "\n".join(tool.__doc__ or "" for tool in mcp.tools).split()
+    )
+    assert decision_guidance not in mcp_descriptions
+    assert "distinct-participation mode" not in mcp_descriptions
 
     claude, codex = _rebuild(_tmp())
     for generated_profile_surface in (claude, codex):
-        assert contribution_guidance not in generated_profile_surface
-        assert "originating request and conversation intent" not in generated_profile_surface
+        normalized = " ".join(generated_profile_surface.split())
+        assert decision_guidance not in normalized
+        assert "distinct-participation mode" not in normalized
 
 
-def test_read_inbox_guides_origin_self_and_new_obligation_reasoning_only_there():
-    reasoning_method = (
-        "Reconstruct the originating request and conversation intent from the pending "
-        "page and relevant `prior_context`.",
-        "First inspect relevant earlier `self=true` rows: when one already fulfills "
-        "this Agent's part of the same originating request, that part stays fulfilled "
-        "and peer progress does not reopen it.",
-        "Distinguish content that newly creates or changes unresolved work for this "
-        "Agent from peers merely progressing the unchanged request.",
-        "Peer progress alone does not create a new obligation.",
-        "If no earlier self contribution fulfills the part, an originating request "
-        "or earlier model-owned decision may still leave this Agent with an unresolved "
-        "existing contribution.",
-        "Use your judgment for a genuine follow-up, correction, direct request, "
-        "changed objective, scope, constraint, deliverable, or newly exposed dependency.",
-        "The final choice to send, remain silent, revise, or use `send_anyway` is "
-        "model-owned.",
+def test_read_inbox_owns_participation_and_continuation_judgment():
+    decision_guidance = " ".join(
+        PARTICIPATION_AND_CONTINUATION_GUIDANCE.split()
     )
     read = " ".join(DEFAULT_SKILLS["read-inbox"][1].split())
-    assert all(phrase in read for phrase in reasoning_method)
-    assert read.count(reasoning_method[0]) == 1
+    assert read.count(decision_guidance) == 1
+    for phrase in (
+        "distinct participation from each addressed participant",
+        "shared result that any participant can satisfy",
+        "Agent messages may legitimately trigger further Agent work or replies",
+        "Continue meaningful or converging interaction",
+        "repeat, oscillate, or self-propagate without meaningful progress",
+        "ask one concise human clarification",
+        "equivalent clarification is already present",
+        "do not by themselves force either another reply or silence",
+    ):
+        assert phrase in read
     for stale_generic_tail in (
         "Evaluate pending messages together with relevant",
         "useful new contribution",
         "otherwise choose silence",
         "peer activity is evidence to evaluate",
+        "Peer progress alone does not create a new obligation",
+        "peer progress does not reopen",
     ):
         assert stale_generic_tail not in read
 
@@ -219,21 +227,17 @@ def test_read_inbox_guides_origin_self_and_new_obligation_reasoning_only_there()
     codex_skill = (
         root / "workspace" / ".agents" / "skills" / "read-inbox" / "SKILL.md"
     ).read_text(encoding="utf-8")
-    assert all(phrase in " ".join(claude_skill.split()) for phrase in reasoning_method)
-    assert all(phrase in " ".join(codex_skill.split()) for phrase in reasoning_method)
+    assert decision_guidance in " ".join(claude_skill.split())
+    assert decision_guidance in " ".join(codex_skill.split())
     assert codex_skill == claude_skill.replace("mcp__puffo__", "")
 
     other_prompt_surfaces = [" ".join(surface.split()) for surface in (claude, codex)]
     other_prompt_surfaces.extend(
         " ".join(body.split())
         for skill_id, (_, body) in DEFAULT_SKILLS.items()
-        if skill_id != "read-inbox"
+        if skill_id not in {"read-inbox", "send-message"}
     )
-    assert not any(
-        phrase in surface
-        for phrase in reasoning_method
-        for surface in other_prompt_surfaces
-    )
+    assert not any(decision_guidance in surface for surface in other_prompt_surfaces)
 
     class CapturingMCP:
         def __init__(self) -> None:
@@ -247,33 +251,16 @@ def test_read_inbox_guides_origin_self_and_new_obligation_reasoning_only_there()
 
     mcp = CapturingMCP()
     register_core_tools(mcp, SimpleNamespace(bridge_client=None))
-    mcp_descriptions = "\n".join(tool.__doc__ or "" for tool in mcp.tools)
-    assert not any(phrase in mcp_descriptions for phrase in reasoning_method)
-
-
-def test_held_send_reconsiders_an_attempted_existing_contribution():
-    held_method = (
-        "held draft as evidence of an attempted contribution",
-        "reconsider the originating request, that draft, and newer context together",
-        "underlying contribution is still needed",
-        "should be revised to fit the current conversation",
-        "Separate the exact draft text from that underlying contribution",
-        "newer context may invalidate the draft while leaving the contribution unresolved",
-        "not merely because peers advanced the conversation or produced overlapping content",
-        "judge whether the draft is context-dependent",
-        "correctness, sequence position, target, necessity, or interpretation",
-        "revise against the latest context and send with normal freshness",
-        "do not use `send_anyway`",
-        "asks multiple participants to contribute separately",
-        "another participant's overlapping contribution does not satisfy this Agent's own contribution",
-        "recompute it from the latest ordered context",
-        "if it already fulfills this Agent's part of the same originating request",
-        "peer progress does not reopen that part",
-        "use the unchanged draft with `send_anyway=True` only after confirming newer context",
-        "or send nothing",
+    mcp_descriptions = " ".join(
+        "\n".join(tool.__doc__ or "" for tool in mcp.tools).split()
     )
+    assert decision_guidance not in mcp_descriptions
+
+
+def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
+    held_method = " ".join(HELD_SEND_RECONSIDERATION_GUIDANCE.split()).lower()
     send = " ".join(DEFAULT_SKILLS["send-message"][1].split()).lower()
-    assert all(phrase.lower() in send for phrase in held_method)
+    assert send.count(held_method) == 1
 
     root = _tmp()
     _rebuild(root)
@@ -282,7 +269,7 @@ def test_held_send_reconsiders_an_attempted_existing_contribution():
         root / "workspace" / ".agents" / "skills" / "send-message" / "SKILL.md",
     ):
         skill = " ".join(path.read_text(encoding="utf-8").split()).lower()
-        assert all(phrase.lower() in skill for phrase in held_method)
+        assert skill.count(held_method) == 1
 
     other_prompt_surfaces = [" ".join(DEFAULT_SHARED_CLAUDE_MD.split())]
     other_prompt_surfaces.extend(
@@ -290,11 +277,8 @@ def test_held_send_reconsiders_an_attempted_existing_contribution():
         for skill_id, (_, body) in DEFAULT_SKILLS.items()
         if skill_id != "send-message"
     )
-    assert not any(
-        phrase in surface
-        for phrase in held_method
-        for surface in other_prompt_surfaces
-    )
+    held_opening = "Treat a held draft as evidence of an attempted response"
+    assert not any(held_opening in surface for surface in other_prompt_surfaces)
 
 
 def test_harnesses_discover_managed_skills_with_correct_tool_names():

@@ -3163,13 +3163,15 @@ async def _run_composed_peer_progress_case(
             self.turn_inputs.append(read_inbox_result)
             lowered_instructions = " ".join(self.instructions.lower().split())
             for phrase in (
-                "reconstruct the originating request and conversation intent",
+                "reconstruct the interaction",
                 "pending page and relevant `prior_context`",
                 "self=true",
-                "newly creates or changes unresolved work for this agent",
-                "peer progress alone does not create a new obligation",
-                "newly exposed dependency",
-                "send, remain silent, revise, or use `send_anyway`",
+                "distinct participation from each addressed participant",
+                "shared result that any participant can satisfy",
+                "agent messages may legitimately trigger further agent work or replies",
+                "repeat, oscillate, or self-propagate without meaningful progress",
+                "ask one concise human clarification",
+                "send, remain silent, revise, clarify, or use `send_anyway`",
             ):
                 assert phrase in lowered_instructions
 

@@ -26,6 +26,7 @@ from ..crypto.message import (
     encrypt_message_with_content_key,
 )
 from ..crypto.primitives import Ed25519KeyPair
+from .shared_content import HELD_SEND_RECONSIDERATION_GUIDANCE
 
 logger = logging.getLogger(__name__)
 
@@ -1335,29 +1336,7 @@ class SendCoordinator:
                         "space_id": space_id, "channel_id": channel_id,
                         "thread_root_id": held.thread_root_id,
                     },
-                    "decision": (
-                        "Reconsider the originating request, the attempted draft, and "
-                        "the latest context together. Separate the exact draft text "
-                        "from its underlying contribution: newer context can make the "
-                        "draft wrong while that contribution remains unresolved. "
-                        "A draft is context-dependent when newer messages can change "
-                        "its correctness, sequence position, target, necessity, or "
-                        "interpretation, including turn-taking and shared-state "
-                        "coordination. For a context-dependent draft, revise against "
-                        "the latest context and retry with normal freshness; do not "
-                        "use send_anyway. When the originating request asks multiple "
-                        "participants to contribute separately, another participant's "
-                        "overlapping contribution does not satisfy this Agent's own "
-                        "contribution; recompute it from the latest ordered context. "
-                        "Conversely, if an earlier self=true contribution already "
-                        "fulfills this Agent's part of the same originating request, "
-                        "peer progress does not reopen it; leave a later draft unsent "
-                        "unless current context genuinely changes or renews that part. "
-                        "Use the unchanged draft with send_anyway=True "
-                        "only after confirming newer context cannot affect those "
-                        "semantics. Send nothing only when current context actually "
-                        "satisfies or cancels the underlying contribution."
-                    ),
+                    "decision": HELD_SEND_RECONSIDERATION_GUIDANCE,
                 },
             }
             if held.diagnostic:

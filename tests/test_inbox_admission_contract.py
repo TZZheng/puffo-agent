@@ -41,6 +41,7 @@ from puffo_agent.agent.send_coordinator import (
     KEYLESS_CHANNEL_SEND_PATH,
     SendCoordinator,
 )
+from puffo_agent.agent.shared_content import HELD_SEND_RECONSIDERATION_GUIDANCE
 from puffo_agent.agent.message_store import (
     MessageStore,
     ProcessingState,
@@ -483,9 +484,7 @@ async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
     reconsideration = held_result["reconsideration"]
     assert reconsideration["context_ready"] is True
     assert "held peer body" in reconsideration["new_channel_context"]
-    assert "draft wrong while that contribution remains unresolved" in (
-        reconsideration["decision"]
-    )
+    assert reconsideration["decision"] == HELD_SEND_RECONSIDERATION_GUIDANCE
     assert held_result["tool_result_admission"].startswith(
         "[puffo:model-visible-read:"
     )

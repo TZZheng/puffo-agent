@@ -12,6 +12,7 @@ from puffo_agent.agent.send_coordinator import (
     SendCoordinator,
     _HeldEvidence,
 )
+from puffo_agent.agent.shared_content import HELD_SEND_RECONSIDERATION_GUIDANCE
 
 
 @pytest.mark.asyncio
@@ -269,24 +270,7 @@ async def test_held_thread_basis_overrides_only_its_presentation_target():
     )
     output = await coordinator._held_context_output(key, "sp_1", "ch_a")
     reconsideration = output["reconsideration"]
-    decision = reconsideration["decision"].lower()
-    for phrase in (
-        "originating request, the attempted draft, and the latest context",
-        "separate the exact draft text from its underlying contribution",
-        "draft wrong while that contribution remains unresolved",
-        "a draft is context-dependent when newer messages can change",
-        "correctness, sequence position, target, necessity, or interpretation",
-        "for a context-dependent draft, revise against the latest context",
-        "do not use send_anyway",
-        "another participant's overlapping contribution does not satisfy",
-        "recompute it from the latest ordered context",
-        "if an earlier self=true contribution already fulfills",
-        "peer progress does not reopen it",
-        "unless current context genuinely changes or renews that part",
-        "only after confirming newer context cannot affect those semantics",
-        "send nothing only when current context actually satisfies or cancels",
-    ):
-        assert phrase in decision
+    assert reconsideration["decision"] == HELD_SEND_RECONSIDERATION_GUIDANCE
     assert reconsideration["visible_draft_basis"].count(
         "## target=thread space_id=sp_1 channel_id=ch_a thread_root_id=thread-root"
     ) == 1
