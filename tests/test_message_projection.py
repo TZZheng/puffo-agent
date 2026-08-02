@@ -70,6 +70,21 @@ def message(**overrides):
             [message(envelope_kind="runtime", content={"text": "system event"})], (), {},
             '## target=thread space_id=sp_1 channel_id=ch_1 thread_root_id=msg_root\n[seq=42 time=2026-08-01T08:31:12.000Z type=system id=msg_42 self=false encrypted=true] @alice-1234:\nsystem event',
         ),
+        (
+            "nullable_root_and_metadata_light_self_alias",
+            [message(thread_root_id=None, sender_slug="@Wire-Agent", content={"text": "local echo"})],
+            ("wire-agent",), {},
+            '## target=channel space_id=sp_1 channel_id=ch_1\n[seq=42 time=2026-08-01T08:31:12.000Z type=agent id=msg_42 self=true encrypted=true] @Wire-Agent:\nlocal echo',
+        ),
+        (
+            "explicit_sender_type_wins_over_matching_alias",
+            [
+                message(envelope_id="human", thread_root_id=None, sender_slug="wire-agent", content={"text": "human", "sender_type": "human"}),
+                message(envelope_id="system", thread_root_id=None, sender_slug="wire-agent", content={"text": "system", "sender_type": "system"}),
+            ],
+            ("wire-agent",), {},
+            '## target=channel space_id=sp_1 channel_id=ch_1\n[seq=42 time=2026-08-01T08:31:12.000Z type=human id=human self=true encrypted=true] @wire-agent:\nhuman\n[seq=42 time=2026-08-01T08:31:12.000Z type=system id=system self=true encrypted=true] @wire-agent:\nsystem',
+        ),
     ],
 )
 def test_canonical_message_projection_matrix(name, rows, aliases, reply_counts, expected):

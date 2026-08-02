@@ -1,6 +1,8 @@
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
+from puffo_agent.mcp.puffo_core_tools import register_core_tools
 from puffo_agent.agent.shared_content import (
     DEFAULT_SHARED_CLAUDE_MD,
     DEFAULT_SKILLS,
@@ -86,6 +88,16 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     normalized_read = " ".join(read.split())
     assert "messages" in read and "prior_context" in read and "strictly earlier" in normalized_read
     assert "do not acknowledge pending Inbox rows" in read
+    contribution_guidance = "Send only when the new content makes a useful new contribution; otherwise choose silence."
+    all_prompt_surfaces = " ".join(
+        " ".join(body.split())
+        for body in (DEFAULT_SHARED_CLAUDE_MD, *[body for _, body in DEFAULT_SKILLS.values()])
+    )
+    assert normalized_read.count(contribution_guidance) == 1
+    assert all_prompt_surfaces.count(contribution_guidance) == 1
+    assert "Arrival or peer activity is evidence to evaluate, not an automatic reply trigger." in normalized_read
+    assert "For conversation decisions, use the `read-inbox` skill." in DEFAULT_SHARED_CLAUDE_MD
+    assert "useful new contribution" not in DEFAULT_SHARED_CLAUDE_MD
     assert "does not acknowledge pending Inbox work" in " ".join(history.split())
     assert "does not acknowledge pending Inbox work" in " ".join(post.split())
     normalized_send = " ".join(send.lower().split())
@@ -115,6 +127,34 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         'prefer "human"', "spontaneous cross-posts",
     ):
         assert forbidden not in send_policy_text
+
+
+def test_contribution_guidance_is_absent_from_mcp_descriptions_and_profiles():
+    contribution_guidance = (
+        "Send only when the new content makes a useful new contribution; "
+        "otherwise choose silence."
+    )
+
+    class CapturingMCP:
+        def __init__(self) -> None:
+            self.tools = []
+
+        def tool(self):
+            def register(function):
+                self.tools.append(function)
+                return function
+            return register
+
+    mcp = CapturingMCP()
+    register_core_tools(mcp, SimpleNamespace(bridge_client=None))
+    mcp_descriptions = "\n".join(tool.__doc__ or "" for tool in mcp.tools)
+    assert contribution_guidance not in mcp_descriptions
+    assert "useful new contribution" not in mcp_descriptions
+
+    claude, codex = _rebuild(_tmp())
+    for generated_profile_surface in (claude, codex):
+        assert contribution_guidance not in generated_profile_surface
+        assert "useful new contribution" not in generated_profile_surface
 
 
 def test_harnesses_discover_managed_skills_with_correct_tool_names():

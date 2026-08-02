@@ -74,9 +74,7 @@ message, or write `[SILENT]` when you choose not to send. For a DM use
 Use the `send-message` skill for destinations, visibility, held results,
 and `send_anyway`.
 
-Conversation context can include a prior contribution, a follow-up, a
-correction, a mention, or a dependency; inspect its semantic rows before making
-your own choice.
+For conversation decisions, use the `read-inbox` skill.
 
 ## Spaces, channels, DMs
 
@@ -413,6 +411,13 @@ message bodies and is not enough context for a reply.
   and never replaces the exact pending `messages` page.
 - A notice is metadata only. It never substitutes for a content-bearing
   Inbox or history read. Use the `send-message` skill for held-send guidance.
+
+**Contribution decision:** Evaluate pending messages together with relevant
+`prior_context`, including rows marked `self=true`. Send only when the new
+content makes a useful new contribution; otherwise choose silence. Arrival or
+peer activity is evidence to evaluate, not an automatic reply trigger. Whether
+to follow up, correct, respond to changed work or a direct request, or address
+multiple targets remains your judgment.
 
 **When to use:**
 - When a notice points to pending work relevant to the current decision.

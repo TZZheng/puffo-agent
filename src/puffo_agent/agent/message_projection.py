@@ -14,6 +14,11 @@ def _content(message: Any) -> Mapping[str, Any]:
     return content if isinstance(content, Mapping) else {}
 
 
+def _normalized_slug(value: Any) -> str:
+    """Normalize the runtime's slug-shaped identities for comparison."""
+    return str(value or "").strip().lstrip("@").lower()
+
+
 def _quoted(value: Any) -> str:
     """Quote readable annotations without letting them alter the row grammar."""
     return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
@@ -33,8 +38,8 @@ def message_text(message: Any) -> str:
 def _dm_peer(message: Any, current_agent_aliases: Sequence[str] = ()) -> str:
     sender = str(_value(message, "sender_slug") or "")
     recipient = str(_value(message, "recipient_slug") or "")
-    aliases = {str(alias).lstrip("@") for alias in current_agent_aliases if alias}
-    if sender.lstrip("@") in aliases and recipient:
+    aliases = {_normalized_slug(alias) for alias in current_agent_aliases if alias}
+    if _normalized_slug(sender) in aliases and recipient:
         return recipient.lstrip("@")
     return (sender or recipient or "unknown").lstrip("@")
 
@@ -51,7 +56,7 @@ def target_label(
     if not channel_id or str(_value(message, "envelope_kind", "")) == "dm":
         return f"target=dm peer_id={_dm_peer(message, current_agent_aliases)}"
     space_id = str(_value(message, "space_id") or "unknown-space")
-    effective_thread_root_id = thread_root_id or str(_value(message, "thread_root_id", ""))
+    effective_thread_root_id = str(thread_root_id or _value(message, "thread_root_id", "") or "")
     target = "thread" if effective_thread_root_id else "channel"
     header = f"target={target} space_id={space_id}"
     header += _annotation("space", content.get("space_name"))
@@ -63,7 +68,7 @@ def target_label(
     return header
 
 
-def sender_type(message: Any) -> str:
+def sender_type(message: Any, *, current_agent_aliases: Sequence[str] = ()) -> str:
     content = _content(message)
     explicit = content.get("sender_type") or _value(message, "sender_type", "")
     if explicit in {"human", "agent", "system"}:
@@ -74,12 +79,15 @@ def sender_type(message: Any) -> str:
         return "system"
     if content.get("is_from_operator") or content.get("sender_is_human") or _value(message, "sender_is_human", False):
         return "human"
+    aliases = {_normalized_slug(alias) for alias in current_agent_aliases if alias}
+    if _normalized_slug(_value(message, "sender_slug")) in aliases:
+        return "agent"
     return "unknown"
 
 
 def _author(message: Any) -> tuple[str, str]:
     content = _content(message)
-    slug = str(_value(message, "sender_slug") or "unknown") .lstrip("@")
+    slug = str(_value(message, "sender_slug") or "unknown").lstrip("@")
     name = content.get("sender_display_name") or content.get("sender_owner_slug")
     return slug, str(name or "")
 
@@ -102,13 +110,13 @@ def _attachment_count(message: Any) -> int | None:
 def format_message_row(message: Any, *, current_agent_aliases: Sequence[str] = (), reply_count: int | None = None) -> str:
     seq = _value(message, "server_seq", None)
     seq_text = str(seq) if isinstance(seq, int) else "unsequenced"
-    aliases = {str(alias).lstrip("@") for alias in current_agent_aliases if alias}
+    aliases = {_normalized_slug(alias) for alias in current_agent_aliases if alias}
     author, display_name = _author(message)
     encrypted = bool(_value(message, "is_encrypted", True))
     fields = [
-        f"seq={seq_text}", f"time={iso_time(message)}", f"type={sender_type(message)}",
+        f"seq={seq_text}", f"time={iso_time(message)}", f"type={sender_type(message, current_agent_aliases=current_agent_aliases)}",
         f"id={_value(message, 'envelope_id', 'unknown')}",
-        f"self={'true' if author in aliases else 'false'}", f"encrypted={'true' if encrypted else 'false'}",
+        f"self={'true' if _normalized_slug(author) in aliases else 'false'}", f"encrypted={'true' if encrypted else 'false'}",
     ]
     count = _attachment_count(message)
     if count is not None:
