@@ -41,6 +41,7 @@ from .message_store import (
     StoredMessage,
 )
 from ._logging import log_runtime_event
+from .message_projection import format_message_group
 
 logger = logging.getLogger(__name__)
 
@@ -238,7 +239,9 @@ def format_stored_message(
     *,
     current_agent_aliases: Sequence[str] = (),
 ) -> str:
-    """Exact per-message model view with optional current-Agent attribution."""
+    """Readable per-message model view (legacy entry point for callers)."""
+    return format_message_group((item,))
+    # Historical structured envelope retained below for source compatibility.
     route = route_for(item)
     content = item.content
     attachments: list[str] = []
@@ -704,15 +707,28 @@ class HeldRecoverySource:
             recovered_through_seq=latest_seq,
             synchronized=True,
         )
-        return ({
-            "space_id": space_id,
-            "channel_id": channel_id,
-            "envelope_id": latest_envelope_id,
-            "server_seq": latest_seq,
-            "latest_seq": latest_seq,
-            "latest_envelope_id": latest_envelope_id,
-            "provider_session_id": provider_session_id,
-        },)
+        through = await self.runtime.store.get_model_visible_through_seq(
+            active.turn_id, space_id, channel_id,
+        )
+        rows = await self.runtime.store.get_held_reconsideration_rows(
+            space_id=space_id, channel_id=channel_id,
+            after_seq=through if through is not None else -1,
+            through_seq=latest_seq,
+        )
+        # The terminal pair has already been checked above; retain it in the
+        # returned local row set so the coordinator can prove exact readiness.
+        projected: list[Mapping[str, Any]] = []
+        for row in rows:
+            projected.append({
+                "space_id": row.space_id, "channel_id": row.channel_id,
+                "thread_root_id": row.thread_root_id or "",
+                "envelope_id": row.envelope_id, "server_seq": row.server_seq,
+                "latest_seq": latest_seq, "latest_envelope_id": latest_envelope_id,
+                "provider_session_id": provider_session_id, "sender_slug": row.sender_slug,
+                "envelope_kind": row.envelope_kind, "sent_at": row.sent_at,
+                "is_encrypted": row.is_encrypted, "content": row.content,
+            })
+        return tuple(projected)
 
 
 TurnRunner = Callable[[PlannedTurn], Awaitable[Any]]

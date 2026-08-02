@@ -117,6 +117,10 @@ class _HeldEvidence:
     latest_seq: int
     latest_envelope_id: str
     synchronized: bool = False
+    draft: str = ""
+    based_on_through_seq: int | None = None
+    thread_root_id: str = ""
+    recovered_messages: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -282,6 +286,10 @@ class SendCoordinator:
                 result.get("latest_seq"), result.get("latest_envelope_id"),
             )
             result["synchronized"] = synchronized
+            session_id, turn_id = self._turn_identity()
+            result.update(await self._held_context_output(
+                (session_id, turn_id, space_id, destination), space_id, destination,
+            ))
         return result
 
     async def _send_keyless(
@@ -559,7 +567,9 @@ class SendCoordinator:
             if result.state == "held":
                 if result.latest_seq is not None and result.latest_envelope_id:
                     await self._record_held(
-                        held_key, result.latest_seq, result.latest_envelope_id
+                        held_key, result.latest_seq, result.latest_envelope_id,
+                        draft=request.caption if request.attachment_paths else request.text,
+                        based_on_through_seq=seen_seq, thread_root_id=root_id or "",
                     )
                 result.note = "No channel message was committed; inspect newer Inbox context."
                 synchronized = await self._recover_held(
@@ -576,6 +586,7 @@ class SendCoordinator:
             output = result.to_dict()
             if result.state == "held":
                 output["synchronized"] = synchronized
+                output.update(await self._held_context_output(held_key, space_id, channel_id))
             if reconsideration is not None:
                 output["_reconsideration_audit"] = (
                     reconsideration.audit_fields()
@@ -810,7 +821,10 @@ class SendCoordinator:
         elif result.state == "held":
             if result.latest_seq is not None and result.latest_envelope_id:
                 await self._record_held(
-                    held_key, result.latest_seq, result.latest_envelope_id
+                    held_key, result.latest_seq, result.latest_envelope_id,
+                    draft=request.caption if request.attachment_paths else request.text,
+                    based_on_through_seq=seen_seq,
+                    thread_root_id=str(resolved.get("root_id") or request.root_id or ""),
                 )
             result.note = (
                 "No message was sent because the channel advanced beyond this "
@@ -820,6 +834,10 @@ class SendCoordinator:
                 f"unsent.{resolved['note']}"
             )
         output = result.to_dict()
+        if result.state == "held":
+            # Native sends recover in ``_send_request``; return the immutable
+            # draft/basis now and enrich it after recovery below.
+            output.update(await self._held_context_output(held_key, space_id, channel_id))
         if reconsideration is not None:
             output["_reconsideration_audit"] = reconsideration.audit_fields()
         return output
@@ -1243,6 +1261,10 @@ class SendCoordinator:
         key: tuple[str, str, str, str],
         latest_seq: int,
         latest_envelope_id: str,
+        *,
+        draft: str = "",
+        based_on_through_seq: int | None = None,
+        thread_root_id: str = "",
     ) -> None:
         async with self._held_lock:
             old = self._held_evidence.get(key)
@@ -1257,7 +1279,33 @@ class SendCoordinator:
                 self._held_evidence[key] = _HeldEvidence(
                     latest_seq=latest_seq,
                     latest_envelope_id=latest_envelope_id,
+                    draft=draft,
+                    based_on_through_seq=based_on_through_seq,
+                    thread_root_id=thread_root_id,
                 )
+
+    async def _held_context_output(
+        self, key: tuple[str, str, str, str], space_id: str, channel_id: str,
+    ) -> dict[str, Any]:
+        async with self._held_lock:
+            held = self._held_evidence.get(key)
+            if held is None:
+                return {"context_ready": False}
+            rows = list(held.recovered_messages)
+            data: dict[str, Any] = {
+                "context_ready": bool(held.synchronized and rows),
+                "draft": held.draft,
+                "based_on_through_seq": held.based_on_through_seq,
+                "target": {
+                    "space_id": space_id, "channel_id": channel_id,
+                    "thread_root_id": held.thread_root_id,
+                },
+            }
+        if rows:
+            from .message_projection import format_message_group
+            data["new_messages"] = format_message_group(rows)
+            data["recovered_message_ids"] = [str(row.get("envelope_id", "")) for row in rows]
+        return {key: value for key, value in data.items() if value is not None}
 
     async def _consume_held(
         self, key: tuple[str, str, str, str]
@@ -1406,6 +1454,13 @@ class SendCoordinator:
             ):
                 return False
             current.synchronized = True
+            # Only locally returned rows with a full plaintext projection are
+            # model evidence. The metadata-only sentinel remains sufficient for
+            # old callers' synchronization proof but never claims readiness.
+            current.recovered_messages = [
+                dict(row) for row in rows
+                if isinstance(row, Mapping) and "content" in row
+            ]
         return True
 
 

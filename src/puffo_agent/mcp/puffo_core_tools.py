@@ -37,6 +37,7 @@ from ..crypto.message import (
 from ..crypto.primitives import Ed25519KeyPair
 from ..limits import MESSAGE_SEGMENT_CHARS
 from ..agent.context_controller import MODEL_VISIBLE_READ_RECEIPT_PREFIX
+from ..agent.message_projection import format_message_group, target_label
 from ..agent._logging import log_runtime_event
 from ..agent.send_coordinator import (
     SemanticSendRequest,
@@ -1006,19 +1007,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             tool_name="get_channel_history",
             tool_arguments=tool_arguments,
         )
-        lines = []
-        for entry in roots:
-            m = entry.message
-            ts = _ts_to_iso(m.sent_at)
-            text = _history_text(m.content).replace("\n", " ")
-            suffix = (
-                f"  ({entry.reply_count} repl{'y' if entry.reply_count == 1 else 'ies'})"
-                if entry.reply_count > 0 else ""
-            )
-            lines.append(
-                f"{ts}  {_enc_tag(m)}  post:{m.envelope_id}  @{m.sender_slug}: {text}{suffix}"
-            )
-        result = "\n".join(lines)
+        result = format_message_group([entry.message for entry in roots], reply_counts={entry.message.envelope_id: entry.reply_count for entry in roots})
         return f"{result}\n{receipt_marker}" if receipt_marker else result
 
     @mcp.tool()
@@ -1045,12 +1034,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
         if not msgs:
             return "(no direct messages with that peer in the requested window)"
-        lines = []
-        for m in msgs:
-            ts = _ts_to_iso(m.sent_at)
-            text = _history_text(m.content).replace("\n", " ")
-            lines.append(f"{ts}  {_enc_tag(m)}  msg:{m.envelope_id}  @{m.sender_slug}: {text}")
-        return "\n".join(lines)
+        return format_message_group(msgs)
 
     @mcp.tool()
     async def get_thread_history(
@@ -1105,14 +1089,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             tool_name="get_thread_history",
             tool_arguments=tool_arguments,
         )
-        lines = []
-        for m in msgs:
-            ts = _ts_to_iso(m.sent_at)
-            text = _history_text(m.content).replace("\n", " ")
-            lines.append(
-                f"{ts}  {_enc_tag(m)}  post:{m.envelope_id}  @{m.sender_slug}: {text}"
-            )
-        result = "\n".join(lines)
+        result = format_message_group(msgs)
         return f"{result}\n{receipt_marker}" if receipt_marker else result
 
     @mcp.tool()
@@ -1307,21 +1284,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             tool_arguments={"post_ref": post_ref},
         )
 
-        ts = _ts_to_iso(msg.sent_at)
-        content_str = _history_text(msg.content)
-        lines = [
-            f"envelope_id: {msg.envelope_id}",
-            f"sender: @{msg.sender_slug}",
-            f"timestamp: {ts}",
-            f"kind: {msg.envelope_kind}",
-        ]
-        if msg.channel_id:
-            lines.append(f"channel_id: {msg.channel_id}")
-        if msg.thread_root_id:
-            lines.append(f"thread_root_id: {msg.thread_root_id}")
-        lines.append(f"is_encrypted: {str(getattr(msg, 'is_encrypted', True)).lower()}")
-        lines.append(f"message:\n{content_str}")
-        result = "\n".join(lines)
+        result = format_message_group([msg])
         return f"{result}\n{receipt_marker}" if receipt_marker else result
 
     @mcp.tool()
@@ -1401,6 +1364,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             tool_arguments=tool_arguments,
         )
         result = (
+            f"source target={target_label(msg)} envelope_id={msg.envelope_id}\n"
             f"segment {segment}/{seg_count - 1} "
             f"(chars {start}..{end - 1} of {total}):\n{chunk}"
         )

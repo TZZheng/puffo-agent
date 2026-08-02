@@ -187,6 +187,22 @@ The repository has a broad pytest suite. Useful clusters:
 
 ## Architectural Invariants
 
+## Model-facing conversation projection (current state)
+
+`agent.message_projection` is the common readable row owner for Inbox rows,
+channel/thread/DM history, and single-post reads. It groups rows under an
+explicit space/channel/thread or DM target and renders the daemon-owned
+`server_seq`, ISO time, sender type, deterministic author display, and body.
+Pagination/status and metadata-only wake notices remain tool-specific.
+
+On a coordinated held channel send the Server still returns only its strict
+metadata contract. `HeldRecoverySource` waits for WebSocket/signed catch-up,
+then `MessageStore` supplies bounded decrypted local rows. `SendCoordinator`
+returns the original draft, exact target, draft boundary, and those local rows
+only when the exact terminal watermark is proven. Server, E2EE ownership,
+public MCP arguments, RPC, and WS-local v2 bundles are unchanged. The older
+`PuffoAgent._format_user_block()` remains a legacy compatibility projection.
+
 - Agent lifecycle is file-driven and reconciled by the daemon.
 - Worker processes/tasks are per-agent; agent state is isolated on disk.
 - The bridge and control plane mutate desired state, not running workers

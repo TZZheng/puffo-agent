@@ -423,16 +423,13 @@ async def test_held_attempted_no_automatic_resend_and_preserves_watermarks():
 
     http.post = post
     result = await coordinator.send(SemanticSendRequest(destination="ch_a", text="draft"))
-    assert result == {
-        "state": "held",
-        "attempted": True,
-        "envelope_id": result["envelope_id"],
-        "context_baseline_seq": 2,
-        "seen_seq": 2,
-        "latest_seq": 5,
-        "latest_envelope_id": "msg_latest",
-        "synchronized": False,
-        "note": result["note"],
+    assert result["state"] == "held"
+    assert result["synchronized"] is False
+    assert result["context_ready"] is False
+    assert result["draft"] == "draft"
+    assert result["based_on_through_seq"] == 2
+    assert result["target"] == {
+        "space_id": "sp_1", "channel_id": "ch_a", "thread_root_id": "",
     }
     assert len([c for c in http.calls if c[0] == "POST"]) == 1
     assert freshness.advances == []

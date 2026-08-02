@@ -2071,6 +2071,32 @@ class MessageStore:
             rows = await cursor.fetchall()
         return [self._row_to_msg(r) for r in reversed(rows)]
 
+    async def get_held_reconsideration_rows(
+        self,
+        *,
+        space_id: str,
+        channel_id: str,
+        after_seq: int,
+        through_seq: int,
+        limit: int = 50,
+    ) -> list[StoredMessage]:
+        """Return the bounded locally-decrypted channel interval for a held send.
+
+        The caller still proves the terminal envelope separately.  Keeping this
+        query in the store makes it impossible for the server response to be
+        mistaken for plaintext context.
+        """
+        db = await self._ensure_db()
+        async with db.execute(
+            """SELECT * FROM messages
+               WHERE space_id = ? AND channel_id = ?
+                 AND server_seq IS NOT NULL AND server_seq > ? AND server_seq <= ?
+               ORDER BY server_seq ASC LIMIT ?""",
+            (space_id, channel_id, after_seq, through_seq, max(1, min(limit, 200))),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [self._row_to_msg(row) for row in rows]
+
     async def get_dm_history(
         self,
         peer_slug: str,
