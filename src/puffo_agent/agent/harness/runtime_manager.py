@@ -320,7 +320,7 @@ class RuntimeManager:
         if not candidates and fact.get("result_omitted") is True:
             if len(matching_candidates) == 1:
                 candidates = matching_candidates
-        if not candidates:
+        if not candidates and self._continuation_admissions:
             logger.warning(
                 "provider tool result did not match an admission "
                 "native_turn=%s active_native_turn=%s tool=%s "
@@ -332,6 +332,7 @@ class RuntimeManager:
                 len(self._continuation_admissions),
                 len(matching_candidates),
             )
+        if not candidates:
             return
         index, admission = max(candidates, key=lambda value: value[1].match_specificity)
         self._continuation_admissions.pop(index)

@@ -541,6 +541,17 @@ async def send_message(
             kind="protocol",
         )
     result.setdefault("attempted", True)
+    if result.get("state") == "held":
+        runtime = getattr(ctx.message_client, "global_runtime", None)
+        if runtime is not None:
+            result = await runtime.stage_held_send_result(
+                result,
+                tool_name=(
+                    "send_message_with_attachments"
+                    if request.attachment_paths else "send_message"
+                ),
+                tool_arguments=request.to_tool_arguments(),
+            )
     return result
 
 

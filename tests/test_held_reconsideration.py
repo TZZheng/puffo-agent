@@ -269,12 +269,16 @@ async def test_held_thread_basis_overrides_only_its_presentation_target():
     )
     output = await coordinator._held_context_output(key, "sp_1", "ch_a")
     reconsideration = output["reconsideration"]
-    decision = reconsideration["decision"]
+    decision = reconsideration["decision"].lower()
     for phrase in (
         "originating request, the attempted draft, and the latest context",
-        "Separate the exact draft text from its underlying contribution",
+        "separate the exact draft text from its underlying contribution",
         "draft wrong while that contribution remains unresolved",
-        "Revise with normal freshness when needed",
+        "a draft is context-dependent when newer messages can change",
+        "correctness, sequence position, target, necessity, or interpretation",
+        "for a context-dependent draft, revise against the latest context",
+        "do not use send_anyway",
+        "only after confirming newer context cannot affect those semantics",
         "send nothing only when current context actually satisfies or cancels",
     ):
         assert phrase in decision

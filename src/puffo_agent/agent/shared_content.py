@@ -225,11 +225,15 @@ text from that underlying contribution: newer context may invalidate the draft
 while leaving the contribution unresolved. Treat it as satisfied or cancelled
 only when current context actually resolves its underlying purpose, not merely
 because peers advanced the conversation or produced overlapping content. Then
-choose one outcome: revise and send with normal freshness; use the unchanged
-draft with `send_anyway=True` only when it is still clear and appropriate; or
-send nothing. `send_anyway=True` is rare and model-owned, never automatic;
-technical eligibility is not a recommendation. Revised or context-derived
-content uses normal freshness and may be held again. When `context_ready=false`,
+judge whether the draft is context-dependent: can newer messages change its
+correctness, sequence position, target, necessity, or interpretation? This
+includes turn-taking and shared-state coordination. If so, revise against the
+latest context and send with normal freshness; do not use `send_anyway`. Use the
+unchanged draft with `send_anyway=True` only after confirming newer context
+cannot affect those semantics, or send nothing. `send_anyway=True` is rare and
+model-owned, never automatic; technical eligibility is not a recommendation.
+Revised or context-derived content uses normal freshness and may be held again.
+When `context_ready=false`,
 do not infer unseen messages: read the relevant tools if more context is needed
 or choose silence. A sequence watermark alone is not semantic context.
 

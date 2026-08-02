@@ -317,15 +317,7 @@ async def _dispatch_semantic_send(
                 result = await runtime.stage_held_send_result(
                     result,
                     tool_name=tool_name,
-                    # Match the public tool's stable semantic core. Optional
-                    # defaults are provider-normalized differently, so adding
-                    # them here would make a genuine original result ambiguous.
-                    tool_arguments=(
-                        _held_send_tool_arguments(request, attachments=False)
-                        if not request.attachment_paths else _held_send_tool_arguments(
-                            request, attachments=True,
-                        )
-                    ),
+                    tool_arguments=request.to_tool_arguments(),
                 )
             return result
         return failed_result(
@@ -357,25 +349,6 @@ async def _dispatch_semantic_send(
         "persistent send coordinator is unavailable",
         kind="coordinator_unavailable",
     )
-
-
-def _held_send_tool_arguments(
-    request: SemanticSendRequest, *, attachments: bool,
-) -> dict[str, Any]:
-    """Mirror the actual public call without turning omitted defaults into requirements."""
-    arguments: dict[str, Any] = {
-        "channel": request.destination,
-        **({"caption": request.caption, "paths": list(request.attachment_paths)}
-           if attachments else {"text": request.text}),
-    }
-    if request.root_id:
-        arguments["root_id"] = request.root_id
-    if request.visibility_level != "default":
-        arguments["visibility_level"] = request.visibility_level
-    if request.send_anyway:
-        arguments["send_anyway"] = True
-    return arguments
-
 
 def _note_contact(
     cfg: "PuffoCoreToolsConfig", slug: str, *,

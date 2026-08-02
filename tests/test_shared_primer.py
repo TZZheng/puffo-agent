@@ -107,10 +107,13 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     for phrase in (
         'state="held"', "unchanged draft", "draft boundary/latest pair",
         "visible_draft_basis", "new_channel_context", "context_ready=true",
-        "context_ready=false", "inspect", "revise and send with normal freshness",
+        "context_ready=false", "inspect", "revise against the latest context",
+        "send with normal freshness",
         "evidence of an attempted contribution",
         "reconsider the originating request, that draft, and newer context",
-        "use the unchanged draft", "or send nothing", "send_anyway=true", "is rare",
+        "context-dependent", "sequence position", "shared-state coordination",
+        "do not use `send_anyway`", "use the unchanged draft", "or send nothing",
+        "send_anyway=true", "is rare",
         "model-owned", "may be held again", "sequence watermark alone is not semantic context",
     ):
         assert phrase.lower() in normalized_send
@@ -239,12 +242,15 @@ def test_held_send_reconsiders_an_attempted_existing_contribution():
         "Separate the exact draft text from that underlying contribution",
         "newer context may invalidate the draft while leaving the contribution unresolved",
         "not merely because peers advanced the conversation or produced overlapping content",
-        "revise and send with normal freshness",
-        "use the unchanged draft with `send_anyway=True` only when it is still clear and appropriate",
+        "judge whether the draft is context-dependent",
+        "correctness, sequence position, target, necessity, or interpretation",
+        "revise against the latest context and send with normal freshness",
+        "do not use `send_anyway`",
+        "use the unchanged draft with `send_anyway=True` only after confirming newer context",
         "or send nothing",
     )
-    send = " ".join(DEFAULT_SKILLS["send-message"][1].split())
-    assert all(phrase in send for phrase in held_method)
+    send = " ".join(DEFAULT_SKILLS["send-message"][1].split()).lower()
+    assert all(phrase.lower() in send for phrase in held_method)
 
     root = _tmp()
     _rebuild(root)
@@ -252,8 +258,8 @@ def test_held_send_reconsiders_an_attempted_existing_contribution():
         root / "workspace" / ".claude" / "skills" / "send-message" / "SKILL.md",
         root / "workspace" / ".agents" / "skills" / "send-message" / "SKILL.md",
     ):
-        skill = " ".join(path.read_text(encoding="utf-8").split())
-        assert all(phrase in skill for phrase in held_method)
+        skill = " ".join(path.read_text(encoding="utf-8").split()).lower()
+        assert all(phrase.lower() in skill for phrase in held_method)
 
     other_prompt_surfaces = [" ".join(DEFAULT_SHARED_CLAUDE_MD.split())]
     other_prompt_surfaces.extend(

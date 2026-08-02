@@ -85,6 +85,24 @@ class SemanticSendRequest:
             body["text"] = self.text
         return body
 
+    def to_tool_arguments(self) -> dict[str, Any]:
+        """Mirror the public model call without materializing omitted defaults."""
+        arguments: dict[str, Any] = {"channel": self.destination}
+        if self.attachment_paths:
+            arguments.update({
+                "caption": self.caption,
+                "paths": list(self.attachment_paths),
+            })
+        else:
+            arguments["text"] = self.text
+        if self.root_id:
+            arguments["root_id"] = self.root_id
+        if self.visibility_level != "default":
+            arguments["visibility_level"] = self.visibility_level
+        if self.send_anyway:
+            arguments["send_anyway"] = True
+        return arguments
+
 
 @dataclass
 class SendResult:
@@ -840,9 +858,10 @@ class SendCoordinator:
             result.note = (
                 "No message was sent because the channel advanced beyond this "
                 "turn's visible boundary. Newer context is returned when "
-                "available. You can decide whether to send revised content, "
-                "send the chosen content with send_anyway=true, or leave it "
-                f"unsent.{resolved['note']}"
+                "available. If that context can change the draft's correctness, "
+                "position, necessity, target, or interpretation, revise and retry "
+                "with normal freshness. Use send_anyway only for an unchanged, "
+                f"context-independent draft, or leave it unsent.{resolved['note']}"
             )
         output = result.to_dict()
         if result.state == "held":
@@ -1321,9 +1340,14 @@ class SendCoordinator:
                         "the latest context together. Separate the exact draft text "
                         "from its underlying contribution: newer context can make the "
                         "draft wrong while that contribution remains unresolved. "
-                        "Revise with normal freshness when needed; use the unchanged "
-                        "draft with send_anyway=True only if it is still clear and "
-                        "appropriate; send nothing only when current context actually "
+                        "A draft is context-dependent when newer messages can change "
+                        "its correctness, sequence position, target, necessity, or "
+                        "interpretation, including turn-taking and shared-state "
+                        "coordination. For a context-dependent draft, revise against "
+                        "the latest context and retry with normal freshness; do not "
+                        "use send_anyway. Use the unchanged draft with send_anyway=True "
+                        "only after confirming newer context cannot affect those "
+                        "semantics. Send nothing only when current context actually "
                         "satisfies or cancels the underlying contribution."
                     ),
                 },
