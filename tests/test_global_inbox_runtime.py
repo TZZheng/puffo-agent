@@ -33,7 +33,7 @@ from puffo_agent.agent.global_inbox_runtime import (
     format_stored_message,
     route_for,
 )
-from puffo_agent.agent.shared_content import DEFAULT_SHARED_CLAUDE_MD
+from puffo_agent.agent.shared_content import DEFAULT_SKILLS, DEFAULT_SHARED_CLAUDE_MD
 from puffo_agent.agent.inbox_scheduler import (
     InboxNoticeDelivery,
     NoticeDeliveryCapability,
@@ -3008,7 +3008,8 @@ def test_format_stored_message_marks_only_runtime_identity_aliases(tmp_path):
 
     human = stored("human", "human")
     peer = stored("peer", "peer-agent")
-    self_echo = stored("self", "wire-agent")
+    self_echo = stored("self", "@Wire-Agent")
+    self_echo.thread_root_id = None
 
     assert projection_metadata(format_stored_message(human))["is_self"] is False
     assert projection_metadata(format_stored_message(peer))["is_self"] is False
@@ -3016,6 +3017,12 @@ def test_format_stored_message_marks_only_runtime_identity_aliases(tmp_path):
     assert projection_metadata(
         format_stored_message(self_echo, current_agent_aliases=("wire-agent",))
     )["is_self"] is True
+    rendered = format_stored_message(self_echo, current_agent_aliases=("wire-agent",))
+    assert "## target=channel" in rendered
+    assert "target=thread" not in rendered
+    assert "thread_root_id=None" not in rendered
+    assert " type=agent " in rendered
+    assert projection_metadata(rendered)["is_self"] is True
 
     runtime = GlobalInboxRuntime(
         store=SimpleNamespace(),
@@ -3108,12 +3115,11 @@ async def _run_composed_peer_progress_case(
             self.turn_inputs.append(read_inbox_result)
             lowered_instructions = " ".join(self.instructions.lower().split())
             for phrase in (
-                "prior contribution",
-                "[silent]",
-                "follow-up",
-                "correction",
-                "mention",
-                "dependency",
+                "evaluate pending messages together with relevant",
+                "self=true",
+                "useful new contribution",
+                "otherwise choose silence",
+                "peer activity is evidence to evaluate",
             ):
                 assert phrase in lowered_instructions
 
@@ -3199,7 +3205,7 @@ async def _run_composed_peer_progress_case(
     adapter = ProviderAdapter()
     transport = FakeServerTransport()
     coordinator = FakeCoordinator(transport)
-    provider = DeterministicProvider(DEFAULT_SHARED_CLAUDE_MD)
+    provider = DeterministicProvider(DEFAULT_SKILLS["read-inbox"][1])
     provider_inputs = []
     decisions = []
     runtime = None
