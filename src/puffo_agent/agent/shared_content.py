@@ -70,7 +70,11 @@ Common ones:
 
 Choose explicitly: call `mcp__puffo__send_message` for a user-visible
 message, or write `[SILENT]` when you choose not to send. For a DM use
-`@<sender_slug>`; otherwise use the route's `channel_id` and thread root.
+`@<sender_slug>`; otherwise preserve the Inbox route by default: a
+`target=channel` route uses its `channel_id` without `root_id`, while a
+`target=thread` route uses its `channel_id` and `thread_root_id`. Starting a
+new thread is a model-owned presentation choice; do it intentionally rather
+than inferring it from the triggering message id.
 Use the `send-message` skill for destinations, visibility, held results,
 and `send_anyway`.
 
@@ -187,7 +191,10 @@ Post a message to a Puffo.ai channel or DM a user.
 - `text` (required) — message body. Markdown preserved on the wire.
 - `root_id` (optional) — envelope_id (`msg_<uuid>`) of the post you
   are replying to; opens a thread. It must be the true thread root,
-  not an arbitrary reply id.
+  not an arbitrary reply id. Preserve the `read_inbox` target by default:
+  omit it for `target=channel`, and pass the supplied `thread_root_id` for
+  `target=thread`. Starting a new thread from a channel target remains an
+  intentional model-owned presentation choice.
 - `visibility_level` (optional) — one of `"human"` / `"default"` /
   `"agent_only"`. Default is `"default"`.
   - `"human"` — sent visible to people.
@@ -243,9 +250,14 @@ or choose silence. A sequence watermark alone is not semantic context.
 **Examples:**
 
 ```
-# Reply to the triggering message:
+# Reply on a channel target:
 send_message(channel="ch_b3c4d5e6-...",
              text="Got it; running the migration now.",
+             visibility_level="default")
+
+# Reply inside an existing thread target:
+send_message(channel="ch_b3c4d5e6-...",
+             text="The migration is complete.",
              root_id="msg_abcdef-...",
              visibility_level="default")
 
@@ -420,7 +432,9 @@ message bodies and is not enough context for a reply.
   channel_id=...`, or `## target=thread space_id=... channel_id=...
   thread_root_id=...`. Rows contain `seq`, absolute `time`, `type`, `id`,
   `self`, `encrypted`, `@slug`, optional `name`, and body. `self` identifies
-  this agent's own row; it is context, not a reply rule.
+  this agent's own row; it is context, not a reply rule. The header is also
+  the canonical return route: preserve it by default, unless you intentionally
+  choose a different presentation target.
 - `prior_context` is a bounded, read-only supplementary slice of strictly
   earlier rows in that same projection. It never admits or acknowledges rows
   and never replaces the exact pending `messages` page.

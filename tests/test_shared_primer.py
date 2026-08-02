@@ -100,6 +100,9 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     assert all_prompt_surfaces.count(contribution_guidance) == 1
     assert "Peer progress alone does not create a new obligation." in normalized_read
     assert "For conversation decisions, use the `read-inbox` skill." in DEFAULT_SHARED_CLAUDE_MD
+    normalized_primer = " ".join(DEFAULT_SHARED_CLAUDE_MD.split())
+    assert "a `target=channel` route uses its `channel_id` without `root_id`" in normalized_primer
+    assert "Starting a new thread is a model-owned presentation choice" in normalized_primer
     assert "originating request and conversation intent" not in DEFAULT_SHARED_CLAUDE_MD
     assert "does not acknowledge pending Inbox work" in " ".join(history.split())
     assert "does not acknowledge pending Inbox work" in " ".join(post.split())
@@ -118,8 +121,13 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         "recompute it from the latest ordered context",
         "send_anyway=true", "is rare",
         "model-owned", "may be held again", "sequence watermark alone is not semantic context",
+        "preserve the `read_inbox` target by default",
+        "omit it for `target=channel`",
+        "pass the supplied `thread_root_id` for `target=thread`",
     ):
         assert phrase.lower() in normalized_send
+    assert "the canonical return route" in normalized_read
+    assert "preserve it by default" in normalized_read
     for skill_id in ("attachments", "channel-history", "send-message-with-attachments"):
         body = DEFAULT_SKILLS[skill_id][1]
         assert "visible_draft_basis" not in body
