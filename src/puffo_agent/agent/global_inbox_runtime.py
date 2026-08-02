@@ -202,6 +202,7 @@ class HeldAdmissionEvidence:
 
     active_turn_id: str
     provider_session_id: str
+    provider_turn_id: str
     space_id: str
     channel_id: str
     latest_seq: int
@@ -706,6 +707,7 @@ class HeldRecoverySource:
         evidence = HeldAdmissionEvidence(
             active_turn_id=active.turn_id,
             provider_session_id=provider_session_id,
+            provider_turn_id=active.provider_turn_id or "",
             space_id=space_id, channel_id=channel_id,
             latest_seq=latest_seq, latest_envelope_id=latest_envelope_id,
             displayed_ids=tuple(row.envelope_id for row in rows),
@@ -839,11 +841,15 @@ class GlobalInboxRuntime:
         *,
         planning_cycle_key: str,
         provider_session_id: str,
+        provider_turn_id: str | None = None,
     ) -> None:
         await callback(ProviderAdmissionEvent(
             planning_cycle_key=planning_cycle_key,
             provider_session_id=provider_session_id,
-            provider_turn_id=self.active.provider_turn_id,
+            provider_turn_id=(
+                provider_turn_id
+                if provider_turn_id is not None else self.active.provider_turn_id
+            ),
             admitted_at=datetime.now(timezone.utc),
         ))
 
@@ -890,7 +896,7 @@ class GlobalInboxRuntime:
         receipt = uuid.uuid4().hex
         marker = ToolResultAdmission.build(
             lambda _event: None, correlation_key,
-            self.active.provider_turn_id or "",
+            evidence.provider_turn_id,
             correlation_receipt=receipt,
         ).receipt_marker
         fired = False
@@ -902,8 +908,9 @@ class GlobalInboxRuntime:
             if (
                 self.active.turn_id != active_turn_id
                 or self.active.provider_session_id != provider_session_id
+                or self.active.provider_turn_id != evidence.provider_turn_id
                 or event.provider_session_id != provider_session_id
-                or event.provider_turn_id != self.active.provider_turn_id
+                or event.provider_turn_id != evidence.provider_turn_id
             ):
                 return
             rows = [await self.store.get_message_by_envelope(item) for item in displayed_ids]
@@ -955,6 +962,7 @@ class GlobalInboxRuntime:
             await self._admit_returned_tool_result(
                 admit_held, planning_cycle_key=correlation_key,
                 provider_session_id=provider_session_id,
+                provider_turn_id=evidence.provider_turn_id,
             )
         else:
             register = getattr(self.adapter, "register_continuation_callback", None)

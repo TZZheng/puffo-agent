@@ -71,6 +71,7 @@ class WsLocalSession:
         make_run_id: Callable[[], str] = lambda: f"run_{uuid.uuid4().hex}",
         on_dead: Callable[[str], Awaitable[None]] | None = None,
         on_admitted: Callable[[Bundle], Awaitable[None]] | None = None,
+        on_tool_result: Callable[[str, dict[str, Any], Any], Awaitable[None]] | None = None,
         capabilities: tuple[str, ...] = (),
     ) -> None:
         self.slug = slug
@@ -82,6 +83,7 @@ class WsLocalSession:
         self._on_acked = on_acked
         self._on_dead = on_dead
         self._on_admitted = on_admitted
+        self._on_tool_result = on_tool_result
         self.capabilities = frozenset(capabilities)
         self._now = now
         self._ack_timeout_s = ack_timeout_s
@@ -230,6 +232,8 @@ class WsLocalSession:
                 command_id=call.command_id, ok=False, error=str(exc),
             )))
             return
+        if self._on_tool_result is not None:
+            await self._on_tool_result(call.tool, call.params, result)
         await self._transport.send(encode(ToolResult(
             command_id=call.command_id, ok=True, result=result,
         )))

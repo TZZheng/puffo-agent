@@ -16,6 +16,8 @@ frame loop, relays replies, and judges liveness; the bridge only couples
 from __future__ import annotations
 
 import asyncio
+import re
+from collections.abc import Mapping
 
 from .bundles import Bundle
 
@@ -37,6 +39,20 @@ class WsLocalBridge:
     async def on_acked(self, bundle: Bundle) -> None:
         if self._waiter is not None and not self._waiter.done():
             self._waiter.set_result(None)
+
+    async def on_tool_result(
+        self, tool_name: str, tool_arguments: Mapping[str, object], result: object,
+    ) -> None:
+        """Keep actual tool evidence private while linking it to its receipt."""
+        if self._runtime is None or not isinstance(result, Mapping):
+            return
+        marker = result.get("tool_result_admission")
+        if not isinstance(marker, str):
+            return
+        match = re.search(r"\[puffo:model-visible-read:([^\]]+)\]", marker)
+        observe = getattr(self._runtime.adapter, "observe_tool_result", None)
+        if match is not None and callable(observe):
+            observe(match.group(1), tool_name, tool_arguments)
 
     async def on_admitted(self, bundle: Bundle, frame=None) -> None:
         """Apply the exact model-visible transition; ``ack`` never does."""

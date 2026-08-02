@@ -53,6 +53,7 @@ class _WsLocalContextAdapter:
         self._callback = None
         self._planning_cycle_key = ""
         self._continuations: dict[str, _WsLocalContinuation] = {}
+        self._observed_tool_results: dict[str, tuple[str, Mapping[str, Any]]] = {}
         self._provider_session_id: str | None = None
 
     async def get_context_snapshot(self):
@@ -104,6 +105,18 @@ class _WsLocalContextAdapter:
         if correlation_receipt:
             self._continuations[correlation_receipt] = entry
 
+    def observe_tool_result(
+        self,
+        correlation_receipt: str,
+        tool_name: str,
+        tool_arguments: Mapping[str, Any],
+    ) -> None:
+        """Record the private, actual WS tool invocation for its receipt."""
+        if correlation_receipt:
+            self._observed_tool_results[correlation_receipt] = (
+                tool_name, dict(tool_arguments),
+            )
+
     async def emit_admission(
         self,
         *,
@@ -125,20 +138,22 @@ class _WsLocalContextAdapter:
             entry = self._continuations.get(correlation_key)
             if entry is None:
                 raise RuntimeError("ws-local admission correlation failed")
-            # The frame intentionally carries only the opaque receipt, so a
-            # real WS callback proves its tool result by that unguessable
-            # receipt.  Test/in-process callers that supply observed metadata
-            # must still satisfy the same real-tool and normalized-argument
-            # contract used by the other provider adapters.
+            # The public frame intentionally carries only the opaque receipt.
+            # The bridge supplies the actual private tool invocation recorded
+            # when that receipt was returned; direct in-process callers may
+            # pass the same evidence explicitly.
+            if tool_name is None or tool_arguments is None:
+                observed = self._observed_tool_results.get(correlation_key)
+                if observed is None:
+                    raise RuntimeError("ws-local admission tool result unavailable")
+                tool_name, tool_arguments = observed
             if (
-                tool_name is not None
-                and entry.tool_names
+                entry.tool_names
                 and tool_name not in entry.tool_names
             ):
                 raise RuntimeError("ws-local admission tool correlation failed")
             if (
-                tool_arguments is not None
-                and entry.normalized_arguments
+                entry.normalized_arguments
                 and normalize_tool_arguments(tool_arguments)
                 != entry.normalized_arguments
             ):
@@ -148,6 +163,7 @@ class _WsLocalContextAdapter:
             for key, registered in tuple(self._continuations.items()):
                 if registered == entry:
                     self._continuations.pop(key, None)
+            self._observed_tool_results.pop(correlation_key, None)
         self._provider_session_id = f"ws-local:{turn_id}"
         await callback(ProviderAdmissionEvent(
             planning_cycle_key=planning_cycle_key,
@@ -275,6 +291,7 @@ async def serve_attached(transport: Transport, hub: WsLocalHub) -> None:
             tool_dispatch=_build_tool_dispatch(point),
             on_acked=bridge.on_acked,
             on_admitted=bridge.on_admitted,
+            on_tool_result=bridge.on_tool_result,
             on_dead=bridge.on_dead,
             capabilities=capabilities,
             now=time.monotonic,

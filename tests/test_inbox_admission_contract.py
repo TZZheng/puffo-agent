@@ -539,6 +539,33 @@ async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
 
 
 @pytest.mark.asyncio
+async def test_held_admission_freezes_provider_turn_at_staging(
+    boundary_harness: BoundaryHarness,
+):
+    h = boundary_harness
+    arguments = {"channel": "ch-held", "text": "held draft"}
+    held_result = (await h.mcp.call_tool("send_message", arguments))[1]
+    assert held_result["state"] == "held"
+
+    # The event and active runtime can agree on a later provider turn, but
+    # neither may reinterpret a continuation staged for the original turn.
+    h.runtime.active.provider_turn_id = "replacement-provider-turn"
+    await h.emit_tool_result(
+        tool_name="send_message",
+        arguments=arguments,
+        result=held_result,
+        native_turn_id="replacement-provider-turn",
+    )
+    await asyncio.sleep(0)
+    row = await h.store.get_message_by_envelope("held-peer")
+    assert row is not None
+    assert row.processing_state is ProcessingState.PENDING
+    assert await h.active_boundary("ch-held") is None
+    assert h.runtime.active.visible_message_ids == []
+    await h.finish()
+
+
+@pytest.mark.asyncio
 async def test_rpc_response_without_provider_completion_keeps_pending_and_unseen(
     boundary_harness: BoundaryHarness,
 ):

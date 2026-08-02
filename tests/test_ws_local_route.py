@@ -16,6 +16,8 @@ import pytest
 from puffo_agent.portal.ws_local import auth as auth_mod
 from puffo_agent.portal.ws_local import route as route_mod
 from puffo_agent.portal.ws_local.auth import AuthedAgent
+from puffo_agent.portal.ws_local.bridge import WsLocalBridge
+from puffo_agent.portal.ws_local.bundles import Bundle
 from puffo_agent.portal.ws_local.hub import AttachPoint, WsLocalHub
 from puffo_agent.portal.ws_local.route import serve_attached
 
@@ -64,8 +66,8 @@ async def test_ws_local_adapter_requires_exact_read_admission_correlation():
         )
     assert seen == []
     # WS frames keep their existing opaque-receipt wire shape, but the
-    # adapter must enforce the registered real tool and normalized semantic
-    # arguments whenever the local handoff supplies them.
+    # private bridge handoff must supply the real tool and normalized semantic
+    # arguments before a continuation can be admitted.
     with pytest.raises(RuntimeError, match="tool correlation failed"):
         await adapter.emit_admission(
             turn_id="turn-1", correlation_key="read-receipt",
@@ -88,6 +90,65 @@ async def test_ws_local_adapter_requires_exact_read_admission_correlation():
         await adapter.emit_admission(
             turn_id="turn-1", correlation_key="read-receipt"
         )
+
+
+@pytest.mark.asyncio
+async def test_ws_local_bridge_records_actual_tool_before_opaque_admission():
+    adapter = route_mod._WsLocalContextAdapter()
+    seen = []
+
+    async def callback(event):
+        seen.append(event)
+
+    adapter.register_continuation_callback(
+        callback,
+        "held-key",
+        correlation_receipt="held-receipt",
+        tool_names=("send_message",),
+        tool_arguments={"channel": "ch-1", "text": "draft"},
+    )
+    runtime = type("Runtime", (), {"adapter": adapter})()
+    bridge = WsLocalBridge(runtime=runtime)
+    bundle = Bundle("bundle", "root", {}, turn_id="turn-1")
+    runtime._ws_local_planned = type("Planned", (), {
+        "turn_id": "turn-1", "planning_cycle_key": "initial-key",
+    })()
+
+    # The public Admitted frame contains only the receipt.  Without the
+    # private observed result, it cannot consume the continuation.
+    with pytest.raises(RuntimeError, match="tool result unavailable"):
+        await bridge.on_admitted(
+            bundle, type("Frame", (), {"correlation_key": "held-receipt"})(),
+        )
+
+    await bridge.on_tool_result(
+        "get_post", {"channel": "ch-1", "text": "draft"},
+        {"tool_result_admission": "[puffo:model-visible-read:held-receipt]"},
+    )
+    with pytest.raises(RuntimeError, match="tool correlation failed"):
+        await bridge.on_admitted(
+            bundle, type("Frame", (), {"correlation_key": "held-receipt"})(),
+        )
+    assert seen == []
+
+    await bridge.on_tool_result(
+        "send_message", {"channel": "ch-1", "text": "other"},
+        {"tool_result_admission": "[puffo:model-visible-read:held-receipt]"},
+    )
+    with pytest.raises(RuntimeError, match="argument correlation failed"):
+        await bridge.on_admitted(
+            bundle, type("Frame", (), {"correlation_key": "held-receipt"})(),
+        )
+    assert seen == []
+
+    await bridge.on_tool_result(
+        "send_message", {"channel": "ch-1", "text": "draft"},
+        {"tool_result_admission": "[puffo:model-visible-read:held-receipt]"},
+    )
+    await bridge.on_admitted(
+        bundle, type("Frame", (), {"correlation_key": "held-receipt"})(),
+    )
+    assert len(seen) == 1
 
 
 @pytest.mark.asyncio
@@ -145,7 +206,10 @@ async def test_ws_local_history_callback_updates_visible_registry_only_after_adm
     assert runtime.active.through_by_channel == {}
     assert row.processing_state == ProcessingState.PENDING.value
 
-    await adapter.emit_admission(turn_id="turn-1", correlation_key=receipt)
+    await adapter.emit_admission(
+        turn_id="turn-1", correlation_key=receipt,
+        tool_name="get_post", tool_arguments={"channel": "ch-1", "seq": 4},
+    )
     assert runtime.active.visible_message_ids == ["ws-history"]
     assert runtime.active.message_ids == []
     assert runtime.active.through_by_channel == {("sp-1", "ch-1"): 4}
@@ -170,6 +234,7 @@ async def test_ws_local_history_callback_updates_visible_registry_only_after_adm
     with pytest.raises(RuntimeError, match="crossed the active provider turn"):
         await adapter.emit_admission(
             turn_id="turn-2", correlation_key=stale["correlation_receipt"],
+            tool_name="get_post", tool_arguments={"channel": "ch-1", "seq": 4},
         )
     assert runtime.active.visible_message_ids == ["ws-history"]
     assert runtime.active.through_by_channel == {("sp-1", "ch-1"): 4}
