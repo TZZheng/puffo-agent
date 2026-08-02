@@ -1872,7 +1872,7 @@ class MessageStore:
             )
             async with db.execute(
                 """SELECT server_seq, processing_turn_id, processing_state,
-                          model_visible_at
+                          receipt_disposition, model_visible_at
                    FROM messages
                    WHERE space_id = ? AND channel_id = ?
                      AND envelope_kind != 'dm' AND server_seq IS NOT NULL
@@ -1901,7 +1901,10 @@ class MessageStore:
                 is_visible = row["model_visible_at"] is not None or is_candidate
                 is_this_turn = row["processing_turn_id"] == turn_id
                 terminal = state == ProcessingState.PROCESSED.value
-                admissible = is_candidate or (
+                terminal_receipt = (
+                    row["receipt_disposition"] == ReceiptDisposition.TERMINAL.value
+                )
+                admissible = terminal_receipt or is_candidate or (
                     is_visible and (terminal or (is_this_turn and state == ProcessingState.IN_TURN.value))
                 )
                 if not admissible:

@@ -1074,6 +1074,36 @@ async def test_pending_lifecycle_turn_recovery_baseline_through_and_cleanup():
 
 
 @pytest.mark.asyncio
+async def test_model_visible_boundary_skips_earlier_terminal_receipt(tmp_path):
+    store = MessageStore(tmp_path / "terminal-safe-prefix.db")
+    await store.store_receipt(
+        _channel_payload("terminal-receipt", channel_id="ch_terminal"),
+        server_seq=10,
+        disposition=ReceiptDisposition.TERMINAL,
+        reason="self echo",
+    )
+    await store.store_receipt(
+        _channel_payload("active-turn", channel_id="ch_terminal"),
+        server_seq=11,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    await store.admit_messages(
+        ["active-turn"], turn_id="active-turn", provider_session_id="provider",
+        model_visible_at=123,
+    )
+
+    terminal = await store.get_message_by_envelope("terminal-receipt")
+    assert terminal is not None
+    assert terminal.receipt_disposition is ReceiptDisposition.TERMINAL
+    assert terminal.processing_state is None
+    assert await store.get_model_visible_through_seq(
+        "active-turn", "sp_1", "ch_terminal"
+    ) == 11
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_active_turn_append_uses_stable_union_for_complete_and_requeue():
     store = _temp_store()
     for seq in range(1, 7):
