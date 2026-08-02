@@ -483,6 +483,9 @@ async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
     reconsideration = held_result["reconsideration"]
     assert reconsideration["context_ready"] is True
     assert "held peer body" in reconsideration["new_channel_context"]
+    assert "draft wrong while that contribution remains unresolved" in (
+        reconsideration["decision"]
+    )
     assert held_result["tool_result_admission"].startswith(
         "[puffo:model-visible-read:"
     )

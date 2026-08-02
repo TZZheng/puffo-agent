@@ -1317,9 +1317,14 @@ class SendCoordinator:
                         "thread_root_id": held.thread_root_id,
                     },
                     "decision": (
-                        "Inspect this context, then choose a revised normal-freshness "
-                        "send, an unchanged send_anyway=True only if it is still clear "
-                        "and appropriate, or send nothing."
+                        "Reconsider the originating request, the attempted draft, and "
+                        "the latest context together. Separate the exact draft text "
+                        "from its underlying contribution: newer context can make the "
+                        "draft wrong while that contribution remains unresolved. "
+                        "Revise with normal freshness when needed; use the unchanged "
+                        "draft with send_anyway=True only if it is still clear and "
+                        "appropriate; send nothing only when current context actually "
+                        "satisfies or cancels the underlying contribution."
                     ),
                 },
             }

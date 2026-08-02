@@ -269,6 +269,15 @@ async def test_held_thread_basis_overrides_only_its_presentation_target():
     )
     output = await coordinator._held_context_output(key, "sp_1", "ch_a")
     reconsideration = output["reconsideration"]
+    decision = reconsideration["decision"]
+    for phrase in (
+        "originating request, the attempted draft, and the latest context",
+        "Separate the exact draft text from its underlying contribution",
+        "draft wrong while that contribution remains unresolved",
+        "Revise with normal freshness when needed",
+        "send nothing only when current context actually satisfies or cancels",
+    ):
+        assert phrase in decision
     assert reconsideration["visible_draft_basis"].count(
         "## target=thread space_id=sp_1 channel_id=ch_a thread_root_id=thread-root"
     ) == 1
