@@ -63,8 +63,23 @@ async def test_ws_local_adapter_requires_exact_read_admission_correlation():
             turn_id="turn-1", correlation_key="wrong-receipt"
         )
     assert seen == []
+    # WS frames keep their existing opaque-receipt wire shape, but the
+    # adapter must enforce the registered real tool and normalized semantic
+    # arguments whenever the local handoff supplies them.
+    with pytest.raises(RuntimeError, match="tool correlation failed"):
+        await adapter.emit_admission(
+            turn_id="turn-1", correlation_key="read-receipt",
+            tool_name="get_thread_history", tool_arguments={"limit": 7},
+        )
+    with pytest.raises(RuntimeError, match="argument correlation failed"):
+        await adapter.emit_admission(
+            turn_id="turn-1", correlation_key="read-receipt",
+            tool_name="read_inbox", tool_arguments={"limit": 8},
+        )
+    assert seen == []
     await adapter.emit_admission(
-        turn_id="turn-1", correlation_key="read-receipt"
+        turn_id="turn-1", correlation_key="read-receipt",
+        tool_name="read_inbox", tool_arguments={"limit": 7},
     )
     assert len(seen) == 1
     assert seen[0].planning_cycle_key == "inbox-read-key"

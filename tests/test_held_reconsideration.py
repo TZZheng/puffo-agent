@@ -10,6 +10,7 @@ from puffo_agent.agent.send_coordinator import (
     KEYLESS_CHANNEL_SEND_PATH,
     SemanticSendRequest,
     SendCoordinator,
+    _HeldEvidence,
 )
 
 
@@ -209,6 +210,42 @@ def held_response(body, *, latest_seq=5, latest_envelope_id="msg_latest"):
         "latest_seq": latest_seq,
         "latest_envelope_id": latest_envelope_id,
     }
+
+
+@pytest.mark.asyncio
+async def test_held_recovery_keeps_channel_wide_terminal_pair_for_thread_send():
+    """A thread draft still needs the channel's actual latest pair."""
+    coordinator, freshness, _http = await coordinator_fixture()
+    coordinator.provider_session_id = "session-a"
+    freshness.active = SimpleNamespace(
+        turn_id="turn-a", provider_session_id="session-a"
+    )
+    recovery = Recovery(rows=[
+        {
+            **exact_row(envelope_id="other-thread-latest"),
+            "thread_root_id": "other-root", "content": "other thread",
+        },
+        {
+            "envelope_id": "requested-root", "server_seq": 4,
+            "latest_seq": 5, "latest_envelope_id": "other-thread-latest",
+            "provider_session_id": "session-a", "thread_root_id": "",
+            "content": "requested thread",
+        },
+    ])
+    coordinator.held_recovery_source = recovery
+    key = ("session-a", "turn-a", "sp_1", "ch_a")
+    coordinator._held_evidence[key] = _HeldEvidence(
+        latest_seq=5,
+        latest_envelope_id="other-thread-latest",
+        thread_root_id="requested-root",
+    )
+
+    assert await coordinator._recover_held(
+        "sp_1", "ch_a", 5, "other-thread-latest"
+    )
+    assert [row["envelope_id"] for row in coordinator._held_evidence[key].recovered_messages] == [
+        "other-thread-latest", "requested-root",
+    ]
 
 
 @pytest.mark.asyncio

@@ -1491,19 +1491,12 @@ class SendCoordinator:
             return False
         if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
             return False
-        async with self._held_lock:
-            current = self._held_evidence.get(key)
-            thread_root_id = current.thread_root_id if current is not None else ""
-        rows = [
-            row for row in rows
-            if isinstance(row, Mapping) and (
-                (not thread_root_id and not row.get("thread_root_id"))
-                or (bool(thread_root_id) and (
-                    row.get("envelope_id") == thread_root_id
-                    or row.get("thread_root_id") == thread_root_id
-                ))
-            )
-        ]
+        # Recovery proves freshness for the whole channel, not merely the
+        # destination thread.  Keep the bounded channel range intact so the
+        # exact Server terminal pair remains inspectable even if it belongs to
+        # another thread.  Target filtering belongs only in
+        # ``_visible_draft_basis`` above.
+        rows = [row for row in rows if isinstance(row, Mapping)]
         synchronized = any(
             isinstance(row, Mapping)
             and row.get("envelope_id") == latest_envelope_id

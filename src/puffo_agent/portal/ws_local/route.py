@@ -15,8 +15,10 @@ import base64
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Mapping
 
 from aiohttp import web
 
@@ -33,13 +35,24 @@ from .tool_dispatch import build_dispatch as _build_dispatch
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _WsLocalContinuation:
+    """Private correlation record; it never crosses the WS protocol."""
+
+    callback: object
+    planning_cycle_key: str
+    correlation_receipt: str
+    tool_names: frozenset[str]
+    normalized_arguments: tuple[tuple[str, str], ...]
+
+
 class _WsLocalContextAdapter:
     """Provider context/admission seam for one authenticated attachment."""
 
     def __init__(self) -> None:
         self._callback = None
         self._planning_cycle_key = ""
-        self._continuations: dict[str, tuple[object, str]] = {}
+        self._continuations: dict[str, _WsLocalContinuation] = {}
         self._provider_session_id: str | None = None
 
     async def get_context_snapshot(self):
@@ -71,18 +84,36 @@ class _WsLocalContextAdapter:
         planning_cycle_key="",
         *,
         correlation_receipt="",
+        tool_names=(),
+        tool_arguments: Mapping[str, Any] | None = None,
         **_metadata,
     ) -> None:
+        from ...agent.context_controller import normalize_tool_arguments
+
         if callback is None:
             self._continuations.pop(planning_cycle_key, None)
             return
-        entry = (callback, planning_cycle_key)
+        entry = _WsLocalContinuation(
+            callback=callback,
+            planning_cycle_key=planning_cycle_key,
+            correlation_receipt=correlation_receipt,
+            tool_names=frozenset(str(name) for name in tool_names if name),
+            normalized_arguments=normalize_tool_arguments(tool_arguments),
+        )
         self._continuations[planning_cycle_key] = entry
         if correlation_receipt:
             self._continuations[correlation_receipt] = entry
 
-    async def emit_admission(self, *, turn_id: str, correlation_key: str) -> None:
+    async def emit_admission(
+        self,
+        *,
+        turn_id: str,
+        correlation_key: str,
+        tool_name: str | None = None,
+        tool_arguments: Mapping[str, Any] | None = None,
+    ) -> None:
         from ...agent.context_controller import ProviderAdmissionEvent
+        from ...agent.context_controller import normalize_tool_arguments
 
         if (
             self._callback is not None
@@ -94,7 +125,26 @@ class _WsLocalContextAdapter:
             entry = self._continuations.get(correlation_key)
             if entry is None:
                 raise RuntimeError("ws-local admission correlation failed")
-            callback, planning_cycle_key = entry
+            # The frame intentionally carries only the opaque receipt, so a
+            # real WS callback proves its tool result by that unguessable
+            # receipt.  Test/in-process callers that supply observed metadata
+            # must still satisfy the same real-tool and normalized-argument
+            # contract used by the other provider adapters.
+            if (
+                tool_name is not None
+                and entry.tool_names
+                and tool_name not in entry.tool_names
+            ):
+                raise RuntimeError("ws-local admission tool correlation failed")
+            if (
+                tool_arguments is not None
+                and entry.normalized_arguments
+                and normalize_tool_arguments(tool_arguments)
+                != entry.normalized_arguments
+            ):
+                raise RuntimeError("ws-local admission argument correlation failed")
+            callback = entry.callback
+            planning_cycle_key = entry.planning_cycle_key
             for key, registered in tuple(self._continuations.items()):
                 if registered == entry:
                     self._continuations.pop(key, None)

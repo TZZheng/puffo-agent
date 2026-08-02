@@ -903,6 +903,7 @@ class GlobalInboxRuntime:
                 self.active.turn_id != active_turn_id
                 or self.active.provider_session_id != provider_session_id
                 or event.provider_session_id != provider_session_id
+                or event.provider_turn_id != self.active.provider_turn_id
             ):
                 return
             rows = [await self.store.get_message_by_envelope(item) for item in displayed_ids]
@@ -930,14 +931,17 @@ class GlobalInboxRuntime:
                     displayed_ids, space_id=space_id, channel_id=channel_id,
                     through_seq=latest_seq,
                 )
-                for row in rows:
-                    if row is not None:
-                        route = route_for(row)
-                        if route not in self.active.routes:
-                            self.active.routes.append(route)
-                self.active.message_ids = list(dict.fromkeys(
-                    [*self.active.message_ids, *displayed_ids]
-                ))
+                # The durable turn-membership table is authoritative.  In
+                # particular, do not construct this union from the previous
+                # in-memory snapshot: another same-turn admission may already
+                # have changed it, and callers retain this list object.
+                durable_rows = await self.store.get_in_turn_messages(
+                    active_turn_id, provider_session_id,
+                )
+                durable_ids = [row.envelope_id for row in durable_rows]
+                self.active.message_ids[:] = durable_ids
+                durable_routes = [route_for(row) for row in durable_rows]
+                self.active.routes[:] = list(dict.fromkeys(durable_routes))
                 self._write_active_current_turn()
                 await ActiveBoundaryAdapter(self.store, self.active).advance_active_turn_through_seq(
                     space_id, channel_id, latest_seq,
