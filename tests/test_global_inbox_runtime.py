@@ -2664,7 +2664,7 @@ async def test_silence_without_correlated_admission_degrades_without_self_wake(
 
 
 @pytest.mark.asyncio
-async def test_held_watermark_sync_proof_does_not_admit_or_expose_content(
+async def test_held_watermark_sync_proof_returns_local_semantic_rows_without_admission(
     tmp_path,
 ):
     store = await make_store(tmp_path)
@@ -2696,19 +2696,11 @@ async def test_held_watermark_sync_proof_does_not_admit_or_expose_content(
         "sp-1", "ch-1", 3, "watermark", "provider-1",
     )
     assert [row["envelope_id"] for row in rows] == ["watermark"]
-    assert rows[0] == {
-        "space_id": "sp-1",
-        "channel_id": "ch-1",
-        "envelope_id": "watermark",
-        "server_seq": 3,
-        "latest_seq": 3,
-        "latest_envelope_id": "watermark",
-        "provider_session_id": "provider-1",
-    }
-    assert "content" not in rows[0]
+    assert rows[0]["content"] == "text-watermark"
+    assert rows[0]["thread_root_id"] == ""
     assert [row.envelope_id for row in await store.get_pending()] == ["watermark"]
     assert runtime.held.synchronized
-    assert runtime.held.message_ids == ()
+    assert runtime.held.message_ids == ("watermark",)
     assert await ActiveBoundaryAdapter(
         store, runtime.active
     ).get_active_turn_through_seq("sp-1", "ch-1") == 1
@@ -2784,7 +2776,7 @@ async def test_held_timeout_mismatch_and_context_pressure_stage_nothing(
     )
     assert metadata
     assert runtime.held.synchronized is True
-    assert runtime.held.message_ids == ()
+    assert runtime.held.message_ids == ("rejected",)
     assert [row.envelope_id for row in await store.get_pending()] == ["rejected"]
     await store.close()
 
@@ -2818,7 +2810,7 @@ async def test_held_timeout_uses_signed_pending_catchup_before_failing(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_held_sync_is_independent_of_fifty_message_content_pages(tmp_path):
+async def test_held_sync_fails_closed_when_bounded_semantic_context_overflows(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "initial", 1)
     await store.admit_messages(
@@ -2839,10 +2831,10 @@ async def test_held_sync_is_independent_of_fifty_message_content_pages(tmp_path)
     rows = await runtime.held_recovery_source.query_held_messages(
         "sp-1", "ch-1", 52, "held-52", "provider-1",
     )
-    assert [row["envelope_id"] for row in rows] == ["held-52"]
-    assert "content" not in rows[0]
-    assert runtime.held.synchronized is True
+    assert rows == ()
+    assert runtime.held.synchronized is False
     assert runtime.held.message_ids == ()
+    assert "exceeds" in runtime.held.diagnostic
     assert [row.envelope_id for row in await store.get_pending()] == [
         f"held-{seq}" for seq in range(2, 53)
     ]
@@ -2870,7 +2862,7 @@ async def test_held_sync_is_independent_of_fifty_message_content_pages(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_held_sync_ignores_formatter_and_context_budget(tmp_path):
+async def test_held_sync_overflow_is_independent_of_formatter_and_context_budget(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "initial", 1)
     await store.admit_messages(
@@ -2895,15 +2887,15 @@ async def test_held_sync_ignores_formatter_and_context_budget(tmp_path):
         "sp-1", "ch-1", 52, "held-52", "provider-1",
     )
 
-    assert [row["envelope_id"] for row in rows] == ["held-52"]
-    assert "content" not in rows[0]
+    assert rows == ()
     assert runtime.held.message_ids == ()
-    assert runtime.held.synchronized is True
+    assert runtime.held.synchronized is False
+    assert "exceeds" in runtime.held.diagnostic
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_repeated_held_sync_proof_is_metadata_only(
+async def test_repeated_held_sync_proof_returns_stable_local_semantic_context(
     tmp_path,
 ):
     store = await make_store(tmp_path)
@@ -2931,7 +2923,8 @@ async def test_repeated_held_sync_proof_is_metadata_only(
         "sp-1", "ch-1", 2, "held", "provider-1",
     )
     assert first == second
-    assert "content" not in first[0]
+    assert first[0]["content"] == "text-held"
+    assert runtime.held.message_ids == ("held",)
 
     in_turn = await store.get_in_turn_messages("turn", "provider-1")
     assert [row.envelope_id for row in in_turn] == ["initial"]

@@ -364,6 +364,8 @@ async def boundary_harness(tmp_path: Path):
         data_client=store,
         agent_id="agent-contract",
         rpc_client=rpc,
+        send_coordinator=coordinator,
+        inbox_runtime=runtime,
     )
     mcp = FastMCP("contract")
     register_core_tools(mcp, cfg)
@@ -465,7 +467,7 @@ async def test_real_rpc_history_and_inbox_admission_wait_for_provider_completion
 
 
 @pytest.mark.asyncio
-async def test_exact_held_chain_stays_unseen_until_rpc_read_then_allows_send_anyway(
+async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
     boundary_harness: BoundaryHarness,
 ):
     h = boundary_harness
@@ -478,6 +480,12 @@ async def test_exact_held_chain_stays_unseen_until_rpc_read_then_allows_send_any
     assert held_result["synchronized"] is True
     assert held_result["latest_seq"] == 4
     assert held_result["latest_envelope_id"] == "held-peer"
+    reconsideration = held_result["reconsideration"]
+    assert reconsideration["context_ready"] is True
+    assert "held peer body" in reconsideration["new_channel_context"]
+    assert held_result["tool_result_admission"].startswith(
+        "[puffo:model-visible-read:"
+    )
     assert len(h.transport.calls) == 1
 
     row = await h.store.get_message_by_envelope("held-peer")
@@ -485,8 +493,8 @@ async def test_exact_held_chain_stays_unseen_until_rpc_read_then_allows_send_any
     assert row.processing_state is ProcessingState.PENDING
     assert await h.active_boundary("ch-held") is None
 
-    # A successful send_message result is content-free evidence. It cannot
-    # admit the exact held route or authorize an override.
+    # The exact original result, including the continuation receipt, admits
+    # the displayed pending row exactly once.
     await h.emit_tool_result(
         tool_name="send_message",
         arguments=send_arguments,
@@ -495,34 +503,6 @@ async def test_exact_held_chain_stays_unseen_until_rpc_read_then_allows_send_any
     await asyncio.sleep(0)
     row = await h.store.get_message_by_envelope("held-peer")
     assert row.processing_state is ProcessingState.PENDING
-    assert await h.active_boundary("ch-held") is None
-
-    blocked_call = await h.mcp.call_tool(
-        "send_message",
-        {**send_arguments, "send_anyway": True},
-    )
-    blocked = blocked_call[1]
-    assert blocked["state"] == "failed"
-    assert blocked["error_kind"] == "reconsideration_ineligible"
-    assert len(h.transport.calls) == 1
-
-    inbox_call = await h.mcp.call_tool(
-        "read_inbox", {"target": target, "limit": 1}
-    )
-    inbox_page = inbox_call[1]
-    assert "held peer body" in inbox_page["messages"][0]
-    assert inbox_page["admission_receipt"].startswith(
-        "[puffo:model-visible-read:"
-    )
-    row = await h.store.get_message_by_envelope("held-peer")
-    assert row.processing_state is ProcessingState.PENDING
-    assert await h.active_boundary("ch-held") is None
-
-    await h.emit_tool_result(
-        tool_name="read_inbox",
-        arguments={"target": target, "limit": 1},
-        result=json.dumps(inbox_page),
-    )
     await _wait_until(
         lambda: h.runtime.active.through_by_channel.get(
             ("sp_1", "ch-held")
@@ -531,6 +511,16 @@ async def test_exact_held_chain_stays_unseen_until_rpc_read_then_allows_send_any
     row = await h.store.get_message_by_envelope("held-peer")
     assert row.processing_state is ProcessingState.IN_TURN
     assert await h.active_boundary("ch-held") == 4
+    assert h.runtime.active.visible_message_ids == ["held-peer"]
+
+    # A duplicate callback cannot change the turn or reoffer the row.
+    await h.emit_tool_result(
+        tool_name="send_message", arguments=send_arguments, result=held_result,
+    )
+    assert h.runtime.active.visible_message_ids == ["held-peer"]
+
+    inbox_call = await h.mcp.call_tool("read_inbox", {"target": target, "limit": 1})
+    assert inbox_call[1]["messages"] == []
 
     sent_call = await h.mcp.call_tool(
         "send_message",

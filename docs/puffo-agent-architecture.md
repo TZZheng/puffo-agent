@@ -197,10 +197,21 @@ Pagination/status and metadata-only wake notices remain tool-specific.
 
 On a coordinated held channel send the Server still returns only its strict
 metadata contract. `HeldRecoverySource` waits for WebSocket/signed catch-up,
-then `MessageStore` supplies bounded decrypted local rows. `SendCoordinator`
-returns the original draft, exact target, draft boundary, and those local rows
-only when the exact terminal watermark is proven. Server, E2EE ownership,
-public MCP arguments, RPC, and WS-local v2 bundles are unchanged. The older
+then `MessageStore` supplies a bounded decrypted local interval and proves the
+exact terminal pair. `SendCoordinator` returns the unchanged draft, exact
+target, pre-send visible basis, terminal watermark, and grouped
+`message_projection` rows only when that proof is complete. It never exposes
+the daemon's pending-ID list.
+
+Those recovered rows remain lifecycle-neutral until the original tool result
+crosses its provider boundary. Claude and Codex correlate the existing
+continuation receipt, tool name, arguments, provider session, and turn;
+WS-local admits at its explicit tool-return boundary. The callback admits only
+still-pending displayed rows to the same turn, adds all displayed rows to the
+active visible registry, and advances a channel only through the Store's
+safe-prefix proof. A later `send_anyway` remains an explicit model-owned
+choice, never an automatic retry. Server, E2EE ownership, public MCP
+arguments, RPC, and WS-local v2 bundles are unchanged. The older
 `PuffoAgent._format_user_block()` remains a legacy compatibility projection.
 
 - Agent lifecycle is file-driven and reconciled by the daemon.

@@ -121,6 +121,8 @@ class _HeldEvidence:
     based_on_through_seq: int | None = None
     thread_root_id: str = ""
     recovered_messages: list[dict[str, Any]] = field(default_factory=list)
+    visible_draft_basis: list[dict[str, Any]] = field(default_factory=list)
+    diagnostic: str = ""
 
 
 @dataclass(frozen=True)
@@ -562,6 +564,9 @@ class SendCoordinator:
                 )
             if refs:
                 body["attachments"] = refs
+            visible_draft_basis = await self._visible_draft_basis(
+                space_id, channel_id, root_id or "",
+            )
             raw = await self._post_keyless_exact(body)
             result = self._validate_keyless_response(raw, body)
             if result.state == "held":
@@ -570,6 +575,7 @@ class SendCoordinator:
                         held_key, result.latest_seq, result.latest_envelope_id,
                         draft=request.caption if request.attachment_paths else request.text,
                         based_on_through_seq=seen_seq, thread_root_id=root_id or "",
+                        visible_draft_basis=visible_draft_basis,
                     )
                 result.note = "No channel message was committed; inspect newer Inbox context."
                 synchronized = await self._recover_held(
@@ -797,6 +803,10 @@ class SendCoordinator:
             "mode": "send_anyway" if request.send_anyway else "require_current",
         }
         body = {"envelope": envelope, "freshness": freshness}
+        visible_draft_basis = await self._visible_draft_basis(
+            space_id, channel_id,
+            str(resolved.get("root_id") or request.root_id or ""),
+        )
         response = await self._post_channel_exact(body)
         result = self._validate_channel_response(response, envelope, freshness)
         action = "uploaded" if request.attachment_paths else "posted"
@@ -825,6 +835,7 @@ class SendCoordinator:
                     draft=request.caption if request.attachment_paths else request.text,
                     based_on_through_seq=seen_seq,
                     thread_root_id=str(resolved.get("root_id") or request.root_id or ""),
+                    visible_draft_basis=visible_draft_basis,
                 )
             result.note = (
                 "No message was sent because the channel advanced beyond this "
@@ -1265,6 +1276,7 @@ class SendCoordinator:
         draft: str = "",
         based_on_through_seq: int | None = None,
         thread_root_id: str = "",
+        visible_draft_basis: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         async with self._held_lock:
             old = self._held_evidence.get(key)
@@ -1282,6 +1294,7 @@ class SendCoordinator:
                     draft=draft,
                     based_on_through_seq=based_on_through_seq,
                     thread_root_id=thread_root_id,
+                    visible_draft_basis=[dict(row) for row in visible_draft_basis],
                 )
 
     async def _held_context_output(
@@ -1293,25 +1306,64 @@ class SendCoordinator:
                 return {"context_ready": False}
             rows = list(held.recovered_messages)
             data: dict[str, Any] = {
-                "context_ready": bool(held.synchronized and rows),
-                "draft": held.draft,
-                "based_on_through_seq": held.based_on_through_seq,
-                "target": {
-                    "space_id": space_id, "channel_id": channel_id,
-                    "thread_root_id": held.thread_root_id,
+                "reconsideration": {
+                    "context_ready": bool(held.synchronized and rows),
+                    "draft": held.draft,
+                    "based_on_through_seq": held.based_on_through_seq,
+                    "latest_seq": held.latest_seq,
+                    "latest_envelope_id": held.latest_envelope_id,
+                    "target": {
+                        "space_id": space_id, "channel_id": channel_id,
+                        "thread_root_id": held.thread_root_id,
+                    },
+                    "decision": (
+                        "Inspect this context, then choose a revised normal-freshness "
+                        "send, an unchanged send_anyway=True only if it is still clear "
+                        "and appropriate, or send nothing."
+                    ),
                 },
             }
+            if held.diagnostic:
+                data["reconsideration"]["diagnostic"] = held.diagnostic
         if rows:
             from .message_projection import format_message_group
-            data["new_messages"] = format_message_group(rows)
-            data["recovered_message_ids"] = [str(row.get("envelope_id", "")) for row in rows]
-        return {key: value for key, value in data.items() if value is not None}
+            data["reconsideration"]["visible_draft_basis"] = format_message_group(
+                held.visible_draft_basis,
+            )
+            data["reconsideration"]["new_channel_context"] = format_message_group(rows)
+        return data
 
     async def _consume_held(
         self, key: tuple[str, str, str, str]
     ) -> None:
         async with self._held_lock:
             self._held_evidence.pop(key, None)
+
+    async def _visible_draft_basis(
+        self, space_id: str, channel_id: str, thread_root_id: str,
+    ) -> list[dict[str, Any]]:
+        """Snapshot only rows visible before transport for this destination."""
+        runtime = getattr(self.held_recovery_source, "runtime", None)
+        active = getattr(runtime, "active", None)
+        store = getattr(runtime, "store", None)
+        if active is None or store is None:
+            return []
+        rows: list[dict[str, Any]] = []
+        for envelope_id in tuple(getattr(active, "visible_message_ids", ())):
+            row = await store.get_message_by_envelope(envelope_id)
+            if row is None or row.space_id != space_id or row.channel_id != channel_id:
+                continue
+            if thread_root_id and (row.thread_root_id or "") != thread_root_id:
+                continue
+            rows.append({
+                "space_id": row.space_id, "channel_id": row.channel_id,
+                "thread_root_id": row.thread_root_id or "",
+                "envelope_id": row.envelope_id, "server_seq": row.server_seq,
+                "sender_slug": row.sender_slug, "envelope_kind": row.envelope_kind,
+                "sent_at": row.sent_at, "is_encrypted": row.is_encrypted,
+                "content": row.content,
+            })
+        return rows
 
     async def _reconsideration_decision(
         self, space_id: str, channel_id: str
@@ -1461,6 +1513,8 @@ class SendCoordinator:
                 dict(row) for row in rows
                 if isinstance(row, Mapping) and "content" in row
             ]
+            if not current.recovered_messages:
+                current.diagnostic = "local held context is unavailable or unreadable"
         return True
 
 

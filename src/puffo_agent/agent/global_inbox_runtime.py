@@ -23,6 +23,7 @@ from .context_controller import (
     ContextController,
     DecisionOutcome,
     ProviderAdmissionEvent,
+    ToolResultAdmission,
 )
 from .inbox_scheduler import (
     MAX_ESTIMATED_TOKENS,
@@ -191,6 +192,7 @@ class HeldStaging:
     synchronized: bool = False
     diagnostic: str = ""
     correlation_key: str = ""
+    message_ids: tuple[str, ...] = ()
 
 
 @dataclass
@@ -665,8 +667,15 @@ class HeldRecoverySource:
         rows = await self.runtime.store.get_held_reconsideration_rows(
             space_id=space_id, channel_id=channel_id,
             after_seq=through if through is not None else -1,
-            through_seq=latest_seq,
+            through_seq=latest_seq, limit=51,
         )
+        if len(rows) > 50:
+            self.runtime.held = HeldStaging(
+                latest_seq=latest_seq,
+                latest_envelope_id=latest_envelope_id,
+                diagnostic="held context exceeds the bounded recovery limit",
+            )
+            return ()
         # The terminal pair has already been checked above; retain it in the
         # returned local row set so the coordinator can prove exact readiness.
         projected: list[Mapping[str, Any]] = []
@@ -680,6 +689,7 @@ class HeldRecoverySource:
                 "envelope_kind": row.envelope_kind, "sent_at": row.sent_at,
                 "is_encrypted": row.is_encrypted, "content": row.content,
             })
+        self.runtime.held.message_ids = tuple(row.envelope_id for row in rows)
         return tuple(projected)
 
 
@@ -808,6 +818,105 @@ class GlobalInboxRuntime:
             provider_turn_id=self.active.provider_turn_id,
             admitted_at=datetime.now(timezone.utc),
         ))
+
+    async def stage_held_send_result(
+        self,
+        result: dict[str, Any],
+        *,
+        tool_name: str,
+        tool_arguments: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Stage exactly the semantic held rows at the original tool boundary."""
+        payload = result.get("reconsideration")
+        staging = self.held
+        if not isinstance(payload, Mapping) or not payload.get("context_ready"):
+            return result
+        active_turn_id = self.active.turn_id
+        provider_session_id = self.active.provider_session_id
+        if not active_turn_id or not provider_session_id or not staging.message_ids:
+            payload = dict(payload)
+            payload["context_ready"] = False
+            payload["diagnostic"] = "active held admission identity unavailable"
+            result["reconsideration"] = payload
+            return result
+        target = payload.get("target") if isinstance(payload.get("target"), Mapping) else {}
+        space_id = str(target.get("space_id") or "")
+        channel_id = str(target.get("channel_id") or "")
+        latest_seq = payload.get("latest_seq")
+        latest_envelope_id = payload.get("latest_envelope_id")
+        if (
+            not space_id or not channel_id or not isinstance(latest_seq, int)
+            or not isinstance(latest_envelope_id, str)
+        ):
+            return result
+        displayed_ids = tuple(staging.message_ids)
+        correlation_key = f"held_send_{uuid.uuid4().hex}"
+        receipt = uuid.uuid4().hex
+        marker = ToolResultAdmission.build(
+            lambda _event: None, correlation_key,
+            self.active.provider_turn_id or "",
+            correlation_receipt=receipt,
+        ).receipt_marker
+        fired = False
+
+        async def admit_held(event: ProviderAdmissionEvent) -> None:
+            nonlocal fired
+            if fired or event.planning_cycle_key != correlation_key:
+                return
+            if (
+                self.active.turn_id != active_turn_id
+                or self.active.provider_session_id != provider_session_id
+                or event.provider_session_id != provider_session_id
+                or self.held.latest_seq != latest_seq
+                or self.held.latest_envelope_id != latest_envelope_id
+            ):
+                return
+            rows = [await self.store.get_message_by_envelope(item) for item in displayed_ids]
+            if any(row is None for row in rows):
+                return
+            pending_ids = [row.envelope_id for row in rows if row is not None and row.processing_state is ProcessingState.PENDING]
+            try:
+                if pending_ids:
+                    await self.store.admit_messages(
+                        pending_ids, turn_id=active_turn_id,
+                        provider_session_id=provider_session_id,
+                    )
+                await self._add_visible_message_ids(
+                    displayed_ids, space_id=space_id, channel_id=channel_id,
+                    through_seq=latest_seq,
+                )
+                for row in rows:
+                    if row is not None:
+                        route = route_for(row)
+                        if route not in self.active.routes:
+                            self.active.routes.append(route)
+                await ActiveBoundaryAdapter(self.store, self.active).advance_active_turn_through_seq(
+                    space_id, channel_id, latest_seq,
+                )
+            except Exception:
+                return
+            fired = True
+
+        if self._admits_tool_results_on_return:
+            await self._admit_returned_tool_result(
+                admit_held, planning_cycle_key=correlation_key,
+                provider_session_id=provider_session_id,
+            )
+        else:
+            register = getattr(self.adapter, "register_continuation_callback", None)
+            if not callable(register):
+                payload = dict(payload)
+                payload["context_ready"] = False
+                payload["diagnostic"] = "provider cannot correlate held tool results"
+                result["reconsideration"] = payload
+                return result
+            register(
+                admit_held, correlation_key, tool_names=(tool_name,),
+                tool_arguments=dict(tool_arguments), correlation_receipt=receipt,
+            )
+        result["tool_result_admission"] = marker
+        self.held.correlation_key = correlation_key
+        return result
 
     def note_input_ready(self, turn_id: str) -> None:
         self.notice_delivery.note_input_ready(turn_id)

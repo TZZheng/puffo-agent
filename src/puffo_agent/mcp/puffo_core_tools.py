@@ -293,6 +293,7 @@ class PuffoCoreToolsConfig:
 
 async def _dispatch_semantic_send(
     cfg: "PuffoCoreToolsConfig", request: SemanticSendRequest,
+    *, tool_name: str = "send_message",
 ) -> dict[str, Any]:
     coordinator = getattr(cfg, "send_coordinator", None)
     if coordinator is None:
@@ -311,6 +312,23 @@ async def _dispatch_semantic_send(
             )
         if isinstance(result, dict):
             result.setdefault("attempted", True)
+            runtime = getattr(cfg, "inbox_runtime", None)
+            if result.get("state") == "held" and runtime is not None:
+                result = await runtime.stage_held_send_result(
+                    result,
+                    tool_name=tool_name,
+                    # Match the public tool's stable semantic core. Optional
+                    # defaults are provider-normalized differently, so adding
+                    # them here would make a genuine original result ambiguous.
+                    tool_arguments=(
+                        {"channel": request.destination, "text": request.text}
+                        if not request.attachment_paths else {
+                            "channel": request.destination,
+                            "caption": request.caption,
+                            "paths": list(request.attachment_paths),
+                        }
+                    ),
+                )
             return result
         return failed_result(
             "persistent send coordinator returned a malformed result",
