@@ -39,21 +39,27 @@ def _dm_peer(message: Any, current_agent_aliases: Sequence[str] = ()) -> str:
     return (sender or recipient or "unknown").lstrip("@")
 
 
-def target_label(message: Any, *, current_agent_aliases: Sequence[str] = ()) -> str:
+def target_label(
+    message: Any,
+    *,
+    current_agent_aliases: Sequence[str] = (),
+    thread_root_id: str = "",
+) -> str:
     """Return the complete canonical target header, including durable IDs."""
     content = _content(message)
     channel_id = str(_value(message, "channel_id") or "")
     if not channel_id or str(_value(message, "envelope_kind", "")) == "dm":
         return f"target=dm peer_id={_dm_peer(message, current_agent_aliases)}"
     space_id = str(_value(message, "space_id") or "unknown-space")
-    target = "thread" if _value(message, "thread_root_id", "") else "channel"
+    effective_thread_root_id = thread_root_id or str(_value(message, "thread_root_id", ""))
+    target = "thread" if effective_thread_root_id else "channel"
     header = f"target={target} space_id={space_id}"
     header += _annotation("space", content.get("space_name"))
     header += f" channel_id={channel_id}"
     channel_name = content.get("channel_name")
     header += _annotation("channel", f"#{str(channel_name).lstrip('#')}") if channel_name else ""
     if target == "thread":
-        header += f" thread_root_id={_value(message, 'thread_root_id')}"
+        header += f" thread_root_id={effective_thread_root_id}"
     return header
 
 
@@ -112,12 +118,22 @@ def format_message_row(message: Any, *, current_agent_aliases: Sequence[str] = (
     return f"[{' '.join(fields)}] @{author}" + (_annotation("name", display_name) if display_name else "") + f":\n{message_text(message)}"
 
 
-def format_message_group(messages: Iterable[Any], *, current_agent_aliases: Sequence[str] = (), reply_counts: Mapping[str, int] | None = None) -> str:
+def format_message_group(
+    messages: Iterable[Any],
+    *,
+    current_agent_aliases: Sequence[str] = (),
+    reply_counts: Mapping[str, int] | None = None,
+    thread_root_id: str = "",
+) -> str:
     """Group only adjacent rows with exactly the same canonical target header."""
     output: list[str] = []
     previous: str | None = None
     for message in messages:
-        header = target_label(message, current_agent_aliases=current_agent_aliases)
+        header = target_label(
+            message,
+            current_agent_aliases=current_agent_aliases,
+            thread_root_id=thread_root_id,
+        )
         if header != previous:
             output.append(f"## {header}")
             previous = header

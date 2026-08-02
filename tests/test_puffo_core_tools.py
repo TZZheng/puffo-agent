@@ -315,6 +315,8 @@ async def _call(mcp, name, args=None):
         and result[1].get("state") == "failed"
     ):
         raise RuntimeError(json.dumps(result[1]))
+    if isinstance(result, tuple):
+        result = result[0]
     if isinstance(result, list):
         return "".join(
             getattr(item, "text", str(item)) for item in result
@@ -372,53 +374,28 @@ async def test_hidden_schema_semantic_send_fields_only():
 
 
 @pytest.mark.asyncio
-async def test_send_tool_descriptions_require_semantic_inspection_before_context_dependent_override():
+async def test_send_tool_descriptions_stay_at_mcp_boundary():
     cfg, _, _ = _setup()
     tools = {tool.name: tool for tool in await _build_tools(cfg).list_tools()}
     for name in ("send_message", "send_message_with_attachments"):
         description = " ".join(tools[name].description.lower().split())
-        for phrase in (
-            "revised or derived from conversation progress is context-dependent",
-            "must use normal freshness",
-            "after a held send of that content, reread the relevant route",
-            "fresh send-or-silence decision",
-            "switching targets does not make that content context-independent",
-            "actual newer message content",
-            "successfully synchronized",
-            "returned and inspected",
-            "newer watermark or sequence advance alone",
-            "empty recovery/read result",
-            "failed history lookup",
-            "not semantic inspection",
-            "do not infer unseen content",
-            "do not infer unseen content or force a stale context-dependent draft",
-        ):
+        for phrase in ("channel", "root_id", "visibility_level", "send_anyway", "held", "error"):
             assert phrase in description, (name, phrase, description)
-        _assert_assignment_completion_boundary(description)
-        _assert_assignment_completion_positive_controls(description)
+        for forbidden in (
+            "same originating assignment", "not an automatic retry",
+            "visible_draft_basis", "new_channel_context", "context_ready",
+            "benchmark", "assignment-completion", "response quota", "counting",
+        ):
+            assert forbidden not in description
 
 
 @pytest.mark.asyncio
-async def test_send_tool_descriptions_preserve_context_independent_override():
+async def test_send_tool_descriptions_point_to_managed_skill():
     cfg, _, _ = _setup()
     tools = {tool.name: tool for tool in await _build_tools(cfg).list_tools()}
     for name in ("send_message", "send_message_with_attachments"):
         description = " ".join(tools[name].description.lower().split())
-        description_without_markup = description.replace("`", "")
-        for phrase in (
-            "after the existing same-turn held/read technical eligibility checks",
-            "explicit send_anyway=true remains available",
-            "model-owned choice only",
-            "genuinely context-independent",
-            "deliberate judgment",
-            "not an automatic retry",
-            "not a way to bypass normal freshness for context-dependent content",
-        ):
-            assert phrase in description_without_markup, (
-                name, phrase, description,
-            )
-        _assert_assignment_completion_boundary(description)
-        _assert_assignment_completion_positive_controls(description)
+        assert "managed" in description and "send-message" in description
 
 
 @pytest.mark.asyncio
@@ -478,25 +455,11 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
     }]
 
     description = " ".join(tools["read_inbox"].description.lower().split())
-    for phrase in (
-        "prior_context",
-        "exact pending",
-        "page plus bounded",
-        "bounded, read-only",
-        "same conversation route(s)",
-        "strictly earlier than that page",
-        "not admitted or acknowledged",
-        "is_self",
-        "same originating assignment",
-        "no unresolved action",
-        "follow-up",
-        "correction",
-        "direct mention",
-        "newly exposed dependency",
-    ):
+    for phrase in ("target", "cursor", "limit", "messages", "prior_context", "next_cursor", "has_more"):
         assert phrase.lower() in description, (phrase, description)
-    _assert_assignment_completion_boundary(description)
-    _assert_assignment_completion_positive_controls(description)
+    for forbidden in ("same originating assignment", "send-anyway", "held", "benchmark", "assignment-completion"):
+        assert forbidden not in description
+    assert "managed" in description and "read-inbox" in description
 
 
 @pytest.mark.asyncio
@@ -2463,6 +2426,19 @@ async def test_get_thread_history_tags_encryption():
     await _store_msg(ms, "msg_reply", is_encrypted=False, thread_root_id="msg_root")
     result = await _call(_build_tools(cfg), "get_thread_history", {"root_id": "msg_root"})
     assert "encrypted=false" in result
+
+
+@pytest.mark.asyncio
+async def test_get_thread_history_presents_root_and_replies_under_one_thread_target():
+    cfg, _, ms = _setup()
+    await _store_msg(ms, "msg_root", is_encrypted=True)
+    await _store_msg(ms, "msg_reply", is_encrypted=False, thread_root_id="msg_root")
+    root = await ms.get_message_by_envelope("msg_root")
+    assert root is not None and not root.thread_root_id
+    result = await _call(_build_tools(cfg), "get_thread_history", {"root_id": "msg_root"})
+    header = "## target=thread space_id=sp_test channel_id=ch_1 thread_root_id=msg_root"
+    assert result.count(header) == 1
+    assert "id=msg_root" in result and "id=msg_reply" in result
 
 # Send-side thread-root rules, end to end through the send_message tool.
 

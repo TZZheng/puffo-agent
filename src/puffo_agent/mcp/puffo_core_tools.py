@@ -617,38 +617,12 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         cursor: str = "",
         limit: int = 50,
     ) -> dict[str, Any]:
-        """Read one stable pending Inbox page.
+        """Read one pending Inbox page.
 
-        target: optional canonical ``channel:<space>:<channel>[:thread:<root>]``
-            or ``dm:<peer>`` projection.
-        cursor: opaque cursor returned by the preceding page.
-        limit: page size from 1 through 50. Continue with ``next_cursor``;
-            there is no total read-depth cap.
-        result: content-bearing results include the exact pending ``messages``
-            page plus bounded, read-only ``prior_context`` blocks from the
-            same conversation route(s), strictly earlier than that page;
-            prior rows are not admitted or acknowledged. Each message block's
-            ``is_self`` metadata is true only when its durable ``sender_slug``
-            matches this Agent's current runtime identity; a true prior row is
-            evidence of an earlier contribution. If that contribution already
-            completed the same originating assignment and the new page adds no
-            unresolved action for this Agent, choose ``[SILENT]``. Send again
-            for a follow-up, correction, direct mention, newly exposed
-            dependency, or otherwise changed assignment.
-            Ordinary peer progress on an unchanged originating intent does not
-            by itself reopen an ``is_self: true`` contribution that already
-            completed this Agent's part. Peer-exposed work or an evolving
-            assignment permits another response only when newly observed
-            content creates or changes an unresolved obligation belonging to
-            this Agent. A genuine follow-up, correction, direct mention,
-            newly exposed dependency, otherwise changed work, including
-            genuine new peer-exposed work (new work exposed by peer progress),
-            can create real work and permit another reply. Treat a changed
-            objective, changed scope, changed constraint, or changed deliverable
-            as genuine evolution.
-            Multi-target turns must address destinations explicitly or stay
-            silent. Keep the final send-or-silence decision model-owned: choose
-            a send or ``[SILENT]`` from current evidence.
+        target is an optional canonical target; cursor is the opaque next
+        cursor; limit is 1..50. Results contain ``messages``, bounded
+        read-only ``prior_context``, ``next_cursor``, and ``has_more``.
+        See the managed ``read-inbox`` skill for interpretation and paging.
         """
         arguments: dict[str, Any] = {}
         if target:
@@ -753,67 +727,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         visibility_level: str = "default",
         send_anyway: bool = False,
     ) -> dict[str, Any]:
-        """Post a message to a Puffo.ai channel or DM a user.
+        """Post text to a channel ``ch_<uuid>`` or DM ``@<slug>``.
 
-        channel: '@<slug>' for a DM (e.g. '@alice-1234'), or a raw
-            channel id (e.g. 'ch_<uuid>'). Use
-            ``list_channels_in_all_spaces`` (or ``list_spaces`` +
-            ``list_channels_in_space``) to discover ids — '#name'
-            shortcuts are not supported.
-        text: message body. Markdown preserved verbatim.
-        root_id: optional — reply inside a thread; pass the
-            envelope_id of the message you're replying to. Non-root
-            ids auto-correct to their thread root; roots from other
-            channels/DMs are rejected; replies to daemon-local system
-            messages go out as new top-level posts.
-        visibility_level: one of ``"human"`` | ``"default"`` |
-            ``"agent_only"`` (default: ``"default"``).
-            - ``"human"`` — anything a person should read (replies,
-              status updates, operator pings). Sent visible.
-            - ``"default"`` — agent-to-agent chatter human clients
-              fold away. Sent hidden BUT with safety-net floors: DMs
-              and messages whose text @-mentions a human are forced
-              visible with a note explaining why. Root-level (non-
-              threaded) posts are also forced visible because they
-              can't fold in the UI.
-            - ``"agent_only"`` — you're explicitly telling the daemon
-              this is agent-to-agent traffic; the DM / @-mention
-              safety net is skipped. Use only when you're confident
-              no human is waiting for this reply. Root-level posts
-              are still forced visible (can't fold either way).
-        send_anyway: for a channel send, keep the chosen content even
-            after a prior held result and a correlated same-Turn read has
-            admitted context through the held watermark. Content revised or
-            derived from conversation progress is context-dependent and must
-            use normal freshness. After a held send of that content, reread
-            the relevant route and make a fresh send-or-silence decision
-            before sending. Switching targets does not make that content
-            context-independent. For context-dependent content, actual newer
-            message content must be successfully synchronized, returned and
-            inspected before choosing ``send_anyway``. A newer watermark or
-            sequence advance alone, an empty recovery/read result, or a
-            failed history lookup is not semantic inspection. Do not infer
-            unseen content or force a stale context-dependent draft. After
-            the existing same-turn held/read technical eligibility checks,
-            explicit ``send_anyway=True`` remains available as a model-owned
-            choice only when the chosen content is genuinely
-            context-independent; this is a deliberate judgment owned by the
-            model, not an automatic retry and not a way to bypass normal
-            freshness for context-dependent content.
-        Assignment completion: ordinary peer progress on an unchanged
-        originating intent does not by itself reopen an ``is_self: true``
-        contribution that already completed this Agent's part. Peer-exposed
-        work or an evolving assignment permits another response only when
-        newly observed content creates or changes an unresolved obligation
-        belonging to this Agent. A genuine follow-up, correction, direct
-        mention, newly exposed dependency, otherwise changed work, including
-        genuine new peer-exposed work (new work exposed by peer progress), can
-        create real work and permit another reply. Treat a changed objective,
-        changed scope, changed constraint, or changed deliverable as genuine
-        evolution. Multi-target turns must address destinations explicitly or
-        stay silent. Keep the final send-or-silence decision model-owned:
-        choose a send or
-        ``[SILENT]`` from current evidence.
+        ``root_id`` is an optional thread root; ``visibility_level`` is
+        ``human``, ``default`` (default), or ``agent_only``; ``send_anyway``
+        is an explicit held-send flag. Results are ``sent``, ``held``, or an
+        error. See the managed ``send-message`` skill for routing, visibility,
+        thread-root validation, and held-send guidance.
         """
         return await _dispatch_semantic_send(
             cfg,
@@ -995,25 +915,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         before: int = 0,
         after: int = 0,
     ) -> str:
-        """List recent **root posts** in a channel from local storage,
-        with the reply count for each thread.
+        """List local channel root posts.
 
-        Replies are NOT inlined — call ``get_thread_history`` if you
-        want to drill into a specific thread. This keeps a single
-        ``get_channel_history`` call from dragging hundreds of replies
-        into your context just because one thread is active.
-
-        Filters (optional, can be combined):
-        - ``since`` — an envelope_id (``msg_<uuid>``). Results have
-          ``sent_at >`` that envelope's ``sent_at``. Use this when
-          you remember the latest root you already saw.
-        - ``after`` — ms-epoch timestamp; exclusive lower bound.
-        - ``before`` — ms-epoch timestamp; exclusive upper bound.
-
-        Output uses semantic target headers and message rows; root rows include
-        their current reply count. Oldest-first inside the returned window.
-        Channel id is a raw
-        ``ch_<uuid>`` (no ``#name`` shortcut)."""
+        ``channel`` is ``ch_<uuid>``; ``limit``, ``since``, ``before``, and
+        ``after`` filter the result. It returns semantic target/row projection
+        groups with root reply counts; use ``get_thread_history`` for replies.
+        See the managed ``channel-history`` skill for context use.
+        """
         limit = max(1, min(int(limit), 200))
         channel_ref = channel.strip()
         if channel_ref.startswith("#"):
@@ -1067,14 +975,12 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         limit: int = 20,
         before: int = 0,
     ) -> str:
-        """List recent **direct messages** between you and ``peer``,
-        oldest-first, from local storage.
+        """List local DMs with ``peer``, oldest first.
 
-        ``peer`` is the other party's slug (e.g. ``alice-1a2b``) — the
-        same slug you'd DM with ``send_message``. ``before`` is an
-        optional ms-epoch upper bound (exclusive) for paging back.
-
-        Output uses semantic target headers and message rows, oldest-first."""
+        ``before`` is an exclusive ms-epoch paging bound. Results use the
+        semantic target/row projection. See the managed ``channel-history``
+        skill for supplementary-context guidance.
+        """
         limit = max(1, min(int(limit), 200))
         peer_slug = peer.strip().lstrip("@")
         if not peer_slug:
@@ -1094,20 +1000,12 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         before: int = 0,
         after: int = 0,
     ) -> str:
-        """List messages in one thread (the root post + every reply
-        that points at it) from local storage.
+        """List a local thread's root and replies, oldest first.
 
-        Used after ``get_channel_history`` shows a thread you want
-        to read into. Same filter semantics as
-        ``get_channel_history``: ``since`` is an envelope_id whose
-        ``sent_at`` becomes the exclusive lower bound; ``after`` /
-        ``before`` are ms-epoch bounds. All filters optional.
-
-        ``root_id`` is the thread root envelope_id (``msg_<uuid>``).
-        For a top-level post that has no replies, this returns just
-        that post.
-
-        Output uses semantic target headers and message rows, oldest-first."""
+        ``root_id`` is the root envelope id; ``limit``, ``since``, ``before``,
+        and ``after`` filter it. Results use the semantic target/row projection.
+        See the managed ``channel-history`` skill for supplementary context.
+        """
         if not root_id.strip():
             raise RuntimeError("root_id required")
         limit = max(1, min(int(limit), 200))
@@ -1138,7 +1036,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             tool_name="get_thread_history",
             tool_arguments=tool_arguments,
         )
-        result = format_message_group(msgs, current_agent_aliases=(cfg.slug,))
+        result = format_message_group(
+            msgs,
+            current_agent_aliases=(cfg.slug,),
+            thread_root_id=root_id.strip(),
+        )
         return f"{result}\n{receipt_marker}" if receipt_marker else result
 
     @mcp.tool()
@@ -1314,10 +1216,10 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
     async def get_post(post_ref: str) -> str:
-        """Fetch one message by its envelope_id from local storage.
+        """Fetch one local message by envelope id.
 
-        post_ref: an envelope_id (e.g. 'env_...'). Returns sender,
-        timestamp, and message text.
+        Returns the semantic target/row projection. See the managed
+        ``channel-history`` skill for supplementary-context guidance.
         """
         envelope_id = (post_ref or "").strip()
         if not envelope_id:
@@ -1413,7 +1315,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             tool_arguments=tool_arguments,
         )
         result = (
-            f"source target={target_label(msg)} envelope_id={msg.envelope_id}\n"
+            f"source {target_label(msg, current_agent_aliases=(cfg.slug,))} envelope_id={msg.envelope_id}\n"
             f"segment {segment}/{seg_count - 1} "
             f"(chars {start}..{end - 1} of {total}):\n{chunk}"
         )
@@ -1428,54 +1330,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         visibility_level: str = "default",
         send_anyway: bool = False,
     ) -> dict[str, Any]:
-        """Send a message carrying one or more workspace files to a
-        channel or DM.
+        """Send workspace files and an optional caption to a channel or DM.
 
-        All files ride in a single envelope — recipients see one
-        message bubble with N attachments.
-
-        paths: workspace-relative file paths. ``..`` and absolute
-            paths are rejected.
-        channel: same syntax as ``send_message`` (``@<slug>`` or a
-            raw channel id).
-        caption: optional text alongside the files.
-        root_id: optional thread reply, same semantics as
-            ``send_message``'s ``root_id``.
-        visibility_level: same semantics as ``send_message`` —
-            ``"human"`` | ``"default"`` | ``"agent_only"``, default
-            ``"default"``. The @-mention floor keys off ``caption``.
-        send_anyway: same channel-freshness override as
-            ``send_message``. Content revised or derived from conversation
-            progress is context-dependent and must use normal freshness.
-            After a held send of that content, reread the relevant route and
-            make a fresh send-or-silence decision before sending. Switching
-            targets does not make that content context-independent. For
-            context-dependent content, actual newer message content must be
-            successfully synchronized, returned and inspected before
-            choosing ``send_anyway``. A newer watermark or sequence advance
-            alone, an empty recovery/read result, or a failed history lookup
-            is not semantic inspection. Do not infer unseen content or force
-            a stale context-dependent draft. After the existing same-turn
-            held/read technical eligibility checks, explicit
-            ``send_anyway=True`` remains available as a model-owned choice only
-            when the chosen content is genuinely context-independent; this is
-            a deliberate judgment owned by the model, not an automatic retry
-            and not a way to bypass normal freshness for context-dependent
-            content.
-        Assignment completion: ordinary peer progress on an unchanged
-        originating intent does not by itself reopen an ``is_self: true``
-        contribution that already completed this Agent's part. Peer-exposed
-        work or an evolving assignment permits another response only when
-        newly observed content creates or changes an unresolved obligation
-        belonging to this Agent. A genuine follow-up, correction, direct
-        mention, newly exposed dependency, otherwise changed work, including
-        genuine new peer-exposed work (new work exposed by peer progress), can
-        create real work and permit another reply. Treat a changed objective,
-        changed scope, changed constraint, or changed deliverable as genuine
-        evolution. Multi-target turns must address destinations explicitly or
-        stay silent. Keep the final send-or-silence decision model-owned:
-        choose a send or
-        ``[SILENT]`` from current evidence.
+        ``paths`` are workspace-relative; ``channel``, ``root_id``,
+        ``visibility_level``, and ``send_anyway`` match ``send_message``.
+        Results are ``sent``, ``held``, or an error. See the managed
+        ``send-message-with-attachments`` skill and its common
+        ``send-message`` held-send procedure.
         """
         return await _dispatch_semantic_send(
             cfg,

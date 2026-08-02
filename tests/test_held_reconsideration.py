@@ -249,6 +249,34 @@ async def test_held_recovery_keeps_channel_wide_terminal_pair_for_thread_send():
 
 
 @pytest.mark.asyncio
+async def test_held_thread_basis_overrides_only_its_presentation_target():
+    coordinator, _freshness, _http = await coordinator_fixture()
+    key = ("session-a", "turn-a", "sp_1", "ch_a")
+    root = {
+        "envelope_id": "thread-root", "server_seq": 4, "sent_at": 1_700_000_000_000,
+        "sender_slug": "alice", "space_id": "sp_1", "channel_id": "ch_a",
+        "thread_root_id": "", "envelope_kind": "channel", "content": "root",
+    }
+    reply = {**root, "envelope_id": "thread-reply", "server_seq": 5,
+             "thread_root_id": "thread-root", "content": "reply"}
+    unrelated = {**root, "envelope_id": "other-route", "server_seq": 6,
+                 "channel_id": "ch_other", "thread_root_id": "other-root",
+                 "content": "other"}
+    coordinator._held_evidence[key] = _HeldEvidence(
+        latest_seq=6, latest_envelope_id="other-route", synchronized=True,
+        thread_root_id="thread-root", visible_draft_basis=[root, reply],
+        recovered_messages=[root, reply, unrelated],
+    )
+    output = await coordinator._held_context_output(key, "sp_1", "ch_a")
+    reconsideration = output["reconsideration"]
+    assert reconsideration["visible_draft_basis"].count(
+        "## target=thread space_id=sp_1 channel_id=ch_a thread_root_id=thread-root"
+    ) == 1
+    assert "## target=channel space_id=sp_1 channel_id=ch_a" in reconsideration["new_channel_context"]
+    assert "## target=thread space_id=sp_1 channel_id=ch_other thread_root_id=other-root" in reconsideration["new_channel_context"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["native", "keyless"])
 async def test_complete_exact_held_identity_and_one_shot_contract(transport):
     if transport == "native":

@@ -198,11 +198,12 @@ class _StubMessage:
     """Mirrors enough of ``StoredMessageDict`` for the tool's
     assertions about ``content`` shape."""
     def __init__(self, envelope_id="env_x", sender_slug="alice",
-                 envelope_kind="dm", channel_id=None,
+                 recipient_slug=None, envelope_kind="dm", channel_id=None,
                  thread_root_id=None, sent_at=1_700_000_000_000,
                  content=""):
         self.envelope_id = envelope_id
         self.sender_slug = sender_slug
+        self.recipient_slug = recipient_slug
         self.envelope_kind = envelope_kind
         self.channel_id = channel_id
         self.thread_root_id = thread_root_id
@@ -252,8 +253,9 @@ async def test_segment_returns_chunk_with_range_metadata():
         _StubMessage(envelope_id="env_5k", content=payload),
     ))
     out = await tool(envelope_id="env_5k", segment=1, segment_size=2000)
-    assert out.startswith("segment 1/2 (chars 2000..3999 of 5000):\n")
-    assert payload[2000:4000] in out
+    assert out.startswith("source target=dm peer_id=alice envelope_id=env_5k\n")
+    assert "segment 1/2 (chars 2000..3999 of 5000):\n" in out
+    assert out.rsplit("\n", 1)[-1] == payload[2000:4000]
 
 
 @pytest.mark.asyncio
@@ -266,12 +268,30 @@ async def test_segment_last_chunk_is_short():
         _StubMessage(envelope_id="env_4500", content=payload),
     ))
     out = await tool(envelope_id="env_4500", segment=2, segment_size=2000)
+    assert out.startswith("source target=dm peer_id=alice envelope_id=env_4500\n")
     # Segment 2 covers chars 4000..4499 (500 chars).
     assert "segment 2/2 (chars 4000..4499 of 4500):\n" in out
     # Body part of the output is exactly the leftover slice.
-    body = out.split("\n", 1)[1]
+    body = out.rsplit("\n", 1)[-1]
     assert body == payload[4000:]
     assert len(body) == 500
+
+
+@pytest.mark.asyncio
+async def test_segment_outbound_dm_source_names_other_peer():
+    """A locally authored DM identifies its recipient as the source peer."""
+    tool = _collect_tool("get_post_segment", _StubDataClient(
+        _StubMessage(
+            envelope_id="env_outbound",
+            sender_slug="d2d2",
+            recipient_slug="r2d2",
+            content="outbound body",
+        ),
+    ))
+    out = await tool(envelope_id="env_outbound", segment=0, segment_size=2000)
+    assert out.startswith(
+        "source target=dm peer_id=r2d2 envelope_id=env_outbound\n"
+    )
 
 
 @pytest.mark.asyncio

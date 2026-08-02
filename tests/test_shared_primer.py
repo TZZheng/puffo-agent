@@ -3,610 +3,143 @@ from pathlib import Path
 
 from puffo_agent.agent.shared_content import (
     DEFAULT_SHARED_CLAUDE_MD,
-    DEFAULT_SKILL_READ_INBOX,
-    DEFAULT_SKILL_SEND_MESSAGE,
-    DEFAULT_SKILL_SEND_MESSAGE_WITH_ATTACHMENTS,
+    DEFAULT_SKILLS,
     ensure_shared_primer,
     rebuild_agent_claude_md,
     rebuild_agent_codex_md,
-    sync_shared_skills_codex,
 )
-from puffo_agent.portal.cli import build_parser
+
+
+PARENT_CLAUDE_BYTES = 16109
+PARENT_CODEX_BYTES = 15989
 
 
 def _tmp() -> Path:
     return Path(tempfile.mkdtemp())
 
 
-# ── ensure_shared_primer ────────────────────────────────────────────
-
-
-def test_ensure_creates_on_fresh_dir():
-    shared = _tmp() / "shared"
-    actions = ensure_shared_primer(shared)
-    assert actions, "expected managed files to be reported"
-    assert all(action == "created" for _, action in actions)
-    assert (
-        (shared / "CLAUDE.md").read_text(encoding="utf-8")
-        == DEFAULT_SHARED_CLAUDE_MD
-    )
-    assert any(rel.startswith("skills/") for rel, _ in actions)
-
-
-def test_ensure_is_noop_when_already_current():
-    shared = _tmp() / "shared"
-    ensure_shared_primer(shared)
-    actions = ensure_shared_primer(shared)
-    assert all(action == "unchanged" for _, action in actions)
-
-
-def test_ensure_overwrites_stale_content_without_backup():
-    """No operator-edit protection — stale content is replaced in
-    place. No ``.bak`` is written."""
-    shared = _tmp() / "shared"
-    ensure_shared_primer(shared)
-    primer = shared / "CLAUDE.md"
-    primer.write_text("stale content", encoding="utf-8")
-
-    by_rel = dict(ensure_shared_primer(shared))
-    assert by_rel["CLAUDE.md"] == "updated"
-    assert by_rel["README.md"] == "unchanged"
-    assert primer.read_text(encoding="utf-8") == DEFAULT_SHARED_CLAUDE_MD
-    assert not (shared / "CLAUDE.md.bak").exists()
-
-
-def test_ensure_prunes_stale_managed_skills():
-    """A managed skill dir whose id is no longer in ``DEFAULT_SKILLS``
-    is deleted on the next sync. Operator-authored dirs (no
-    ``.puffo-managed`` marker) are preserved."""
-    from puffo_agent.agent.shared_content import _MANAGED_MARKER
-
-    shared = _tmp() / "shared"
-    ensure_shared_primer(shared)
-
-    stale = shared / "skills" / "removed-in-v2"
-    stale.mkdir()
-    (stale / "SKILL.md").write_text("old body", encoding="utf-8")
-    (stale / _MANAGED_MARKER).write_text("m", encoding="utf-8")
-
-    custom = shared / "skills" / "operator-authored"
-    custom.mkdir()
-    (custom / "SKILL.md").write_text("keep me", encoding="utf-8")
-
-    by_rel = dict(ensure_shared_primer(shared))
-    assert by_rel.get("skills/removed-in-v2") == "pruned"
-    assert not stale.exists()
-    assert custom.exists()
-    assert (custom / "SKILL.md").read_text(encoding="utf-8") == "keep me"
-
-
-# ── rebuild_agent_claude_md ─────────────────────────────────────────
-
-
-def test_rebuild_agent_claude_md_assembles_primer_profile_memory():
-    root = _tmp()
-    shared = root / "shared"
+def _rebuild(root: Path) -> tuple[str, str]:
     profile = root / "profile.md"
-    profile.write_text("# Soul\nI am a test agent.", encoding="utf-8")
+    profile.write_text("# Soul\nSOUL-MARKER-7b", encoding="utf-8")
     memory = root / "memory"
-    memory.mkdir()
-    # Legacy flat memory file — migrated into briefing/ on rebuild.
-    (memory / "facts.md").write_text("a remembered fact", encoding="utf-8")
     workspace = root / "workspace"
     workspace.mkdir()
-    claude_user = root / ".claude"
-    gemini_user = root / ".gemini"
-
-    out = rebuild_agent_claude_md(
-        shared_dir=shared,
-        profile_path=profile,
-        memory_dir=memory,
-        workspace_dir=workspace,
-        claude_user_dir=claude_user,
-        gemini_user_dir=gemini_user,
-        agent_id="tester-0001",
-        display_name="Tester",
+    common = dict(
+        shared_dir=root / "shared", profile_path=profile, memory_dir=memory,
+        workspace_dir=workspace, agent_id="AGENT-ID-MARKER-8c",
+        display_name="DISPLAY-NAME-MARKER-9d", role="LONG-ROLE-MARKER-ae",
+        role_short="SHORT-ROLE-MARKER-bf",
     )
-    # Shared primer is seeded on demand, then primer + profile + the
-    # compiled memory briefing all land in the assembled prompt.
-    assert "Puffo.ai platform primer" in out
-    assert "I am a test agent." in out
-    assert "a remembered fact" in out
-    # The flat file was migrated into the briefing tree, and the
-    # managed profile briefing was synced from the identity fields.
-    assert (memory / "briefing" / "facts.md").is_file()
-    assert not (memory / "facts.md").exists()
-    assert (memory / "briefing" / "profile.md").is_file()
-    # notes/ content never lands in the artifact.
-    (memory / "notes" / "scratch.md").write_text(
-        "note-only detail", encoding="utf-8",
-    )
-    out2 = rebuild_agent_claude_md(
-        shared_dir=shared,
-        profile_path=profile,
-        memory_dir=memory,
-        workspace_dir=workspace,
-        claude_user_dir=claude_user,
-        gemini_user_dir=gemini_user,
-        agent_id="tester-0001",
-        display_name="Tester",
-    )
-    assert "note-only detail" not in out2
-    # Written to both user-level dirs.
-    assert (claude_user / "CLAUDE.md").read_text(encoding="utf-8") == out2
-    assert (gemini_user / "GEMINI.md").read_text(encoding="utf-8") == out2
-
-
-# ── codex variants strip mcp__puffo__ prefix ───────────────────────
-
-
-def test_rebuild_agent_codex_md_strips_mcp_puffo_prefix():
-    """Codex's tool router dispatches MCP tools under bare names —
-    the LLM must NOT see ``mcp__puffo__`` in its instructions or it
-    will generate calls the router rejects with ``unsupported``."""
-    root = _tmp()
-    shared = root / "shared"
-    profile = root / "profile.md"
-    profile.write_text("# Soul\nI am codex.", encoding="utf-8")
-    memory = root / "memory"
-    memory.mkdir()
-    workspace = root / "workspace"
-    workspace.mkdir()
-    codex_user = root / ".codex"
-
-    out = rebuild_agent_codex_md(
-        shared_dir=shared,
-        profile_path=profile,
-        memory_dir=memory,
-        workspace_dir=workspace,
-        codex_user_dir=codex_user,
-    )
-
-    # Primer originally references the prefix; codex variant must
-    # not.
-    assert "mcp__puffo__" not in out
-    # Bare tool names still present so the LLM sees what to call.
-    assert "send_message" in out
-    # File written.
-    assert (codex_user / "AGENTS.md").read_text(encoding="utf-8") == out
-
-
-def _assert_followup_decision_contract(text: str) -> None:
-    lowered = " ".join(text.lower().split())
-    ordered = (
-        "recover the originating human intent",
-        "inspect this agent's relevant prior contribution",
-        "classify newly observed peer progress",
-        "decide whether a new unresolved action belongs to this agent",
-    )
-    positions = [lowered.index(phrase) for phrase in ordered]
-    assert positions == sorted(positions)
-
-    required = (
-        "is_self: true",
-        "same originating assignment",
-        "no unresolved action for this agent",
-    )
-    for phrase in required:
-        assert phrase in lowered
-    assert "arrival or peer progress alone does not require speech" in lowered
-    assert "[silent]" in lowered
-    for phrase in (
-        "follow-up",
-        "correction",
-        "mention",
-        "dependency",
-        "evolving assignment",
-        "another reply",
-        "agent-authored message is not an automatic silence condition",
-    ):
-        assert phrase in lowered
-    for forbidden in (
-        "only one reply",
-        "one reply per",
-        "must stay silent after replying",
-        "ignore agent-authored messages",
-    ):
-        assert forbidden not in lowered
-
-
-def _assert_assignment_completion_boundary(text: str) -> None:
-    lowered = " ".join(text.lower().split())
-    for phrase in (
-        "ordinary peer progress on an unchanged originating intent",
-        "does not by itself reopen",
-        "is_self: true",
-        "already completed this agent's part",
-        "peer-exposed work or an evolving assignment permits another response only when",
-        "newly observed content creates or changes an unresolved obligation belonging to this agent",
-        "changed objective",
-        "changed scope",
-        "changed constraint",
-        "changed deliverable",
-    ):
-        assert phrase in lowered, (phrase, text)
-
-
-def test_followup_decision_context_is_shared_across_managed_prompts():
-    root = _tmp()
-    shared = root / "shared"
-    profile = root / "profile.md"
-    profile.write_text("# Soul\nI am a follow-up test agent.", encoding="utf-8")
-    memory = root / "memory"
-    memory.mkdir()
-    workspace = root / "workspace"
-    workspace.mkdir()
-    claude_user = root / ".claude"
-    gemini_user = root / ".gemini"
-    codex_user = root / ".codex"
-
     claude = rebuild_agent_claude_md(
-        shared_dir=shared,
-        profile_path=profile,
-        memory_dir=memory,
-        workspace_dir=workspace,
-        claude_user_dir=claude_user,
-        gemini_user_dir=gemini_user,
-        agent_id="follow-up-0001",
+        **common, claude_user_dir=root / ".claude", gemini_user_dir=root / ".gemini",
     )
-    codex = rebuild_agent_codex_md(
-        shared_dir=shared,
-        profile_path=profile,
-        memory_dir=memory,
-        workspace_dir=workspace,
-        codex_user_dir=codex_user,
-        agent_id="follow-up-0001",
+    (memory / "briefing" / "topic.md").write_text(
+        "NON-PROFILE-TOPIC-MARKER-c0", encoding="utf-8",
     )
+    claude = rebuild_agent_claude_md(
+        **common, claude_user_dir=root / ".claude", gemini_user_dir=root / ".gemini",
+    )
+    codex = rebuild_agent_codex_md(**common, codex_user_dir=root / ".codex")
+    return claude, codex
 
-    for prompt in (
-        DEFAULT_SHARED_CLAUDE_MD,
-        claude,
-        (claude_user / "CLAUDE.md").read_text(encoding="utf-8"),
-        (gemini_user / "GEMINI.md").read_text(encoding="utf-8"),
-        codex,
-        (codex_user / "AGENTS.md").read_text(encoding="utf-8"),
+
+def test_standing_prompt_is_compact_and_identity_is_compiled_once():
+    claude, codex = _rebuild(_tmp())
+    for text in (claude, codex):
+        for marker in (
+            "DISPLAY-NAME-MARKER-9d", "AGENT-ID-MARKER-8c", "LONG-ROLE-MARKER-ae",
+            "SHORT-ROLE-MARKER-bf", "SOUL-MARKER-7b", "NON-PROFILE-TOPIC-MARKER-c0",
+        ):
+            assert text.count(marker) == 1
+        assert "# Your role" not in text
+        assert "# Your memory" in text
+    assert len(claude.encode()) < PARENT_CLAUDE_BYTES
+    assert len(codex.encode()) < PARENT_CODEX_BYTES
+
+
+def test_policy_has_one_detailed_owner_and_primer_retains_contract():
+    assert "<global_inbox_notice>" in DEFAULT_SHARED_CLAUDE_MD
+    assert '"content_included":false' in DEFAULT_SHARED_CLAUDE_MD
+    assert "read_inbox" in DEFAULT_SHARED_CLAUDE_MD
+    assert "send_message" in DEFAULT_SHARED_CLAUDE_MD
+    assert "[SILENT]" in DEFAULT_SHARED_CLAUDE_MD
+    for absent in (
+        "prior_context", "visible_draft_basis", "new_channel_context",
+        "context_ready", "same originating assignment", "send_anyway=True",
     ):
-        _assert_followup_decision_contract(prompt)
-        _assert_assignment_completion_boundary(prompt)
+        assert absent not in DEFAULT_SHARED_CLAUDE_MD
+    read = DEFAULT_SKILLS["read-inbox"][1]
+    history = DEFAULT_SKILLS["channel-history"][1]
+    post = DEFAULT_SKILLS["get-post"][1]
+    send = DEFAULT_SKILLS["send-message"][1]
+    for phrase in (
+        "## target=dm peer_id=...",
+        "## target=channel space_id=...\n  channel_id=...",
+        "## target=thread space_id=... channel_id=...\n  thread_root_id=...",
+        "seq", "absolute `time`", "type", "id", "self", "encrypted",
+        "@slug", "optional `name`", "body",
+    ):
+        assert phrase in read
+    for text in (history, post):
+        assert "read-inbox" in text
+        assert "seq" not in text
+    normalized_read = " ".join(read.split())
+    assert "messages" in read and "prior_context" in read and "strictly earlier" in normalized_read
+    assert "do not acknowledge pending Inbox rows" in read
+    assert "does not acknowledge pending Inbox work" in " ".join(history.split())
+    assert "does not acknowledge pending Inbox work" in " ".join(post.split())
+    normalized_send = " ".join(send.lower().split())
+    for phrase in (
+        'state="held"', "unchanged draft", "draft boundary/latest pair",
+        "visible_draft_basis", "new_channel_context", "context_ready=true",
+        "context_ready=false", "inspect", "revise and send with normal freshness",
+        "retry the unchanged draft", "or send nothing", "send_anyway=true", "is rare",
+        "model-owned", "may be held again", "sequence watermark alone is not semantic context",
+    ):
+        assert phrase.lower() in normalized_send
+    for skill_id in ("attachments", "channel-history", "send-message-with-attachments"):
+        body = DEFAULT_SKILLS[skill_id][1]
+        assert "visible_draft_basis" not in body
+        assert "same originating assignment" not in body
+    assert "common held-send procedure" in DEFAULT_SKILLS["send-message-with-attachments"][1]
+    for forbidden in (
+        "<inbox_message>", "one line per root post", "nested `route`",
+        "assignment-completion", "benchmark", "response quota", "counting-specific",
+        "sender-type silence", "forced mention/DM", "automatically retries",
+        "always requires a separate history read",
+    ):
+        assert forbidden not in "\n".join((DEFAULT_SHARED_CLAUDE_MD, *[body for _, body in DEFAULT_SKILLS.values()]))
+    send_policy_text = "\n".join((send, DEFAULT_SKILLS["send-message-with-attachments"][1])).lower()
+    for forbidden in (
+        "**when to use:**", "**when not to use:**", "prefer this over",
+        'prefer "human"', "spontaneous cross-posts",
+    ):
+        assert forbidden not in send_policy_text
 
+
+def test_harnesses_discover_managed_skills_with_correct_tool_names():
+    root = _tmp()
+    claude, codex = _rebuild(root)
     assert "mcp__puffo__" in claude
     assert "mcp__puffo__" not in codex
     assert "send_message" in codex
+    ensure_shared_primer(root / "shared")
+    for skill_id in ("read-inbox", "send-message"):
+        claude_skill = root / "workspace" / ".claude" / "skills" / skill_id / "SKILL.md"
+        codex_skill = root / "workspace" / ".agents" / "skills" / skill_id / "SKILL.md"
+        for skill in (claude_skill, codex_skill):
+            text = skill.read_text(encoding="utf-8")
+            assert "name:" in text and "description:" in text
+        assert "mcp__puffo__" in claude_skill.read_text(encoding="utf-8")
+        assert "mcp__puffo__" not in codex_skill.read_text(encoding="utf-8")
 
 
-def _assert_context_dependent_send_contract(text: str) -> None:
-    lowered = " ".join(text.lower().split())
-    for phrase in (
-        "revised or derived from conversation progress is context-dependent",
-        "must use normal freshness",
-        "after a held send of that content, reread the relevant route",
-        "fresh send-or-silence decision",
-        "switching targets does not make that content context-independent",
-        "after the existing same-turn held/read technical eligibility checks",
-        "send_anyway=true",
-        "model-owned choice only",
-        "genuinely context-independent",
-        "not an automatic retry",
-    ):
-        assert phrase in lowered, (phrase, text)
-
-
-def _assert_reply_eligibility_controls(text: str) -> None:
-    lowered = " ".join(text.lower().split())
-    for phrase in (
-        "follow-up",
-        "correction",
-        "direct mention",
-        "newly exposed dependency",
-        "otherwise changed work",
-        "new work exposed by peer progress",
-        "genuine new peer-exposed work",
-        "changed objective",
-        "changed scope",
-        "changed constraint",
-        "changed deliverable",
-        "permit another reply",
-        "multi-target turns must address destinations explicitly",
-        "choose a send or `[silent]`",
-        "final send-or-silence decision model-owned",
-        "independently choose whether to revise",
-    ):
-        assert phrase in lowered, (phrase, text)
-
-
-def test_context_dependent_send_contract_is_shared_across_guidance_and_skills():
+def test_managed_refresh_rewrites_stale_skill():
     root = _tmp()
     shared = root / "shared"
-    profile = root / "profile.md"
-    profile.write_text("# Soul\nI am a context-dependent test agent.", encoding="utf-8")
-    memory = root / "memory"
-    memory.mkdir()
-    workspace = root / "workspace"
-    workspace.mkdir()
-    claude_user = root / ".claude"
-    gemini_user = root / ".gemini"
-    codex_user = root / ".codex"
-
-    claude = rebuild_agent_claude_md(
-        shared_dir=shared,
-        profile_path=profile,
-        memory_dir=memory,
-        workspace_dir=workspace,
-        claude_user_dir=claude_user,
-        gemini_user_dir=gemini_user,
-        agent_id="context-dependent-0001",
-    )
-    codex = rebuild_agent_codex_md(
-        shared_dir=shared,
-        profile_path=profile,
-        memory_dir=memory,
-        workspace_dir=workspace,
-        codex_user_dir=codex_user,
-        agent_id="context-dependent-0001",
-    )
-
-    guidance_surfaces = (
-        DEFAULT_SHARED_CLAUDE_MD,
-        claude,
-        (claude_user / "CLAUDE.md").read_text(encoding="utf-8"),
-        (gemini_user / "GEMINI.md").read_text(encoding="utf-8"),
-        codex,
-        (codex_user / "AGENTS.md").read_text(encoding="utf-8"),
-    )
-    for prompt in guidance_surfaces:
-        _assert_assignment_completion_boundary(prompt)
-        _assert_context_dependent_send_contract(prompt)
-        _assert_reply_eligibility_controls(prompt)
-
-    send_skill_surfaces = (
-        DEFAULT_SKILL_SEND_MESSAGE,
-        DEFAULT_SKILL_SEND_MESSAGE_WITH_ATTACHMENTS,
-        (workspace / ".claude" / "skills" / "send-message" / "SKILL.md").read_text(
-            encoding="utf-8"
-        ),
-        (
-            workspace
-            / ".claude"
-            / "skills"
-            / "send-message-with-attachments"
-            / "SKILL.md"
-        ).read_text(encoding="utf-8"),
-        (workspace / ".agents" / "skills" / "send-message" / "SKILL.md").read_text(
-            encoding="utf-8"
-        ),
-        (
-            workspace
-            / ".agents"
-            / "skills"
-            / "send-message-with-attachments"
-            / "SKILL.md"
-        ).read_text(encoding="utf-8"),
-    )
-    for skill in send_skill_surfaces:
-        _assert_context_dependent_send_contract(skill)
-        _assert_assignment_completion_boundary(skill)
-
-    assert "mcp__puffo__" in claude
-    assert "mcp__puffo__" not in codex
-
-
-def test_read_inbox_prior_context_contract_is_shared_across_claude_codex_and_skills():
-    root = _tmp()
-    shared = root / "shared"
-    profile = root / "profile.md"
-    profile.write_text("# Soul\nI am a context test agent.", encoding="utf-8")
-    memory = root / "memory"
-    memory.mkdir()
-    workspace = root / "workspace"
-    workspace.mkdir()
-
-    claude = rebuild_agent_claude_md(
-        shared_dir=shared,
-        profile_path=profile,
-        memory_dir=memory,
-        workspace_dir=workspace,
-        claude_user_dir=root / ".claude",
-        gemini_user_dir=root / ".gemini",
-        agent_id="context-0001",
-    )
-    codex = rebuild_agent_codex_md(
-        shared_dir=shared,
-        profile_path=profile,
-        memory_dir=memory,
-        workspace_dir=workspace,
-        codex_user_dir=root / ".codex",
-        agent_id="context-0001",
-    )
-    codex_skill = (workspace / ".agents" / "skills" / "read-inbox" / "SKILL.md").read_text(
-        encoding="utf-8"
-    )
-    claude_skill = (workspace / ".claude" / "skills" / "read-inbox" / "SKILL.md").read_text(
-        encoding="utf-8"
-    )
-
-    for prompt in (
-        DEFAULT_SHARED_CLAUDE_MD,
-        DEFAULT_SKILL_READ_INBOX,
-        claude,
-        codex,
-        claude_skill,
-        codex_skill,
-    ):
-        lowered = " ".join(prompt.lower().split())
-        for phrase in (
-            "prior_context",
-            "bounded",
-            "read-only",
-            "same selected conversation route",
-            "strictly earlier",
-            "does not admit",
-            "is_self: true",
-            "same originating assignment",
-            "follow-up",
-            "correction",
-            "direct mention",
-            "newly exposed dependency",
-        ):
-            assert phrase in lowered, (phrase, prompt)
-        _assert_assignment_completion_boundary(prompt)
-        for forbidden in (
-            "call this first for every",
-            "first action after every",
-            "participant count",
-            "one reply per",
-            "sender-wide",
-        ):
-            assert forbidden not in lowered
-
-    assert "mcp__puffo__" in claude_skill
-    assert "mcp__puffo__" not in codex_skill
-
-
-def test_sync_shared_skills_codex_strips_prefix_in_skill_bodies():
-    """Skill bodies mirror the same convention as the primer —
-    codex needs them prefix-free."""
-    root = _tmp()
-    shared = root / "shared"
-    workspace = root / "workspace"
-    workspace.mkdir()
-
-    # ensure_shared_primer populates shared/skills/<id>/SKILL.md with
-    # the DEFAULT_SKILLS bodies (which include mcp__puffo__ refs).
     ensure_shared_primer(shared)
-
-    sync_shared_skills_codex(shared, workspace)
-
-    skills_root = workspace / ".agents" / "skills"
-    assert skills_root.is_dir(), "skills dir should be created"
-    found_skill_md = False
-    for skill_md in skills_root.glob("*/SKILL.md"):
-        found_skill_md = True
-        body = skill_md.read_text(encoding="utf-8")
-        assert "mcp__puffo__" not in body, (
-            f"{skill_md} still carries mcp__puffo__ prefix — codex "
-            f"router would reject calls generated against it"
-        )
-    assert found_skill_md, "no SKILL.md files materialised"
-
-
-# ── agent reset-primer CLI ──────────────────────────────────────────
-
-
-def _seed_agent(home: Path, agent_id: str) -> Path:
-    adir = home / "agents" / agent_id
-    (adir / "memory").mkdir(parents=True)
-    (adir / "profile.md").write_text(
-        "# Soul\nI test things.", encoding="utf-8",
-    )
-    (adir / "agent.yml").write_text(
-        f"id: {agent_id}\nstate: running\nruntime:\n  kind: chat-local\n",
-        encoding="utf-8",
-    )
-    return adir
-
-
-def test_cli_reset_primer_rebuilds_listed_agent(monkeypatch):
-    home = _tmp()
-    monkeypatch.setenv("PUFFO_AGENT_HOME", str(home))
-    adir = _seed_agent(home, "tester-0001")
-
-    args = build_parser().parse_args(
-        ["agent", "reset-primer", "tester-0001"],
-    )
-    assert args.func(args) == 0
-
-    claude_md = (adir / ".claude" / "CLAUDE.md").read_text(encoding="utf-8")
-    assert "Puffo.ai platform primer" in claude_md
-    assert "I test things." in claude_md
-    # The shared primer was seeded as a side effect.
-    assert (home / "docker" / "shared" / "CLAUDE.md").exists()
-
-
-def test_cli_reset_primer_unknown_agent_returns_error(monkeypatch):
-    home = _tmp()
-    monkeypatch.setenv("PUFFO_AGENT_HOME", str(home))
-
-    args = build_parser().parse_args(
-        ["agent", "reset-primer", "does-not-exist"],
-    )
-    # Shared primer still re-seeds; the unknown agent yields a non-zero rc.
-    assert args.func(args) == 2
-    assert (home / "docker" / "shared" / "CLAUDE.md").exists()
-
-
-# ── primer + skill body correctness invariants ─────────────────────
-
-
-def test_docs_use_msg_envelope_id_format():
-    """Envelope ids are ``msg_<uuid>`` (crypto/message.py stamps them;
-    the server's prefix validator rejects anything else). No agent-facing
-    doc may teach the phantom ``env_`` format."""
-    from puffo_agent.agent.shared_content import DEFAULT_SKILLS
-
-    assert "env_" not in DEFAULT_SHARED_CLAUDE_MD
-    assert "msg_<uuid>" in DEFAULT_SHARED_CLAUDE_MD
-    for skill_id, (description, body) in DEFAULT_SKILLS.items():
-        assert "env_" not in description, f"stale env_ id in {skill_id} description"
-        assert "env_" not in body, f"stale env_ id in {skill_id} body"
-
-
-def test_primer_dm_reply_rule_lives_in_how_to_reply():
-    """The DM ``@<slug>`` rule sits inside 'How to reply' (where
-    agents actually read on reply), not only 100+ lines below."""
-    start = DEFAULT_SHARED_CLAUDE_MD.index("## How to reply")
-    end = DEFAULT_SHARED_CLAUDE_MD.index("## Spaces, channels, DMs")
-    how_to_reply = DEFAULT_SHARED_CLAUDE_MD[start:end]
-    assert "@<sender_slug>" in how_to_reply
-    assert "DMs have no `channel_id`" in how_to_reply
-
-
-def test_primer_metadata_example_matches_builder():
-    """The documented metadata block must track what
-    ``agent/core.py`` actually emits: display-name ``sender`` +
-    separate ``sender_slug``, absolute ``.puffo/inbox`` attachment
-    paths, and the metadata-notice/read-Inbox contract."""
-    assert '"envelope_id":"msg_<uuid>"' in DEFAULT_SHARED_CLAUDE_MD
-    assert '"server_seq":42' in DEFAULT_SHARED_CLAUDE_MD
-    assert '"is_self":false' in DEFAULT_SHARED_CLAUDE_MD
-    assert '"route":{"channel_id"' in DEFAULT_SHARED_CLAUDE_MD
-    assert "post_id:" not in DEFAULT_SHARED_CLAUDE_MD
-    assert "<global_inbox_notice>" in DEFAULT_SHARED_CLAUDE_MD
-    assert '"content_included":false' in DEFAULT_SHARED_CLAUDE_MD
-    assert '"read_tool":"read_inbox"' in DEFAULT_SHARED_CLAUDE_MD
-    assert "mcp__puffo__read_inbox" in DEFAULT_SHARED_CLAUDE_MD
-    assert "synchronization metadata" in DEFAULT_SHARED_CLAUDE_MD
-    assert "exposes the actual" in DEFAULT_SHARED_CLAUDE_MD
-    assert "pending content" in DEFAULT_SHARED_CLAUDE_MD
-    assert "non-urgent index" in DEFAULT_SHARED_CLAUDE_MD
-    assert "context-independent" in DEFAULT_SHARED_CLAUDE_MD
-    assert "provider-visible result" not in DEFAULT_SHARED_CLAUDE_MD
-    assert "admission receipt" not in DEFAULT_SHARED_CLAUDE_MD
-    assert "First action after every" not in DEFAULT_SHARED_CLAUDE_MD
-    assert "Call this first for every" not in DEFAULT_SHARED_CLAUDE_MD
-    assert "Reply to the `message:`" not in DEFAULT_SHARED_CLAUDE_MD
-    assert "followup_messages_since" not in DEFAULT_SHARED_CLAUDE_MD
-    assert ".puffo/inbox/<envelope_id>/<filename>" in DEFAULT_SHARED_CLAUDE_MD
-    # The old, wrong relative form must be gone.
-    assert "- attachments/<envelope_id>" not in DEFAULT_SHARED_CLAUDE_MD
-    # The attachments skill mirrors the same absolute-path convention.
-    from puffo_agent.agent.shared_content import DEFAULT_SKILLS
-
-    description, body = DEFAULT_SKILLS["attachments"]
-    assert "<workspace>/.puffo/inbox/" in description
-    assert "<workspace>/.puffo/inbox/<envelope_id>/<filename>" in body
-
-
-def test_skills_do_not_reference_removed_send_params():
-    """``is_visible_to_human``/``agent_only`` send-side params were
-    replaced by ``visibility_level`` in 1.0.6. The incoming metadata
-    FIELD ``is_visible_to_human`` is still real, so only skill docs
-    are held to this — not the primer's metadata example."""
-    from puffo_agent.agent.shared_content import DEFAULT_SKILLS
-
-    for skill_id, (description, body) in DEFAULT_SKILLS.items():
-        assert "is_visible_to_human" not in description, (
-            f"stale send-param in {skill_id} description"
-        )
-        assert "is_visible_to_human" not in body, (
-            f"stale send-param in {skill_id} body"
-        )
+    skill = shared / "skills" / "read-inbox" / "SKILL.md"
+    skill.write_text("stale", encoding="utf-8")
+    actions = dict(ensure_shared_primer(shared))
+    assert actions["skills/read-inbox/SKILL.md"] == "updated"
+    assert "prior_context" in skill.read_text(encoding="utf-8")

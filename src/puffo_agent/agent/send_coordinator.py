@@ -1331,6 +1331,7 @@ class SendCoordinator:
             data["reconsideration"]["visible_draft_basis"] = format_message_group(
                 held.visible_draft_basis,
                 current_agent_aliases=aliases,
+                thread_root_id=held.thread_root_id,
             )
             data["reconsideration"]["new_channel_context"] = format_message_group(
                 rows, current_agent_aliases=aliases,
