@@ -403,6 +403,10 @@ class CodexAppServerDriver(HarnessDriver):
                             "tool_name": name,
                             "arguments": arguments,
                             "result": result,
+                            "result_omitted": (
+                                item_type == "dynamicToolCall"
+                                and result is None
+                            ),
                             "is_error": is_error,
                         },
                     )

@@ -453,6 +453,69 @@ async def test_runtime_manager_correlates_private_tool_result_and_rejects_termin
 
     adapter.register_continuation_callback(
         admit,
+        "read-page-provider-omitted-result",
+        tool_names=("read_inbox",),
+        tool_arguments={"cursor": "provider-omitted"},
+        correlation_receipt="receipt-provider-omitted",
+    )
+    await driver.queue.put(HarnessEvent.normalized(
+        type="turn.tool_completed", driver="fake",
+        session_ref=SessionRef("native-session"), turn_ref=driver.turn,
+        native_session_id="native-session", native_turn_id="native-turn",
+        data={
+            "tool_call_ref": "call-provider-omitted",
+            "label": "read_inbox", "outcome": "succeeded",
+        },
+        native_payload={
+            "_puffo_internal": "tool_result",
+            "tool_call_id": "call-provider-omitted",
+            "tool_name": "read_inbox",
+            "arguments": {"cursor": "provider-omitted"},
+            "result": None,
+            "result_omitted": True,
+            "is_error": False,
+        },
+    ))
+    for _ in range(20):
+        if admitted:
+            break
+        await asyncio.sleep(0)
+    assert len(admitted) == 1
+    assert admitted[0].planning_cycle_key == "read-page-provider-omitted-result"
+    assert admitted[0].tool_call_id == "call-provider-omitted"
+
+    admitted.clear()
+    for cycle in ("ambiguous-a", "ambiguous-b"):
+        adapter.register_continuation_callback(
+            admit,
+            cycle,
+            tool_names=("read_inbox",),
+            tool_arguments={"cursor": "ambiguous"},
+            correlation_receipt=f"receipt-{cycle}",
+        )
+    await driver.queue.put(HarnessEvent.normalized(
+        type="turn.tool_completed", driver="fake",
+        session_ref=SessionRef("native-session"), turn_ref=driver.turn,
+        native_session_id="native-session", native_turn_id="native-turn",
+        data={
+            "tool_call_ref": "call-ambiguous", "label": "read_inbox",
+            "outcome": "succeeded",
+        },
+        native_payload={
+            "_puffo_internal": "tool_result",
+            "tool_call_id": "call-ambiguous",
+            "tool_name": "read_inbox",
+            "arguments": {"cursor": "ambiguous"},
+            "result": None,
+            "result_omitted": True,
+            "is_error": False,
+        },
+    ))
+    await asyncio.sleep(0)
+    assert admitted == []
+
+    adapter.register_continuation_callback(
+        admit,
         "read-page-foreign-session",
         tool_names=("read_inbox",),
         tool_arguments={"cursor": "foreign"},
@@ -690,15 +753,24 @@ async def test_metadata_notice_through_real_manager_reads_paginated_exact_union(
         )
         tool_id = f"tool-{page_number}"
         if provider == "codex":
+            item = {
+                "id": tool_id,
+                "type": "mcpToolCall",
+                "tool": "read_inbox",
+                "arguments": arguments,
+                "result": receipt_marker,
+            }
+            if page_number == 2:
+                item.update({
+                    "type": "dynamicToolCall",
+                    "status": "completed",
+                    "success": True,
+                    "contentItems": None,
+                })
+                item.pop("result")
             proc.feed({
                 "method": "item/completed",
-                "params": {"item": {
-                    "id": tool_id,
-                    "type": "mcpToolCall",
-                    "tool": "read_inbox",
-                    "arguments": arguments,
-                    "result": receipt_marker,
-                }},
+                "params": {"item": item},
             })
         else:
             proc.feed({

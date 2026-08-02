@@ -298,25 +298,39 @@ class RuntimeManager:
         arguments = fact.get("arguments")
         if not isinstance(arguments, dict):
             return
-        exact_candidates = [
+        matching_candidates = [
             (index, admission)
             for index, admission in enumerate(self._continuation_admissions)
             if admission.provider_turn_id == event.native_turn_id
             and admission.matches(tool_name, arguments)
             and admission.receipt_marker
-            and admission.receipt_marker in repr(fact.get("result"))
+        ]
+        exact_candidates = [
+            (index, admission)
+            for index, admission in matching_candidates
+            if admission.receipt_marker in repr(fact.get("result"))
         ]
         candidates = exact_candidates
+        # Current Codex app-server dynamicToolCall completion events can omit
+        # contentItems even after the model has received the tool result.  In
+        # that provider-specific shape, the completion event itself is still
+        # valid admission evidence when the active turn has exactly one
+        # semantic match.  Never guess if the provider returned a conflicting
+        # result or if multiple registrations match the same call.
+        if not candidates and fact.get("result_omitted") is True:
+            if len(matching_candidates) == 1:
+                candidates = matching_candidates
         if not candidates:
             logger.warning(
                 "provider tool result did not match an admission "
                 "native_turn=%s active_native_turn=%s tool=%s "
-                "argument_keys=%s candidate_count=%d",
+                "argument_keys=%s candidate_count=%d semantic_matches=%d",
                 event.native_turn_id,
                 self.native_turn_id,
                 tool_name,
                 sorted(str(key) for key in arguments),
                 len(self._continuation_admissions),
+                len(matching_candidates),
             )
             return
         index, admission = max(candidates, key=lambda value: value[1].match_specificity)
