@@ -215,15 +215,19 @@ across channel switches.
 A held channel result preserves evidence, not permission to override: it
 returns `state="held"`, the exact target, the unchanged draft, the draft
 boundary/latest pair, `visible_draft_basis`, and, when `context_ready=true`,
-`new_channel_context`. Inspect that returned context carefully, plus any Inbox
-or history context you decide is useful. Then choose one outcome: revise and
-send with normal freshness; retry the unchanged draft with `send_anyway=True`
-only when it still fits the current conversation and will not confuse readers;
-or send nothing. `send_anyway=True` is rare and model-owned, never automatic;
-technical eligibility is not a recommendation. Revised or context-derived
-content uses normal freshness and may be held again. When `context_ready=false`,
-do not infer unseen messages: read the relevant tools if more context is needed
-or choose silence. A sequence watermark alone is not semantic context.
+`new_channel_context`. Inspect that returned context carefully. Treat the held
+draft as evidence of an attempted contribution: reconsider the originating
+request, that draft, and newer context together, plus any Inbox or history
+context you decide is useful, to decide whether that same contribution is still
+needed, should be revised, has genuinely been satisfied or cancelled, or should
+remain unsent. Then choose one outcome: revise and send with normal freshness;
+use the unchanged draft with `send_anyway=True` only when it is still clear and
+appropriate; or send nothing. `send_anyway=True` is rare and model-owned, never
+automatic; technical eligibility is not a recommendation. Revised or
+context-derived content uses normal freshness and may be held again. When
+`context_ready=false`, do not infer unseen messages: read the relevant tools if
+more context is needed or choose silence. A sequence watermark alone is not
+semantic context.
 
 **Examples:**
 
@@ -416,7 +420,9 @@ message bodies and is not enough context for a reply.
 intent from the pending page and relevant `prior_context`. Inspect your relevant
 earlier `self=true` contribution. Distinguish content that newly creates or
 changes unresolved work for this Agent from peers merely progressing the
-unchanged request. Peer progress alone does not create an obligation. Use your
+unchanged request. Peer progress alone does not create an obligation or new
+work. An originating request or earlier model-owned decision
+may still leave this Agent with an unresolved existing contribution. Use your
 judgment for a genuine follow-up, correction, direct request, changed objective,
 scope, constraint, deliverable, or newly exposed dependency. The final choice
 to send, remain silent, revise, or use `send_anyway` is model-owned.
