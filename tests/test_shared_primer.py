@@ -98,7 +98,7 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     )
     assert normalized_read.count(contribution_guidance) == 1
     assert all_prompt_surfaces.count(contribution_guidance) == 1
-    assert "Peer progress alone does not create an obligation or new work." in normalized_read
+    assert "Peer progress alone does not create a new obligation." in normalized_read
     assert "For conversation decisions, use the `read-inbox` skill." in DEFAULT_SHARED_CLAUDE_MD
     assert "originating request and conversation intent" not in DEFAULT_SHARED_CLAUDE_MD
     assert "does not acknowledge pending Inbox work" in " ".join(history.split())
@@ -171,7 +171,7 @@ def test_read_inbox_guides_origin_self_and_new_obligation_reasoning_only_there()
         "Inspect your relevant earlier `self=true` contribution.",
         "Distinguish content that newly creates or changes unresolved work for this "
         "Agent from peers merely progressing the unchanged request.",
-        "Peer progress alone does not create an obligation or new work.",
+        "Peer progress alone does not create a new obligation.",
         "An originating request or earlier model-owned decision may still leave this "
         "Agent with an unresolved existing contribution.",
         "Use your judgment for a genuine follow-up, correction, direct request, "

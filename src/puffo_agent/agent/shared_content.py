@@ -420,9 +420,9 @@ message bodies and is not enough context for a reply.
 intent from the pending page and relevant `prior_context`. Inspect your relevant
 earlier `self=true` contribution. Distinguish content that newly creates or
 changes unresolved work for this Agent from peers merely progressing the
-unchanged request. Peer progress alone does not create an obligation or new
-work. An originating request or earlier model-owned decision
-may still leave this Agent with an unresolved existing contribution. Use your
+unchanged request. Peer progress alone does not create a new obligation. An
+originating request or earlier model-owned decision may still leave this Agent
+with an unresolved existing contribution. Use your
 judgment for a genuine follow-up, correction, direct request, changed objective,
 scope, constraint, deliverable, or newly exposed dependency. The final choice
 to send, remain silent, revise, or use `send_anyway` is model-owned.

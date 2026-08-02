@@ -3119,7 +3119,7 @@ async def _run_composed_peer_progress_case(
                 "pending page and relevant `prior_context`",
                 "self=true",
                 "newly creates or changes unresolved work for this agent",
-                "peer progress alone does not create an obligation",
+                "peer progress alone does not create a new obligation",
                 "newly exposed dependency",
                 "send, remain silent, revise, or use `send_anyway`",
             ):
