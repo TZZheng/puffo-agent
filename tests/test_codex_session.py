@@ -38,6 +38,12 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.adapters.codex_session import CodexSession
+from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
+from puffo_agent.agent.message_store import (
+    MessageStore,
+    ProcessingState,
+    ReceiptDisposition,
+)
 
 
 @pytest.mark.asyncio
@@ -656,7 +662,9 @@ def test_history_continuation_matches_exact_codex_tool_result(tmp_path):
         register(
             "clamped",
             "receipt-clamped",
-            {"channel": "ch-a", "limit": 999},
+            # History staging records the tool's normalized (clamped) limit,
+            # which is the value the provider completion must echo.
+            {"channel": "ch-a", "limit": 200},
         )
 
         def tool_result(receipt, *, status="completed", arguments=None):
@@ -751,6 +759,106 @@ def test_history_continuation_matches_exact_codex_tool_result(tmp_path):
                 tool_arguments={"channel": "ch-a"},
                 correlation_receipt="unused",
             )
+
+    asyncio.run(drive())
+
+
+def test_codex_history_callback_updates_visible_registry_only_on_exact_result(
+    tmp_path,
+):
+    """Codex completion correlation is the visibility mutation boundary."""
+    from puffo_agent.agent.adapters.codex_session import _PendingTurn
+
+    async def drive():
+        store = MessageStore(tmp_path / "messages.db")
+        await store.open()
+        await store.store_receipt(
+            {
+                "envelope_id": "codex-history",
+                "envelope_kind": "channel",
+                "sender_slug": "alice",
+                "space_id": "sp-1",
+                "channel_id": "ch-1",
+                "content": "history",
+                "content_type": "text/plain",
+                "sent_at": 7,
+            },
+            server_seq=7,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="test",
+        )
+        cs = CodexSession("visible-codex", tmp_path / "session.json", ["true"])
+        cs._conversation_id = "thread-current"
+        cs._active_turn = _PendingTurn(1, time.time())
+        await cs._handle_notification("turn/started", {
+            "threadId": "thread-current", "turn": {"id": "user-turn"},
+        })
+        runtime = GlobalInboxRuntime(
+            store=store, adapter=cs, run_turn=lambda _planned: None,
+            workspace=tmp_path,
+        )
+        runtime.active.turn_id = "runtime-turn"
+        runtime.active.provider_session_id = "thread-current"
+        runtime.active.provider_turn_id = "user-turn"
+        staged = await runtime.stage_model_visible_read(
+            space_id="sp-1", channel_id="ch-1", through_seq=7,
+            through_envelope_id="codex-history",
+            tool_name="get_channel_history", tool_arguments={"channel": "ch-1"},
+            visible_message_ids=["codex-history"],
+        )
+        receipt = staged["correlation_receipt"]
+
+        def completion(*, status="completed", tool="get_channel_history",
+                       arguments=None, marker=receipt, turn="user-turn"):
+            return {
+                "threadId": "thread-current", "turnId": turn,
+                "item": {
+                    "id": f"call-{marker}", "type": "mcpToolCall",
+                    "server": "puffo", "tool": tool, "status": status,
+                    "arguments": arguments or {"channel": "ch-1"},
+                    "result": {"content": [{"type": "text", "text": (
+                        f"history [puffo:model-visible-read:{marker}]"
+                    )}]},
+                },
+            }
+
+        # Failed, wrong-tool, and wrong-normalized-argument completions do not
+        # consume the runtime continuation or mutate any local state.
+        for event in (
+            completion(status="failed"),
+            completion(tool="get_post"),
+            completion(arguments={"channel": "other"}),
+        ):
+            await cs._handle_notification("item/completed", event)
+        row = await store.get_message_by_envelope("codex-history")
+        assert runtime.active.visible_message_ids == []
+        assert runtime.active.message_ids == []
+        assert runtime.active.through_by_channel == {}
+        assert row.processing_state == ProcessingState.PENDING.value
+
+        await cs._handle_notification("item/completed", completion())
+        assert runtime.active.visible_message_ids == ["codex-history"]
+        assert runtime.active.message_ids == []
+        assert runtime.active.through_by_channel == {("sp-1", "ch-1"): 7}
+        assert (await store.get_message_by_envelope("codex-history")).processing_state == (
+            ProcessingState.PENDING.value
+        )
+        # The adapter consumes the exact continuation; a duplicate completion
+        # remains an idempotent no-op.
+        await cs._handle_notification("item/completed", completion())
+        assert runtime.active.visible_message_ids == ["codex-history"]
+        assert runtime.active.through_by_channel == {("sp-1", "ch-1"): 7}
+
+        # A completed/replaced provider turn cannot update the old runtime turn.
+        await cs._handle_notification("turn/completed", {
+            "threadId": "thread-current", "turn": {"id": "user-turn"},
+        })
+        runtime.active.turn_id = "replacement-turn"
+        runtime.active.provider_turn_id = "next-turn"
+        await cs._handle_notification("item/completed", completion(turn="next-turn"))
+        assert runtime.active.visible_message_ids == ["codex-history"]
+        assert runtime.active.through_by_channel == {("sp-1", "ch-1"): 7}
+        await store.close()
 
     asyncio.run(drive())
 

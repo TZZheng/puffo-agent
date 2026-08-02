@@ -75,6 +75,95 @@ async def test_ws_local_adapter_requires_exact_read_admission_correlation():
         )
 
 
+@pytest.mark.asyncio
+async def test_ws_local_history_callback_updates_visible_registry_only_after_admission(
+    tmp_path,
+):
+    from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
+    from puffo_agent.agent.message_store import (
+        MessageStore,
+        ProcessingState,
+        ReceiptDisposition,
+    )
+
+    store = MessageStore(tmp_path / "messages.db")
+    await store.open()
+    await store.store_receipt(
+        {
+            "envelope_id": "ws-history",
+            "envelope_kind": "channel",
+            "sender_slug": "alice",
+            "space_id": "sp-1",
+            "channel_id": "ch-1",
+            "content": "history",
+            "content_type": "text/plain",
+            "sent_at": 4,
+        },
+        server_seq=4,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    adapter = route_mod._WsLocalContextAdapter()
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.active.turn_id = "ws-runtime-turn"
+    runtime.active.provider_session_id = "ws-local:turn-1"
+    runtime.active.provider_turn_id = "turn-1"
+    staged = await runtime.stage_model_visible_read(
+        space_id="sp-1", channel_id="ch-1", through_seq=4,
+        through_envelope_id="ws-history", tool_name="get_post",
+        tool_arguments={"channel": "ch-1", "seq": 4},
+        visible_message_ids=["ws-history"],
+    )
+    receipt = staged["correlation_receipt"]
+
+    # A failed/no-admission result and a wrong receipt leave the continuation
+    # unconsumed and all state untouched.
+    assert runtime.active.visible_message_ids == []
+    with pytest.raises(RuntimeError, match="correlation failed"):
+        await adapter.emit_admission(turn_id="turn-1", correlation_key="wrong")
+    row = await store.get_message_by_envelope("ws-history")
+    assert runtime.active.visible_message_ids == []
+    assert runtime.active.message_ids == []
+    assert runtime.active.through_by_channel == {}
+    assert row.processing_state == ProcessingState.PENDING.value
+
+    await adapter.emit_admission(turn_id="turn-1", correlation_key=receipt)
+    assert runtime.active.visible_message_ids == ["ws-history"]
+    assert runtime.active.message_ids == []
+    assert runtime.active.through_by_channel == {("sp-1", "ch-1"): 4}
+    assert (await store.get_message_by_envelope("ws-history")).processing_state == (
+        ProcessingState.PENDING.value
+    )
+    with pytest.raises(RuntimeError, match="correlation failed"):
+        await adapter.emit_admission(turn_id="turn-1", correlation_key=receipt)
+    assert runtime.active.visible_message_ids == ["ws-history"]
+    assert runtime.active.through_by_channel == {("sp-1", "ch-1"): 4}
+
+    # An admission retained from the old provider turn must not cross into a
+    # replacement runtime turn, even if its receipt is otherwise exact.
+    stale = await runtime.stage_model_visible_read(
+        space_id="sp-1", channel_id="ch-1", through_seq=4,
+        through_envelope_id="ws-history", tool_name="get_post",
+        tool_arguments={"channel": "ch-1", "seq": 4},
+        visible_message_ids=["ws-history"],
+    )
+    runtime.active.turn_id = "ws-replacement-turn"
+    runtime.active.provider_session_id = "ws-local:turn-2"
+    with pytest.raises(RuntimeError, match="crossed the active provider turn"):
+        await adapter.emit_admission(
+            turn_id="turn-2", correlation_key=stale["correlation_receipt"],
+        )
+    assert runtime.active.visible_message_ids == ["ws-history"]
+    assert runtime.active.through_by_channel == {("sp-1", "ch-1"): 4}
+    assert (await store.get_message_by_envelope("ws-history")).processing_state == (
+        ProcessingState.PENDING.value
+    )
+    await store.close()
+
+
 class FakeReporter:
     def __init__(self) -> None:
         self.heartbeats = 0

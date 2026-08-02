@@ -1425,10 +1425,7 @@ class CodexSession:
                 if admission.provider_turn_id == expected_turn
                 and admission.receipt_marker
                 and admission.receipt_marker in serialized
-                and (
-                    not admission.tool_names
-                    or tool in admission.tool_names
-                )
+                and admission.matches(tool, arguments)
             ),
             None,
         )
