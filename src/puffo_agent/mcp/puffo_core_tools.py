@@ -321,12 +321,10 @@ async def _dispatch_semantic_send(
                     # defaults are provider-normalized differently, so adding
                     # them here would make a genuine original result ambiguous.
                     tool_arguments=(
-                        {"channel": request.destination, "text": request.text}
-                        if not request.attachment_paths else {
-                            "channel": request.destination,
-                            "caption": request.caption,
-                            "paths": list(request.attachment_paths),
-                        }
+                        _held_send_tool_arguments(request, attachments=False)
+                        if not request.attachment_paths else _held_send_tool_arguments(
+                            request, attachments=True,
+                        )
                     ),
                 )
             return result
@@ -334,6 +332,8 @@ async def _dispatch_semantic_send(
             "persistent send coordinator returned a malformed result",
             kind="protocol",
         )
+
+
     rpc = getattr(cfg, "rpc_client", None)
     if rpc is not None:
         try:
@@ -357,6 +357,24 @@ async def _dispatch_semantic_send(
         "persistent send coordinator is unavailable",
         kind="coordinator_unavailable",
     )
+
+
+def _held_send_tool_arguments(
+    request: SemanticSendRequest, *, attachments: bool,
+) -> dict[str, Any]:
+    """Mirror the actual public call without turning omitted defaults into requirements."""
+    arguments: dict[str, Any] = {
+        "channel": request.destination,
+        **({"caption": request.caption, "paths": list(request.attachment_paths)}
+           if attachments else {"text": request.text}),
+    }
+    if request.root_id:
+        arguments["root_id"] = request.root_id
+    if request.visibility_level != "default":
+        arguments["visibility_level"] = request.visibility_level
+    if request.send_anyway:
+        arguments["send_anyway"] = True
+    return arguments
 
 
 def _note_contact(
@@ -1469,6 +1487,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 visibility_level=visibility_level,
                 send_anyway=send_anyway,
             ),
+            tool_name="send_message_with_attachments",
         )
 
         import mimetypes

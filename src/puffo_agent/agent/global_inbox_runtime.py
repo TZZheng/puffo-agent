@@ -184,6 +184,8 @@ class RuntimeHealth:
 
 @dataclass
 class HeldStaging:
+    # Compatibility/status snapshot only. Admission never reads this mutable
+    # field; each callback uses HeldAdmissionEvidence instead.
     message_ids: tuple[str, ...] = ()
     latest_seq: int | None = None
     latest_envelope_id: str | None = None
@@ -192,7 +194,19 @@ class HeldStaging:
     synchronized: bool = False
     diagnostic: str = ""
     correlation_key: str = ""
-    message_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class HeldAdmissionEvidence:
+    """Local-only recovery evidence frozen for one held send result."""
+
+    active_turn_id: str
+    provider_session_id: str
+    space_id: str
+    channel_id: str
+    latest_seq: int
+    latest_envelope_id: str
+    displayed_ids: tuple[str, ...]
 
 
 @dataclass
@@ -689,7 +703,18 @@ class HeldRecoverySource:
                 "envelope_kind": row.envelope_kind, "sent_at": row.sent_at,
                 "is_encrypted": row.is_encrypted, "content": row.content,
             })
-        self.runtime.held.message_ids = tuple(row.envelope_id for row in rows)
+        evidence = HeldAdmissionEvidence(
+            active_turn_id=active.turn_id,
+            provider_session_id=provider_session_id,
+            space_id=space_id, channel_id=channel_id,
+            latest_seq=latest_seq, latest_envelope_id=latest_envelope_id,
+            displayed_ids=tuple(row.envelope_id for row in rows),
+        )
+        self.runtime._held_admission_evidence[
+            (active.turn_id, provider_session_id, space_id, channel_id,
+             latest_seq, latest_envelope_id)
+        ] = evidence
+        self.runtime.held.message_ids = evidence.displayed_ids
         return tuple(projected)
 
 
@@ -738,6 +763,9 @@ class GlobalInboxRuntime:
         self.attempts = SendAttemptState()
         self.health = RuntimeHealth()
         self.held = HeldStaging()
+        self._held_admission_evidence: dict[
+            tuple[str, str, str, str, int, str], HeldAdmissionEvidence
+        ] = {}
         self._boundary = asyncio.Lock()
         self._stopping = False
         self._degraded = False
@@ -828,12 +856,11 @@ class GlobalInboxRuntime:
     ) -> dict[str, Any]:
         """Stage exactly the semantic held rows at the original tool boundary."""
         payload = result.get("reconsideration")
-        staging = self.held
         if not isinstance(payload, Mapping) or not payload.get("context_ready"):
             return result
         active_turn_id = self.active.turn_id
         provider_session_id = self.active.provider_session_id
-        if not active_turn_id or not provider_session_id or not staging.message_ids:
+        if not active_turn_id or not provider_session_id:
             payload = dict(payload)
             payload["context_ready"] = False
             payload["diagnostic"] = "active held admission identity unavailable"
@@ -849,7 +876,16 @@ class GlobalInboxRuntime:
             or not isinstance(latest_envelope_id, str)
         ):
             return result
-        displayed_ids = tuple(staging.message_ids)
+        evidence_key = (active_turn_id, provider_session_id, space_id, channel_id,
+                        latest_seq, latest_envelope_id)
+        evidence = self._held_admission_evidence.get(evidence_key)
+        if evidence is None or not evidence.displayed_ids:
+            payload = dict(payload)
+            payload["context_ready"] = False
+            payload["diagnostic"] = "exact held recovery evidence unavailable"
+            result["reconsideration"] = payload
+            return result
+        displayed_ids = evidence.displayed_ids
         correlation_key = f"held_send_{uuid.uuid4().hex}"
         receipt = uuid.uuid4().hex
         marker = ToolResultAdmission.build(
@@ -867,12 +903,21 @@ class GlobalInboxRuntime:
                 self.active.turn_id != active_turn_id
                 or self.active.provider_session_id != provider_session_id
                 or event.provider_session_id != provider_session_id
-                or self.held.latest_seq != latest_seq
-                or self.held.latest_envelope_id != latest_envelope_id
             ):
                 return
             rows = [await self.store.get_message_by_envelope(item) for item in displayed_ids]
-            if any(row is None for row in rows):
+            if any(
+                row is None or row.space_id != space_id or row.channel_id != channel_id
+                or row.server_seq is None or row.server_seq > latest_seq
+                for row in rows
+            ):
+                return
+            if any(
+                row is not None and row.processing_state is not ProcessingState.PENDING
+                and not (row.processing_state is ProcessingState.IN_TURN
+                         and row.processing_turn_id == active_turn_id)
+                for row in rows
+            ):
                 return
             pending_ids = [row.envelope_id for row in rows if row is not None and row.processing_state is ProcessingState.PENDING]
             try:
@@ -890,12 +935,17 @@ class GlobalInboxRuntime:
                         route = route_for(row)
                         if route not in self.active.routes:
                             self.active.routes.append(route)
+                self.active.message_ids = list(dict.fromkeys(
+                    [*self.active.message_ids, *displayed_ids]
+                ))
+                self._write_active_current_turn()
                 await ActiveBoundaryAdapter(self.store, self.active).advance_active_turn_through_seq(
                     space_id, channel_id, latest_seq,
                 )
             except Exception:
                 return
             fired = True
+            self._held_admission_evidence.pop(evidence_key, None)
 
         if self._admits_tool_results_on_return:
             await self._admit_returned_tool_result(
@@ -917,6 +967,19 @@ class GlobalInboxRuntime:
         result["tool_result_admission"] = marker
         self.held.correlation_key = correlation_key
         return result
+
+    def _write_active_current_turn(self) -> None:
+        """Atomically persist the exact active union after held admission."""
+        targets = tuple(dict.fromkeys(route.target for route in self.active.routes))
+        self._write_current_turn(PlannedTurn(
+            turn_id=self.active.turn_id,
+            planning_cycle_key="held_admission",
+            message_ids=tuple(self.active.message_ids),
+            items=(), routes=tuple(self.active.routes), targets=targets,
+            pending_targets=(), target_summary="", formatted_blocks=(),
+            provider_input="", formatted_tokens=0, wrapper_overhead_tokens=0,
+            formatted_bytes=0, wrapper_overhead_bytes=0,
+        ))
 
     def note_input_ready(self, turn_id: str) -> None:
         self.notice_delivery.note_input_ready(turn_id)

@@ -1327,10 +1327,14 @@ class SendCoordinator:
                 data["reconsideration"]["diagnostic"] = held.diagnostic
         if rows:
             from .message_projection import format_message_group
+            aliases = (self.slug,)
             data["reconsideration"]["visible_draft_basis"] = format_message_group(
                 held.visible_draft_basis,
+                current_agent_aliases=aliases,
             )
-            data["reconsideration"]["new_channel_context"] = format_message_group(rows)
+            data["reconsideration"]["new_channel_context"] = format_message_group(
+                rows, current_agent_aliases=aliases,
+            )
         return data
 
     async def _consume_held(
@@ -1353,7 +1357,10 @@ class SendCoordinator:
             row = await store.get_message_by_envelope(envelope_id)
             if row is None or row.space_id != space_id or row.channel_id != channel_id:
                 continue
-            if thread_root_id and (row.thread_root_id or "") != thread_root_id:
+            if thread_root_id:
+                if row.envelope_id != thread_root_id and row.thread_root_id != thread_root_id:
+                    continue
+            elif row.thread_root_id:
                 continue
             rows.append({
                 "space_id": row.space_id, "channel_id": row.channel_id,
@@ -1484,6 +1491,19 @@ class SendCoordinator:
             return False
         if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
             return False
+        async with self._held_lock:
+            current = self._held_evidence.get(key)
+            thread_root_id = current.thread_root_id if current is not None else ""
+        rows = [
+            row for row in rows
+            if isinstance(row, Mapping) and (
+                (not thread_root_id and not row.get("thread_root_id"))
+                or (bool(thread_root_id) and (
+                    row.get("envelope_id") == thread_root_id
+                    or row.get("thread_root_id") == thread_root_id
+                ))
+            )
+        ]
         synchronized = any(
             isinstance(row, Mapping)
             and row.get("envelope_id") == latest_envelope_id

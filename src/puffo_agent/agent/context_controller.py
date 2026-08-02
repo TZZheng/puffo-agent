@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
+import json
 from typing import Any, Awaitable, Callable, Mapping, Protocol, runtime_checkable
 
 
@@ -143,15 +144,7 @@ class ToolResultAdmission:
         tool_arguments: Mapping[str, Any] | None = None,
         correlation_receipt: str = "",
     ) -> "ToolResultAdmission":
-        encoded_arguments = tuple(
-            sorted(
-                (
-                    str(key),
-                    repr(value),
-                )
-                for key, value in (tool_arguments or {}).items()
-            )
-        )
+        encoded_arguments = normalize_tool_arguments(tool_arguments)
         return cls(
             callback=callback,
             planning_cycle_key=planning_cycle_key,
@@ -176,15 +169,50 @@ class ToolResultAdmission:
             return False
         if self.channel_id and str(arguments.get("channel") or "") != self.channel_id:
             return False
-        return all(
-            key in arguments and repr(arguments[key]) == expected
-            for key, expected in self.tool_arguments
-        )
+        # This is deliberately equality, not a subset check: a continuation
+        # must be the original semantic send, not merely a call that happens
+        # to share its channel or text.  Provider-added default optionals are
+        # removed by the shared normalizer on both sides.
+        observed = normalize_tool_arguments(arguments)
+        if not self.tool_arguments:
+            return True
+        if tool_name in {"send_message", "send_message_with_attachments"}:
+            return self.tool_arguments == observed
+        # Existing history-tool registrations intentionally specify only the
+        # stable semantic fields; provider pagination defaults are not part of
+        # their continuation contract.
+        return all(item in observed for item in self.tool_arguments)
 
     @property
     def match_specificity(self) -> int:
         """Prefer the most constrained admission when argument subsets overlap."""
         return len(self.tool_arguments) + int(bool(self.channel_id))
+
+
+def normalize_tool_arguments(
+    arguments: Mapping[str, Any] | None,
+) -> tuple[tuple[str, str], ...]:
+    """Deterministic semantic representation shared by all providers.
+
+    JSON encoding avoids provider- and Python-version-specific ``repr``
+    differences, recursively normalizes mappings, and treats public omitted
+    optional send defaults as omitted whether a provider echoes them or not.
+    """
+    optional_defaults = {
+        "root_id": "",
+        "visibility_level": "default",
+        "send_anyway": False,
+    }
+    normalized: dict[str, Any] = {}
+    for key, value in (arguments or {}).items():
+        name = str(key)
+        if name in optional_defaults and value == optional_defaults[name]:
+            continue
+        normalized[name] = value
+    return tuple(sorted(
+        (key, json.dumps(value, sort_keys=True, separators=(",", ":"), default=str))
+        for key, value in normalized.items()
+    ))
 
 
 @runtime_checkable
