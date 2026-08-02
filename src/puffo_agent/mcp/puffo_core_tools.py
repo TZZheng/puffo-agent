@@ -1007,7 +1007,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             tool_name="get_channel_history",
             tool_arguments=tool_arguments,
         )
-        result = format_message_group([entry.message for entry in roots], reply_counts={entry.message.envelope_id: entry.reply_count for entry in roots})
+        result = format_message_group(
+            [entry.message for entry in roots],
+            current_agent_aliases=(cfg.slug,),
+            reply_counts={entry.message.envelope_id: entry.reply_count for entry in roots},
+        )
         return f"{result}\n{receipt_marker}" if receipt_marker else result
 
     @mcp.tool()
@@ -1033,7 +1037,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
         if not msgs:
             return "(no direct messages with that peer in the requested window)"
-        return format_message_group(msgs)
+        return format_message_group(msgs, current_agent_aliases=(cfg.slug,))
 
     @mcp.tool()
     async def get_thread_history(
@@ -1087,7 +1091,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             tool_name="get_thread_history",
             tool_arguments=tool_arguments,
         )
-        result = format_message_group(msgs)
+        result = format_message_group(msgs, current_agent_aliases=(cfg.slug,))
         return f"{result}\n{receipt_marker}" if receipt_marker else result
 
     @mcp.tool()
@@ -1282,7 +1286,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             tool_arguments={"post_ref": post_ref},
         )
 
-        result = format_message_group([msg])
+        result = format_message_group([msg], current_agent_aliases=(cfg.slug,))
         return f"{result}\n{receipt_marker}" if receipt_marker else result
 
     @mcp.tool()

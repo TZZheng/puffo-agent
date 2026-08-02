@@ -1368,7 +1368,7 @@ async def test_get_dm_history_from_local():
     })
     await ms.store({
         "envelope_id": "dm_2", "envelope_kind": "dm",
-        "sender_slug": "me-0001", "recipient_slug": "alice-0001",
+        "sender_slug": "agent-0001", "recipient_slug": "alice-0001",
         "content_type": "text/plain", "content": "hi back", "sent_at": base + 1000,
     })
     await ms.store({
@@ -1381,6 +1381,7 @@ async def test_get_dm_history_from_local():
     assert "hi from alice" in result
     assert "hi back" in result
     assert "bob here" not in result   # a different peer is filtered out
+    assert "id=dm_2 self=true" in result
     await ms.close()
 
 
