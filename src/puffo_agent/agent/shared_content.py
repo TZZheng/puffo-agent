@@ -239,6 +239,10 @@ latest context and send with normal freshness; do not use `send_anyway`. When
 the originating request asks multiple participants to contribute separately,
 another participant's overlapping contribution does not satisfy this Agent's
 own contribution; recompute it from the latest ordered context. Use the
+earlier `self=true` context as completion evidence too: if it already fulfills
+this Agent's part of the same originating request, peer progress does not
+reopen that part, so leave a later draft unsent unless current context genuinely
+changes or renews it. Use the
 unchanged draft with `send_anyway=True` only after confirming newer context
 cannot affect those semantics, or send nothing. `send_anyway=True` is rare and
 model-owned, never automatic; technical eligibility is not a recommendation.
@@ -442,12 +446,14 @@ message bodies and is not enough context for a reply.
   Inbox or history read. Use the `send-message` skill for held-send guidance.
 
 **Contribution decision:** Reconstruct the originating request and conversation
-intent from the pending page and relevant `prior_context`. Inspect your relevant
-earlier `self=true` contribution. Distinguish content that newly creates or
-changes unresolved work for this Agent from peers merely progressing the
-unchanged request. Peer progress alone does not create a new obligation. An
-originating request or earlier model-owned decision may still leave this Agent
-with an unresolved existing contribution. Use your
+intent from the pending page and relevant `prior_context`. First inspect relevant
+earlier `self=true` rows: when one already fulfills this Agent's part of the same
+originating request, that part stays fulfilled and peer progress does not reopen
+it. Distinguish content that newly creates or changes unresolved work for this
+Agent from peers merely progressing the unchanged request. Peer progress alone
+does not create a new obligation. If no earlier self contribution fulfills the
+part, an originating request or earlier model-owned decision may still leave
+this Agent with an unresolved existing contribution. Use your
 judgment for a genuine follow-up, correction, direct request, changed objective,
 scope, constraint, deliverable, or newly exposed dependency. The final choice
 to send, remain silent, revise, or use `send_anyway` is model-owned.

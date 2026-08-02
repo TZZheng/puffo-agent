@@ -99,6 +99,8 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     assert normalized_read.count(contribution_guidance) == 1
     assert all_prompt_surfaces.count(contribution_guidance) == 1
     assert "Peer progress alone does not create a new obligation." in normalized_read
+    assert "when one already fulfills this Agent's part of the same originating request" in normalized_read
+    assert "that part stays fulfilled and peer progress does not reopen it" in normalized_read
     assert "For conversation decisions, use the `read-inbox` skill." in DEFAULT_SHARED_CLAUDE_MD
     normalized_primer = " ".join(DEFAULT_SHARED_CLAUDE_MD.split())
     assert "a `target=channel` route uses its `channel_id` without `root_id`" in normalized_primer
@@ -119,6 +121,8 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         "asks multiple participants to contribute separately",
         "another participant's overlapping contribution does not satisfy this agent's own contribution",
         "recompute it from the latest ordered context",
+        "if it already fulfills this agent's part of the same originating request",
+        "peer progress does not reopen that part",
         "send_anyway=true", "is rare",
         "model-owned", "may be held again", "sequence watermark alone is not semantic context",
         "preserve the `read_inbox` target by default",
@@ -182,12 +186,15 @@ def test_read_inbox_guides_origin_self_and_new_obligation_reasoning_only_there()
     reasoning_method = (
         "Reconstruct the originating request and conversation intent from the pending "
         "page and relevant `prior_context`.",
-        "Inspect your relevant earlier `self=true` contribution.",
+        "First inspect relevant earlier `self=true` rows: when one already fulfills "
+        "this Agent's part of the same originating request, that part stays fulfilled "
+        "and peer progress does not reopen it.",
         "Distinguish content that newly creates or changes unresolved work for this "
         "Agent from peers merely progressing the unchanged request.",
         "Peer progress alone does not create a new obligation.",
-        "An originating request or earlier model-owned decision may still leave this "
-        "Agent with an unresolved existing contribution.",
+        "If no earlier self contribution fulfills the part, an originating request "
+        "or earlier model-owned decision may still leave this Agent with an unresolved "
+        "existing contribution.",
         "Use your judgment for a genuine follow-up, correction, direct request, "
         "changed objective, scope, constraint, deliverable, or newly exposed dependency.",
         "The final choice to send, remain silent, revise, or use `send_anyway` is "
@@ -260,6 +267,8 @@ def test_held_send_reconsiders_an_attempted_existing_contribution():
         "asks multiple participants to contribute separately",
         "another participant's overlapping contribution does not satisfy this Agent's own contribution",
         "recompute it from the latest ordered context",
+        "if it already fulfills this Agent's part of the same originating request",
+        "peer progress does not reopen that part",
         "use the unchanged draft with `send_anyway=True` only after confirming newer context",
         "or send nothing",
     )

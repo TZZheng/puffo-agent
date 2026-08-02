@@ -280,6 +280,9 @@ async def test_held_thread_basis_overrides_only_its_presentation_target():
         "do not use send_anyway",
         "another participant's overlapping contribution does not satisfy",
         "recompute it from the latest ordered context",
+        "if an earlier self=true contribution already fulfills",
+        "peer progress does not reopen it",
+        "unless current context genuinely changes or renews that part",
         "only after confirming newer context cannot affect those semantics",
         "send nothing only when current context actually satisfies or cancels",
     ):
