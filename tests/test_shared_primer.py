@@ -98,7 +98,7 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     )
     assert normalized_read.count(contribution_guidance) == 1
     assert all_prompt_surfaces.count(contribution_guidance) == 1
-    assert "Peer progress alone does not create an obligation." in normalized_read
+    assert "Peer progress alone does not create an obligation or new work." in normalized_read
     assert "For conversation decisions, use the `read-inbox` skill." in DEFAULT_SHARED_CLAUDE_MD
     assert "originating request and conversation intent" not in DEFAULT_SHARED_CLAUDE_MD
     assert "does not acknowledge pending Inbox work" in " ".join(history.split())
@@ -108,7 +108,9 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         'state="held"', "unchanged draft", "draft boundary/latest pair",
         "visible_draft_basis", "new_channel_context", "context_ready=true",
         "context_ready=false", "inspect", "revise and send with normal freshness",
-        "retry the unchanged draft", "or send nothing", "send_anyway=true", "is rare",
+        "evidence of an attempted contribution",
+        "reconsider the originating request, that draft, and newer context",
+        "use the unchanged draft", "or send nothing", "send_anyway=true", "is rare",
         "model-owned", "may be held again", "sequence watermark alone is not semantic context",
     ):
         assert phrase.lower() in normalized_send
@@ -169,7 +171,9 @@ def test_read_inbox_guides_origin_self_and_new_obligation_reasoning_only_there()
         "Inspect your relevant earlier `self=true` contribution.",
         "Distinguish content that newly creates or changes unresolved work for this "
         "Agent from peers merely progressing the unchanged request.",
-        "Peer progress alone does not create an obligation.",
+        "Peer progress alone does not create an obligation or new work.",
+        "An originating request or earlier model-owned decision may still leave this "
+        "Agent with an unresolved existing contribution.",
         "Use your judgment for a genuine follow-up, correction, direct request, "
         "changed objective, scope, constraint, deliverable, or newly exposed dependency.",
         "The final choice to send, remain silent, revise, or use `send_anyway` is "
@@ -224,6 +228,40 @@ def test_read_inbox_guides_origin_self_and_new_obligation_reasoning_only_there()
     register_core_tools(mcp, SimpleNamespace(bridge_client=None))
     mcp_descriptions = "\n".join(tool.__doc__ or "" for tool in mcp.tools)
     assert not any(phrase in mcp_descriptions for phrase in reasoning_method)
+
+
+def test_held_send_reconsiders_an_attempted_existing_contribution():
+    held_method = (
+        "held draft as evidence of an attempted contribution",
+        "reconsider the originating request, that draft, and newer context together",
+        "has genuinely been satisfied or cancelled, or should remain unsent",
+        "revise and send with normal freshness",
+        "use the unchanged draft with `send_anyway=True` only when it is still clear and appropriate",
+        "or send nothing",
+    )
+    send = " ".join(DEFAULT_SKILLS["send-message"][1].split())
+    assert all(phrase in send for phrase in held_method)
+
+    root = _tmp()
+    _rebuild(root)
+    for path in (
+        root / "workspace" / ".claude" / "skills" / "send-message" / "SKILL.md",
+        root / "workspace" / ".agents" / "skills" / "send-message" / "SKILL.md",
+    ):
+        skill = " ".join(path.read_text(encoding="utf-8").split())
+        assert all(phrase in skill for phrase in held_method)
+
+    other_prompt_surfaces = [" ".join(DEFAULT_SHARED_CLAUDE_MD.split())]
+    other_prompt_surfaces.extend(
+        " ".join(body.split())
+        for skill_id, (_, body) in DEFAULT_SKILLS.items()
+        if skill_id != "send-message"
+    )
+    assert not any(
+        phrase in surface
+        for phrase in held_method
+        for surface in other_prompt_surfaces
+    )
 
 
 def test_harnesses_discover_managed_skills_with_correct_tool_names():
