@@ -412,12 +412,14 @@ message bodies and is not enough context for a reply.
 - A notice is metadata only. It never substitutes for a content-bearing
   Inbox or history read. Use the `send-message` skill for held-send guidance.
 
-**Contribution decision:** Evaluate pending messages together with relevant
-`prior_context`, including rows marked `self=true`. Send only when the new
-content makes a useful new contribution; otherwise choose silence. Arrival or
-peer activity is evidence to evaluate, not an automatic reply trigger. Whether
-to follow up, correct, respond to changed work or a direct request, or address
-multiple targets remains your judgment.
+**Contribution decision:** Reconstruct the originating request and conversation
+intent from the pending page and relevant `prior_context`. Inspect your relevant
+earlier `self=true` contribution. Distinguish content that newly creates or
+changes unresolved work for this Agent from peers merely progressing the
+unchanged request. Peer progress alone does not create an obligation. Use your
+judgment for a genuine follow-up, correction, direct request, changed objective,
+scope, constraint, deliverable, or newly exposed dependency. The final choice
+to send, remain silent, revise, or use `send_anyway` is model-owned.
 
 **When to use:**
 - When a notice points to pending work relevant to the current decision.
