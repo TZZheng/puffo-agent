@@ -205,14 +205,21 @@ class PuffoAgent:
         planned,
         on_progress=None,
     ) -> str | None:
-        """Run one exact durable global batch without trigger-route inference."""
-        self.log.append({"role": "user", "content": planned.provider_input})
-        self._truncate_log()
+        """Run one metadata-only Inbox notice without retaining it in history."""
+        # A notice wakes the current provider turn but is not conversation
+        # content. Resumable Drivers retain their own history, while
+        # stateless adapters receive this ephemeral final user entry alongside
+        # the ordinary Puffo log for this one call.
+        messages = [
+            *self.log,
+            {"role": "user", "content": planned.provider_input},
+        ]
         return await self._run_turn_and_route(
             channel_name="global inbox",
             sender="multiple" if len(planned.targets) > 1 else "",
             on_progress=on_progress,
             allow_plain_fallback=False,
+            messages=messages,
         )
 
     async def handle_global_inbox_retry(
@@ -359,6 +366,7 @@ class PuffoAgent:
         sender: str,
         on_progress=None,
         allow_plain_fallback: bool = True,
+        messages: list[dict] | None = None,
     ) -> str | None:
         """Shared tail for ``handle_message`` and ``handle_message_batch``.
         Runs one adapter turn against the current ``self.log`` and
@@ -366,7 +374,7 @@ class PuffoAgent:
         """
         ctx = TurnContext(
             system_prompt=self.system_prompt,
-            messages=list(self.log),
+            messages=list(self.log if messages is None else messages),
             workspace_dir=self.workspace_dir,
             claude_dir=self.claude_dir,
             memory_dir=self.memory_dir,

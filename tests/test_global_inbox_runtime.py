@@ -994,6 +994,7 @@ async def test_turn_send_mode_aliases_clear_after_provider_failure(tmp_path, cap
         workspace=tmp_path,
         send_mode_keys=keys,
     )
+    before_notice = await store.get_notice_state()
     assert await runtime.process_once()
     assert runtime.health.state == "degraded"
     requeued = next(
@@ -1007,6 +1008,9 @@ async def test_turn_send_mode_aliases_clear_after_provider_failure(tmp_path, cap
     )
     for key in keys:
         assert not await send_mode.encryption_required(key, store, None)
+    rearmed_notice = await store.get_notice_state()
+    assert rearmed_notice.generation == before_notice.generation + 1
+    assert rearmed_notice.is_due_for(adapter.session)
     await store.close()
 
 
@@ -1056,6 +1060,7 @@ async def test_turn_send_mode_clears_when_provider_turn_is_cancelled(tmp_path):
         workspace=tmp_path,
         send_mode_keys=("cancelled-agent",),
     )
+    before_notice = await store.get_notice_state()
     task = asyncio.create_task(runtime.process_once())
     await provider_started.wait()
     assert await send_mode.encryption_required("cancelled-agent", store, None)
@@ -1069,6 +1074,9 @@ async def test_turn_send_mode_clears_when_provider_turn_is_cancelled(tmp_path):
     assert [row.envelope_id for row in await store.get_pending()] == [
         "cancelled-encrypted"
     ]
+    rearmed_notice = await store.get_notice_state()
+    assert rearmed_notice.generation == before_notice.generation + 1
+    assert rearmed_notice.is_due_for(adapter.session)
     await store.close()
 
 
@@ -1226,6 +1234,44 @@ async def test_multi_target_real_provider_input_preserves_every_sender_metadata(
     ):
         assert expected in sent
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_global_notice_turns_are_ephemeral_to_the_agent_log(tmp_path):
+    received = []
+
+    class RecordingAdapter:
+        async def run_turn(self, ctx):
+            received.append(list(ctx.messages))
+            return TurnResult(
+                reply="[SILENT]",
+                metadata={"assistant_text_parts": ["[SILENT]"]},
+            )
+
+    agent = PuffoAgent(
+        adapter=RecordingAdapter(),
+        system_prompt="system",
+        memory_dir=str(tmp_path / "memory"),
+        workspace_dir=str(tmp_path),
+        agent_id="test",
+    )
+    ordinary = {"role": "user", "content": "ordinary conversation input"}
+    agent.log.append(ordinary)
+    notices = [
+        "<global_inbox_notice>first-current-notice</global_inbox_notice>",
+        "<global_inbox_notice>second-current-notice</global_inbox_notice>",
+    ]
+
+    for notice in notices:
+        await agent.handle_global_inbox_turn(SimpleNamespace(
+            provider_input=notice,
+            targets=(),
+        ))
+
+    assert [messages[-1]["content"] for messages in received] == notices
+    assert all(messages[:-1] == [ordinary] for messages in received)
+    assert agent.log == [ordinary]
+    assert all("<global_inbox_notice>" not in entry["content"] for entry in agent.log)
 
 
 @pytest.mark.asyncio
@@ -3583,6 +3629,8 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     assert attachment not in busy_serialized
     state = await store.get_notice_state()
     assert state.last_delivered_generation == state.generation
+    assert state.last_delivered_provider_session_id == "provider-1"
+    assert not state.is_due_for("provider-1")
     await store.close()
 
 
@@ -3618,12 +3666,17 @@ async def test_rejected_or_stale_busy_notice_retains_generation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_notice_turn_without_correlated_read_rearms_pending_work(tmp_path):
+async def test_notice_turn_without_correlated_read_stays_suppressed_for_same_session(
+    tmp_path,
+):
     store = await make_store(tmp_path)
     await receipt(store, "notice-unread", 10)
     adapter = Adapter()
+    calls = 0
 
     async def run_turn(_planned):
+        nonlocal calls
+        calls += 1
         await adapter.admit()
 
     runtime = GlobalInboxRuntime(
@@ -3640,9 +3693,159 @@ async def test_notice_turn_without_correlated_read_rearms_pending_work(tmp_path)
     assert [row.envelope_id for row in await store.get_pending()] == [
         "notice-unread"
     ]
-    assert after.generation == before.generation + 1
+    assert after.generation == before.generation
     assert after.last_delivered_generation == before.generation
-    assert after.delivery_pending
+    assert after.last_delivered_provider_session_id == adapter.session
+    assert not after.is_due_for(adapter.session)
+    assert not await runtime.process_once()
+    assert calls == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_notice_restart_suppresses_same_session_and_rediscovers_once_for_replacement(
+    tmp_path,
+):
+    store = await make_store(tmp_path)
+    await receipt(store, "session-notice", 10)
+    first_adapter = Adapter()
+    first_calls = []
+
+    async def first_run(planned):
+        first_calls.append(planned.provider_input)
+        await first_adapter.admit(first_adapter.session)
+
+    first = GlobalInboxRuntime(
+        store=store,
+        adapter=first_adapter,
+        run_turn=first_run,
+        workspace=tmp_path,
+    )
+    assert await first.process_once()
+    accepted = await store.get_notice_state()
+    assert not accepted.is_due_for(first_adapter.session)
+    assert len(first_calls) == 1
+
+    resumed_calls = []
+
+    async def resumed_run(_planned):
+        resumed_calls.append(True)
+
+    resumed = GlobalInboxRuntime(
+        store=store,
+        adapter=first_adapter,
+        run_turn=resumed_run,
+        workspace=tmp_path,
+    )
+    assert not await resumed.process_once()
+    assert resumed_calls == []
+
+    replacement_adapter = Adapter()
+    replacement_adapter.session = "provider-2"
+    replacement_calls = []
+
+    async def replacement_run(planned):
+        replacement_calls.append(planned.provider_input)
+        await replacement_adapter.admit(replacement_adapter.session)
+
+    replacement = GlobalInboxRuntime(
+        store=store,
+        adapter=replacement_adapter,
+        run_turn=replacement_run,
+        workspace=tmp_path,
+    )
+    assert await replacement.process_once()
+    assert not await replacement.process_once()
+    assert len(replacement_calls) == 1
+    assert replacement_calls == first_calls
+    final = await store.get_notice_state()
+    assert final.last_delivered_provider_session_id == "provider-2"
+    assert not final.is_due_for("provider-2")
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_changed_pending_generation_replaces_accepted_notice_without_losing_unread_rows(
+    tmp_path,
+):
+    store = await make_store(tmp_path)
+    first_body = "first-unread-body"
+    second_body = "second-unread-body"
+    await receipt(store, "first-unread", 10, content=first_body)
+    adapter = Adapter()
+    notices = []
+
+    async def run(planned):
+        notices.append(planned.provider_input)
+        await adapter.admit(adapter.session)
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=run,
+        workspace=tmp_path,
+    )
+    assert await runtime.process_once()
+    accepted = await store.get_notice_state()
+    assert not accepted.is_due_for(adapter.session)
+
+    await receipt(store, "second-unread", 11, content=second_body)
+    changed = await store.get_notice_state()
+    assert changed.generation == accepted.generation + 1
+    assert changed.is_due_for(adapter.session)
+    assert await runtime.process_once()
+    assert not await runtime.process_once()
+
+    assert len(notices) == 2
+    assert notices[0] != notices[1]
+    assert '"message_count":2' in notices[1]
+    assert first_body not in notices[1]
+    assert second_body not in notices[1]
+    assert [row.envelope_id for row in await store.get_pending()] == [
+        "first-unread", "second-unread",
+    ]
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["provider_failure", "cancellation"])
+async def test_accepted_empty_notice_rearms_after_non_success_terminal(
+    tmp_path, terminal,
+):
+    store = await make_store(tmp_path)
+    await receipt(store, f"{terminal}-notice", 10)
+    adapter = Adapter()
+    admitted = asyncio.Event()
+
+    async def run(_planned):
+        await adapter.admit(adapter.session)
+        admitted.set()
+        if terminal == "provider_failure":
+            raise RuntimeError("provider failed after notice acceptance")
+        await asyncio.Event().wait()
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=run,
+        workspace=tmp_path,
+    )
+    before = await store.get_notice_state()
+    if terminal == "provider_failure":
+        assert await runtime.process_once()
+    else:
+        task = asyncio.create_task(runtime.process_once())
+        await admitted.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    rearmed = await store.get_notice_state()
+    assert rearmed.generation == before.generation + 1
+    assert rearmed.is_due_for(adapter.session)
+    assert [row.envelope_id for row in await store.get_pending()] == [
+        f"{terminal}-notice",
+    ]
     await store.close()
 
 
@@ -3665,7 +3868,7 @@ async def test_crash_recovery_requeues_empty_notice_turn_and_rearms_delivery(tmp
         provider_session_id=adapter.session,
     )
     before = await store.get_notice_state()
-    assert await store.mark_notice_delivered(before.generation)
+    assert await store.mark_notice_delivered(before.generation, adapter.session)
 
     recovered = GlobalInboxRuntime(
         store=store,
@@ -3697,7 +3900,7 @@ async def test_startup_recovers_orphaned_turn_without_crash_join(
     store = await make_store(tmp_path)
     await receipt(store, "orphan-pending", 12)
     notice = await store.get_notice_state()
-    assert await store.mark_notice_delivered(notice.generation)
+    assert await store.mark_notice_delivered(notice.generation, "provider-old")
     if admitted:
         await store.admit_messages(
             ["orphan-pending"],

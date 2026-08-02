@@ -145,7 +145,8 @@ CREATE TABLE IF NOT EXISTS inbox_notice_state (
     generation INTEGER NOT NULL,
     pending_count INTEGER NOT NULL,
     first_pending_deadline_ms INTEGER,
-    last_delivered_generation INTEGER NOT NULL
+    last_delivered_generation INTEGER NOT NULL,
+    last_delivered_provider_session_id TEXT
 );
 INSERT OR IGNORE INTO inbox_notice_state(
     singleton, generation, pending_count, first_pending_deadline_ms,
@@ -206,12 +207,42 @@ class InboxNoticeState:
     pending_count: int
     first_pending_deadline_ms: int | None
     last_delivered_generation: int
+    last_delivered_provider_session_id: str | None
 
     @property
     def delivery_pending(self) -> bool:
+        """Whether the current generation lacks a session-aware acceptance.
+
+        New scheduling must use :meth:`is_due_for`, because one accepted
+        generation is suppressed only for the native provider session that
+        accepted it.  This compatibility projection remains useful to receipt
+        callers that only need to know whether a new generation exists.
+        """
         return (
             self.pending_count > 0
-            and self.generation != self.last_delivered_generation
+            and (
+                self.generation != self.last_delivered_generation
+                or not self.last_delivered_provider_session_id
+            )
+        )
+
+    def is_due_for(self, provider_session_id: str | None) -> bool:
+        """Return whether this session needs one metadata-only notice.
+
+        Some provider transports learn their native session id only in the
+        acceptance receipt for their first offered turn.  Before that receipt,
+        a notice is due only when this generation has no session-aware
+        acceptance at all.  Once an accepting session is durable, an unknown
+        session must remain suppressed rather than recreating an equivalent
+        notice loop.
+        """
+        if self.pending_count <= 0:
+            return False
+        if not provider_session_id:
+            return self.delivery_pending
+        return (
+            self.generation != self.last_delivered_generation
+            or provider_session_id != self.last_delivered_provider_session_id
         )
 
 
@@ -350,6 +381,7 @@ class MessageStore:
                     # Phase 3: indexes and tables whose definitions use the new columns.
                     await self._execute_locked_script(db, _DEPENDENT_SCHEMA)
                     await self._migrate_nullable_provider_session(db)
+                    await self._migrate_notice_provider_session(db)
                     self._db = db
                 except BaseException:
                     await db.close()
@@ -447,6 +479,31 @@ class MessageStore:
             await db.rollback()
             raise
 
+    async def _migrate_notice_provider_session(
+        self, db: aiosqlite.Connection
+    ) -> None:
+        """Add the accepting native session without rewriting notice state.
+
+        The first global-Inbox schema stored only a generation-level delivery
+        marker.  Existing accepted generations keep that marker and get a
+        ``NULL`` session, which makes them eligible for one bounded discovery
+        by the next known native session instead of pretending the old
+        acceptance belongs to an arbitrary resumed transcript.
+        """
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute("PRAGMA table_info(inbox_notice_state)") as cursor:
+                columns = {row["name"] for row in await cursor.fetchall()}
+            if "last_delivered_provider_session_id" not in columns:
+                await db.execute(
+                    "ALTER TABLE inbox_notice_state "
+                    "ADD COLUMN last_delivered_provider_session_id TEXT"
+                )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+
     async def close(self) -> None:
         async with self._open_lock:
             if self._db:
@@ -468,7 +525,8 @@ class MessageStore:
         """Refresh the singleton notice row inside the caller's transaction."""
         async with db.execute(
             "SELECT generation, pending_count, first_pending_deadline_ms, "
-            "last_delivered_generation FROM inbox_notice_state WHERE singleton = 1"
+            "last_delivered_generation, last_delivered_provider_session_id "
+            "FROM inbox_notice_state WHERE singleton = 1"
         ) as cursor:
             old = await cursor.fetchone()
         async with db.execute(
@@ -499,6 +557,7 @@ class MessageStore:
             pending_count,
             int(deadline) if deadline is not None else None,
             int(old["last_delivered_generation"]),
+            old["last_delivered_provider_session_id"],
         )
 
     async def get_notice_state(self) -> InboxNoticeState:
@@ -506,7 +565,8 @@ class MessageStore:
             db = await self._ensure_db()
             async with db.execute(
                 "SELECT generation, pending_count, first_pending_deadline_ms, "
-                "last_delivered_generation FROM inbox_notice_state WHERE singleton = 1"
+                "last_delivered_generation, last_delivered_provider_session_id "
+                "FROM inbox_notice_state WHERE singleton = 1"
             ) as cursor:
                 row = await cursor.fetchone()
             return InboxNoticeState(
@@ -518,50 +578,66 @@ class MessageStore:
                     else None
                 ),
                 int(row["last_delivered_generation"]),
+                row["last_delivered_provider_session_id"],
             )
 
-    async def mark_notice_delivered(self, generation: int) -> bool:
-        """Deduplicate delivery without mutating any message lifecycle row."""
-        if isinstance(generation, bool) or not isinstance(generation, int):
-            return False
-        async with self._inbox_lock:
-            db = await self._ensure_db()
-            cursor = await db.execute(
-                "UPDATE inbox_notice_state SET last_delivered_generation = ? "
-                "WHERE singleton = 1 AND generation = ? AND pending_count > 0 "
-                "AND last_delivered_generation <> ?",
-                (generation, generation, generation),
-            )
-            await db.commit()
-            return cursor.rowcount == 1
+    @staticmethod
+    def _valid_notice_acceptance(
+        generation: int, provider_session_id: str | None,
+    ) -> bool:
+        return (
+            not isinstance(generation, bool)
+            and isinstance(generation, int)
+            and isinstance(provider_session_id, str)
+            and bool(provider_session_id)
+        )
 
-    async def rearm_stranded_notice(self) -> bool:
-        """Repair pending work whose only notice was already consumed.
+    async def _mark_notice_delivered_unlocked(
+        self,
+        db: aiosqlite.Connection,
+        generation: int,
+        provider_session_id: str,
+    ) -> bool:
+        """Persist one native acceptance while the caller owns the write lock."""
+        cursor = await db.execute(
+            "UPDATE inbox_notice_state "
+            "SET last_delivered_generation = ?, "
+            "last_delivered_provider_session_id = ? "
+            "WHERE singleton = 1 AND generation = ? AND pending_count > 0 "
+            "AND NOT (last_delivered_generation = ? "
+            "AND last_delivered_provider_session_id IS ?)",
+            (
+                generation,
+                provider_session_id,
+                generation,
+                generation,
+                provider_session_id,
+            ),
+        )
+        return cursor.rowcount == 1
 
-        This is an upgrade and restart guard. It never rearms while a durable
-        Turn is active, because that Turn may still admit the pending rows.
+    async def mark_notice_delivered(
+        self, generation: int, provider_session_id: str | None,
+    ) -> bool:
+        """Record a notice only after its native provider accepts it.
+
+        Acceptance is deduplicated by ``(generation, provider_session_id)``.
+        The same pending generation may therefore be rediscovered once by a
+        replacement session, while a resumed session never receives its own
+        accepted notice again.
         """
+        if not self._valid_notice_acceptance(generation, provider_session_id):
+            return False
+        assert isinstance(provider_session_id, str)
         async with self._inbox_lock:
             db = await self._ensure_db()
-            completed = int(self._now_ms())
             await db.execute("BEGIN IMMEDIATE")
             try:
-                await self._refresh_notice_state(db)
-                cursor = await db.execute(
-                    "UPDATE inbox_notice_state "
-                    "SET generation = generation + 1, "
-                    "first_pending_deadline_ms = ? "
-                    "WHERE singleton = 1 AND pending_count > 0 "
-                    "AND generation = last_delivered_generation "
-                    "AND NOT EXISTS ("
-                    "SELECT 1 FROM turn_runs WHERE state = ?)",
-                    (
-                        completed + self.NOTICE_WINDOW_MS,
-                        ProcessingState.IN_TURN.value,
-                    ),
+                accepted = await self._mark_notice_delivered_unlocked(
+                    db, generation, provider_session_id,
                 )
                 await db.commit()
-                return cursor.rowcount == 1
+                return accepted
             except Exception:
                 await db.rollback()
                 raise
@@ -1214,7 +1290,8 @@ class MessageStore:
         db = await self._ensure_db()
         async with db.execute(
             "SELECT generation, pending_count, first_pending_deadline_ms, "
-            "last_delivered_generation FROM inbox_notice_state WHERE singleton = 1"
+            "last_delivered_generation, last_delivered_provider_session_id "
+            "FROM inbox_notice_state WHERE singleton = 1"
         ) as cursor:
             row = await cursor.fetchone()
         return InboxNoticeState(
@@ -1226,6 +1303,7 @@ class MessageStore:
                 else None
             ),
             int(row["last_delivered_generation"]),
+            row["last_delivered_provider_session_id"],
         )
 
     async def get_prior_context(
@@ -1424,15 +1502,30 @@ class MessageStore:
         turn_id: str,
         provider_session_id: str | None,
         started_at: int | None = None,
+        notice_generation: int | None = None,
     ) -> TurnRun:
-        """Create the active notice Turn without admitting message rows."""
+        """Create an active Turn, atomically accepting a notice when present."""
         if not turn_id:
             raise LifecycleConflict("turn ID is required")
+        if notice_generation is not None and not self._valid_notice_acceptance(
+            notice_generation, provider_session_id,
+        ):
+            raise LifecycleConflict(
+                "notice acceptance requires a generation and provider session"
+            )
         async with self._inbox_lock:
             db = await self._ensure_db()
             started = started_at if started_at is not None else int(self._now_ms())
             try:
                 await db.execute("BEGIN IMMEDIATE")
+                if notice_generation is not None:
+                    assert isinstance(provider_session_id, str)
+                    if not await self._mark_notice_delivered_unlocked(
+                        db, notice_generation, provider_session_id,
+                    ):
+                        raise LifecycleConflict(
+                            "Inbox notice is stale or already accepted by this session"
+                        )
                 await db.execute(
                     "INSERT INTO turn_runs(turn_id, provider_session_id, state, "
                     "started_at, completed_at) VALUES (?, ?, ?, ?, NULL)",

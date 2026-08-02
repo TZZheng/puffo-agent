@@ -357,10 +357,16 @@ class RuntimeManagerAdapter(Adapter):
         self.assistant_text_parts: list[str] = []
 
     async def run_turn(self, ctx: TurnContext) -> TurnResult:
-        message = "\n".join(
-            str(item.get("content", ""))
-            for item in ctx.messages if item.get("role") == "user"
-        )
+        if not ctx.messages:
+            raise RuntimeStateError("turn context requires a current user input")
+        current = ctx.messages[-1]
+        if not isinstance(current, dict) or current.get("role") != "user":
+            raise RuntimeStateError(
+                "turn context must end with the current user input"
+            )
+        message = current.get("content")
+        if not isinstance(message, str) or not message.strip():
+            raise RuntimeStateError("current user input must be non-empty text")
         stream = self.manager.events()
         started = await self.manager.start_turn(TurnInput(message))
         if isinstance(started, UnsupportedCapability) or not started.accepted:

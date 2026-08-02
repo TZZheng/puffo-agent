@@ -592,7 +592,10 @@ async def test_runtime_manager_correlates_private_tool_result_and_rejects_termin
 
     with pytest.raises(RuntimeStateError, match="outcome cancelled"):
         await RuntimeManagerAdapter(FailedManager()).run_turn(
-            SimpleNamespace(messages=[], on_progress=None)
+            SimpleNamespace(
+                messages=[{"role": "user", "content": "notice"}],
+                on_progress=None,
+            )
         )
 
 
@@ -638,12 +641,54 @@ async def test_manager_adapter_only_accepts_succeeded_canonical_terminal(
 
 
 @pytest.mark.asyncio
+async def test_manager_adapter_submits_only_current_semantic_input():
+    """A resumed provider session must not receive historical notice text."""
+    historical_notice = (
+        "<global_inbox_notice>historical-notice-sentinel</global_inbox_notice>"
+    )
+    current_notice = (
+        "<global_inbox_notice>current-notice-sentinel</global_inbox_notice>"
+    )
+    captured = {}
+
+    class Manager:
+        async def start_turn(self, input):
+            captured["content"] = input.content
+            return TurnStarted(TurnRef("logical-turn"), "native-turn")
+
+        def events(self):
+            async def iterate():
+                yield HarnessEvent(
+                    type="turn.completed",
+                    driver="fake",
+                    session_ref=SessionRef("logical-session"),
+                    turn_ref=TurnRef("logical-turn"),
+                    data={"outcome": "succeeded"},
+                )
+            return iterate()
+
+    await RuntimeManagerAdapter(Manager()).run_turn(SimpleNamespace(
+        messages=[
+            {"role": "user", "content": historical_notice},
+            {"role": "assistant", "content": "already handled"},
+            {"role": "user", "content": current_notice},
+        ],
+        on_progress=None,
+    ))
+
+    assert captured["content"] == current_notice
+    assert "historical-notice-sentinel" not in captured["content"]
+    assert captured["content"].count("current-notice-sentinel") == 1
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["codex", "claude-code"])
 @pytest.mark.parametrize("terminal_outcome", ["succeeded", "failed"])
 async def test_metadata_notice_through_real_manager_reads_paginated_exact_union(
     tmp_path, provider, terminal_outcome,
 ):
     holder = {}
+    provider_inputs = []
 
     def on_codex_frame(frame):
         proc = holder["proc"]
@@ -656,9 +701,7 @@ async def test_metadata_notice_through_real_manager_reads_paginated_exact_union(
                 "result": {"thread": {"id": "native-session"}},
             })
         elif method == "turn/start":
-            assert "<global_inbox_notice>" in (
-                frame["params"]["input"][0]["text"]
-            )
+            provider_inputs.append(frame["params"]["input"][0]["text"])
             proc.feed({
                 "id": frame["id"],
                 "result": {"turn": {"id": "native-turn"}},
@@ -671,6 +714,7 @@ async def test_metadata_notice_through_real_manager_reads_paginated_exact_union(
     else:
         def replay_claude_frame(frame):
             if frame.get("type") == "user":
+                provider_inputs.append(frame["message"]["content"][0]["text"])
                 proc.feed({**frame, "isReplay": True})
 
         proc = _FakeProcess(replay_claude_frame)
@@ -728,6 +772,9 @@ async def test_metadata_notice_through_real_manager_reads_paginated_exact_union(
         run_turn=agent.handle_global_inbox_turn,
         workspace=tmp_path,
     )
+    expected_notice = await runtime.plan_pending()
+    assert expected_notice is not None
+    expected_provider_input = expected_notice.provider_input
     task = asyncio.create_task(runtime.process_once())
 
     for _ in range(500):
@@ -738,7 +785,8 @@ async def test_metadata_notice_through_real_manager_reads_paginated_exact_union(
         await asyncio.sleep(0.001)
     assert runtime.active.provider_session_id == "native-session"
     assert runtime.active.message_ids == []
-    assert agent.log and "<global_inbox_notice>" in agent.log[-1]["content"]
+    assert provider_inputs == [expected_provider_input]
+    assert all("<global_inbox_notice>" not in entry["content"] for entry in agent.log)
 
     cursor = ""
     admitted = []

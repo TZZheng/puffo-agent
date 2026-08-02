@@ -1000,7 +1000,9 @@ class GlobalInboxRuntime:
         """Offer metadata-only work to the named active Turn when safe."""
         if turn_id != self.active.turn_id:
             return False
-        planned = await self.plan_pending()
+        planned = await self.plan_pending(
+            provider_session_id=self.active.provider_session_id,
+        )
         if planned is None:
             return False
         decision = await self.context_controller.decide(
@@ -1025,7 +1027,9 @@ class GlobalInboxRuntime:
         )
         if not accepted:
             return False
-        return await self.store.mark_notice_delivered(planned.notice_generation)
+        return await self.store.mark_notice_delivered(
+            planned.notice_generation, self.active.provider_session_id,
+        )
 
     def resolve_active_send_route(
         self,
@@ -1576,30 +1580,23 @@ class GlobalInboxRuntime:
     async def run(self) -> None:
         await self.recover_current_turn()
         await self.recover_orphaned_turns()
-        if await self.store.rearm_stranded_notice():
-            log_runtime_event(
-                logger,
-                "notice.armed",
-                agent_id=self.agent_id,
-                mode="startup",
-                outcome="rearmed",
-            )
         if self._defer_requeued_resume:
             # Consume the recovery wake without immediately feeding the same
             # failed durable union through the initial-turn path.
             await self.coalescer.wait_for_burst()
         elif await self.store.get_pending(limit=1):
             notice = await self.store.get_notice_state()
-            remaining = (
-                max(
-                    0.0,
-                    (notice.first_pending_deadline_ms - int(time.time() * 1000))
-                    / 1000,
+            if notice.is_due_for(self.adapter.get_provider_session_id()):
+                remaining = (
+                    max(
+                        0.0,
+                        (notice.first_pending_deadline_ms - int(time.time() * 1000))
+                        / 1000,
+                    )
+                    if notice.first_pending_deadline_ms is not None
+                    else 0.0
                 )
-                if notice.first_pending_deadline_ms is not None
-                else 0.0
-            )
-            self.coalescer.notify(delay_seconds=remaining)
+                self.coalescer.notify(delay_seconds=remaining)
         while not self._stopping:
             await self.coalescer.wait_for_burst()
             if self._stopping:
@@ -1709,13 +1706,19 @@ class GlobalInboxRuntime:
         max_items: int | None = None,
         turn_id: str | None = None,
         planning_cycle_key: str | None = None,
+        provider_session_id: str | None = None,
     ) -> PlannedTurn | None:
         pending_universe = (
             items if items is not None else await self.store.get_pending()
         )
         if items is None:
             notice = await self.store.get_notice_state()
-            if not pending_universe or not notice.delivery_pending:
+            session = (
+                provider_session_id
+                if provider_session_id is not None
+                else self.adapter.get_provider_session_id()
+            )
+            if not pending_universe or not notice.is_due_for(session):
                 return None
             routes = tuple(route_for(item) for item in pending_universe)
             targets: list[tuple[str, ...]] = []
@@ -1919,20 +1922,11 @@ class GlobalInboxRuntime:
                 provider_session_id=event.provider_session_id,
             )
         else:
-            state = await self.store.get_notice_state()
-            if (
-                state.generation != planned.notice_generation
-                or state.pending_count == 0
-            ):
-                raise RuntimeError("Inbox notice became stale before admission")
             run = await self.store.start_turn(
                 turn_id=planned.turn_id,
                 provider_session_id=event.provider_session_id,
+                notice_generation=planned.notice_generation,
             )
-            if not await self.store.mark_notice_delivered(
-                planned.notice_generation
-            ):
-                raise RuntimeError("Inbox notice generation was already delivered")
         self.active.turn_id = run.turn_id
         self.active.message_ids[:] = list(run.message_ids)
         await self._add_visible_message_ids(list(run.message_ids))
@@ -2101,7 +2095,9 @@ class GlobalInboxRuntime:
                 if (
                     current_notice.pending_count == 0
                     or current_notice.generation != planned.notice_generation
-                    or not current_notice.delivery_pending
+                    or not current_notice.is_due_for(
+                        self.adapter.get_provider_session_id()
+                    )
                 ):
                     self.health = RuntimeHealth()
                     return False
@@ -2164,7 +2160,6 @@ class GlobalInboxRuntime:
                     else:
                         await self.store.finalize_empty_turn(
                             turn_id=planned.turn_id,
-                            rearm_notice=True,
                         )
                     for item_id in self.active.message_ids:
                         row = await self.store.get_message_by_envelope(item_id)
@@ -2314,7 +2309,9 @@ class GlobalInboxRuntime:
                 if self.health.state == "in_progress":
                     self.health = RuntimeHealth()
             if not self._degraded and await self.store.get_pending(limit=1):
-                self.notify()
+                notice = await self.store.get_notice_state()
+                if notice.is_due_for(self.adapter.get_provider_session_id()):
+                    self.notify()
             return True
 
     async def _run_retry(self, planned: PlannedTurn) -> Any:

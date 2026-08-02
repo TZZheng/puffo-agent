@@ -108,6 +108,8 @@ class RuntimeSpec:
 
 @dataclass(frozen=True, slots=True)
 class TurnInput:
+    # Exactly one current Puffo semantic input. Native resumable sessions own
+    # their prior conversation history; callers must not concatenate it here.
     content: str
     client_correlation_id: str = ""
     metadata: Mapping[str, str] = field(default_factory=dict)

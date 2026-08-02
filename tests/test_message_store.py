@@ -1351,13 +1351,73 @@ async def test_durable_notice_deadline_is_fixed_and_survives_reopen(tmp_path):
     later = await store.get_notice_state()
     assert later.first_pending_deadline_ms == 4_000
     assert later.generation > first.generation
+    # A transport that learns its native session only from acceptance may
+    # still offer an unaccepted generation once.
+    assert later.is_due_for(None)
     await store.close()
 
     reopened = MessageStore(path, now_ms=lambda: 20_000)
     assert (await reopened.get_notice_state()).first_pending_deadline_ms == 4_000
-    assert await reopened.mark_notice_delivered(later.generation)
-    assert not await reopened.mark_notice_delivered(later.generation)
+    assert await reopened.mark_notice_delivered(later.generation, "provider-1")
+    accepted = await reopened.get_notice_state()
+    assert accepted.last_delivered_provider_session_id == "provider-1"
+    assert not accepted.is_due_for("provider-1")
+    assert not accepted.is_due_for(None)
+    assert accepted.is_due_for("provider-2")
+    assert not await reopened.mark_notice_delivered(later.generation, "provider-1")
+    assert await reopened.mark_notice_delivered(later.generation, "provider-2")
+    assert not await reopened.mark_notice_delivered(later.generation, "provider-2")
     await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_notice_state_session_migration_preserves_baseline_row(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "baseline-notice-state.db"
+    con = sqlite3.connect(path)
+    con.execute(
+        "CREATE TABLE messages (envelope_id TEXT PRIMARY KEY, "
+        "envelope_kind TEXT NOT NULL, sender_slug TEXT NOT NULL, "
+        "channel_id TEXT, space_id TEXT, recipient_slug TEXT, "
+        "content_type TEXT NOT NULL DEFAULT 'text/plain', content TEXT NOT NULL, "
+        "sent_at INTEGER NOT NULL, received_at INTEGER NOT NULL, "
+        "thread_root_id TEXT, reply_to_id TEXT, "
+        "is_encrypted INTEGER NOT NULL DEFAULT 1)"
+    )
+    con.execute(
+        "CREATE TABLE inbox_notice_state ("
+        "singleton INTEGER PRIMARY KEY CHECK (singleton = 1), "
+        "generation INTEGER NOT NULL, pending_count INTEGER NOT NULL, "
+        "first_pending_deadline_ms INTEGER, "
+        "last_delivered_generation INTEGER NOT NULL)"
+    )
+    con.execute(
+        "INSERT INTO inbox_notice_state VALUES (1, 7, 3, 4321, 7)"
+    )
+    con.commit()
+    con.close()
+
+    store = MessageStore(path)
+    await store.open()
+    state = await store.get_notice_state()
+    assert (
+        state.generation,
+        state.pending_count,
+        state.first_pending_deadline_ms,
+        state.last_delivered_generation,
+        state.last_delivered_provider_session_id,
+    ) == (7, 3, 4321, 7, None)
+    assert state.is_due_for("replacement-session")
+    db = await store._ensure_db()
+    async with db.execute("PRAGMA table_info(inbox_notice_state)") as cursor:
+        columns = {row["name"] for row in await cursor.fetchall()}
+    assert "last_delivered_provider_session_id" in columns
+    assert await store.mark_notice_delivered(7, "replacement-session")
+    assert (await store.get_notice_state()).last_delivered_provider_session_id == (
+        "replacement-session"
+    )
+    await store.close()
 
 
 @pytest.mark.asyncio
@@ -1371,7 +1431,7 @@ async def test_empty_notice_turn_rearms_unchanged_pending_work_atomically(tmp_pa
         reason="test",
     )
     delivered = await store.get_notice_state()
-    assert await store.mark_notice_delivered(delivered.generation)
+    assert await store.mark_notice_delivered(delivered.generation, "provider-1")
     await store.start_turn(
         turn_id="empty-notice-turn",
         provider_session_id="provider-1",
@@ -1395,37 +1455,32 @@ async def test_empty_notice_turn_rearms_unchanged_pending_work_atomically(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_startup_rearm_repairs_only_stranded_notice_without_active_turn(
+async def test_successful_empty_notice_turn_keeps_same_session_suppressed(
     tmp_path,
 ):
-    store = MessageStore(tmp_path / "notice-startup-rearm.db")
+    store = MessageStore(tmp_path / "notice-empty-success.db")
     await store.store_receipt(
-        _channel_payload("notice-stranded"),
+        _channel_payload("notice-empty-success"),
         server_seq=1,
         disposition=ReceiptDisposition.ELIGIBLE,
         reason="test",
     )
-    delivered = await store.get_notice_state()
-    assert await store.mark_notice_delivered(delivered.generation)
-
+    due = await store.get_notice_state()
     await store.start_turn(
-        turn_id="active-notice-turn",
+        turn_id="empty-success-turn",
         provider_session_id="provider-1",
+        notice_generation=due.generation,
     )
-    active = await store.get_active_turn_runs()
-    assert [run.turn_id for run in active] == ["active-notice-turn"]
-    assert not await store.rearm_stranded_notice()
-    await store.finalize_empty_turn(
-        turn_id="active-notice-turn",
-        state="requeued",
-    )
+    run = await store.finalize_empty_turn(turn_id="empty-success-turn")
+    state = await store.get_notice_state()
 
-    assert await store.rearm_stranded_notice()
-    repaired = await store.get_notice_state()
-    assert repaired.generation == delivered.generation + 1
-    assert repaired.last_delivered_generation == delivered.generation
-    assert repaired.delivery_pending
-    assert not await store.rearm_stranded_notice()
+    assert run.state == ProcessingState.PROCESSED.value
+    assert state.generation == due.generation
+    assert state.pending_count == 1
+    assert state.last_delivered_generation == due.generation
+    assert state.last_delivered_provider_session_id == "provider-1"
+    assert not state.is_due_for("provider-1")
+    assert state.is_due_for("provider-2")
     assert await store.get_active_turn_runs() == ()
     await store.close()
 
