@@ -88,16 +88,19 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     normalized_read = " ".join(read.split())
     assert "messages" in read and "prior_context" in read and "strictly earlier" in normalized_read
     assert "do not acknowledge pending Inbox rows" in read
-    contribution_guidance = "Send only when the new content makes a useful new contribution; otherwise choose silence."
+    contribution_guidance = (
+        "Reconstruct the originating request and conversation intent from the pending "
+        "page and relevant `prior_context`."
+    )
     all_prompt_surfaces = " ".join(
         " ".join(body.split())
         for body in (DEFAULT_SHARED_CLAUDE_MD, *[body for _, body in DEFAULT_SKILLS.values()])
     )
     assert normalized_read.count(contribution_guidance) == 1
     assert all_prompt_surfaces.count(contribution_guidance) == 1
-    assert "Arrival or peer activity is evidence to evaluate, not an automatic reply trigger." in normalized_read
+    assert "Peer progress alone does not create an obligation." in normalized_read
     assert "For conversation decisions, use the `read-inbox` skill." in DEFAULT_SHARED_CLAUDE_MD
-    assert "useful new contribution" not in DEFAULT_SHARED_CLAUDE_MD
+    assert "originating request and conversation intent" not in DEFAULT_SHARED_CLAUDE_MD
     assert "does not acknowledge pending Inbox work" in " ".join(history.split())
     assert "does not acknowledge pending Inbox work" in " ".join(post.split())
     normalized_send = " ".join(send.lower().split())
@@ -118,9 +121,11 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         "<inbox_message>", "one line per root post", "nested `route`",
         "assignment-completion", "benchmark", "response quota", "counting-specific",
         "sender-type silence", "forced mention/DM", "automatically retries",
-        "always requires a separate history read",
+        "always requires a separate history read", "participant-count", "one-reply",
+        "sender suppression", "destination rule", "parser", "deterministic silence",
+        "runtime policy",
     ):
-        assert forbidden not in "\n".join((DEFAULT_SHARED_CLAUDE_MD, *[body for _, body in DEFAULT_SKILLS.values()]))
+        assert forbidden not in read.lower()
     send_policy_text = "\n".join((send, DEFAULT_SKILLS["send-message-with-attachments"][1])).lower()
     for forbidden in (
         "**when to use:**", "**when not to use:**", "prefer this over",
@@ -131,8 +136,8 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
 
 def test_contribution_guidance_is_absent_from_mcp_descriptions_and_profiles():
     contribution_guidance = (
-        "Send only when the new content makes a useful new contribution; "
-        "otherwise choose silence."
+        "Reconstruct the originating request and conversation intent from the pending "
+        "page and relevant `prior_context`."
     )
 
     class CapturingMCP:
@@ -149,12 +154,76 @@ def test_contribution_guidance_is_absent_from_mcp_descriptions_and_profiles():
     register_core_tools(mcp, SimpleNamespace(bridge_client=None))
     mcp_descriptions = "\n".join(tool.__doc__ or "" for tool in mcp.tools)
     assert contribution_guidance not in mcp_descriptions
-    assert "useful new contribution" not in mcp_descriptions
+    assert "originating request and conversation intent" not in mcp_descriptions
 
     claude, codex = _rebuild(_tmp())
     for generated_profile_surface in (claude, codex):
         assert contribution_guidance not in generated_profile_surface
-        assert "useful new contribution" not in generated_profile_surface
+        assert "originating request and conversation intent" not in generated_profile_surface
+
+
+def test_read_inbox_guides_origin_self_and_new_obligation_reasoning_only_there():
+    reasoning_method = (
+        "Reconstruct the originating request and conversation intent from the pending "
+        "page and relevant `prior_context`.",
+        "Inspect your relevant earlier `self=true` contribution.",
+        "Distinguish content that newly creates or changes unresolved work for this "
+        "Agent from peers merely progressing the unchanged request.",
+        "Peer progress alone does not create an obligation.",
+        "Use your judgment for a genuine follow-up, correction, direct request, "
+        "changed objective, scope, constraint, deliverable, or newly exposed dependency.",
+        "The final choice to send, remain silent, revise, or use `send_anyway` is "
+        "model-owned.",
+    )
+    read = " ".join(DEFAULT_SKILLS["read-inbox"][1].split())
+    assert all(phrase in read for phrase in reasoning_method)
+    assert read.count(reasoning_method[0]) == 1
+    for stale_generic_tail in (
+        "Evaluate pending messages together with relevant",
+        "useful new contribution",
+        "otherwise choose silence",
+        "peer activity is evidence to evaluate",
+    ):
+        assert stale_generic_tail not in read
+
+    root = _tmp()
+    claude, codex = _rebuild(root)
+    claude_skill = (
+        root / "workspace" / ".claude" / "skills" / "read-inbox" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    codex_skill = (
+        root / "workspace" / ".agents" / "skills" / "read-inbox" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert all(phrase in " ".join(claude_skill.split()) for phrase in reasoning_method)
+    assert all(phrase in " ".join(codex_skill.split()) for phrase in reasoning_method)
+    assert codex_skill == claude_skill.replace("mcp__puffo__", "")
+
+    other_prompt_surfaces = [" ".join(surface.split()) for surface in (claude, codex)]
+    other_prompt_surfaces.extend(
+        " ".join(body.split())
+        for skill_id, (_, body) in DEFAULT_SKILLS.items()
+        if skill_id != "read-inbox"
+    )
+    assert not any(
+        phrase in surface
+        for phrase in reasoning_method
+        for surface in other_prompt_surfaces
+    )
+
+    class CapturingMCP:
+        def __init__(self) -> None:
+            self.tools = []
+
+        def tool(self):
+            def register(function):
+                self.tools.append(function)
+                return function
+            return register
+
+    mcp = CapturingMCP()
+    register_core_tools(mcp, SimpleNamespace(bridge_client=None))
+    mcp_descriptions = "\n".join(tool.__doc__ or "" for tool in mcp.tools)
+    assert not any(phrase in mcp_descriptions for phrase in reasoning_method)
 
 
 def test_harnesses_discover_managed_skills_with_correct_tool_names():
