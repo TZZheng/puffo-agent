@@ -342,6 +342,10 @@ async def test_model_visible_read_structured_round_trip(
         ("through_seq", -1),
         ("tool_name", "get_dm_history"),
         ("tool_arguments", {"channel": ["ch_1"]}),
+        ("visible_message_ids", "msg_9"),
+        ("visible_message_ids", ["msg_9", ""]),
+        ("visible_message_ids", ["msg_9", "msg_9"]),
+        ("visible_message_ids", [f"msg_{index}" for index in range(201)]),
         ("unexpected", "field"),
     ],
 )

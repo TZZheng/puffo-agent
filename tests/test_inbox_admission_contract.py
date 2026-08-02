@@ -410,6 +410,7 @@ async def test_real_rpc_history_and_inbox_admission_wait_for_provider_completion
     history_row = await h.store.get_message_by_envelope("history-peer")
     assert history_row is not None
     assert history_row.processing_state is ProcessingState.PENDING
+    assert h.runtime.active.visible_message_ids == []
     assert await h.active_boundary("ch-history") is None
 
     history_receipt = re.search(
@@ -427,6 +428,7 @@ async def test_real_rpc_history_and_inbox_admission_wait_for_provider_completion
     )
     assert history_receipt in history_text
     assert await h.active_boundary("ch-history") == 2
+    assert h.runtime.active.visible_message_ids == ["history-peer"]
 
     inbox_call = await h.mcp.call_tool(
         "read_inbox",
@@ -440,6 +442,7 @@ async def test_real_rpc_history_and_inbox_admission_wait_for_provider_completion
     inbox_row = await h.store.get_message_by_envelope("inbox-peer")
     assert inbox_row is not None
     assert inbox_row.processing_state is ProcessingState.PENDING
+    assert h.runtime.active.visible_message_ids == ["history-peer"]
     assert await h.active_boundary("ch-inbox") is None
 
     await h.emit_tool_result(
@@ -455,6 +458,8 @@ async def test_real_rpc_history_and_inbox_admission_wait_for_provider_completion
     inbox_row = await h.store.get_message_by_envelope("inbox-peer")
     assert inbox_row.processing_state is ProcessingState.IN_TURN
     assert await h.active_boundary("ch-inbox") == 3
+    assert h.runtime.active.message_ids == ["inbox-peer"]
+    assert h.runtime.active.visible_message_ids == ["history-peer", "inbox-peer"]
 
     await h.finish()
 
@@ -604,6 +609,7 @@ async def test_real_provider_correlation_rejects_empty_failed_and_mismatched_res
         )
         await asyncio.sleep(0)
         assert await h.active_boundary("ch-history") is None
+        assert h.runtime.active.visible_message_ids == []
         row = await h.store.get_message_by_envelope("history-peer")
         assert row.processing_state is ProcessingState.PENDING
         blocked_call = await h.mcp.call_tool(
@@ -630,6 +636,7 @@ async def test_real_provider_correlation_rejects_empty_failed_and_mismatched_res
         ) == 2
     )
     assert await h.active_boundary("ch-history") == 2
+    assert h.runtime.active.visible_message_ids == ["history-peer"]
     await h.finish()
 
 

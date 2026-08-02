@@ -26,6 +26,7 @@ from puffo_agent.agent.global_inbox_runtime import (
     GlobalInboxRuntime,
     HeldRecoverySource,
     MessageRoute,
+    PlannedTurn,
     SendAttemptState,
     TrackingSendDelegate,
     await_listener_with_runtime,
@@ -1398,7 +1399,7 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
             ))
 
         async def admit_continuation(self):
-            callback, key, *_ = self.continuations.pop(0)
+            callback, key, *_ = self.continuations[0]
             await callback(ProviderAdmissionEvent(
                 planning_cycle_key=key,
                 provider_session_id="provider-1",
@@ -1446,6 +1447,11 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
         event["event"] == "history.read_admitted" for event in staged_events
     )
 
+    await adapter.admit_continuation()
+    assert runtime.active.visible_message_ids == ["history-2"]
+    assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 2
+    # A duplicated provider completion is idempotent: neither the watermark
+    # nor the ordered visibility registry changes.
     await adapter.admit_continuation()
     assert runtime.active.visible_message_ids == ["history-2"]
     assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 2
@@ -1514,6 +1520,83 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
         and event.get("state") == "invalid_watermark"
         for event in runtime_events(caplog)
     )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_initial_admission_visibility_is_exact_deduplicated_and_memory_only(tmp_path):
+    store = await make_store(tmp_path)
+    await receipt(store, "initial-visible-1", 1)
+    await receipt(store, "initial-visible-2", 2)
+    rows = tuple(await store.get_pending())
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=Adapter(), run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    planned = PlannedTurn(
+        turn_id="initial-visible-turn", planning_cycle_key="initial-visible-key",
+        message_ids=("initial-visible-1", "initial-visible-2"), items=rows,
+        routes=tuple(route_for(row) for row in rows), targets=(), pending_targets=(),
+        target_summary="", formatted_blocks=(), provider_input="", formatted_tokens=0,
+        wrapper_overhead_tokens=0, formatted_bytes=0, wrapper_overhead_bytes=0,
+    )
+    await runtime._admit(planned, ProviderAdmissionEvent(
+        planning_cycle_key="initial-visible-key", provider_session_id="provider-1",
+        provider_turn_id="provider-turn", admitted_at=datetime.now(timezone.utc),
+    ))
+    assert runtime.active.message_ids == ["initial-visible-1", "initial-visible-2"]
+    assert runtime.active.visible_message_ids == ["initial-visible-1", "initial-visible-2"]
+    await runtime._add_visible_message_ids([
+        "initial-visible-2", "initial-visible-1", "initial-visible-2",
+    ])
+    assert runtime.active.visible_message_ids == ["initial-visible-1", "initial-visible-2"]
+    with pytest.raises(RuntimeError, match="does not resolve locally"):
+        await runtime._add_visible_message_ids(["initial-visible-1", "unknown-visible"])
+    assert runtime.active.visible_message_ids == ["initial-visible-1", "initial-visible-2"]
+    runtime.active.clear()
+    assert runtime.active.visible_message_ids == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("visible_ids", [
+    ["unknown-visible"], ["visible-dm"], ["visible-cross-channel"],
+    ["visible-beyond-watermark"],
+])
+async def test_model_visible_read_rejects_invalid_local_ids_before_callback_registration(
+    tmp_path, visible_ids,
+):
+    store = await make_store(tmp_path)
+    await receipt(store, "visible-watermark", 2)
+    await receipt(store, "visible-cross-channel", 1, channel="other-channel")
+    await receipt(store, "visible-beyond-watermark", 3)
+    await receipt(store, "visible-dm", 1, kind="dm", channel="", space="")
+
+    class RecordingAdapter(Adapter):
+        def __init__(self):
+            super().__init__()
+            self.callbacks = []
+
+        def register_continuation_callback(self, *args, **kwargs):
+            self.callbacks.append((args, kwargs))
+
+    adapter = RecordingAdapter()
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.active.turn_id = "visible-validation-turn"
+    runtime.active.provider_session_id = "provider-1"
+    with pytest.raises(RuntimeError, match="visible message ID"):
+        await runtime.stage_model_visible_read(
+            space_id="sp-1", channel_id="ch-1", through_seq=2,
+            through_envelope_id="visible-watermark",
+            tool_name="get_channel_history", tool_arguments={"channel": "ch-1"},
+            visible_message_ids=visible_ids,
+        )
+    assert adapter.callbacks == []
+    assert runtime.active.visible_message_ids == []
+    assert runtime.active.through_by_channel == {}
     await store.close()
 
 
@@ -2890,12 +2973,15 @@ async def test_notice_then_correlated_read_admits_and_processes_exact_page(tmp_p
     async def run(planned):
         assert "text-pull" not in planned.provider_input
         await adapter.admit()
+        # A metadata-only notice has no plaintext rows to register.
+        assert runtime.active.visible_message_ids == []
         page = await runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
         assert len(page["messages"]) == 1
         assert [row.envelope_id for row in await store.get_pending()] == [
             "pull-1", "pull-2"
         ]
         await adapter.admit_continuation()
+        assert runtime.active.visible_message_ids == ["pull-1"]
         assert [row.envelope_id for row in await store.get_pending()] == ["pull-2"]
 
     runtime = GlobalInboxRuntime(
@@ -3410,6 +3496,9 @@ async def test_read_inbox_prior_context_preserves_paging_and_exact_admission(
     assert second["has_more"] is False
     assert second["next_cursor"] == ""
     assert runtime.active.message_ids == ["page-context-1", "page-context-2"]
+    assert runtime.active.visible_message_ids == [
+        "page-context-1", "prior-page-context", "page-context-2",
+    ]
     prior = await store.get_message_by_envelope("prior-page-context")
     page_rows = await asyncio.gather(
         store.get_message_by_envelope("page-context-1"),
