@@ -133,6 +133,12 @@ _CODEX_AUTH_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"refresh token (?:was )?revoked", re.IGNORECASE),
     re.compile(r"\btoken_invalidated\b", re.IGNORECASE),
     re.compile(r"invalidated\s+oauth\s+token", re.IGNORECASE),
+    re.compile(
+        r"(?:^|:\s*)your access token could not be refreshed because you have "
+        r"since logged out or signed in to another account\. please sign in "
+        r"again\.\s*$",
+        re.IGNORECASE,
+    ),
 )
 
 # 401 counts only with an auth-context marker in the same clause; keeps
@@ -156,6 +162,27 @@ def _looks_like_codex_auth_error(err_text: str) -> bool:
     if any(p.search(text) for p in _CODEX_AUTH_ERROR_PATTERNS):
         return True
     return any(p.search(text) for p in _CODEX_AUTH_401_PATTERNS)
+
+
+def _completion_failure(params: dict[str, Any]) -> str | None:
+    """Return a readable failure from ``turn/completed``, if present.
+
+    App-server versions have emitted terminal data both under ``params.turn``
+    and directly under ``params``.  A populated error is authoritative even
+    when a producer also reports a success-like status; sparse legacy frames
+    intentionally remain successful.
+    """
+    turn = params.get("turn")
+    turn_obj = turn if isinstance(turn, dict) else {}
+    for candidate in (turn_obj.get("error"), params.get("error")):
+        if candidate not in (None, "", {}, []):
+            return _readable_error(candidate)
+    status = turn_obj.get("status")
+    if status is None:
+        status = params.get("status")
+    if isinstance(status, str) and status.lower() in {"failed", "error"}:
+        return f"turn completed with status {status}"
+    return None
 
 # Puffo MCP "counts as a reply" tools; success skips the [SILENT]-fallback
 # auto-post. Inline frozenset avoids an MCP import cycle.
@@ -1377,7 +1404,13 @@ class CodexSession:
             self._discard_turn_continuations(turn.provider_turn_id)
             self._absorb_turn_usage(turn, params)
             if not turn.completed.done():
-                turn.completed.set_result(None)
+                failure = _completion_failure(params or {})
+                if failure is None:
+                    turn.completed.set_result(None)
+                else:
+                    turn.completed.set_exception(
+                        RuntimeError(f"codex turn failed: {failure}"),
+                    )
             return
         # turn/failed OR top-level error, depending on where it failed; both
         # are turn-fatal, else the turn times out into "no reply".

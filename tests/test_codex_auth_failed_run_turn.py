@@ -110,6 +110,44 @@ while True:
     assert err_message.lower() in str(excinfo.value).lower()
 
 
+def test_auth_class_completed_error_raises_agent_api_error_auth(tmp_path):
+    """A terminal ``turn/completed`` error must not become an empty success."""
+    message = (
+        "Your access token could not be refreshed because you have since logged "
+        "out or signed in to another account. Please sign in again."
+    )
+    cs = _make_session(tmp_path, '''\
+absorb_initialize()
+msg = r()
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"id": "conv_completed_auth"}}})
+
+msg = r()
+turn_id = msg["id"]
+w({"jsonrpc": "2.0", "id": turn_id,
+   "result": {"turn": {"id": "t1", "status": "running"}}})
+w({"jsonrpc": "2.0", "method": "turn/completed",
+   "params": {"turn": {"status": "completed", "error": {"message": MESSAGE}}}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+'''.replace("MESSAGE", repr(message)))
+
+    async def _run():
+        try:
+            await cs.warm("sp")
+            await cs.run_turn("hi", "sp")
+        finally:
+            await cs.aclose()
+
+    with pytest.raises(AgentAPIError) as excinfo:
+        asyncio.run(_run())
+    assert excinfo.value.is_auth is True
+    assert message.lower() in str(excinfo.value).lower()
+
+
 # ── Non-auth turn/failed: still raises RuntimeError ────────────────────────
 
 
