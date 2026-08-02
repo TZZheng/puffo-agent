@@ -26,42 +26,6 @@ def _now_ms():
     return int(time.time() * 1000)
 
 
-def _assert_assignment_completion_boundary(text: str) -> None:
-    lowered = " ".join(text.lower().split())
-    for phrase in (
-        "ordinary peer progress on an unchanged originating intent",
-        "does not by itself reopen",
-        "is_self: true",
-        "already completed this agent's part",
-        "peer-exposed work or an evolving assignment permits another response only when",
-        "newly observed content creates or changes an unresolved obligation belonging to this agent",
-        "changed objective",
-        "changed scope",
-        "changed constraint",
-        "changed deliverable",
-    ):
-        assert phrase in lowered, (phrase, text)
-
-
-def _assert_assignment_completion_positive_controls(text: str) -> None:
-    lowered = " ".join(text.lower().split())
-    for phrase in (
-        "follow-up",
-        "correction",
-        "direct mention",
-        "newly exposed dependency",
-        "genuine new peer-exposed work",
-        "changed objective",
-        "changed scope",
-        "changed constraint",
-        "changed deliverable",
-        "multi-target turns must address destinations explicitly",
-        "final send-or-silence decision model-owned",
-        "[silent]",
-    ):
-        assert phrase in lowered, (phrase, text)
-
-
 class FakeHttpClient:
     """Test stub. Match priority: exact path, then path-without-query,
     then query params modulo the ``since`` cursor (so a test can

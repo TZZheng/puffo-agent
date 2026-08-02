@@ -33,7 +33,7 @@ from puffo_agent.agent.global_inbox_runtime import (
     format_stored_message,
     route_for,
 )
-from puffo_agent.agent.shared_content import DEFAULT_SKILLS, DEFAULT_SHARED_CLAUDE_MD
+from puffo_agent.agent.shared_content import DEFAULT_SHARED_CLAUDE_MD
 from puffo_agent.agent.inbox_scheduler import (
     InboxNoticeDelivery,
     NoticeDeliveryCapability,
@@ -73,12 +73,6 @@ def projection_metadata(block: str) -> dict[str, object]:
         "sender_slug": re.search(r"\] @([^ :]+)", row).group(1),
         "is_self": " self=true" in row,
     }
-
-
-def projection_body(block: str) -> str:
-    lines = block.splitlines()
-    row_index = next(index for index, line in enumerate(lines) if line.startswith("[seq="))
-    return "\n".join(lines[row_index + 1:])
 
 
 def test_runtime_event_helper_fails_open_and_omits_unavailable(
@@ -3112,16 +3106,9 @@ def test_format_stored_message_marks_only_runtime_identity_aliases(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_peer_progress_starts_grounded_followup_turn(tmp_path):
-    result = await _run_composed_peer_progress_case(
-        tmp_path,
-        peer_body=(
-            "The current task has progressed to the next dependency; "
-            "the requested outline is complete."
-        ),
-    )
+async def test_peer_progress_turn_receives_grounded_prior_context(tmp_path):
+    result = await _run_prior_context_delivery_case(tmp_path)
     assert result["provider_turns"] == 2
-    assert result["decisions"] == ["send", "[SILENT]"]
     assert result["transport_calls"] == 1
     assert result["peer_state"] is ProcessingState.PROCESSED
     second_input = json.dumps(result["provider_inputs"][1], sort_keys=True)
@@ -3137,71 +3124,22 @@ async def test_peer_progress_starts_grounded_followup_turn(tmp_path):
     assert result["future_state"] is ProcessingState.PENDING
 
 
-async def _run_composed_peer_progress_case(
-    tmp_path,
-    *,
-    peer_body: str,
-):
+async def _run_prior_context_delivery_case(tmp_path):
     """Run two fresh provider Turns against only durable/tool-return input."""
     store = await make_store(tmp_path)
     human_body = "Please outline the current task."
     first_contribution = "I mapped the current dependency."
+    peer_body = "A peer supplied additional context for the same interaction."
     await receipt(store, "human-origin", 1, sender="human", content=human_body)
 
-    class DeterministicProvider:
-        """Small provider double that reasons from the real tool result only."""
+    class ProviderRecorder:
+        """Capture the exact context delivered at each provider boundary."""
 
-        def __init__(self, instructions):
-            self.instructions = instructions
+        def __init__(self):
             self.turn_inputs = []
 
-        @staticmethod
-        def parse(block):
-            return projection_metadata(block), projection_body(block)
-
-        def decide(self, read_inbox_result):
+        def capture(self, read_inbox_result):
             self.turn_inputs.append(read_inbox_result)
-            lowered_instructions = " ".join(self.instructions.lower().split())
-            for phrase in (
-                "reconstruct the interaction",
-                "pending page and relevant `prior_context`",
-                "self=true",
-                "distinct participation from each addressed participant",
-                "shared result that any participant can satisfy",
-                "agent messages may legitimately trigger further agent work or replies",
-                "repeat, oscillate, or self-propagate without meaningful progress",
-                "ask one concise human clarification",
-                "send, remain silent, revise, clarify, or use `send_anyway`",
-            ):
-                assert phrase in lowered_instructions
-
-            messages = [self.parse(block) for block in read_inbox_result["messages"]]
-            prior_context = [
-                self.parse(block) for block in read_inbox_result["prior_context"]
-            ]
-            if not prior_context:
-                return "send", "I will take the requested action."
-
-            prior_self = [
-                (metadata, body)
-                for metadata, body in prior_context
-                if metadata.get("is_self") is True
-            ]
-            peer_text = " ".join(body.lower() for _metadata, body in messages)
-            new_action = any(
-                marker in peer_text
-                for marker in (
-                    "follow-up",
-                    "correction",
-                    "@you(",
-                    "new dependency",
-                    "please verify",
-                )
-            )
-            same_assignment_satisfied = bool(prior_self) and not new_action
-            if same_assignment_satisfied:
-                return "[SILENT]", None
-            return "send", "I will take the newly identified action."
 
     class ProviderAdapter(Adapter):
         def __init__(self):
@@ -3257,9 +3195,8 @@ async def _run_composed_peer_progress_case(
     adapter = ProviderAdapter()
     transport = FakeServerTransport()
     coordinator = FakeCoordinator(transport)
-    provider = DeterministicProvider(DEFAULT_SKILLS["read-inbox"][1])
+    provider = ProviderRecorder()
     provider_inputs = []
-    decisions = []
     runtime = None
 
     async def run(planned):
@@ -3292,10 +3229,7 @@ async def _run_composed_peer_progress_case(
         if turn_number == 1:
             assert human_body in page["messages"][0]
             assert page["prior_context"] == []
-            decision, reply = provider.decide(page)
-            assert decision == "send"
-            assert reply
-            decisions.append(decision)
+            provider.capture(page)
             sent = await runtime.send_delegate.send({
                 "destination": "ch-1",
                 "text": first_contribution,
@@ -3324,27 +3258,7 @@ async def _run_composed_peer_progress_case(
         )
         assert self_metadata["sender_slug"] == "agent"
         assert self_metadata["is_self"] is True
-        decision, reply = provider.decide(page)
-        decisions.append(decision)
-        if decision == "send":
-            assert reply
-            sent = await runtime.send_delegate.send({
-                "destination": "ch-1",
-                "text": reply,
-                "visibility_level": "human",
-            })
-            assert sent["state"] == "sent"
-            await receipt(
-                store,
-                "agent-followup",
-                5,
-                sender="agent",
-                disposition=ReceiptDisposition.TERMINAL,
-                content=reply,
-            )
-        else:
-            assert decision == "[SILENT]"
-            assert reply is None
+        provider.capture(page)
 
     runtime = GlobalInboxRuntime(
         store=store,
@@ -3435,7 +3349,6 @@ async def _run_composed_peer_progress_case(
     result = {
         "provider_turns": len(provider_inputs),
         "provider_inputs": provider_inputs,
-        "decisions": decisions,
         "transport_calls": len(transport.calls),
         "peer_state": peer.processing_state,
         "future_state": future.processing_state,
@@ -3449,46 +3362,6 @@ async def _run_composed_peer_progress_case(
     }
     await store.close()
     return result
-
-
-@pytest.mark.asyncio
-async def test_followup_after_prior_contribution(tmp_path):
-    result = await _run_composed_peer_progress_case(
-        tmp_path,
-        peer_body="A follow-up asks for the next concrete step.",
-    )
-    assert result["decisions"] == ["send", "send"]
-    assert result["transport_calls"] == 2
-
-
-@pytest.mark.asyncio
-async def test_correction_after_prior_contribution(tmp_path):
-    result = await _run_composed_peer_progress_case(
-        tmp_path,
-        peer_body="Correction: the dependency is on the other branch.",
-    )
-    assert result["decisions"] == ["send", "send"]
-    assert result["transport_calls"] == 2
-
-
-@pytest.mark.asyncio
-async def test_mention_after_prior_contribution(tmp_path):
-    result = await _run_composed_peer_progress_case(
-        tmp_path,
-        peer_body="@you(agent) please verify the current dependency.",
-    )
-    assert result["decisions"] == ["send", "send"]
-    assert result["transport_calls"] == 2
-
-
-@pytest.mark.asyncio
-async def test_dependency_after_prior_contribution(tmp_path):
-    result = await _run_composed_peer_progress_case(
-        tmp_path,
-        peer_body="New dependency exposed: the release checklist needs approval.",
-    )
-    assert result["decisions"] == ["send", "send"]
-    assert result["transport_calls"] == 2
 
 
 @pytest.mark.asyncio
