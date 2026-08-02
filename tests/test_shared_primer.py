@@ -234,7 +234,11 @@ def test_held_send_reconsiders_an_attempted_existing_contribution():
     held_method = (
         "held draft as evidence of an attempted contribution",
         "reconsider the originating request, that draft, and newer context together",
-        "has genuinely been satisfied or cancelled, or should remain unsent",
+        "underlying contribution is still needed",
+        "should be revised to fit the current conversation",
+        "Separate the exact draft text from that underlying contribution",
+        "newer context may invalidate the draft while leaving the contribution unresolved",
+        "not merely because peers advanced the conversation or produced overlapping content",
         "revise and send with normal freshness",
         "use the unchanged draft with `send_anyway=True` only when it is still clear and appropriate",
         "or send nothing",

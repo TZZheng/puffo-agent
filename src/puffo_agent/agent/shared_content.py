@@ -218,16 +218,20 @@ boundary/latest pair, `visible_draft_basis`, and, when `context_ready=true`,
 `new_channel_context`. Inspect that returned context carefully. Treat the held
 draft as evidence of an attempted contribution: reconsider the originating
 request, that draft, and newer context together, plus any Inbox or history
-context you decide is useful, to decide whether that same contribution is still
-needed, should be revised, has genuinely been satisfied or cancelled, or should
-remain unsent. Then choose one outcome: revise and send with normal freshness;
-use the unchanged draft with `send_anyway=True` only when it is still clear and
-appropriate; or send nothing. `send_anyway=True` is rare and model-owned, never
-automatic; technical eligibility is not a recommendation. Revised or
-context-derived content uses normal freshness and may be held again. When
-`context_ready=false`, do not infer unseen messages: read the relevant tools if
-more context is needed or choose silence. A sequence watermark alone is not
-semantic context.
+context you decide is useful, to decide whether its underlying contribution is
+still needed, should be revised to fit the current conversation, has genuinely
+been satisfied or cancelled, or should remain unsent. Separate the exact draft
+text from that underlying contribution: newer context may invalidate the draft
+while leaving the contribution unresolved. Treat it as satisfied or cancelled
+only when current context actually resolves its underlying purpose, not merely
+because peers advanced the conversation or produced overlapping content. Then
+choose one outcome: revise and send with normal freshness; use the unchanged
+draft with `send_anyway=True` only when it is still clear and appropriate; or
+send nothing. `send_anyway=True` is rare and model-owned, never automatic;
+technical eligibility is not a recommendation. Revised or context-derived
+content uses normal freshness and may be held again. When `context_ready=false`,
+do not infer unseen messages: read the relevant tools if more context is needed
+or choose silence. A sequence watermark alone is not semantic context.
 
 **Examples:**
 
