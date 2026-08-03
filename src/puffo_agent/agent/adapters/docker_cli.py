@@ -65,8 +65,8 @@ def _puffo_agent_pkg_dir() -> Path:
 # Bump on Dockerfile changes so existing hosts rebuild without manual
 # image-tag pruning. ``_ensure_image`` only builds when the tag is
 # missing locally.
-DEFAULT_IMAGE = "puffo/agent-runtime:v12"
-CONTAINER_LAYOUT_VERSION = "12"
+DEFAULT_IMAGE = "puffo/agent-runtime:v15"
+CONTAINER_LAYOUT_VERSION = "15"
 
 # Pinned Claude Code CLI version baked into the image. Floating would
 # let an upstream release shift the stream-json protocol or
@@ -105,8 +105,10 @@ RUN npm install -g \\
 # (Python counterpart of ``npx``) so agents can register stdio MCPs
 # without per-server pip/npm install.
 RUN pip3 install --break-system-packages --no-cache-dir \\
-        "mcp>=1.0" "aiohttp>=3.9" "uv>=0.5" \\
-        "cryptography>=43" "pyhpke>=0.6" "aiosqlite>=0.20" "pyyaml>=6.0"
+        "mcp>=1.0,<2" "aiohttp>=3.9" "aiohttp-socks>=0.10" \\
+        "aiosqlite>=0.20" "certifi>=2024.2.2" "cryptography>=43" \\
+        "pillow>=10.0" "psutil>=5.9" "pyhpke>=0.6" "python-socks>=2.4" \\
+        "pyyaml>=6.0" "tzdata>=2024.1" "uv>=0.5" "websockets>=12.0"
 
 RUN useradd -m -u 2000 -s /bin/bash agent
 USER agent
