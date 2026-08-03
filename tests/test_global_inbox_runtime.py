@@ -3886,6 +3886,14 @@ async def test_reconstructed_overdue_reminder_has_one_inbox_event_and_one_turn(t
         async def put(self, _path, _body):
             raise AssertionError("delivery is not uploaded by this Inbox test")
 
+        async def post(self, path, body):
+            return {
+                "occurrence_id": path.split("/")[-2],
+                "revision": body["revision"],
+                "lifecycle": "scheduled",
+                "status": "acquired",
+            }
+
     store = await make_store(tmp_path / "first")
     adapter = Adapter()
     turns: list[str] = []
@@ -3904,6 +3912,7 @@ async def test_reconstructed_overdue_reminder_has_one_inbox_event_and_one_turn(t
         http_client=SnapshotTransport(),
         scheduler=runtime.reminder_scheduler,
     )
+    runtime.reminder_scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
     assert await sync.reconcile_snapshot() == 1
     assert await sync.reconcile_snapshot() == 0
     assert [item.occurrence_id for item in await runtime.reminder_scheduler.process_due_once()] == [
@@ -3924,6 +3933,9 @@ async def test_reconstructed_overdue_reminder_has_one_inbox_event_and_one_turn(t
         owner_slug="agent-a",
         http_client=SnapshotTransport(),
         scheduler=restarted.reminder_scheduler,
+    )
+    restarted.reminder_scheduler.set_delivery_authorizer(
+        restarted_sync.authorize_due_delivery
     )
     assert await restarted_sync.reconcile_snapshot() == 0
     assert await restarted.reminder_scheduler.process_due_once() == ()

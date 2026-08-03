@@ -49,6 +49,14 @@ class _RetryThenSnapshotTransport:
     async def get(self, _path: str) -> dict[str, object]:
         return {"occurrences": copy.deepcopy(self.snapshot), "next_after": None}
 
+    async def post(self, path: str, body: dict[str, object]) -> dict[str, object]:
+        return {
+            "occurrence_id": path.split("/")[-2],
+            "revision": body["revision"],
+            "lifecycle": "scheduled",
+            "status": "acquired",
+        }
+
 
 class _RecordingTransport:
     """A small strict-shape double for native/keyless sync tests."""
@@ -259,6 +267,7 @@ async def test_encrypted_retry_reconstructs_overdue_occurrence(tmp_path):
         now_ms=lambda: now[0],
     )
     assert await restored_sync.reconcile_snapshot() == 1
+    restored_scheduler.set_delivery_authorizer(restored_sync.authorize_due_delivery)
     delivered = await restored_scheduler.process_due_once()
 
     assert [item.occurrence_id for item in delivered] == ["occurrence-a"]
@@ -288,6 +297,86 @@ async def test_acknowledged_due_reminder_is_blocked_until_snapshot_ready(tmp_pat
         f"reminder-occurrence:{reminder.occurrence_id}"
     ) is None
     assert transport.claims == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_successful_put_with_local_ack_loss_blocks_prepared_row_until_snapshot(
+    tmp_path, monkeypatch,
+):
+    transport = _RecordingTransport()
+    sync, store, _scheduler, keys = _sync(tmp_path, transport)
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+
+    async def lose_local_ack(**_kwargs) -> bool:
+        raise OSError("local acknowledgement lost")
+
+    monkeypatch.setattr(store, "acknowledge_reminder_sync_revision", lose_local_ack)
+    with pytest.raises(OSError, match="local acknowledgement lost"):
+        await sync.upload_pending_once()
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None
+    assert (
+        record.server_ack_revision,
+        record.payload_format,
+        record.opaque_payload is not None,
+    ) == (0, REMINDER_PAYLOAD_FORMAT, True)
+    assert [call[0] for call in transport.calls] == ["put"]
+    await store.close()
+
+    resumed, reopened, resumed_scheduler, _keys = _sync(
+        tmp_path, transport, keys=keys,
+    )
+    transport.snapshot_failure = OSError("snapshot unavailable")
+    with pytest.raises(OSError, match="snapshot unavailable"):
+        await resumed.reconcile_snapshot()
+    resumed_scheduler.set_delivery_authorizer(resumed.authorize_due_delivery)
+
+    assert await resumed_scheduler.process_due_once() == ()
+    assert transport.claims == []
+    record = await reopened.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None and record.server_ack_revision == 0
+    assert record.payload_format == REMINDER_PAYLOAD_FORMAT
+    assert record.opaque_payload is not None
+    assert await reopened.get_message_by_envelope(
+        f"reminder-occurrence:{reminder.occurrence_id}"
+    ) is None
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_prepared_unknown_ack_reminder_claims_once_after_snapshot_is_ready(
+    tmp_path, monkeypatch,
+):
+    transport = _RecordingTransport()
+    sync, store, scheduler, _keys = _sync(tmp_path, transport)
+    assert await sync.reconcile_snapshot() == 0
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+
+    async def lose_local_ack(**_kwargs) -> bool:
+        raise OSError("local acknowledgement lost")
+
+    monkeypatch.setattr(store, "acknowledge_reminder_sync_revision", lose_local_ack)
+    with pytest.raises(OSError, match="local acknowledgement lost"):
+        await sync.upload_pending_once()
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None and record.server_ack_revision == 0
+    assert record.payload_format == REMINDER_PAYLOAD_FORMAT
+    assert record.opaque_payload is not None
+
+    assert [item.occurrence_id for item in await scheduler.process_due_once()] == [
+        reminder.occurrence_id
+    ]
+    assert len(transport.claims) == 1
+    assert await scheduler.process_due_once() == ()
+    assert [item.envelope_id for item in await store.get_pending()] == [
+        f"reminder-occurrence:{reminder.occurrence_id}"
+    ]
     await store.close()
 
 
@@ -382,6 +471,44 @@ async def test_acknowledged_persisted_delivery_claim_rejects_cancellation(tmp_pa
     with pytest.raises(LifecycleConflict):
         await store.cancel_reminder(reminder.reminder_id)
     assert (await store.get_reminder(reminder.reminder_id)).state == "scheduled"
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim_status", ["held", "acquired"])
+async def test_unknown_ack_persisted_delivery_claim_rejects_cancellation(
+    tmp_path, monkeypatch, claim_status,
+):
+    transport = _RecordingTransport()
+    sync, store, _scheduler, _keys = _sync(tmp_path, transport)
+    assert await sync.reconcile_snapshot() == 0
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+
+    async def lose_local_ack(**_kwargs) -> bool:
+        raise OSError("local acknowledgement lost")
+
+    monkeypatch.setattr(store, "acknowledge_reminder_sync_revision", lose_local_ack)
+    with pytest.raises(OSError, match="local acknowledgement lost"):
+        await sync.upload_pending_once()
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None and record.server_ack_revision == 0
+
+    transport.claim_status = claim_status
+    authorization = await sync.authorize_due_delivery((record,))
+    if claim_status == "acquired":
+        assert authorization.occurrence_ids == (reminder.occurrence_id,)
+    else:
+        assert authorization.occurrence_ids == ()
+
+    with pytest.raises(LifecycleConflict):
+        await store.cancel_reminder(reminder.reminder_id)
+    retained = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert retained is not None
+    assert retained.state == "scheduled"
+    assert retained.delivery_claim_id is not None
+    assert retained.delivery_claim_acquired is (claim_status == "acquired")
     await store.close()
 
 
@@ -639,8 +766,10 @@ async def test_keyless_missing_unsigned_put_is_permanent_not_retryable(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_offline_create_and_due_delivery_do_not_depend_on_sync_transport(tmp_path):
-    """A transport outage leaves the local durable scheduler fully usable."""
+async def test_untouched_local_reminder_delivers_with_real_authorizer_while_offline(
+    tmp_path,
+):
+    """Only work not yet prepared for sync may use the offline local path."""
     transport = _RecordingTransport()
     transport.failure = OSError("offline")
     sync, store, scheduler, _keys = _sync(tmp_path, transport)
@@ -653,7 +782,10 @@ async def test_offline_create_and_due_delivery_do_not_depend_on_sync_transport(t
         created_at_ms=500,
     )
 
-    assert await sync.upload_pending_once() == 0
+    transport.snapshot_failure = OSError("snapshot unavailable")
+    with pytest.raises(OSError, match="snapshot unavailable"):
+        await sync.reconcile_snapshot()
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
     assert [item.occurrence_id for item in await scheduler.process_due_once()] == [
         reminder.occurrence_id
     ]
@@ -665,6 +797,8 @@ async def test_offline_create_and_due_delivery_do_not_depend_on_sync_transport(t
     assert [item.envelope_id for item in await store.get_pending()] == [
         "reminder-occurrence:occurrence-offline"
     ]
+    assert transport.claims == []
+    assert record.payload_format is None and record.opaque_payload is None
     await store.close()
 
 
@@ -738,7 +872,7 @@ async def test_upload_race_does_not_ack_newer_local_cancel(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_upload_race_does_not_ack_or_regress_newer_local_delivery(tmp_path):
+async def test_envelope_fence_blocks_upload_race_from_local_delivery(tmp_path):
     now = [2_000]
 
     class _RaceTransport(_RecordingTransport):
@@ -764,15 +898,13 @@ async def test_upload_race_does_not_ack_or_regress_newer_local_delivery(tmp_path
         created_at_ms=500,
     )
 
-    assert await sync.upload_pending_once() == 0
+    assert await sync.upload_pending_once() == 1
     record = await store.get_reminder_sync_record("occurrence-delivery-race")
     assert record is not None
     assert (record.state, record.revision, record.server_ack_revision) == (
-        "delivered", 2, 0,
+        "claimed", 1, 1,
     )
-    assert [item.envelope_id for item in await store.get_pending()] == [
-        "reminder-occurrence:occurrence-delivery-race"
-    ]
+    assert await store.get_pending() == ()
     await store.close()
 
 
@@ -948,6 +1080,7 @@ async def test_snapshot_reconstruct_duplicate_restart_overdue_once(tmp_path):
 
     assert await sync.reconcile_snapshot() == 1
     assert await sync.reconcile_snapshot() == 0
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
     assert [item.occurrence_id for item in await scheduler.process_due_once()] == [
         "occurrence-restore"
     ]
@@ -1087,7 +1220,7 @@ async def test_snapshot_never_regresses_terminal_or_deletes_or_overwrites_confli
 @pytest.mark.asyncio
 async def test_snapshot_never_resurrects_delivered_or_deletes_local_only_work(tmp_path):
     transport = _RecordingTransport()
-    sync, store, _scheduler, _keys = _sync(tmp_path, transport)
+    sync, store, scheduler, _keys = _sync(tmp_path, transport)
     delivered = await store.create_reminder(
         reminder_id="reminder-delivered-snapshot",
         occurrence_id="occurrence-delivered-snapshot",
@@ -1097,7 +1230,11 @@ async def test_snapshot_never_resurrects_delivered_or_deletes_local_only_work(tm
         created_at_ms=500,
     )
     assert await sync.upload_pending_once() == 1
-    await store.deliver_due_reminders(now_ms=2_000)
+    assert await sync.reconcile_snapshot() == 0
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+    assert [item.occurrence_id for item in await scheduler.process_due_once()] == [
+        delivered.occurrence_id
+    ]
     delivered_record = await store.get_reminder_sync_record(delivered.occurrence_id)
     assert delivered_record is not None and delivered_record.opaque_payload is not None
     transport.rows = [{

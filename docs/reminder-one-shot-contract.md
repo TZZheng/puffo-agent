@@ -129,13 +129,20 @@ delivered-state transaction. Repeating the winning claim ID resumes
 idempotently; another runtime's claim is held. `terminal` reconciles local
 state without creating an Inbox row or Agent turn. Claim IDs are coordination
 metadata only: snapshots never expose them and the Server never sees reminder
-plaintext.
+plaintext. Once a claim ID is durably recorded for the current non-terminal
+revision, local cancellation fails closed regardless of whether the PUT
+acknowledgement was committed; cancellation cannot erase possible Server
+custody.
 
 Successful local delivery immediately wakes the outbox so revision 2 reaches
 the Server without waiting for the idle sync cadence. A held runtime retries
 on a separate bounded cadence and consumes the terminal snapshot once the
-winner uploads it. A reminder that has never been acknowledged by the Server
-remains local-first and may fire while offline without a remote claim.
+winner uploads it. Only an unacknowledged row with both `payload_format` and
+`opaque_payload` still `NULL` has never been prepared for remote transmission
+and may fire while offline without a Server claim. Persisted envelope bytes
+are the write-ahead fence: after envelope preparation, ambiguous network
+outcomes, including a successful PUT followed by local acknowledgement loss,
+fail closed until retry, snapshot, or delivery claim establishes custody.
 
 Loss of both the Agent state and this `MessageBackupDEK` remains outside v1;
 the Server does not decrypt reminders or retain a plaintext recovery copy.

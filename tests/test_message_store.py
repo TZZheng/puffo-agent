@@ -2085,3 +2085,77 @@ async def test_claimed_cancel_delivery_race_serializes_to_one_valid_terminal_sta
         assert terminal.state == "delivered" and event is not None
         assert cancel.state == "delivered"
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_authorization_cannot_cross_an_envelope_fence_between_connections(
+    tmp_path, monkeypatch,
+):
+    """A second runtime may persist the fence after local authorization."""
+    now = 2_000
+    path = tmp_path / "reminder-envelope-fence.db"
+    first = MessageStore(path, now_ms=lambda: now)
+    second = MessageStore(path, now_ms=lambda: now)
+
+    async def create_due(name: str):
+        return await first.create_reminder(
+            reminder_id=f"reminder-{name}",
+            occurrence_id=f"occurrence-{name}",
+            content="due",
+            target="dm:peer",
+            intended_at_ms=1_000,
+            created_at_ms=500,
+        )
+
+    async def persist_fence(occurrence_id: str) -> None:
+        await second.persist_reminder_envelope(
+            occurrence_id=occurrence_id,
+            payload_format="puffo-reminder-aead-v1",
+            opaque_payload=f"fence:{occurrence_id}".encode("ascii"),
+        )
+
+    blocked_before_claim = await create_due("before-claim")
+    await persist_fence(blocked_before_claim.occurrence_id)
+    assert await first.claim_authorized_reminders(
+        (blocked_before_claim.occurrence_id,), now_ms=now,
+    ) == ()
+    assert (await first.get_reminder(blocked_before_claim.reminder_id)).state == "scheduled"
+
+    blocked_before_delivery = await create_due("before-delivery")
+    assert [item.occurrence_id for item in await first.claim_authorized_reminders(
+        (blocked_before_delivery.occurrence_id,), now_ms=now,
+    )] == [blocked_before_delivery.occurrence_id]
+    await persist_fence(blocked_before_delivery.occurrence_id)
+    assert await first.deliver_authorized_reminders(
+        (blocked_before_delivery.occurrence_id,), now_ms=now,
+    ) == ()
+    assert (await first.get_reminder(blocked_before_delivery.reminder_id)).state == "claimed"
+
+    blocked_during_delivery = await create_due("during-delivery")
+    assert [item.occurrence_id for item in await first.claim_authorized_reminders(
+        (blocked_during_delivery.occurrence_id,), now_ms=now,
+    )] == [blocked_during_delivery.occurrence_id]
+    original_deliver = first._deliver_claimed_reminder_unlocked
+
+    async def persist_before_final_delivery(reminder_id: str, *, now_ms: int):
+        assert reminder_id == blocked_during_delivery.reminder_id
+        await persist_fence(blocked_during_delivery.occurrence_id)
+        return await original_deliver(reminder_id, now_ms=now_ms)
+
+    monkeypatch.setattr(
+        first, "_deliver_claimed_reminder_unlocked", persist_before_final_delivery,
+    )
+    assert await first.deliver_authorized_reminders(
+        (blocked_during_delivery.occurrence_id,), now_ms=now,
+    ) == ()
+    assert (await first.get_reminder(blocked_during_delivery.reminder_id)).state == "claimed"
+    for reminder in (
+        blocked_before_claim,
+        blocked_before_delivery,
+        blocked_during_delivery,
+    ):
+        assert await first.get_message_by_envelope(
+            f"reminder-occurrence:{reminder.occurrence_id}"
+        ) is None
+    await first.close()
+    await second.close()

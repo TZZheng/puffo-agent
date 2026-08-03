@@ -27,6 +27,19 @@ _SCHEMA_INIT_LOCKS: weakref.WeakKeyDictionary[
 PRIOR_CONTEXT_MAX_ITEMS = 20
 PRIOR_CONTEXT_MAX_BYTES = 48_000
 
+# Persisting an envelope is the write-ahead fence for remote delivery.  Only
+# an entirely unprepared row can use the local-only delivery path.
+_REMINDER_DELIVERY_CUSTODY_SQL = """
+(
+    delivery_claim_acquired = 1
+    OR (
+        server_ack_revision = 0
+        AND payload_format IS NULL
+        AND opaque_payload IS NULL
+    )
+)
+"""
+
 
 def _schema_init_lock(db_path: Path) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
@@ -2108,7 +2121,7 @@ class MessageStore:
     async def claim_authorized_reminders(
         self, occurrence_ids: tuple[str, ...], *, now_ms: int,
     ) -> tuple[ReminderOccurrence, ...]:
-        """Enter local claimed state only for remote-acquired occurrence IDs."""
+        """Enter local claimed state only for IDs that still have custody."""
         if not occurrence_ids:
             return ()
         async with self._inbox_lock:
@@ -2121,14 +2134,14 @@ class MessageStore:
                         SET state = 'claimed', claimed_at_ms = ?, actual_fire_at_ms = ?
                         WHERE occurrence_id IN ({placeholders})
                           AND state = 'scheduled'
-                          AND (delivery_claim_acquired = 1 OR server_ack_revision = 0)""",
+                          AND {_REMINDER_DELIVERY_CUSTODY_SQL}""",
                     (now_ms, now_ms, *occurrence_ids),
                 )
                 async with db.execute(
                     f"""SELECT * FROM reminder_occurrences
                         WHERE occurrence_id IN ({placeholders})
                           AND state = 'claimed'
-                          AND (delivery_claim_acquired = 1 OR server_ack_revision = 0)
+                          AND {_REMINDER_DELIVERY_CUSTODY_SQL}
                         ORDER BY intended_at_ms, occurrence_id""",
                     occurrence_ids,
                 ) as cursor:
@@ -2221,10 +2234,17 @@ class MessageStore:
         db = await self._ensure_db()
         await db.execute("BEGIN IMMEDIATE")
         try:
-            reminder = await self._get_reminder_unlocked(db, reminder_id)
-            if reminder is None or reminder.state != "claimed":
+            async with db.execute(
+                f"""SELECT * FROM reminder_occurrences
+                    WHERE reminder_id = ? AND state = 'claimed'
+                      AND {_REMINDER_DELIVERY_CUSTODY_SQL}""",
+                (reminder_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
                 await db.rollback()
                 return None
+            reminder = self._reminder_from_row(row)
             event_id = f"reminder-occurrence:{reminder.occurrence_id}"
             async with db.execute(
                 "SELECT receipt_disposition, content FROM messages WHERE envelope_id = ?",
@@ -2259,14 +2279,15 @@ class MessageStore:
                         "reminder delivery event identity belongs to another row"
                     )
             cursor = await db.execute(
-                """UPDATE reminder_occurrences
+                f"""UPDATE reminder_occurrences
                    SET state = 'delivered', delivered_event_id = ?, delivered_at_ms = ?,
                        revision = revision + 1,
                        sync_retry_after_ms = NULL,
                        sync_retry_count = 0,
                        sync_permanent_revision = NULL,
                        sync_permanent_code = NULL
-                   WHERE reminder_id = ? AND state = 'claimed'""",
+                   WHERE reminder_id = ? AND state = 'claimed'
+                     AND {_REMINDER_DELIVERY_CUSTODY_SQL}""",
                 (event_id, now_ms, reminder_id),
             )
             if cursor.rowcount != 1:
@@ -2311,7 +2332,7 @@ class MessageStore:
     async def deliver_authorized_reminders(
         self, occurrence_ids: tuple[str, ...], *, now_ms: int,
     ) -> tuple[ReminderOccurrence, ...]:
-        """Use the existing Inbox-plus-terminal transaction for acquired IDs only."""
+        """Use the Inbox-plus-terminal transaction only for IDs with custody."""
         if not occurrence_ids:
             return ()
         async with self._inbox_lock:
@@ -2321,7 +2342,7 @@ class MessageStore:
                 f"""SELECT reminder_id FROM reminder_occurrences
                     WHERE occurrence_id IN ({placeholders})
                       AND state = 'claimed'
-                      AND (delivery_claim_acquired = 1 OR server_ack_revision = 0)
+                      AND {_REMINDER_DELIVERY_CUSTODY_SQL}
                     ORDER BY intended_at_ms, occurrence_id""",
                 occurrence_ids,
             ) as cursor:
@@ -2356,8 +2377,7 @@ class MessageStore:
                 )
                 assert record is not None
                 if (
-                    record.server_ack_revision >= 1
-                    and record.delivery_claim_id is not None
+                    record.delivery_claim_id is not None
                     and reminder.state in {"scheduled", "claimed"}
                 ):
                     raise LifecycleConflict("reminder cancellation conflicts with delivery claim")

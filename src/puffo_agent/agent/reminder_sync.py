@@ -437,14 +437,20 @@ class ReminderSync:
     async def authorize_due_delivery(
         self, candidates: tuple[ReminderSyncRecord, ...],
     ) -> ReminderDeliveryAuthorization:
-        """Acquire Server custody before the scheduler enters local delivery."""
+        """Authorize untouched local work or acquire Server delivery custody."""
         retry_after = int(self._now_ms()) + DELIVERY_CLAIM_RETRY_MS
         blocked = False
         authorized: list[str] = []
         for candidate in candidates:
-            # New local work is intentionally offline-first until its first
-            # scheduled revision has been acknowledged by the Server.
-            if candidate.server_ack_revision < 1:
+            # A row cannot have crossed the remote boundary until its
+            # immutable envelope exists.  That lets untouched local work fire
+            # while offline without treating a prepared unknown-ack row as
+            # safe to deliver locally.
+            if (
+                candidate.server_ack_revision == 0
+                and candidate.payload_format is None
+                and candidate.opaque_payload is None
+            ):
                 authorized.append(candidate.occurrence_id)
                 continue
             if not self._delivery_ready:
@@ -453,10 +459,7 @@ class ReminderSync:
             if candidate.delivery_claim_acquired:
                 authorized.append(candidate.occurrence_id)
                 continue
-            if (
-                candidate.state not in {"scheduled", "claimed"}
-                or candidate.server_ack_revision < candidate.revision
-            ):
+            if candidate.state not in {"scheduled", "claimed"}:
                 blocked = True
                 continue
             claim_id = candidate.delivery_claim_id or str(uuid.uuid4())
