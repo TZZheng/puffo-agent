@@ -62,14 +62,62 @@ work before waiting, and waits only until the next durable deadline or a
 create/cancel signal. This covers an online local Agent and a local worker that
 restarts later.
 
-The next Server contract extends this local behavior so an offline Agent can
-catch up and reconstruct local reminder state. The Agent encrypts the private
-payload with its remote-data DEK (the current Core architecture calls this
-`MessageBackupDEK`) directly through AEAD with a unique nonce. It does not
-derive a Reminder-specific key and does not reuse the local SQLCipher
-`DatabaseDek`. The Server receives only opaque ciphertext plus the minimum
-plaintext occurrence, lifecycle, and scheduling metadata needed to index and
-wake due work.
+## Encrypted remote sync v1
+
+The Agent keeps one random 32-byte `MessageBackupDEK` under its private
+`keys/` state boundary, outside `messages.db`. It is created atomically with
+private file permissions and survives an Agent restart. This is the first
+Python custody seam for that Core architecture role: it is used directly with
+ChaCha20-Poly1305, is not derived into a Reminder key, and is never substituted
+with `DatabaseDek`, an identity key, a session key, or a sandbox token.
+
+For each occurrence, the Agent persists one immutable UTF-8 envelope before
+the first upload. Its format is `puffo-reminder-aead-v1` and its canonical JSON
+body contains only:
+
+```json
+{"algorithm":"chacha20-poly1305","ciphertext":"<base64url>","nonce":"<base64url>","version":1}
+```
+
+The ciphertext encrypts exactly canonical `{"content":...,"target":...}`
+JSON using a fresh 12-byte nonce. Canonical AAD binds `owner_slug`,
+`reminder_id`, `occurrence_id`, canonical UTC `intended_at`, and envelope
+version. Every retry reuses the same stored envelope bytes; it never
+re-encrypts an occurrence. The Server receives only base64url of that envelope
+plus occurrence metadata, never target, content, a DEK, provider/model data,
+or a payload-derived wake reason.
+
+`reminder_occurrences` remains both the local source of truth and its embedded
+outbox. A create is local revision 1. `claimed` is local crash recovery only
+and uploads as Server `scheduled` without a revision change. A first local
+`cancelled` or `delivered` transition becomes revision 2; delivery commits the
+Inbox event and revision together. Each row records its last acknowledged
+Server revision plus bounded retry and payload-free permanent diagnostic state.
+An acknowledgement is a compare-and-set against the attempted revision, so a
+late scheduled response cannot clear a newer cancellation or delivery.
+
+Native Agents use signed:
+
+- `PUT /v2/agent-runtime/reminder-occurrences/{occurrence_id}`
+- `GET /v2/agent-runtime/reminder-occurrences?after=<occurrence_id>&limit=<n>`
+
+Bridge Agents use the same DTO through the existing keyless boundary:
+
+- `PUT /v2/cloud-agents/agent-runtime/reminder-occurrences/{occurrence_id}`
+- `GET /v2/cloud-agents/agent-runtime/reminder-occurrences?after=<occurrence_id>&limit=<n>`
+
+PUT sends `revision`, `reminder_id`, RFC3339 `due_at`, `lifecycle`,
+`lifecycle_at`, `payload_format`, and base64url `opaque_payload`. The Server
+snapshot returns active scheduled rows as `{occurrences,next_after}` ordered by
+occurrence ID. On startup and reconnect, the Agent consumes every page,
+strictly validates/decrypts the envelope, and materializes only missing or
+byte-identical scheduled rows. A snapshot never deletes a local-only row,
+overwrites an immutable conflict, or regresses local `claimed`, `cancelled`, or
+`delivered` state. One changed batch signals the existing scheduler so overdue
+reconstruction takes the normal late Reminder Inbox path.
+
+Loss of both the Agent state and this `MessageBackupDEK` remains outside v1;
+the Server does not decrypt reminders or retain a plaintext recovery copy.
 
 Cross-device timer election and transfer remain outside the first Server
 snapshot contract.
@@ -78,5 +126,5 @@ snapshot contract.
 
 This slice has no editing, rescheduling, recurrence, snooze, browser surface,
 cloud sandbox lifecycle scheduling, cross-device election, or
-provider-specific scheduler behavior. Server storage/API and Agent snapshot
-reconciliation are delivered as a separate reviewed slice.
+provider-specific scheduler behavior. Server-side decryption and recovery-key
+upload are not part of this contract.

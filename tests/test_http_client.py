@@ -131,6 +131,9 @@ class TestHttpClientSigning(AioHTTPTestCase):
         app.router.add_route("GET", "/health", self._handle)
         app.router.add_route("POST", "/messages", self._handle)
         app.router.add_route("PUT", "/update", self._handle)
+        app.router.add_route(
+            "PUT", "/v2/agent-runtime/reminder-occurrences/{occurrence_id}", self._handle,
+        )
         app.router.add_route("DELETE", "/remove", self._handle)
         return app
 
@@ -167,6 +170,22 @@ class TestHttpClientSigning(AioHTTPTestCase):
             assert body["text"] == "hello"
             h = {k.lower(): v for k, v in self.captured_headers.items()}
             assert "x-puffo-signature" in h
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_reminder_put_is_signed(self):
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001")
+        try:
+            await client.put(
+                "/v2/agent-runtime/reminder-occurrences/occurrence-a",
+                {"revision": 1, "opaque_payload": "AQ"},
+            )
+            headers = {key.lower(): value for key, value in self.captured_headers.items()}
+            assert "x-puffo-signature" in headers
+            assert "x-sandbox-token" not in headers
+            assert json.loads(self.captured_body)["opaque_payload"] == "AQ"
         finally:
             await client.close()
 
@@ -440,6 +459,10 @@ class TestHttpClientKeylessEgress(AioHTTPTestCase):
         app = web.Application()
         app.router.add_route("POST", "/v2/cloud-agents/blobs/upload", self._echo)
         app.router.add_route("POST", "/v2/cloud-agents/messages", self._echo)
+        app.router.add_route(
+            "PUT", "/v2/cloud-agents/agent-runtime/reminder-occurrences/{occurrence_id}",
+            self._echo,
+        )
         app.router.add_route("GET", "/v2/cloud-agents/spaces", self._echo)
         # Signed routes — used to prove the shim never touches them.
         app.router.add_route("GET", "/health", self._echo)
@@ -469,6 +492,23 @@ class TestHttpClientKeylessEgress(AioHTTPTestCase):
             )
             assert "x-puffo-signature" not in self.captured_headers
             assert "x-sandbox-token" not in self.captured_headers
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_put_unsigned_reminder_uses_egress_token_without_signature(self):
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001", keyless=True)
+        try:
+            with patch.dict(os.environ, {"PUFFO_LOCAL_SANDBOX_TOKEN": "tok-reminder"}):
+                result = await client.put_unsigned(
+                    "/v2/cloud-agents/agent-runtime/reminder-occurrences/occurrence-a",
+                    {"revision": 1, "opaque_payload": "AQ"},
+                )
+            assert result["ok"] is True
+            assert self.captured_headers.get("x-sandbox-token") == "tok-reminder"
+            assert "x-puffo-signature" not in self.captured_headers
+            assert json.loads(self.captured_body)["opaque_payload"] == "AQ"
         finally:
             await client.close()
 

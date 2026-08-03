@@ -1171,3 +1171,70 @@ def test_worker_build_and_listener_use_global_runtime_contract():
         "agent_id",
         "bridge_client",
     )
+
+
+@pytest.mark.asyncio
+async def test_reminder_sync_reconnect_callbacks_and_shutdown_close_resources(tmp_path):
+    """Both transport flavors expose the same signal-only reconnect seam."""
+    from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
+
+    ks, _ks_dir, _directory, _kem = _make_keystore()
+
+    class Http:
+        keyless = False
+
+        def __init__(self):
+            self.close_calls = 0
+
+        async def close(self):
+            self.close_calls += 1
+
+    native_http = Http()
+    native = PuffoCoreMessageClient(
+        slug="bot-0001", device_id="dev_test", space_id="sp_test",
+        keystore=ks, http_client=native_http,
+        message_store=MessageStore(tmp_path / "native.db"),
+    )
+    native_calls: list[str] = []
+
+    async def native_signal():
+        native_calls.append("native")
+
+    native.add_connected_callback(native_signal)
+    await native._notify_connected_callbacks()
+    assert native_calls == ["native"]
+    await native.stop()
+    assert native_http.close_calls == 1
+
+    class Bridge:
+        def __init__(self):
+            self.callbacks = []
+            self.close_calls = 0
+
+        def add_connected_callback(self, callback):
+            self.callbacks.append(callback)
+
+        async def close(self):
+            self.close_calls += 1
+
+    bridge = Bridge()
+    bridge_http = Http()
+    bridge_http.keyless = True
+    bridge_client = PuffoCoreMessageClient(
+        slug="bot-0001", device_id="dev_test", space_id="sp_test",
+        keystore=ks, http_client=bridge_http,
+        message_store=MessageStore(tmp_path / "bridge.db"),
+        bridge_client=bridge,
+    )
+    bridge_calls: list[str] = []
+
+    async def bridge_signal():
+        bridge_calls.append("bridge")
+
+    bridge_client.add_connected_callback(bridge_signal)
+    assert len(bridge.callbacks) == 1
+    await bridge.callbacks[0]()
+    assert bridge_calls == ["bridge"]
+    await bridge_client.stop()
+    assert bridge.close_calls == 1
+    assert bridge_http.close_calls == 1

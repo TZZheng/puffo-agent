@@ -228,6 +228,28 @@ class PuffoCoreHttpClient:
             except (json.JSONDecodeError, ValueError):
                 return text
 
+    async def put_unsigned(self, path: str, body: dict | None = None) -> Any:
+        """Unsigned JSON PUT for the keyless cloud-Agent namespace.
+
+        Mirrors ``post_unsigned`` so provider-neutral callers retain the
+        existing egress-token boundary instead of opening a second aiohttp
+        request path in a scheduler or tool.
+        """
+        raw = json.dumps(body).encode() if body else b""
+        http = await self._get_session()
+        async with http.put(
+            f"{self.server_url}{path}",
+            data=raw,
+            headers=self._egress_headers({"content-type": "application/json"}),
+        ) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise HttpError(resp.status, text)
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, ValueError):
+                return text
+
     async def post_bytes_unsigned(self, path: str, body: bytes) -> Any:
         """POST raw bytes unsigned (keyless blob upload). Mirrors
         ``post_unsigned`` but carries an ``application/octet-stream`` body

@@ -1935,7 +1935,30 @@ class Worker:
         client.global_runtime = global_runtime
         client.send_coordinator = coordinator
         client.send_delegate = global_runtime.send_delegate
+        # The reminder sync worker owns only encrypted outbox/snapshot work.
+        # It shares the existing durable store, HTTP client, and scheduler;
+        # it neither creates a provider turn nor changes GlobalInboxRuntime
+        # policy.  Connect callbacks merely signal a later bounded pull.
+        from ..agent.reminder_sync import ReminderSync
+
+        reminder_sync = None
+        reminder_sync_task = None
+        if (
+            callable(getattr(client, "add_connected_callback", None))
+            and callable(getattr(client.keystore, "load_or_create_message_backup_dek", None))
+        ):
+            reminder_sync = ReminderSync(
+                store=client.store,
+                keystore=client.keystore,
+                owner_slug=client.slug,
+                http_client=client.http,
+                scheduler=global_runtime.reminder_scheduler,
+            )
+            client.add_connected_callback(reminder_sync.on_transport_connected)
+            reminder_sync.signal_snapshot()
         global_runtime_task = asyncio.ensure_future(global_runtime.run())
+        if reminder_sync is not None:
+            reminder_sync_task = asyncio.ensure_future(reminder_sync.run())
 
         async def heartbeat():
             interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)
@@ -2064,6 +2087,13 @@ class Worker:
                 except asyncio.TimeoutError:
                     pass
         finally:
+            if reminder_sync is not None and reminder_sync_task is not None:
+                reminder_sync.stop()
+                reminder_sync_task.cancel()
+                try:
+                    await reminder_sync_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             global_runtime.stop()
             global_runtime_task.cancel()
             try:

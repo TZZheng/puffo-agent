@@ -51,6 +51,13 @@ from puffo_agent.agent.message_store import (
 from puffo_agent.agent._logging import log_runtime_event
 from puffo_agent.agent.runtime_event_outbox import RuntimeEventOutbox
 from puffo_agent.agent.runtime_events import RuntimeEvent
+from puffo_agent.agent.reminder_sync import (
+    REMINDER_PAYLOAD_FORMAT,
+    ReminderSync,
+    _base64url_encode,
+    encrypt_reminder_payload,
+)
+from puffo_agent.crypto.keystore import KeyStore
 from puffo_agent.crypto.message import MessagePayload
 from puffo_agent.crypto.ws_client import TransportOutcome
 
@@ -3822,6 +3829,86 @@ async def test_mixed_message_and_due_reminder_share_one_notice_read_and_turn(tmp
         item = await store.get_message_by_envelope(item_id)
         assert item is not None and item.processing_state is ProcessingState.PROCESSED
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reconstructed_overdue_reminder_has_one_inbox_event_and_one_turn(tmp_path):
+    """Repeated snapshots/restart use the existing reminder Inbox path once."""
+    keys = KeyStore(tmp_path / "agent-state" / "keys")
+    key = keys.load_or_create_message_backup_dek("agent-a")
+    envelope = encrypt_reminder_payload(
+        dek=key,
+        owner_slug="agent-a",
+        reminder_id="reminder-remote",
+        occurrence_id="occurrence-remote",
+        intended_at_ms=1,
+        target="channel:sp-1:ch-1",
+        content="reconstructed exact content",
+    )
+    row = {
+        "occurrence_id": "occurrence-remote",
+        "revision": 1,
+        "reminder_id": "reminder-remote",
+        "due_at": "1970-01-01T00:00:00.001Z",
+        "lifecycle": "scheduled",
+        "lifecycle_at": "1970-01-01T00:00:00.000Z",
+        "payload_format": REMINDER_PAYLOAD_FORMAT,
+        "opaque_payload": _base64url_encode(envelope),
+    }
+
+    class SnapshotTransport:
+        keyless = False
+
+        async def get(self, _path):
+            return {"occurrences": [row], "next_after": None}
+
+        async def put(self, _path, _body):
+            raise AssertionError("delivery is not uploaded by this Inbox test")
+
+    store = await make_store(tmp_path / "first")
+    adapter = Adapter()
+    turns: list[str] = []
+
+    async def run_turn(planned):
+        turns.append(planned.provider_input)
+        await adapter.admit()
+
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=run_turn, workspace=tmp_path,
+    )
+    sync = ReminderSync(
+        store=store,
+        keystore=keys,
+        owner_slug="agent-a",
+        http_client=SnapshotTransport(),
+        scheduler=runtime.reminder_scheduler,
+    )
+    assert await sync.reconcile_snapshot() == 1
+    assert await sync.reconcile_snapshot() == 0
+    assert [item.occurrence_id for item in await runtime.reminder_scheduler.process_due_once()] == [
+        "occurrence-remote"
+    ]
+    assert await runtime.process_once()
+    assert not await runtime.process_once()
+    assert len(turns) == 1
+    await store.close()
+
+    reopened = MessageStore(tmp_path / "first" / "messages.db")
+    restarted = GlobalInboxRuntime(
+        store=reopened, adapter=Adapter(), run_turn=lambda _planned: None, workspace=tmp_path,
+    )
+    restarted_sync = ReminderSync(
+        store=reopened,
+        keystore=keys,
+        owner_slug="agent-a",
+        http_client=SnapshotTransport(),
+        scheduler=restarted.reminder_scheduler,
+    )
+    assert await restarted_sync.reconcile_snapshot() == 0
+    assert await restarted.reminder_scheduler.process_due_once() == ()
+    event = await reopened.get_message_by_envelope("reminder-occurrence:occurrence-remote")
+    assert event is not None
+    await reopened.close()
 
 
 @pytest.mark.asyncio

@@ -505,6 +505,13 @@ class PuffoCoreMessageClient:
         # non-None, listen() runs the bridge lifecycle loop instead of
         # the signed WS client — no identity file is ever loaded.
         self._bridge = bridge_client
+        # Provider-neutral transport-connect observers.  They may signal
+        # background work, but do not run HTTP reconciliation in either WS
+        # callback.  This keeps reconnect mechanics out of turn policy.
+        self._connected_callbacks: list[Callable[[], Coroutine[Any, Any, None]]] = []
+        bridge_connected = getattr(self._bridge, "add_connected_callback", None)
+        if callable(bridge_connected):
+            bridge_connected(self._notify_connected_callbacks)
         # In-flight fire-and-forget tasks scheduled off the bridge
         # dispatch loop (F1 acks + added_to_space spaces refreshes).
         # Held so the tasks aren't GC'd mid-flight; each removes
@@ -602,6 +609,22 @@ class PuffoCoreMessageClient:
 
         # Single source for every allow/block read — see contact_cache.py.
         self._contacts = ContactCache(self.http, self._log)
+
+    def add_connected_callback(
+        self, callback: Callable[[], Coroutine[Any, Any, None]],
+    ) -> None:
+        """Register a bounded background signal for native and bridge connects."""
+        self._connected_callbacks.append(callback)
+
+    async def _notify_connected_callbacks(self) -> None:
+        for callback in tuple(getattr(self, "_connected_callbacks", ())):
+            try:
+                await callback()
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning(
+                    "transport connected callback failed category=%s",
+                    type(exc).__name__,
+                )
 
     def _is_stale_for_catchup(self, sent_at: int, now_ms: int | None = None) -> bool:
         """Past the staleness threshold → store but skip the LLM.
@@ -3477,6 +3500,7 @@ class PuffoCoreMessageClient:
                 self._contacts.refresh(),
             )
         )
+        await self._notify_connected_callbacks()
 
     async def _warm_member_caches(self) -> None:
         """Background prefetch on ``listen()`` startup: walks ``GET
@@ -5613,4 +5637,21 @@ class PuffoCoreMessageClient:
     async def stop(self) -> None:
         if self._ws:
             self._ws.stop()
+        bridge = getattr(self, "_bridge", None)
+        close_bridge = getattr(bridge, "close", None)
+        if callable(close_bridge):
+            try:
+                await close_bridge()
+            except Exception as exc:  # noqa: BLE001
+                self._log.warning("bridge close failed category=%s", type(exc).__name__)
+        for task in tuple(getattr(self, "_ack_tasks", ())):
+            task.cancel()
+        for task in tuple(getattr(self, "_ack_tasks", ())):
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         await self.store.close()
+        close_http = getattr(self.http, "close", None)
+        if callable(close_http):
+            await close_http()

@@ -169,7 +169,18 @@ CREATE TABLE IF NOT EXISTS reminder_occurrences (
     actual_fire_at_ms INTEGER,
     cancelled_at_ms INTEGER,
     delivered_at_ms INTEGER,
-    delivered_event_id TEXT UNIQUE
+    delivered_event_id TEXT UNIQUE,
+    -- The Server sees only scheduled/cancelled/delivered.  These fields make
+    -- the existing occurrence row its own durable outbox; no second queue or
+    -- database is needed for remote reconciliation.
+    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+    server_ack_revision INTEGER NOT NULL DEFAULT 0 CHECK (server_ack_revision >= 0),
+    payload_format TEXT CHECK (payload_format IS NULL OR length(payload_format) BETWEEN 1 AND 64),
+    opaque_payload BLOB CHECK (opaque_payload IS NULL OR length(opaque_payload) BETWEEN 1 AND 32768),
+    sync_retry_after_ms INTEGER,
+    sync_retry_count INTEGER NOT NULL DEFAULT 0 CHECK (sync_retry_count >= 0 AND sync_retry_count <= 20),
+    sync_permanent_revision INTEGER,
+    sync_permanent_code TEXT CHECK (sync_permanent_code IS NULL OR length(sync_permanent_code) <= 128)
 );
 CREATE INDEX IF NOT EXISTS idx_reminder_occurrences_due
     ON reminder_occurrences (state, intended_at_ms, occurrence_id);
@@ -327,6 +338,59 @@ class ReminderOccurrence:
                 if self.delivered_at_ms is not None else None
             ),
         }
+
+
+@dataclass(frozen=True)
+class ReminderSyncRecord:
+    """Private sync projection of one durable reminder occurrence.
+
+    This type is deliberately not used by MCP/RPC reminder results.  It
+    contains local plaintext only long enough for the Agent-owned AEAD seam
+    to construct (or validate) the persisted opaque envelope.
+    """
+
+    reminder_id: str
+    occurrence_id: str
+    target: str
+    content: str
+    intended_at_ms: int
+    state: str
+    created_at_ms: int
+    claimed_at_ms: int | None
+    actual_fire_at_ms: int | None
+    cancelled_at_ms: int | None
+    delivered_at_ms: int | None
+    revision: int
+    server_ack_revision: int
+    payload_format: str | None
+    opaque_payload: bytes | None
+    sync_retry_after_ms: int | None
+    sync_retry_count: int
+    sync_permanent_revision: int | None
+    sync_permanent_code: str | None
+
+    @property
+    def server_lifecycle(self) -> str:
+        """Map local-only crash recovery state to the Server contract."""
+        return "scheduled" if self.state == "claimed" else self.state
+
+    @property
+    def lifecycle_at_ms(self) -> int:
+        if self.state in {"scheduled", "claimed"}:
+            return self.created_at_ms
+        if self.state == "cancelled" and self.cancelled_at_ms is not None:
+            return self.cancelled_at_ms
+        if self.state == "delivered" and self.delivered_at_ms is not None:
+            return self.delivered_at_ms
+        raise LifecycleConflict("reminder lifecycle timestamp is missing")
+
+
+@dataclass(frozen=True)
+class ReminderMaterializationResult:
+    """Outcome of applying one validated scheduled Server row locally."""
+
+    changed: bool
+    conflict: bool = False
 
 
 REMINDER_STATES = frozenset({"scheduled", "claimed", "cancelled", "delivered"})
@@ -488,6 +552,7 @@ class MessageStore:
 
                     # Phase 3: indexes and tables whose definitions use the new columns.
                     await self._execute_locked_script(db, _DEPENDENT_SCHEMA)
+                    await self._migrate_reminder_sync_schema(db)
                     await self._migrate_nullable_provider_session(db)
                     await self._migrate_notice_provider_session(db)
                     self._db = db
@@ -582,6 +647,77 @@ class MessageStore:
             )
             for statement in statements:
                 await db.execute(statement)
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+
+    async def _migrate_reminder_sync_schema(
+        self, db: aiosqlite.Connection
+    ) -> None:
+        """Add v1 remote-sync state to the existing occurrence table.
+
+        The first reminder slice already made ``reminder_occurrences`` the
+        durable source of truth.  This migration deliberately keeps that
+        table and adds its embedded outbox facts in one locked transaction.
+        Old terminal rows predate a remotely visible scheduled revision, so
+        their local terminal transition is represented as revision two.
+        """
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute("PRAGMA table_info(reminder_occurrences)") as cursor:
+                columns = {row["name"] for row in await cursor.fetchall()}
+            additions = {
+                # Nullable only for the duration of the backfill.  SQLite
+                # cannot add a NOT NULL/CHECK column without rebuilding an
+                # existing table, which would violate the additive contract.
+                "revision": "revision INTEGER",
+                "server_ack_revision": (
+                    "server_ack_revision INTEGER NOT NULL DEFAULT 0"
+                ),
+                "payload_format": "payload_format TEXT",
+                "opaque_payload": "opaque_payload BLOB",
+                "sync_retry_after_ms": "sync_retry_after_ms INTEGER",
+                "sync_retry_count": (
+                    "sync_retry_count INTEGER NOT NULL DEFAULT 0"
+                ),
+                "sync_permanent_revision": "sync_permanent_revision INTEGER",
+                "sync_permanent_code": "sync_permanent_code TEXT",
+            }
+            added_revision = "revision" not in columns
+            for name, declaration in additions.items():
+                if name not in columns:
+                    await db.execute(
+                        f"ALTER TABLE reminder_occurrences ADD COLUMN {declaration}"
+                    )
+            if added_revision:
+                await db.execute(
+                    """UPDATE reminder_occurrences
+                       SET revision = CASE
+                           WHEN state IN ('scheduled', 'claimed') THEN 1
+                           ELSE 2
+                       END"""
+                )
+            # A defensive repair for partially created development databases;
+            # no normal v1 row may retain a null/non-positive revision.
+            await db.execute(
+                """UPDATE reminder_occurrences
+                   SET revision = CASE
+                       WHEN state IN ('scheduled', 'claimed') THEN 1
+                       ELSE 2
+                   END
+                   WHERE revision IS NULL OR revision <= 0"""
+            )
+            await db.execute(
+                """UPDATE reminder_occurrences
+                   SET server_ack_revision = 0
+                   WHERE server_ack_revision IS NULL OR server_ack_revision < 0"""
+            )
+            await db.execute(
+                """CREATE INDEX IF NOT EXISTS idx_reminder_occurrences_sync_pending
+                   ON reminder_occurrences
+                   (server_ack_revision, revision, sync_retry_after_ms, occurrence_id)"""
+            )
             await db.commit()
         except BaseException:
             await db.rollback()
@@ -1262,6 +1398,42 @@ class MessageStore:
         )
 
     @staticmethod
+    def _reminder_sync_record_from_row(row: aiosqlite.Row) -> ReminderSyncRecord:
+        """Project a schema-upgraded occurrence for the private sync worker."""
+        def optional_int(name: str) -> int | None:
+            value = row[name]
+            return int(value) if value is not None else None
+
+        payload = row["opaque_payload"]
+        return ReminderSyncRecord(
+            reminder_id=str(row["reminder_id"]),
+            occurrence_id=str(row["occurrence_id"]),
+            target=str(row["target"]),
+            content=str(row["content"]),
+            intended_at_ms=int(row["intended_at_ms"]),
+            state=str(row["state"]),
+            created_at_ms=int(row["created_at_ms"]),
+            claimed_at_ms=optional_int("claimed_at_ms"),
+            actual_fire_at_ms=optional_int("actual_fire_at_ms"),
+            cancelled_at_ms=optional_int("cancelled_at_ms"),
+            delivered_at_ms=optional_int("delivered_at_ms"),
+            revision=int(row["revision"]),
+            server_ack_revision=int(row["server_ack_revision"]),
+            payload_format=(
+                str(row["payload_format"])
+                if row["payload_format"] is not None else None
+            ),
+            opaque_payload=bytes(payload) if payload is not None else None,
+            sync_retry_after_ms=optional_int("sync_retry_after_ms"),
+            sync_retry_count=int(row["sync_retry_count"]),
+            sync_permanent_revision=optional_int("sync_permanent_revision"),
+            sync_permanent_code=(
+                str(row["sync_permanent_code"])
+                if row["sync_permanent_code"] is not None else None
+            ),
+        )
+
+    @staticmethod
     def _valid_reminder_time(value: int) -> bool:
         return isinstance(value, int) and not isinstance(value, bool)
 
@@ -1302,8 +1474,8 @@ class MessageStore:
                 await db.execute(
                     """INSERT INTO reminder_occurrences
                        (reminder_id, occurrence_id, target, content, intended_at_ms,
-                        state, created_at_ms)
-                       VALUES (?, ?, ?, ?, ?, 'scheduled', ?)""",
+                        state, created_at_ms, revision, server_ack_revision)
+                       VALUES (?, ?, ?, ?, ?, 'scheduled', ?, 1, 0)""",
                     (
                         reminder_id,
                         occurrence_id,
@@ -1338,6 +1510,317 @@ class MessageStore:
             return await self._get_reminder_unlocked(
                 await self._ensure_db(), reminder_id,
             )
+
+    async def _get_reminder_sync_by_occurrence_unlocked(
+        self, db: aiosqlite.Connection, occurrence_id: str,
+    ) -> ReminderSyncRecord | None:
+        async with db.execute(
+            "SELECT * FROM reminder_occurrences WHERE occurrence_id = ?",
+            (occurrence_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._reminder_sync_record_from_row(row) if row is not None else None
+
+    async def get_reminder_sync_record(
+        self, occurrence_id: str,
+    ) -> ReminderSyncRecord | None:
+        """Return a private worker-only sync view by immutable occurrence ID."""
+        if not isinstance(occurrence_id, str) or not occurrence_id:
+            raise ValueError("occurrence_id must be a non-empty string")
+        async with self._inbox_lock:
+            return await self._get_reminder_sync_by_occurrence_unlocked(
+                await self._ensure_db(), occurrence_id,
+            )
+
+    async def persist_reminder_envelope(
+        self,
+        *,
+        occurrence_id: str,
+        payload_format: str,
+        opaque_payload: bytes,
+    ) -> ReminderSyncRecord:
+        """Persist one immutable opaque envelope, never replacing it.
+
+        The sync worker may race a local terminal transition.  The terminal
+        row still needs the original envelope for the Server's immutable-byte
+        check, so this operation is allowed for every local lifecycle state.
+        """
+        if (
+            not isinstance(occurrence_id, str)
+            or not occurrence_id
+            or not isinstance(payload_format, str)
+            or not payload_format
+            or len(payload_format) > 64
+            or not payload_format.isascii()
+            or any(char.isspace() for char in payload_format)
+            or not isinstance(opaque_payload, bytes)
+            or not 1 <= len(opaque_payload) <= 32_768
+        ):
+            raise ValueError("invalid reminder envelope metadata")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                record = await self._get_reminder_sync_by_occurrence_unlocked(
+                    db, occurrence_id,
+                )
+                if record is None:
+                    raise ValueError("unknown reminder occurrence")
+                if record.opaque_payload is not None:
+                    if (
+                        record.payload_format != payload_format
+                        or record.opaque_payload != opaque_payload
+                    ):
+                        raise LifecycleConflict("reminder envelope is immutable")
+                    await db.rollback()
+                    return record
+                await db.execute(
+                    """UPDATE reminder_occurrences
+                       SET payload_format = ?, opaque_payload = ?
+                       WHERE occurrence_id = ? AND opaque_payload IS NULL""",
+                    (payload_format, opaque_payload, occurrence_id),
+                )
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+            updated = await self._get_reminder_sync_by_occurrence_unlocked(
+                db, occurrence_id,
+            )
+            assert updated is not None
+            return updated
+
+    async def pending_reminder_sync_records(
+        self,
+        *,
+        now_ms: int | None = None,
+        limit: int = 100,
+        force: bool = False,
+        retry_permanent: bool = False,
+    ) -> tuple[ReminderSyncRecord, ...]:
+        """Find current unacknowledged revisions due for one bounded sync pass.
+
+        ``retry_permanent`` is reserved for an explicit completed snapshot
+        reconciliation.  Normal cadence never bypasses a permanent failure,
+        so a malformed/conflicting Server response cannot create a tight loop.
+        """
+        now = int(self._now_ms()) if now_ms is None else now_ms
+        if not self._valid_reminder_time(now):
+            raise ValueError("now_ms must be an integer epoch milliseconds")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
+            raise ValueError("limit must be between 1 and 200")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            async with db.execute(
+                """SELECT * FROM reminder_occurrences
+                   WHERE server_ack_revision < revision
+                     AND (? = 1
+                          OR sync_permanent_revision IS NULL
+                          OR sync_permanent_revision != revision)
+                     AND (? = 1 OR sync_retry_after_ms IS NULL
+                          OR sync_retry_after_ms <= ?)
+                   ORDER BY intended_at_ms, occurrence_id
+                   LIMIT ?""",
+                (1 if retry_permanent else 0, 1 if force else 0, now, limit),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return tuple(self._reminder_sync_record_from_row(row) for row in rows)
+
+    async def acknowledge_reminder_sync_revision(
+        self, *, occurrence_id: str, revision: int,
+    ) -> bool:
+        """Compare-and-set a Server acknowledgment without clearing newer work."""
+        if not isinstance(occurrence_id, str) or not occurrence_id or revision <= 0:
+            raise ValueError("invalid reminder acknowledgment")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    """UPDATE reminder_occurrences
+                       SET server_ack_revision = ?,
+                           sync_retry_after_ms = NULL,
+                           sync_retry_count = 0,
+                           sync_permanent_revision = NULL,
+                           sync_permanent_code = NULL
+                       WHERE occurrence_id = ? AND revision = ?
+                         AND server_ack_revision < ?""",
+                    (revision, occurrence_id, revision, revision),
+                )
+                changed = cursor.rowcount == 1
+                await db.commit()
+                return changed
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def schedule_reminder_sync_retry(
+        self,
+        *,
+        occurrence_id: str,
+        revision: int,
+        retry_after_ms: int,
+    ) -> bool:
+        """Durably back off only the same current revision."""
+        if (
+            not isinstance(occurrence_id, str)
+            or not occurrence_id
+            or revision <= 0
+            or not self._valid_reminder_time(retry_after_ms)
+        ):
+            raise ValueError("invalid reminder retry state")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    """UPDATE reminder_occurrences
+                       SET sync_retry_after_ms = ?,
+                           sync_retry_count = MIN(sync_retry_count + 1, 20),
+                           sync_permanent_revision = NULL,
+                           sync_permanent_code = NULL
+                       WHERE occurrence_id = ? AND revision = ?""",
+                    (retry_after_ms, occurrence_id, revision),
+                )
+                changed = cursor.rowcount == 1
+                await db.commit()
+                return changed
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def record_reminder_sync_permanent_failure(
+        self, *, occurrence_id: str, revision: int, code: str,
+    ) -> bool:
+        """Suppress a malformed/conflicting revision without retaining payload text."""
+        safe_code = (
+            code
+            if isinstance(code, str)
+            and 1 <= len(code) <= 64
+            and all(char.isascii() and (char.islower() or char.isdigit() or char in "_-") for char in code)
+            else "contract_error"
+        )
+        if not isinstance(occurrence_id, str) or not occurrence_id or revision <= 0:
+            raise ValueError("invalid reminder permanent failure")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    """UPDATE reminder_occurrences
+                       SET sync_retry_after_ms = NULL,
+                           sync_permanent_revision = ?,
+                           sync_permanent_code = ?
+                       WHERE occurrence_id = ? AND revision = ?""",
+                    (revision, safe_code, occurrence_id, revision),
+                )
+                changed = cursor.rowcount == 1
+                await db.commit()
+                return changed
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def materialize_remote_scheduled_reminder(
+        self,
+        *,
+        reminder_id: str,
+        occurrence_id: str,
+        target: str,
+        content: str,
+        intended_at_ms: int,
+        lifecycle_at_ms: int,
+        revision: int,
+        payload_format: str,
+        opaque_payload: bytes,
+    ) -> ReminderMaterializationResult:
+        """Insert one validated Server scheduled row without local regression.
+
+        A snapshot is an active-state reconstruction source, never authority
+        to erase a local-only row or turn a local terminal fact back into a
+        schedule.  Exact schedule/claimed repeats may advance only their
+        acknowledged revision.
+        """
+        if (
+            not all(isinstance(value, str) and value for value in (
+                reminder_id, occurrence_id, target, content, payload_format,
+            ))
+            or reminder_id == occurrence_id
+            or not self._valid_reminder_time(intended_at_ms)
+            or not self._valid_reminder_time(lifecycle_at_ms)
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision <= 0
+            or len(payload_format) > 64
+            or not payload_format.isascii()
+            or any(char.isspace() for char in payload_format)
+            or not isinstance(opaque_payload, bytes)
+            or not 1 <= len(opaque_payload) <= 32_768
+        ):
+            raise ValueError("invalid remote reminder metadata")
+        parse_reminder_target(target)
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                record = await self._get_reminder_sync_by_occurrence_unlocked(
+                    db, occurrence_id,
+                )
+                if record is not None:
+                    exact_immutable = (
+                        record.reminder_id == reminder_id
+                        and record.target == target
+                        and record.content == content
+                        and record.intended_at_ms == intended_at_ms
+                        and record.payload_format == payload_format
+                        and record.opaque_payload == opaque_payload
+                    )
+                    if not exact_immutable:
+                        await db.rollback()
+                        return ReminderMaterializationResult(False, conflict=True)
+                    if record.state in {"scheduled", "claimed"}:
+                        ack = min(revision, record.revision)
+                        cursor = await db.execute(
+                            """UPDATE reminder_occurrences
+                               SET server_ack_revision = MAX(server_ack_revision, ?)
+                               WHERE occurrence_id = ?
+                                 AND server_ack_revision < ?""",
+                            (ack, occurrence_id, ack),
+                        )
+                        changed = cursor.rowcount == 1
+                        await db.commit()
+                        return ReminderMaterializationResult(changed)
+                    # Cancelled/delivered state is a locally durable fact.  A
+                    # stale scheduled snapshot may not acknowledge, overwrite,
+                    # or resurrect it; its newer terminal revision stays due.
+                    await db.rollback()
+                    return ReminderMaterializationResult(False)
+
+                async with db.execute(
+                    "SELECT occurrence_id FROM reminder_occurrences WHERE reminder_id = ?",
+                    (reminder_id,),
+                ) as cursor:
+                    same_reminder = await cursor.fetchone()
+                if same_reminder is not None:
+                    await db.rollback()
+                    return ReminderMaterializationResult(False, conflict=True)
+                await db.execute(
+                    """INSERT INTO reminder_occurrences
+                       (reminder_id, occurrence_id, target, content, intended_at_ms,
+                        state, created_at_ms, revision, server_ack_revision,
+                        payload_format, opaque_payload)
+                       VALUES (?, ?, ?, ?, ?, 'scheduled', ?, ?, ?, ?, ?)""",
+                    (
+                        reminder_id, occurrence_id, target, content, intended_at_ms,
+                        lifecycle_at_ms, revision, revision,
+                        payload_format, opaque_payload,
+                    ),
+                )
+                await db.commit()
+                return ReminderMaterializationResult(True)
+            except BaseException:
+                await db.rollback()
+                raise
 
     async def list_reminders(
         self, *, state: str = "", limit: int = 50,
@@ -1519,7 +2002,12 @@ class MessageStore:
                     )
             cursor = await db.execute(
                 """UPDATE reminder_occurrences
-                   SET state = 'delivered', delivered_event_id = ?, delivered_at_ms = ?
+                   SET state = 'delivered', delivered_event_id = ?, delivered_at_ms = ?,
+                       revision = revision + 1,
+                       sync_retry_after_ms = NULL,
+                       sync_retry_count = 0,
+                       sync_permanent_revision = NULL,
+                       sync_permanent_code = NULL
                    WHERE reminder_id = ? AND state = 'claimed'""",
                 (event_id, now_ms, reminder_id),
             )
@@ -1581,7 +2069,12 @@ class MessageStore:
                 if reminder.state in {"scheduled", "claimed"}:
                     cursor = await db.execute(
                         """UPDATE reminder_occurrences
-                           SET state = 'cancelled', cancelled_at_ms = ?
+                           SET state = 'cancelled', cancelled_at_ms = ?,
+                               revision = revision + 1,
+                               sync_retry_after_ms = NULL,
+                               sync_retry_count = 0,
+                               sync_permanent_revision = NULL,
+                               sync_permanent_code = NULL
                            WHERE reminder_id = ? AND state IN ('scheduled', 'claimed')""",
                         (cancelled_at, reminder_id),
                     )
