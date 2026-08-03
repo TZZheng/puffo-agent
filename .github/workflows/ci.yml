@@ -21,6 +21,7 @@ jobs:
   test:
     name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     env:
       QT_QPA_PLATFORM: offscreen  # the PySide6 UI tests render headless
     strategy:
@@ -54,4 +55,4 @@ jobs:
           puffo-agent --help > /dev/null
 
       - name: pytest
-        run: pytest -p no:warnings
+        run: timeout --signal=INT --kill-after=30s 8m pytest -vv -p no:warnings
