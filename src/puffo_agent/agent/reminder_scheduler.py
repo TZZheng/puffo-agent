@@ -5,6 +5,7 @@ import asyncio
 import re
 import time
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from .message_store import (
@@ -12,6 +13,7 @@ from .message_store import (
     REMINDER_STATES,
     MessageStore,
     ReminderOccurrence,
+    ReminderSyncRecord,
     reminder_time_to_rfc3339,
 )
 
@@ -23,6 +25,19 @@ _RFC3339_OFFSET = re.compile(
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+@dataclass(frozen=True)
+class ReminderDeliveryAuthorization:
+    """Provider-neutral permission result for due reminder delivery."""
+
+    occurrence_ids: tuple[str, ...] = ()
+    retry_after_ms: int | None = None
+
+
+ReminderDeliveryAuthorizer = Callable[
+    [tuple[ReminderSyncRecord, ...]], Awaitable[ReminderDeliveryAuthorization]
+]
 
 
 def normalize_reminder_timestamp(value: str) -> tuple[int, str]:
@@ -56,11 +71,14 @@ class ReminderScheduler:
         notify: Callable[[], None],
         now_ms: Callable[[], int] = _now_ms,
         wait_for_change: Callable[[asyncio.Event, float | None], Awaitable[None]] | None = None,
+        delivery_authorizer: ReminderDeliveryAuthorizer | None = None,
     ) -> None:
         self.store = store
         self._notify = notify
         self._now_ms = now_ms
         self._wait_for_change = wait_for_change
+        self._delivery_authorizer = delivery_authorizer
+        self._authorization_retry_after_ms: int | None = None
         self._wakeup = asyncio.Event()
         self._stopping = False
 
@@ -72,6 +90,14 @@ class ReminderScheduler:
         """Idempotently end a pending wait without owning a worker task."""
         self._stopping = True
         self._wakeup.set()
+
+    def set_delivery_authorizer(
+        self, authorizer: ReminderDeliveryAuthorizer | None,
+    ) -> None:
+        """Install remote delivery custody before this scheduler worker starts."""
+        self._delivery_authorizer = authorizer
+        self._authorization_retry_after_ms = None
+        self.signal()
 
     async def create_reminder(
         self, *, content: str, target: str, intended_at: str,
@@ -104,7 +130,20 @@ class ReminderScheduler:
 
     async def process_due_once(self) -> tuple[ReminderOccurrence, ...]:
         """Deliver due or restart-recovered claims and wake after each commit set."""
-        delivered = await self.store.deliver_due_reminders(now_ms=int(self._now_ms()))
+        now = int(self._now_ms())
+        if self._delivery_authorizer is None:
+            delivered = await self.store.deliver_due_reminders(now_ms=now)
+        else:
+            candidates = await self.store.due_reminder_delivery_candidates(now_ms=now)
+            authorization = await self._delivery_authorizer(candidates)
+            self._authorization_retry_after_ms = authorization.retry_after_ms
+            if authorization.occurrence_ids:
+                await self.store.claim_authorized_reminders(
+                    authorization.occurrence_ids, now_ms=now,
+                )
+            delivered = await self.store.deliver_authorized_reminders(
+                authorization.occurrence_ids, now_ms=now,
+            )
         for _occurrence in delivered:
             self._notify()
         return delivered
@@ -139,4 +178,9 @@ class ReminderScheduler:
             deadline = await self.store.next_reminder_deadline(
                 now_ms=int(self._now_ms())
             )
+            if self._authorization_retry_after_ms is not None:
+                deadline = max(
+                    self._authorization_retry_after_ms,
+                    deadline if deadline is not None else self._authorization_retry_after_ms,
+                )
             await self._wait_until_changed_or_due(deadline)

@@ -54,6 +54,9 @@ class _RecordingTransport:
         self.calls: list[tuple[str, str, dict[str, object] | None]] = []
         self.rows: list[dict[str, object]] = []
         self.failure: Exception | None = None
+        self.snapshot_failure: Exception | None = None
+        self.claim_status = "acquired"
+        self.claims: list[tuple[str, dict[str, object]]] = []
 
     @staticmethod
     def _response(path: str, body: dict[str, object]) -> dict[str, object]:
@@ -76,12 +79,28 @@ class _RecordingTransport:
             raise self.failure
         return self._response(path, body)
 
+    async def post(self, path: str, body: dict[str, object]) -> dict[str, object]:
+        self.claims.append((path, copy.deepcopy(body)))
+        if self.failure is not None:
+            raise self.failure
+        lifecycle = "delivered" if self.claim_status == "terminal" else "scheduled"
+        return {
+            "occurrence_id": path.split("/")[-2],
+            "revision": body["revision"],
+            "lifecycle": lifecycle,
+            "status": self.claim_status,
+        }
+
     async def get(self, path: str) -> dict[str, object]:
         self.calls.append(("get", path, None))
+        if self.snapshot_failure is not None:
+            raise self.snapshot_failure
         return self._snapshot(path)
 
     async def get_unsigned(self, path: str) -> dict[str, object]:
         self.calls.append(("get_unsigned", path, None))
+        if self.snapshot_failure is not None:
+            raise self.snapshot_failure
         return self._snapshot(path)
 
     def _snapshot(self, path: str) -> dict[str, object]:
@@ -244,6 +263,135 @@ async def test_encrypted_retry_reconstructs_overdue_occurrence(tmp_path):
     assert wakes == ["wake"]
     await source.close()
     await restored.close()
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_due_reminder_is_blocked_until_snapshot_ready(tmp_path):
+    transport = _RecordingTransport()
+    sync, store, scheduler, _keys = _sync(tmp_path, transport)
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+    assert await sync.upload_pending_once() == 1
+    transport.snapshot_failure = OSError("snapshot unavailable")
+    with pytest.raises(OSError):
+        await sync.reconcile_snapshot()
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+
+    assert await scheduler.process_due_once() == ()
+    assert await store.get_message_by_envelope(
+        f"reminder-occurrence:{reminder.occurrence_id}"
+    ) is None
+    assert transport.claims == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_acquired_claim_delivers_and_terminal_put_carries_same_claim_id(tmp_path):
+    transport = _RecordingTransport()
+    sync, store, scheduler, _keys = _sync(tmp_path, transport)
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+    assert await sync.upload_pending_once() == 1
+    assert await sync.reconcile_snapshot() == 0
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+
+    assert [item.occurrence_id for item in await scheduler.process_due_once()] == [
+        reminder.occurrence_id
+    ]
+    claim_id = transport.claims[0][1]["claim_id"]
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None and record.delivery_claim_id == claim_id
+    assert record.delivery_claim_acquired
+    assert await sync.upload_pending_once() == 1
+    delivered_put = transport.calls[-1][2]
+    assert delivered_put is not None and delivered_put["delivery_claim_id"] == claim_id
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_held_or_terminal_claim_never_creates_a_local_inbox_event(tmp_path):
+    transport = _RecordingTransport()
+    sync, store, scheduler, _keys = _sync(tmp_path, transport)
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+    assert await sync.upload_pending_once() == 1
+    assert await sync.reconcile_snapshot() == 0
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+    transport.claim_status = "held"
+    assert await scheduler.process_due_once() == ()
+    assert await store.get_message_by_envelope(f"reminder-occurrence:{reminder.occurrence_id}") is None
+
+    transport.claim_status = "terminal"
+    transport.rows = [_terminal_row(
+        reminder_id=reminder.reminder_id,
+        occurrence_id=reminder.occurrence_id,
+    )]
+    assert await scheduler.process_due_once() == ()
+    assert (await store.get_reminder(reminder.reminder_id)).state == "delivered"
+    assert await store.get_message_by_envelope(f"reminder-occurrence:{reminder.occurrence_id}") is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_claim_id_survives_restart_before_claim_response(tmp_path):
+    transport = _RecordingTransport()
+    sync, store, scheduler, keys = _sync(tmp_path, transport)
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+    assert await sync.upload_pending_once() == 1
+    assert await sync.reconcile_snapshot() == 0
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+    transport.failure = OSError("offline")
+    assert await scheduler.process_due_once() == ()
+    first_claim_id = transport.claims[-1][1]["claim_id"]
+    await store.close()
+
+    transport.failure = None
+    resumed, reopened, resumed_scheduler, _keys = _sync(
+        tmp_path, transport, keys=keys,
+    )
+    assert await resumed.reconcile_snapshot() == 0
+    resumed_scheduler.set_delivery_authorizer(resumed.authorize_due_delivery)
+    assert [item.occurrence_id for item in await resumed_scheduler.process_due_once()] == [
+        reminder.occurrence_id
+    ]
+    assert transport.claims[-1][1]["claim_id"] == first_claim_id
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_only_acquired_replica_delivers_shared_acknowledged_occurrence(tmp_path):
+    transport = _RecordingTransport()
+    first, first_store, first_scheduler, keys = _sync(tmp_path, transport, name="first.db")
+    second, second_store, second_scheduler, _keys = _sync(
+        tmp_path, transport, name="second.db", keys=keys,
+    )
+    for store in (first_store, second_store):
+        await store.create_reminder(
+            reminder_id="reminder-shared",
+            occurrence_id="occurrence-shared",
+            content="due", target="dm:peer", intended_at_ms=1_000,
+        )
+    assert await first.upload_pending_once() == 1
+    assert await second.upload_pending_once() == 1
+    assert await first.reconcile_snapshot() == 0
+    assert await second.reconcile_snapshot() == 0
+    first_scheduler.set_delivery_authorizer(first.authorize_due_delivery)
+    second_scheduler.set_delivery_authorizer(second.authorize_due_delivery)
+
+    assert [item.occurrence_id for item in await first_scheduler.process_due_once()] == [
+        "occurrence-shared"
+    ]
+    transport.claim_status = "held"
+    assert await second_scheduler.process_due_once() == ()
+    assert await first_store.get_message_by_envelope("reminder-occurrence:occurrence-shared")
+    assert await second_store.get_message_by_envelope("reminder-occurrence:occurrence-shared") is None
+    await first_store.close()
+    await second_store.close()
 
 
 def test_dek_is_private_stable_and_scoped_to_agent_state(tmp_path, caplog):

@@ -180,7 +180,9 @@ CREATE TABLE IF NOT EXISTS reminder_occurrences (
     sync_retry_after_ms INTEGER,
     sync_retry_count INTEGER NOT NULL DEFAULT 0 CHECK (sync_retry_count >= 0 AND sync_retry_count <= 20),
     sync_permanent_revision INTEGER,
-    sync_permanent_code TEXT CHECK (sync_permanent_code IS NULL OR length(sync_permanent_code) <= 128)
+    sync_permanent_code TEXT CHECK (sync_permanent_code IS NULL OR length(sync_permanent_code) <= 128),
+    delivery_claim_id TEXT,
+    delivery_claim_acquired INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_reminder_occurrences_due
     ON reminder_occurrences (state, intended_at_ms, occurrence_id);
@@ -369,6 +371,8 @@ class ReminderSyncRecord:
     sync_retry_count: int
     sync_permanent_revision: int | None
     sync_permanent_code: str | None
+    delivery_claim_id: str | None
+    delivery_claim_acquired: bool
 
     @property
     def server_lifecycle(self) -> str:
@@ -684,6 +688,10 @@ class MessageStore:
                 ),
                 "sync_permanent_revision": "sync_permanent_revision INTEGER",
                 "sync_permanent_code": "sync_permanent_code TEXT",
+                "delivery_claim_id": "delivery_claim_id TEXT",
+                "delivery_claim_acquired": (
+                    "delivery_claim_acquired INTEGER NOT NULL DEFAULT 0"
+                ),
             }
             added_revision = "revision" not in columns
             for name, declaration in additions.items():
@@ -713,6 +721,12 @@ class MessageStore:
                 """UPDATE reminder_occurrences
                    SET server_ack_revision = 0
                    WHERE server_ack_revision IS NULL OR server_ack_revision < 0"""
+            )
+            await db.execute(
+                """UPDATE reminder_occurrences
+                   SET delivery_claim_acquired = 0
+                   WHERE delivery_claim_acquired IS NULL
+                      OR delivery_claim_acquired NOT IN (0, 1)"""
             )
             await db.execute(
                 """CREATE INDEX IF NOT EXISTS idx_reminder_occurrences_sync_pending
@@ -1436,6 +1450,11 @@ class MessageStore:
                 str(row["sync_permanent_code"])
                 if row["sync_permanent_code"] is not None else None
             ),
+            delivery_claim_id=(
+                str(row["delivery_claim_id"])
+                if row["delivery_claim_id"] is not None else None
+            ),
+            delivery_claim_acquired=bool(row["delivery_claim_acquired"]),
         )
 
     @staticmethod
@@ -2008,6 +2027,118 @@ class MessageStore:
         async with self._inbox_lock:
             return await self._claim_due_reminders_unlocked(now)
 
+    async def due_reminder_delivery_candidates(
+        self, *, now_ms: int | None = None,
+    ) -> tuple[ReminderSyncRecord, ...]:
+        """Return due work for a remote delivery authorizer without claiming it."""
+        now = int(self._now_ms()) if now_ms is None else now_ms
+        if not self._valid_reminder_time(now):
+            raise ValueError("now_ms must be an integer epoch milliseconds")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            async with db.execute(
+                """SELECT * FROM reminder_occurrences
+                   WHERE (state = 'scheduled' AND intended_at_ms <= ?)
+                      OR state = 'claimed'
+                   ORDER BY intended_at_ms, occurrence_id""",
+                (now,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            return tuple(self._reminder_sync_record_from_row(row) for row in rows)
+
+    async def persist_reminder_delivery_claim_id(
+        self, *, occurrence_id: str, revision: int, claim_id: str,
+    ) -> ReminderSyncRecord | None:
+        """Persist an idempotency key before its remote delivery-claim POST."""
+        if (
+            not isinstance(occurrence_id, str) or not occurrence_id
+            or not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0
+            or not isinstance(claim_id, str) or not claim_id
+        ):
+            raise ValueError("invalid reminder delivery claim")
+        try:
+            uuid.UUID(claim_id)
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("invalid reminder delivery claim") from exc
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                record = await self._get_reminder_sync_by_occurrence_unlocked(db, occurrence_id)
+                if record is None or record.revision != revision:
+                    await db.rollback()
+                    return None
+                if record.delivery_claim_id is not None:
+                    await db.rollback()
+                    return record
+                await db.execute(
+                    """UPDATE reminder_occurrences SET delivery_claim_id = ?
+                       WHERE occurrence_id = ? AND revision = ?
+                         AND delivery_claim_id IS NULL""",
+                    (claim_id, occurrence_id, revision),
+                )
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+            return await self._get_reminder_sync_by_occurrence_unlocked(db, occurrence_id)
+
+    async def acquire_reminder_delivery_claim(
+        self, *, occurrence_id: str, revision: int, claim_id: str,
+    ) -> bool:
+        """Record Server-acquired delivery custody for one current revision."""
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    """UPDATE reminder_occurrences SET delivery_claim_acquired = 1
+                       WHERE occurrence_id = ? AND revision = ?
+                         AND delivery_claim_id = ?
+                         AND state IN ('scheduled', 'claimed')""",
+                    (occurrence_id, revision, claim_id),
+                )
+                changed = cursor.rowcount == 1
+                await db.commit()
+                return changed
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def claim_authorized_reminders(
+        self, occurrence_ids: tuple[str, ...], *, now_ms: int,
+    ) -> tuple[ReminderOccurrence, ...]:
+        """Enter local claimed state only for remote-acquired occurrence IDs."""
+        if not occurrence_ids:
+            return ()
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                placeholders = ", ".join("?" for _ in occurrence_ids)
+                await db.execute(
+                    f"""UPDATE reminder_occurrences
+                        SET state = 'claimed', claimed_at_ms = ?, actual_fire_at_ms = ?
+                        WHERE occurrence_id IN ({placeholders})
+                          AND state = 'scheduled'
+                          AND (delivery_claim_acquired = 1 OR server_ack_revision = 0)""",
+                    (now_ms, now_ms, *occurrence_ids),
+                )
+                async with db.execute(
+                    f"""SELECT * FROM reminder_occurrences
+                        WHERE occurrence_id IN ({placeholders})
+                          AND state = 'claimed'
+                          AND (delivery_claim_acquired = 1 OR server_ack_revision = 0)
+                        ORDER BY intended_at_ms, occurrence_id""",
+                    occurrence_ids,
+                ) as cursor:
+                    rows = await cursor.fetchall()
+                await db.commit()
+                return tuple(self._reminder_from_row(row) for row in rows)
+            except BaseException:
+                await db.rollback()
+                raise
+
     async def _claim_due_reminders_unlocked(
         self, now_ms: int,
     ) -> tuple[ReminderOccurrence, ...]:
@@ -2177,6 +2308,33 @@ class MessageStore:
                     delivered.append(occurrence)
             return tuple(delivered)
 
+    async def deliver_authorized_reminders(
+        self, occurrence_ids: tuple[str, ...], *, now_ms: int,
+    ) -> tuple[ReminderOccurrence, ...]:
+        """Use the existing Inbox-plus-terminal transaction for acquired IDs only."""
+        if not occurrence_ids:
+            return ()
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            placeholders = ", ".join("?" for _ in occurrence_ids)
+            async with db.execute(
+                f"""SELECT reminder_id FROM reminder_occurrences
+                    WHERE occurrence_id IN ({placeholders})
+                      AND state = 'claimed'
+                      AND (delivery_claim_acquired = 1 OR server_ack_revision = 0)
+                    ORDER BY intended_at_ms, occurrence_id""",
+                occurrence_ids,
+            ) as cursor:
+                rows = await cursor.fetchall()
+            delivered: list[ReminderOccurrence] = []
+            for row in rows:
+                occurrence = await self._deliver_claimed_reminder_unlocked(
+                    str(row["reminder_id"]), now_ms=now_ms,
+                )
+                if occurrence is not None:
+                    delivered.append(occurrence)
+            return tuple(delivered)
+
     async def cancel_reminder(
         self, reminder_id: str, *, cancelled_at_ms: int | None = None,
     ) -> ReminderOccurrence:
@@ -2198,6 +2356,8 @@ class MessageStore:
                         """UPDATE reminder_occurrences
                            SET state = 'cancelled', cancelled_at_ms = ?,
                                revision = revision + 1,
+                               delivery_claim_id = NULL,
+                               delivery_claim_acquired = 0,
                                sync_retry_after_ms = NULL,
                                sync_retry_count = 0,
                                sync_permanent_revision = NULL,

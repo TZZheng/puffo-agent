@@ -1790,7 +1790,7 @@ async def test_reminder_schema_migrates_additively_without_changing_existing_inb
         "cancelled_at_ms", "delivered_at_ms", "delivered_event_id",
         "revision", "server_ack_revision", "payload_format", "opaque_payload",
         "sync_retry_after_ms", "sync_retry_count", "sync_permanent_revision",
-        "sync_permanent_code",
+        "sync_permanent_code", "delivery_claim_id", "delivery_claim_acquired",
     }
     async with db.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' "

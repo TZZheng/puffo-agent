@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
@@ -27,7 +28,10 @@ from .message_store import (
     parse_reminder_target,
     reminder_time_to_rfc3339,
 )
-from .reminder_scheduler import ReminderScheduler
+from .reminder_scheduler import (
+    ReminderDeliveryAuthorization,
+    ReminderScheduler,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -296,6 +300,9 @@ class ReminderSync:
         self._wakeup = asyncio.Event()
         self._stopping = False
         self._snapshot_requested = False
+        # A remote-coordinated scheduler is fail-closed until an authenticated
+        # complete current-state snapshot has reconciled this local database.
+        self._delivery_ready = False
 
     @property
     def route_prefix(self) -> str:
@@ -310,6 +317,7 @@ class ReminderSync:
 
     async def on_transport_connected(self) -> None:
         """Provider-neutral callback: signal only, never do HTTP in WS code."""
+        self._delivery_ready = False
         self.signal_snapshot()
 
     def stop(self) -> None:
@@ -363,7 +371,7 @@ class ReminderSync:
     def _put_body(self, record: ReminderSyncRecord) -> dict[str, object]:
         if record.opaque_payload is None or record.payload_format != REMINDER_PAYLOAD_FORMAT:
             raise ReminderEnvelopeError("invalid opaque envelope")
-        return {
+        body: dict[str, object] = {
             "revision": record.revision,
             "reminder_id": record.reminder_id,
             "due_at": _canonical_utc(record.intended_at_ms),
@@ -372,6 +380,9 @@ class ReminderSync:
             "payload_format": record.payload_format,
             "opaque_payload": _base64url_encode(record.opaque_payload),
         }
+        if record.server_lifecycle == "delivered" and record.delivery_claim_id is not None:
+            body["delivery_claim_id"] = record.delivery_claim_id
+        return body
 
     async def _put(self, path: str, body: dict[str, object]) -> Any:
         if bool(getattr(self.http_client, "keyless", False)):
@@ -386,6 +397,108 @@ class ReminderSync:
             return await self.http_client.get_unsigned(path)
         return await self.http_client.get(path)
 
+    async def _post(self, path: str, body: dict[str, object]) -> Any:
+        if bool(getattr(self.http_client, "keyless", False)):
+            method = getattr(self.http_client, "post_unsigned", None)
+            if not callable(method):
+                raise ReminderContractError("missing keyless reminder transport")
+            return await method(path, body)
+        return await self.http_client.post(path, body)
+
+    @staticmethod
+    def _validate_delivery_claim_response(
+        response: Any, record: ReminderSyncRecord,
+    ) -> str:
+        if not isinstance(response, Mapping) or set(response) != {
+            "occurrence_id", "revision", "lifecycle", "status",
+        }:
+            raise ReminderContractError("invalid reminder delivery claim")
+        if response.get("occurrence_id") != record.occurrence_id:
+            raise ReminderContractError("invalid reminder delivery claim")
+        if type(response.get("revision")) is not int or response["revision"] != record.revision:
+            raise ReminderContractError("invalid reminder delivery claim")
+        lifecycle = response.get("lifecycle")
+        status = response.get("status")
+        if status not in {"acquired", "held", "terminal"}:
+            raise ReminderContractError("invalid reminder delivery claim")
+        if status == "terminal":
+            if lifecycle not in {"cancelled", "delivered"}:
+                raise ReminderContractError("invalid reminder delivery claim")
+        elif lifecycle != "scheduled":
+            raise ReminderContractError("invalid reminder delivery claim")
+        return status
+
+    async def authorize_due_delivery(
+        self, candidates: tuple[ReminderSyncRecord, ...],
+    ) -> ReminderDeliveryAuthorization:
+        """Acquire Server custody before the scheduler enters local delivery."""
+        retry_after = int(self._now_ms()) + RETRY_BASE_MS
+        blocked = False
+        authorized: list[str] = []
+        for candidate in candidates:
+            # New local work is intentionally offline-first until its first
+            # scheduled revision has been acknowledged by the Server.
+            if candidate.server_ack_revision < 1:
+                authorized.append(candidate.occurrence_id)
+                continue
+            if not self._delivery_ready:
+                blocked = True
+                continue
+            if candidate.delivery_claim_acquired:
+                authorized.append(candidate.occurrence_id)
+                continue
+            if (
+                candidate.state != "scheduled"
+                or candidate.server_ack_revision < candidate.revision
+            ):
+                blocked = True
+                continue
+            claim_id = candidate.delivery_claim_id or str(uuid.uuid4())
+            try:
+                persisted = await self.store.persist_reminder_delivery_claim_id(
+                    occurrence_id=candidate.occurrence_id,
+                    revision=candidate.revision,
+                    claim_id=claim_id,
+                )
+                if persisted is None:
+                    continue
+                claim_id = persisted.delivery_claim_id
+                if claim_id is None:
+                    continue
+                response = await self._post(
+                    f"{self.route_prefix}/{persisted.occurrence_id}/delivery-claim",
+                    {"revision": persisted.revision, "claim_id": claim_id},
+                )
+                status = self._validate_delivery_claim_response(response, persisted)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                blocked = True
+                continue
+            if status == "acquired":
+                if await self.store.acquire_reminder_delivery_claim(
+                    occurrence_id=persisted.occurrence_id,
+                    revision=persisted.revision,
+                    claim_id=claim_id,
+                ):
+                    authorized.append(persisted.occurrence_id)
+            elif status == "terminal":
+                blocked = True
+                self._delivery_ready = False
+                self.signal_snapshot()
+                try:
+                    await self.reconcile_snapshot()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+            else:
+                blocked = True
+        return ReminderDeliveryAuthorization(
+            occurrence_ids=tuple(authorized),
+            retry_after_ms=retry_after if blocked else None,
+        )
+
     def _validate_put_response(
         self, response: Any, record: ReminderSyncRecord, body: Mapping[str, object],
     ) -> None:
@@ -396,6 +509,9 @@ class ReminderSync:
             "lifecycle_at", "payload_format",
         }
         allowed = required | {"opaque_payload"}
+        if record.server_lifecycle == "delivered" and record.delivery_claim_id is not None:
+            required = required | {"delivery_claim_id"}
+            allowed = required
         if frozenset(response) not in {frozenset(required), frozenset(allowed)}:
             raise ReminderContractError("invalid reminder response")
         if response.get("occurrence_id") != record.occurrence_id:
@@ -420,10 +536,13 @@ class ReminderSync:
         if record.server_lifecycle == "scheduled":
             if returned_payload != body["opaque_payload"]:
                 raise ReminderContractError("invalid reminder response")
-        elif returned_payload not in (None, body["opaque_payload"]):
+        elif returned_payload is not None:
             # Current Server terminals omit this field.  If a compatible
             # implementation does return it, it must be the immutable bytes.
             raise ReminderContractError("invalid reminder response")
+        if record.server_lifecycle == "delivered" and record.delivery_claim_id is not None:
+            if response.get("delivery_claim_id") != record.delivery_claim_id:
+                raise ReminderContractError("invalid reminder response")
 
     async def _record_retry(
         self, record: ReminderSyncRecord, category: str,
@@ -651,6 +770,7 @@ class ReminderSync:
             # One changed batch gives the existing scheduler a chance to
             # process every overdue reconstruction through its normal path.
             self.scheduler.signal()
+        self._delivery_ready = True
         return changed
 
     async def run(self, *, request_snapshot_on_start: bool = True) -> None:
@@ -668,6 +788,8 @@ class ReminderSync:
                     raise
                 except Exception:
                     logger.warning("reminder snapshot failed category=transport_or_contract")
+                    self._delivery_ready = False
+                    self._snapshot_requested = True
             try:
                 await self.upload_pending_once(
                     retry_permanent=reconciliation_completed,

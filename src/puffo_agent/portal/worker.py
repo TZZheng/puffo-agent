@@ -1954,6 +1954,11 @@ class Worker:
                 http_client=client.http,
                 scheduler=global_runtime.reminder_scheduler,
             )
+            # Install the remote custody gate before the scheduler worker is
+            # started. ReminderSync remains fail-closed until snapshot success.
+            global_runtime.reminder_scheduler.set_delivery_authorizer(
+                reminder_sync.authorize_due_delivery,
+            )
             client.add_connected_callback(reminder_sync.on_transport_connected)
             # Reconcile Server current-state before the local scheduler can
             # deliver overdue work. This closes the restore race where an old
@@ -1964,9 +1969,10 @@ class Worker:
                 raise
             except Exception:
                 logger.warning(
-                    "agent %s: startup reminder snapshot failed; continuing local-first",
+                    "agent %s: startup reminder snapshot failed; delivery remains blocked",
                     agent_id,
                 )
+                reminder_sync.signal_snapshot()
         global_runtime_task = asyncio.ensure_future(global_runtime.run())
         if reminder_sync is not None:
             reminder_sync_task = asyncio.ensure_future(
