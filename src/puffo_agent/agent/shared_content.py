@@ -178,14 +178,36 @@ an agent to force).
 
 
 PARTICIPATION_AND_CONTINUATION_GUIDANCE = """\
-Determine whether the interaction expects distinct participation from each
-addressed participant or a shared result that any participant can satisfy. In
-distinct-participation mode, another participant's response does not substitute
-for yours. In shared-result mode, an existing result may satisfy the request,
-so do not duplicate it.
+Reconstruct the current interaction from the message that originated the
+request through the latest relevant rows. Earlier unrelated activity is
+context, not evidence of turn position, assignment, or participation, unless
+the interaction explicitly refers to it.
+
+Infer the interaction's participation shape: who is addressed, whether it
+expects distinct turns or a shared result, how many turns each participant is
+expected to take, and what ends the round. In an ordered group interaction,
+when the request calls on the addressed participants to act in turn and gives
+no indication of repetition, normally treat one successful turn per identity
+as that round's shape. Explicit repetition, multiple rounds, or later work may
+require more.
+
+In distinct-participation mode, track successful visible participation by
+identity within that interaction. Another participant's response does not
+substitute for yours, and an attempted, held, or failed draft does not count as
+your visible contribution. A successful visible contribution that fulfills
+your expected turn or turns normally completes your participation in that
+round; later peer progress alone does not reopen the same contribution. In
+shared-result mode, an existing result may satisfy the request, so do not
+duplicate it.
+
+For ordered interactions, keep participant position separate from the content
+or value produced at that position. A special value assigned to one position
+does not by itself reset later positions; infer a reset only when the request or
+conversation indicates one.
 
 Agent messages may legitimately trigger further Agent work or replies. When
-your next action would continue a recurring interaction, judge whether another
+considering another action, distinguish genuinely new work or a still-open
+step from replaying a contribution already completed. Judge whether another
 iteration remains meaningful: whether it adds information, changes shared
 state, resolves uncertainty, advances work, or moves toward a useful outcome.
 Continue meaningful or converging interaction. If it would only repeat,
@@ -194,31 +216,34 @@ silent. Explicitly requested repetition follows its intended scope and stopping
 condition.
 
 Use earlier `self=true` rows as evidence of what you already attempted or
-completed; they do not by themselves force either another reply or silence. If
-the participation mode or value of continuing is materially ambiguous and the
-available context cannot resolve it, ask one concise human clarification. First
-check whether an equivalent clarification is already present; if so, wait for
-its answer instead of asking again."""
+completed within that interaction. If the participation mode or value of
+continuing is materially ambiguous and the available context cannot resolve it,
+ask one concise human clarification. First check whether an equivalent
+clarification is already present; if so, wait for its answer instead of asking
+again."""
 
 
 HELD_SEND_RECONSIDERATION_GUIDANCE = f"""\
-Treat a held draft as evidence of an attempted response, not as permission or
-an obligation to send it. Reconsider the originating interaction, the exact
-draft, its visible basis, and the latest context together. Separate the draft
-text from its purpose: newer context can make it wrong, redundant, unnecessary,
-or still needed.
+A held draft was attempted but not sent. It is evidence for reconsideration,
+not visible participation, permission, or an obligation to send. Reconsider the
+originating interaction, the exact draft, its visible basis, and the latest
+context together. Separate the draft text from its purpose: newer context can
+make it wrong, redundant, unnecessary, or still needed.
 
 {PARTICIPATION_AND_CONTINUATION_GUIDANCE}
 
-Then judge whether the draft is context-dependent: can newer messages change
-its correctness, sequence position, target, necessity, interpretation,
+First decide whether the current interaction still expects a new successful
+visible contribution from you. If an earlier successful `self=true` row already
+fulfills it and the latest context creates no genuinely new work, send nothing.
+Otherwise judge whether the draft is context-dependent: can newer messages
+change its correctness, sequence position, target, necessity, interpretation,
 participation mode, or continuation value? This includes turn-taking and
 shared-state coordination. If so, revise against the latest context and send
 with normal freshness; do not use `send_anyway`. Use the unchanged draft with
 `send_anyway=True` only after confirming newer context cannot affect those
-semantics. Otherwise send nothing. `send_anyway=True` is rare and model-owned,
-never automatic; technical eligibility is not a recommendation. Revised or
-context-derived content uses normal freshness and may be held again."""
+semantics. `send_anyway=True` is rare and model-owned, never automatic;
+technical eligibility is not a recommendation. Revised or context-derived
+content uses normal freshness and may be held again."""
 
 
 DEFAULT_SKILL_SEND_MESSAGE = f"""\

@@ -99,7 +99,7 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     )
     assert normalized_read.count(decision_guidance) == 1
     assert all_prompt_surfaces.count(decision_guidance) == 2
-    assert "distinct participation" in normalized_read
+    assert "distinct turns" in normalized_read
     assert "shared result" in normalized_read
     assert "Agent messages may legitimately trigger" in normalized_read
     assert "ask one concise human clarification" in normalized_read
@@ -115,11 +115,11 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         'state="held"', "unchanged draft", "draft boundary/latest pair",
         "visible_draft_basis", "new_channel_context", "context_ready=true",
         "context_ready=false", "inspect", "revise against the latest context",
-        "send with normal freshness",
-        "evidence of an attempted response",
-        "reconsider the originating interaction",
-        "context-dependent", "sequence position", "shared-state coordination",
-        "do not use `send_anyway`", "use the unchanged draft", "otherwise send nothing",
+        "send with normal freshness", "attempted but not sent",
+        "not visible participation", "new successful visible contribution",
+        "reconsider the originating interaction", "context-dependent",
+        "sequence position", "shared-state coordination",
+        "do not use `send_anyway`", "use the unchanged draft", "send nothing",
         "distinct-participation mode",
         "shared-result mode",
         "meaningful or converging interaction",
@@ -199,14 +199,26 @@ def test_read_inbox_owns_participation_and_continuation_judgment():
     read = " ".join(DEFAULT_SKILLS["read-inbox"][1].split())
     assert read.count(decision_guidance) == 1
     for phrase in (
-        "distinct participation from each addressed participant",
-        "shared result that any participant can satisfy",
+        "message that originated the request",
+        "Earlier unrelated activity is context",
+        "not evidence of turn position, assignment, or participation",
+        "interaction's participation shape",
+        "how many turns each participant is expected to take",
+        "one successful turn per identity",
+        "Explicit repetition, multiple rounds, or later work may require more",
+        "track successful visible participation by identity",
+        "within that interaction",
+        "does not count as your visible contribution",
+        "normally completes your participation in that round",
+        "later peer progress alone does not reopen the same contribution",
+        "keep participant position separate from the content or value",
+        "does not by itself reset later positions",
         "Agent messages may legitimately trigger further Agent work or replies",
+        "genuinely new work or a still-open step",
         "Continue meaningful or converging interaction",
         "repeat, oscillate, or self-propagate without meaningful progress",
         "ask one concise human clarification",
         "equivalent clarification is already present",
-        "do not by themselves force either another reply or silence",
     ):
         assert phrase in read
     for stale_generic_tail in (
@@ -277,8 +289,11 @@ def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
         for skill_id, (_, body) in DEFAULT_SKILLS.items()
         if skill_id != "send-message"
     )
-    held_opening = "Treat a held draft as evidence of an attempted response"
+    held_opening = "A held draft was attempted but not sent"
     assert not any(held_opening in surface for surface in other_prompt_surfaces)
+    assert "new successful visible contribution from you" in send
+    assert "earlier successful `self=true` row already fulfills it" in send
+    assert "Treat a held draft as evidence of an attempted response" not in send
 
 
 def test_harnesses_discover_managed_skills_with_correct_tool_names():
