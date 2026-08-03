@@ -1,4 +1,4 @@
-# One-shot local reminder contract
+# One-shot reminder contract
 
 The Agent owns one-shot reminder intent, occurrence identity, plaintext
 content, cancellation, delivery, and local scheduling in its per-Agent
@@ -100,11 +100,13 @@ Native Agents use signed:
 
 - `PUT /v2/agent-runtime/reminder-occurrences/{occurrence_id}`
 - `GET /v2/agent-runtime/reminder-occurrences?after=<occurrence_id>&limit=<n>`
+- `POST /v2/agent-runtime/reminder-occurrences/{occurrence_id}/delivery-claim`
 
 Bridge Agents use the same DTO through the existing keyless boundary:
 
 - `PUT /v2/cloud-agents/agent-runtime/reminder-occurrences/{occurrence_id}`
 - `GET /v2/cloud-agents/agent-runtime/reminder-occurrences?after=<occurrence_id>&limit=<n>`
+- `POST /v2/cloud-agents/agent-runtime/reminder-occurrences/{occurrence_id}/delivery-claim`
 
 PUT sends `revision`, `reminder_id`, RFC3339 `due_at`, `lifecycle`,
 `lifecycle_at`, `payload_format`, and base64url `opaque_payload`. The Server
@@ -116,15 +118,36 @@ overwrites an immutable conflict, or regresses local `claimed`, `cancelled`, or
 `delivered` state. One changed batch signals the existing scheduler so overdue
 reconstruction takes the normal late Reminder Inbox path.
 
+Server-acknowledged occurrences remain ineligible for local delivery until the
+startup or reconnect snapshot completes. When one becomes due, each runtime
+first durably records a random `claim_id` and submits `{revision,claim_id}` to
+the delivery-claim route. The Server atomically returns `acquired`, `held`, or
+`terminal`. Only `acquired` may enter the existing atomic local Inbox-event and
+delivered-state transaction. Repeating the winning claim ID resumes
+idempotently; another runtime's claim is held. `terminal` reconciles local
+state without creating an Inbox row or Agent turn. Claim IDs are coordination
+metadata only: snapshots never expose them and the Server never sees reminder
+plaintext.
+
+Successful local delivery immediately wakes the outbox so revision 2 reaches
+the Server without waiting for the idle sync cadence. A held runtime retries
+on a separate bounded cadence and consumes the terminal snapshot once the
+winner uploads it. A reminder that has never been acknowledged by the Server
+remains local-first and may fire while offline without a remote claim.
+
 Loss of both the Agent state and this `MessageBackupDEK` remains outside v1;
 the Server does not decrypt reminders or retain a plaintext recovery copy.
 
-Cross-device timer election and transfer remain outside the first Server
-snapshot contract.
+The Server delivery claim provides cross-runtime election for acknowledged
+occurrences. Claims are durable and do not expire: if the winning runtime loses
+its local state after acquiring a claim but before committing delivery, v1
+prefers preventing duplicate execution over automatic takeover. Copying an
+already-claimed local state is likewise not an automatic transfer protocol.
+Both cases require a future explicit recovery policy.
 
 ## Non-goals
 
 This slice has no editing, rescheduling, recurrence, snooze, browser surface,
-cloud sandbox lifecycle scheduling, cross-device election, or
+cloud sandbox lifecycle scheduling, automatic claim transfer, or
 provider-specific scheduler behavior. Server-side decryption and recovery-key
 upload are not part of this contract.
