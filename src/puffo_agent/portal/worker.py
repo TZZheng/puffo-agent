@@ -1955,10 +1955,23 @@ class Worker:
                 scheduler=global_runtime.reminder_scheduler,
             )
             client.add_connected_callback(reminder_sync.on_transport_connected)
-            reminder_sync.signal_snapshot()
+            # Reconcile Server current-state before the local scheduler can
+            # deliver overdue work. This closes the restore race where an old
+            # local scheduled row outlives a terminal occurrence on Server.
+            try:
+                await reminder_sync.reconcile_snapshot()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "agent %s: startup reminder snapshot failed; continuing local-first",
+                    agent_id,
+                )
         global_runtime_task = asyncio.ensure_future(global_runtime.run())
         if reminder_sync is not None:
-            reminder_sync_task = asyncio.ensure_future(reminder_sync.run())
+            reminder_sync_task = asyncio.ensure_future(
+                reminder_sync.run(request_snapshot_on_start=False)
+            )
 
         async def heartbeat():
             interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)

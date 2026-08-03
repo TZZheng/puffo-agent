@@ -3832,6 +3832,27 @@ async def test_mixed_message_and_due_reminder_share_one_notice_read_and_turn(tmp
 
 
 @pytest.mark.asyncio
+async def test_runtime_create_reminder_forwards_the_public_timestamp(tmp_path):
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=ToolReturnAdapter(),
+        run_turn=lambda _planned: asyncio.sleep(0),
+        workspace=tmp_path,
+    )
+
+    reminder = await runtime.create_reminder(
+        content="runtime reminder",
+        target="channel:sp-1:ch-1",
+        intended_at="2026-08-03T02:00:00Z",
+    )
+
+    assert reminder["content"] == "runtime reminder"
+    assert reminder["intended_at"] == "2026-08-03T02:00:00.000Z"
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_reconstructed_overdue_reminder_has_one_inbox_event_and_one_turn(tmp_path):
     """Repeated snapshots/restart use the existing reminder Inbox path once."""
     keys = KeyStore(tmp_path / "agent-state" / "keys")

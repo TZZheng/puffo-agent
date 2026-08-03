@@ -360,6 +360,7 @@ class ReminderSyncRecord:
     actual_fire_at_ms: int | None
     cancelled_at_ms: int | None
     delivered_at_ms: int | None
+    delivered_event_id: str | None
     revision: int
     server_ack_revision: int
     payload_format: str | None
@@ -387,7 +388,7 @@ class ReminderSyncRecord:
 
 @dataclass(frozen=True)
 class ReminderMaterializationResult:
-    """Outcome of applying one validated scheduled Server row locally."""
+    """Outcome of applying one validated Server occurrence locally."""
 
     changed: bool
     conflict: bool = False
@@ -1417,6 +1418,10 @@ class MessageStore:
             actual_fire_at_ms=optional_int("actual_fire_at_ms"),
             cancelled_at_ms=optional_int("cancelled_at_ms"),
             delivered_at_ms=optional_int("delivered_at_ms"),
+            delivered_event_id=(
+                str(row["delivered_event_id"])
+                if row["delivered_event_id"] is not None else None
+            ),
             revision=int(row["revision"]),
             server_ack_revision=int(row["server_ack_revision"]),
             payload_format=(
@@ -1814,6 +1819,128 @@ class MessageStore:
                         reminder_id, occurrence_id, target, content, intended_at_ms,
                         lifecycle_at_ms, revision, revision,
                         payload_format, opaque_payload,
+                    ),
+                )
+                await db.commit()
+                return ReminderMaterializationResult(True)
+            except BaseException:
+                await db.rollback()
+                raise
+
+    async def materialize_remote_terminal_reminder(
+        self,
+        *,
+        reminder_id: str,
+        occurrence_id: str,
+        intended_at_ms: int,
+        lifecycle: str,
+        lifecycle_at_ms: int,
+        revision: int,
+        payload_format: str,
+    ) -> ReminderMaterializationResult:
+        """Apply an authenticated Server tombstone without creating an Inbox event.
+
+        A terminal snapshot has deliberately discarded its opaque payload, so
+        it can only reconcile a local row whose immutable public identifiers
+        still match. Missing local rows need no placeholder: the Server keeps
+        returning the tombstone on future snapshots.
+        """
+        if (
+            not all(isinstance(value, str) and value for value in (
+                reminder_id, occurrence_id, lifecycle, payload_format,
+            ))
+            or reminder_id == occurrence_id
+            or lifecycle not in {"cancelled", "delivered"}
+            or not self._valid_reminder_time(intended_at_ms)
+            or not self._valid_reminder_time(lifecycle_at_ms)
+            or not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision <= 0
+            or len(payload_format) > 64
+            or not payload_format.isascii()
+            or any(char.isspace() for char in payload_format)
+        ):
+            raise ValueError("invalid remote reminder tombstone")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                record = await self._get_reminder_sync_by_occurrence_unlocked(
+                    db, occurrence_id,
+                )
+                if record is None:
+                    await db.rollback()
+                    return ReminderMaterializationResult(False)
+                if (
+                    record.reminder_id != reminder_id
+                    or record.intended_at_ms != intended_at_ms
+                    or record.payload_format not in {None, payload_format}
+                ):
+                    await db.rollback()
+                    return ReminderMaterializationResult(False, conflict=True)
+
+                # A local delivery is irreversible evidence. Otherwise the
+                # authenticated Server terminal is the canonical lifecycle.
+                next_state = (
+                    "delivered" if record.state == "delivered" else lifecycle
+                )
+                next_revision = max(record.revision, revision)
+                if next_state == "delivered":
+                    actual_fire_at_ms = (
+                        record.actual_fire_at_ms
+                        if record.state == "delivered"
+                        else lifecycle_at_ms
+                    )
+                    delivered_at_ms = (
+                        record.delivered_at_ms
+                        if record.state == "delivered"
+                        else lifecycle_at_ms
+                    )
+                    delivered_event_id = (
+                        record.delivered_event_id
+                        if record.state == "delivered"
+                        else None
+                    )
+                    cancelled_at_ms = None
+                else:
+                    actual_fire_at_ms = None
+                    delivered_at_ms = None
+                    delivered_event_id = None
+                    cancelled_at_ms = lifecycle_at_ms
+
+                changed = (
+                    record.state != next_state
+                    or record.revision != next_revision
+                    or record.server_ack_revision < next_revision
+                    or record.payload_format is None
+                    or record.actual_fire_at_ms != actual_fire_at_ms
+                    or record.cancelled_at_ms != cancelled_at_ms
+                    or record.delivered_at_ms != delivered_at_ms
+                    or record.delivered_event_id != delivered_event_id
+                    or record.claimed_at_ms is not None
+                    or record.sync_retry_after_ms is not None
+                    or record.sync_retry_count != 0
+                    or record.sync_permanent_revision is not None
+                    or record.sync_permanent_code is not None
+                )
+                if not changed:
+                    await db.rollback()
+                    return ReminderMaterializationResult(False)
+                await db.execute(
+                    """UPDATE reminder_occurrences
+                       SET state = ?, claimed_at_ms = NULL,
+                           actual_fire_at_ms = ?, cancelled_at_ms = ?,
+                           delivered_at_ms = ?, delivered_event_id = ?,
+                           revision = ?, server_ack_revision = ?,
+                           payload_format = COALESCE(payload_format, ?),
+                           sync_retry_after_ms = NULL, sync_retry_count = 0,
+                           sync_permanent_revision = NULL,
+                           sync_permanent_code = NULL
+                       WHERE occurrence_id = ?""",
+                    (
+                        next_state, actual_fire_at_ms, cancelled_at_ms,
+                        delivered_at_ms, delivered_event_id, next_revision,
+                        next_revision, payload_format, occurrence_id,
                     ),
                 )
                 await db.commit()

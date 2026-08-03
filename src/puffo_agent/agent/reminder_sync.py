@@ -257,16 +257,17 @@ def decrypt_reminder_payload(
 
 
 @dataclass(frozen=True)
-class _RemoteScheduledOccurrence:
+class _RemoteOccurrence:
     reminder_id: str
     occurrence_id: str
     intended_at_ms: int
     lifecycle_at_ms: int
     revision: int
+    lifecycle: str
     payload_format: str
-    opaque_payload: bytes
-    target: str
-    content: str
+    opaque_payload: bytes | None
+    target: str | None
+    content: str | None
 
 
 class ReminderSync:
@@ -508,49 +509,59 @@ class ReminderSync:
                 uploaded += 1
         return uploaded
 
-    def _validate_snapshot_row(self, value: object) -> _RemoteScheduledOccurrence:
+    def _validate_snapshot_row(self, value: object) -> _RemoteOccurrence:
         if not isinstance(value, Mapping):
             raise ReminderContractError("invalid reminder snapshot")
-        if set(value) != {
+        required = {
             "occurrence_id", "revision", "reminder_id", "due_at", "lifecycle",
-            "lifecycle_at", "payload_format", "opaque_payload",
+            "lifecycle_at", "payload_format",
+        }
+        lifecycle = value.get("lifecycle")
+        expected = required | ({"opaque_payload"} if lifecycle == "scheduled" else set())
+        if set(value) != expected or lifecycle not in {
+            "scheduled", "cancelled", "delivered",
         }:
             raise ReminderContractError("invalid reminder snapshot")
         occurrence_id = _validate_id(value.get("occurrence_id"))
         reminder_id = _validate_id(value.get("reminder_id"))
         revision = value.get("revision")
-        # The Server accepts no scheduled rewrite: every active snapshot row
-        # is the original create revision.  Enforcing that here prevents a
-        # malformed response from falsely acknowledging a later local state.
-        if isinstance(revision, bool) or not isinstance(revision, int) or revision != 1:
-            raise ReminderContractError("invalid reminder snapshot")
-        if value.get("lifecycle") != "scheduled":
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision <= 0
+            or (lifecycle == "scheduled" and revision != 1)
+        ):
             raise ReminderContractError("invalid reminder snapshot")
         payload_format = value.get("payload_format")
         if payload_format != REMINDER_PAYLOAD_FORMAT:
             raise ReminderContractError("invalid reminder snapshot")
-        opaque_payload = _base64url_decode(value.get("opaque_payload"))
-        if not 1 <= len(opaque_payload) <= MAX_ENVELOPE_BYTES:
-            raise ReminderContractError("invalid reminder snapshot")
         intended_at_ms = _parse_rfc3339_ms(value.get("due_at"))
         lifecycle_at_ms = _parse_rfc3339_ms(value.get("lifecycle_at"))
-        try:
-            target, content = decrypt_reminder_payload(
-                dek=self._dek,
-                owner_slug=self.owner_slug,
-                reminder_id=reminder_id,
-                occurrence_id=occurrence_id,
-                intended_at_ms=intended_at_ms,
-                envelope=opaque_payload,
-            )
-        except ReminderEnvelopeError as exc:
-            raise ReminderContractError("invalid reminder snapshot") from exc
-        return _RemoteScheduledOccurrence(
+        opaque_payload: bytes | None = None
+        target: str | None = None
+        content: str | None = None
+        if lifecycle == "scheduled":
+            opaque_payload = _base64url_decode(value.get("opaque_payload"))
+            if not 1 <= len(opaque_payload) <= MAX_ENVELOPE_BYTES:
+                raise ReminderContractError("invalid reminder snapshot")
+            try:
+                target, content = decrypt_reminder_payload(
+                    dek=self._dek,
+                    owner_slug=self.owner_slug,
+                    reminder_id=reminder_id,
+                    occurrence_id=occurrence_id,
+                    intended_at_ms=intended_at_ms,
+                    envelope=opaque_payload,
+                )
+            except ReminderEnvelopeError as exc:
+                raise ReminderContractError("invalid reminder snapshot") from exc
+        return _RemoteOccurrence(
             reminder_id=reminder_id,
             occurrence_id=occurrence_id,
             intended_at_ms=intended_at_ms,
             lifecycle_at_ms=lifecycle_at_ms,
             revision=revision,
+            lifecycle=lifecycle,
             payload_format=payload_format,
             opaque_payload=opaque_payload,
             target=target,
@@ -558,7 +569,7 @@ class ReminderSync:
         )
 
     async def reconcile_snapshot(self) -> int:
-        """Exhaust the active Server snapshot and materialize changed rows once."""
+        """Exhaust the Server current-state snapshot and apply changed rows once."""
         after: str | None = None
         pages = 0
         changed = 0
@@ -592,17 +603,31 @@ class ReminderSync:
             ):
                 raise ReminderContractError("invalid reminder snapshot")
             for remote in remote_rows:
-                result = await self.store.materialize_remote_scheduled_reminder(
-                    reminder_id=remote.reminder_id,
-                    occurrence_id=remote.occurrence_id,
-                    target=remote.target,
-                    content=remote.content,
-                    intended_at_ms=remote.intended_at_ms,
-                    lifecycle_at_ms=remote.lifecycle_at_ms,
-                    revision=remote.revision,
-                    payload_format=remote.payload_format,
-                    opaque_payload=remote.opaque_payload,
-                )
+                if remote.lifecycle == "scheduled":
+                    assert remote.target is not None
+                    assert remote.content is not None
+                    assert remote.opaque_payload is not None
+                    result = await self.store.materialize_remote_scheduled_reminder(
+                        reminder_id=remote.reminder_id,
+                        occurrence_id=remote.occurrence_id,
+                        target=remote.target,
+                        content=remote.content,
+                        intended_at_ms=remote.intended_at_ms,
+                        lifecycle_at_ms=remote.lifecycle_at_ms,
+                        revision=remote.revision,
+                        payload_format=remote.payload_format,
+                        opaque_payload=remote.opaque_payload,
+                    )
+                else:
+                    result = await self.store.materialize_remote_terminal_reminder(
+                        reminder_id=remote.reminder_id,
+                        occurrence_id=remote.occurrence_id,
+                        intended_at_ms=remote.intended_at_ms,
+                        lifecycle=remote.lifecycle,
+                        lifecycle_at_ms=remote.lifecycle_at_ms,
+                        revision=remote.revision,
+                        payload_format=remote.payload_format,
+                    )
                 if result.changed:
                     changed += 1
                 if result.conflict:
@@ -628,9 +653,10 @@ class ReminderSync:
             self.scheduler.signal()
         return changed
 
-    async def run(self) -> None:
+    async def run(self, *, request_snapshot_on_start: bool = True) -> None:
         """Own the bounded background cadence; never own provider turns."""
-        self.signal_snapshot()
+        if request_snapshot_on_start:
+            self.signal_snapshot()
         while not self._stopping:
             reconciliation_completed = False
             if self._snapshot_requested:

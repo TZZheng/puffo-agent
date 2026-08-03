@@ -133,6 +133,26 @@ def _remote_row(
     }
 
 
+def _terminal_row(
+    *,
+    reminder_id: str,
+    occurrence_id: str,
+    intended_at_ms: int = 1_000,
+    lifecycle: str = "delivered",
+    lifecycle_at_ms: int = 1_500,
+    revision: int = 2,
+) -> dict[str, object]:
+    return {
+        "occurrence_id": occurrence_id,
+        "revision": revision,
+        "reminder_id": reminder_id,
+        "due_at": reminder_time_to_rfc3339(intended_at_ms),
+        "lifecycle": lifecycle,
+        "lifecycle_at": reminder_time_to_rfc3339(lifecycle_at_ms),
+        "payload_format": REMINDER_PAYLOAD_FORMAT,
+    }
+
+
 def _sync(
     tmp_path,
     transport: object,
@@ -754,6 +774,39 @@ async def test_snapshot_reconstruct_duplicate_restart_overdue_once(tmp_path):
     ]
     assert wakes == ["wake"]
     await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_snapshot_suppresses_stale_local_schedule_without_event(tmp_path):
+    transport = _RecordingTransport()
+    now = [2_000]
+    sync, store, scheduler, _keys = _sync(tmp_path, transport, now=now)
+    reminder = await store.create_reminder(
+        reminder_id="reminder-stale-replica",
+        occurrence_id="occurrence-stale-replica",
+        target="dm:peer-a",
+        content="must not fire on the stale replica",
+        intended_at_ms=1_000,
+        created_at_ms=500,
+    )
+    assert await sync.upload_pending_once() == 1
+    transport.rows = [_terminal_row(
+        reminder_id=reminder.reminder_id,
+        occurrence_id=reminder.occurrence_id,
+    )]
+
+    assert await sync.reconcile_snapshot() == 1
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None
+    assert (record.state, record.revision, record.server_ack_revision) == (
+        "delivered", 2, 2,
+    )
+    assert await scheduler.process_due_once() == ()
+    assert await store.get_message_by_envelope(
+        f"reminder-occurrence:{reminder.occurrence_id}"
+    ) is None
+    assert await sync.reconcile_snapshot() == 0
+    await store.close()
 
 
 @pytest.mark.asyncio

@@ -831,7 +831,7 @@ class GlobalInboxRuntime:
     ) -> dict[str, object]:
         """Create local reminder intent without introducing provider policy."""
         return await self.reminder_scheduler.create_reminder(
-            content=content, target=target, intended_at=intended,
+            content=content, target=target, intended_at=intended_at,
         )
 
     async def list_reminders(
