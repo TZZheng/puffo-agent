@@ -16,7 +16,7 @@ Contract:
     entry; rejects host-local commands.
   * uninstall_mcp_server only touches project scope; system MCPs in
     ~/.claude.json can't be removed from here.
-  * refresh.flag payload carries an optional model override.
+  * daemon refresh payloads carry model/runtime/inference overrides.
 """
 
 from __future__ import annotations
@@ -525,6 +525,20 @@ def test_write_refresh_model_flag_carries_harness_and_model(tmp_path):
     assert payload["harness"] == "codex"
     assert payload["model"] == "gpt-5"
     assert isinstance(payload["requested_at"], int)
+
+
+def test_write_refresh_model_flag_carries_inference_level(tmp_path):
+    path = _write_refresh_model_flag(
+        tmp_path,
+        harness="",
+        model="",
+        inference_level="high",
+    )
+
+    payload = json.loads(path.read_text())
+    assert payload["harness"] == ""
+    assert payload["model"] == ""
+    assert payload["inference_level"] == "high"
 
 
 def test_write_refresh_runtime_flag_kind_only(tmp_path):

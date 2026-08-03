@@ -1081,14 +1081,19 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if args.sandbox is not None:
         cfg.runtime.sandbox = args.sandbox
         touched = True
+    inference_level_cleared = False
     if args.harness is not None:
         cfg.runtime.harness = args.harness
         touched = True
-    if args.inference_level is not None:
+    if args.inference_level is not None or args.harness is not None:
         from ..mcp.config import supported_inference_levels
 
         levels = supported_inference_levels(cfg.runtime.harness)
-        if args.inference_level and args.inference_level not in levels:
+        if (
+            args.inference_level is not None
+            and args.inference_level
+            and args.inference_level not in levels
+        ):
             print(
                 f"error: inference level {args.inference_level!r} is not "
                 f"supported by {cfg.runtime.harness!r}; expected one of "
@@ -1096,8 +1101,15 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 2
-        cfg.runtime.inference_level = args.inference_level
-        touched = True
+        if args.inference_level is not None:
+            cfg.runtime.inference_level = args.inference_level
+            touched = True
+        elif (
+            cfg.runtime.inference_level
+            and cfg.runtime.inference_level not in levels
+        ):
+            cfg.runtime.inference_level = ""
+            inference_level_cleared = True
     if args.max_turns is not None:
         if args.max_turns < 1:
             print("error: --max-turns must be >= 1", file=sys.stderr)
@@ -1135,6 +1147,10 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     print(f"  kind={cfg.runtime.kind} model={cfg.runtime.model or '(default)'}")
     if cfg.runtime.inference_level:
         print(f"  inference_level={cfg.runtime.inference_level}")
+    elif inference_level_cleared:
+        print(
+            "  inference_level=(harness default; incompatible prior value cleared)"
+        )
     if cfg.runtime.allowed_tools:
         print(f"  allowed_tools={cfg.runtime.allowed_tools}")
     if cfg.runtime.docker_image:

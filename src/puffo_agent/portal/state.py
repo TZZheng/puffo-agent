@@ -986,9 +986,10 @@ class PuffoCoreConfig:
 class RuntimeConfig:
     """Contents of the ``runtime:`` block in agent.yml.
 
-    Three orthogonal knobs (see ``portal/runtime_matrix.py``):
+    Four orthogonal knobs (see ``portal/runtime_matrix.py``):
     ``kind`` (where), ``provider`` (who), ``harness`` (what engine,
-    CLI kinds only). Empty strings on ``provider`` / ``model`` /
+    CLI kinds only), and ``inference_level`` (provider reasoning effort).
+    Empty strings on ``provider`` / ``model`` / ``inference_level`` /
     ``api_key`` mean "inherit from daemon defaults".
     """
     kind: str = "chat-local"      # chat-local | sdk-local | cli-local | cli-docker
@@ -1093,6 +1094,21 @@ class AgentConfig:
         )
         provider = rt.get("provider", "")
         harness = rt.get("harness", "claude-code")
+        inference_level = rt.get("inference_level", "") or ""
+        if not isinstance(inference_level, str):
+            raise RuntimeError(
+                f"agent {agent_id!r}: runtime.inference_level must be a string"
+            )
+        if inference_level:
+            from ..mcp.config import supported_inference_levels
+
+            levels = supported_inference_levels(harness)
+            if inference_level not in levels:
+                raise RuntimeError(
+                    f"agent {agent_id!r}: inference_level={inference_level!r} "
+                    f"is not supported by harness={harness!r}; expected one "
+                    f"of {list(levels)}"
+                )
 
         # Fail fast on invalid triples (e.g. gemini-cli + anthropic,
         # or reserved kind=cli-sandbox).
@@ -1141,7 +1157,7 @@ class AgentConfig:
                 kind=kind,
                 provider=provider,
                 model=rt.get("model", ""),
-                inference_level=rt.get("inference_level", ""),
+                inference_level=inference_level,
                 api_key=rt.get("api_key", ""),
                 llm_base_url=rt.get("llm_base_url", ""),
                 allowed_tools=list(rt.get("allowed_tools") or []),

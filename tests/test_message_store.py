@@ -515,7 +515,6 @@ async def test_equal_timestamp_envelope_cursor_pages_both_directions(tmp_path):
         assert list(reversed(thread_backward)) == thread_forward
     finally:
         await store.close()
-    await store.close()
 
 
 @pytest.mark.asyncio

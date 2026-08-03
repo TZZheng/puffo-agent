@@ -15,6 +15,7 @@ that needs a live hermes install and is covered in the smoke suite.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -190,6 +191,20 @@ def test_refresh_default_writes_refresh_agent_flag(tmp_path):
     assert (
         Path(workspace) / ".puffo-agent" / "refresh_agent.flag"
     ).exists()
+
+
+def test_refresh_inference_level_writes_daemon_request(tmp_path):
+    server, workspace = _build_mcp_with_harness("codex", tmp_path=tmp_path)
+
+    out = _call_tool(server, "refresh", inference_level="medium")
+
+    assert "inference_level='medium'" in out
+    payload = json.loads(
+        (tmp_path / ".puffo-agent" / "refresh_model.flag").read_text()
+    )
+    assert payload["harness"] == ""
+    assert payload["model"] == ""
+    assert payload["inference_level"] == "medium"
 
 
 def test_install_mcp_server_blocked_under_hermes():

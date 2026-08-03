@@ -835,8 +835,9 @@ def _mark_flag_broken(flag_path: Path, reason: str) -> None:
 
 def _process_daemon_refresh_flags(agent_id: str) -> None:
     """Consume ``refresh_model.flag`` + ``refresh_runtime.flag``:
-    validate payload, mutate agent.yml, ``.broken``-rename on
-    failure. Respawn is left to the config-changed check."""
+    validate model, harness, provider, and inference-level agreement;
+    mutate agent.yml; ``.broken``-rename invalid requests. Respawn is
+    left to the config-changed check."""
     import json
     try:
         agent_cfg = AgentConfig.load(agent_id)
@@ -854,7 +855,29 @@ def _process_daemon_refresh_flags(agent_id: str) -> None:
             payload = json.loads(model_flag.read_text(encoding="utf-8") or "{}")
             harness = str(payload.get("harness") or "")
             model = str(payload.get("model") or "")
-            _validate_daemon_refresh_model(harness, model)
+            has_model_swap = bool(harness or model)
+            if bool(harness) != bool(model):
+                raise ValueError("harness and model must be provided together")
+            has_inference_level = "inference_level" in payload
+            inference_level = payload.get("inference_level")
+            if not has_model_swap and not has_inference_level:
+                raise ValueError("refresh_model.flag contains no requested change")
+            if has_model_swap:
+                _validate_daemon_refresh_model(harness, model)
+            effective_harness = (
+                harness if has_model_swap else agent_cfg.runtime.harness
+            )
+            if has_inference_level:
+                if not isinstance(inference_level, str) or not inference_level:
+                    raise ValueError("inference_level must be a non-empty string")
+                from ..mcp.config import supported_inference_levels
+
+                levels = supported_inference_levels(effective_harness)
+                if inference_level not in levels:
+                    raise ValueError(
+                        f"inference_level={inference_level!r} not supported by "
+                        f"harness={effective_harness!r}; expected one of {list(levels)}"
+                    )
         except Exception as exc:
             logger.warning(
                 "agent %s: refresh_model.flag invalid (%s); marking broken",
@@ -862,13 +885,36 @@ def _process_daemon_refresh_flags(agent_id: str) -> None:
             )
             _mark_flag_broken(model_flag, str(exc))
         else:
-            agent_cfg.runtime.harness = harness
-            agent_cfg.runtime.model = model
+            if has_model_swap:
+                agent_cfg.runtime.harness = harness
+                agent_cfg.runtime.model = model
+                from .runtime_matrix import HARNESS_PROVIDERS
+
+                providers = HARNESS_PROVIDERS.get(harness, frozenset())
+                if len(providers) != 1:
+                    raise RuntimeError(
+                        f"refresh cannot infer a unique provider for harness={harness!r}"
+                    )
+                agent_cfg.runtime.provider = next(iter(providers))
+            if has_inference_level:
+                agent_cfg.runtime.inference_level = inference_level
+            elif has_model_swap and agent_cfg.runtime.inference_level:
+                from ..mcp.config import supported_inference_levels
+
+                if (
+                    agent_cfg.runtime.inference_level
+                    not in supported_inference_levels(harness)
+                ):
+                    agent_cfg.runtime.inference_level = ""
             try:
                 agent_cfg.save()
                 logger.info(
-                    "agent %s: refresh_model applied (harness=%r model=%r)",
-                    agent_id, harness, model,
+                    "agent %s: refresh_model applied (provider=%r harness=%r "
+                    "model=%r inference_level=%r)",
+                    agent_id, agent_cfg.runtime.provider,
+                    agent_cfg.runtime.harness,
+                    agent_cfg.runtime.model,
+                    agent_cfg.runtime.inference_level,
                 )
             except Exception as exc:
                 logger.warning(
@@ -914,6 +960,14 @@ def _process_daemon_refresh_flags(agent_id: str) -> None:
             agent_cfg.runtime.kind = kind
             if new_harness is not None:
                 agent_cfg.runtime.harness = str(new_harness)
+                if agent_cfg.runtime.inference_level:
+                    from ..mcp.config import supported_inference_levels
+
+                    if (
+                        agent_cfg.runtime.inference_level
+                        not in supported_inference_levels(agent_cfg.runtime.harness)
+                    ):
+                        agent_cfg.runtime.inference_level = ""
             if new_provider is not None:
                 agent_cfg.runtime.provider = str(new_provider)
             if new_model is not None:

@@ -188,7 +188,7 @@ def _register_local_tools(
                 ws,
                 harness=harness or "",
                 model=model or "",
-                inference_level=inference_level or "",
+                inference_level=inference_level,
             )
             parts: list[str] = []
             if harness is not None:

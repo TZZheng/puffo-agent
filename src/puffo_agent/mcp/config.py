@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 MCP_SERVER_NAME = "puffo"
 
-# Web enum superset; per-harness narrowing at emit.
+# Claude Code reasoning-effort values.
 INFERENCE_LEVELS = ("low", "medium", "high", "xhigh")
 
 # codex model_reasoning_effort values.
@@ -32,12 +32,12 @@ REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 
 
 def supported_inference_levels(harness: str) -> tuple[str, ...]:
-    """Reasoning-effort values a harness accepts; unknown → the union."""
+    """Reasoning-effort values implemented by a specific harness."""
     if harness == "codex":
         return REASONING_EFFORTS
     if harness == "claude-code":
         return INFERENCE_LEVELS
-    return tuple(dict.fromkeys(INFERENCE_LEVELS + REASONING_EFFORTS))
+    return ()
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
