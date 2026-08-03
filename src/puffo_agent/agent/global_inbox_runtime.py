@@ -43,6 +43,7 @@ from .message_store import (
 )
 from ._logging import log_runtime_event
 from .message_projection import format_message_group
+from .reminder_scheduler import ReminderScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -749,6 +750,7 @@ class GlobalInboxRuntime:
         agent_id: str = "",
         notice_delivery: InboxNoticeDelivery | None = None,
         runtime_event_outbox: Any | None = None,
+        reminder_scheduler: ReminderScheduler | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -771,7 +773,7 @@ class GlobalInboxRuntime:
         self._boundary = asyncio.Lock()
         self._stopping = False
         self._degraded = False
-        self._defer_requeued_resume = False
+        self._defer_requeued_recovery = False
         self.max_context_decisions = max_context_decisions
         self.max_api_retries = max_api_retries
         self.retry_sleep = retry_sleep
@@ -788,6 +790,9 @@ class GlobalInboxRuntime:
             NoticeDeliveryCapability.NEXT_TURN
         )
         self.runtime_event_outbox = runtime_event_outbox
+        self.reminder_scheduler = reminder_scheduler or ReminderScheduler(
+            store=store, notify=self.notify,
+        )
         self.send_delegate: TrackingSendDelegate | None = None
         self.held_recovery_source = HeldRecoverySource(
             self,
@@ -820,6 +825,26 @@ class GlobalInboxRuntime:
     def notify(self) -> None:
         self._degraded = False
         self.coalescer.notify()
+
+    async def create_reminder(
+        self, *, content: str, target: str, intended_at: str,
+    ) -> dict[str, object]:
+        """Create local reminder intent without introducing provider policy."""
+        return await self.reminder_scheduler.create_reminder(
+            content=content, target=target, intended_at=intended,
+        )
+
+    async def list_reminders(
+        self, *, state: str = "", limit: int = 50,
+    ) -> dict[str, object]:
+        return await self.reminder_scheduler.list_reminders(
+            state=state, limit=limit,
+        )
+
+    async def cancel_reminder(self, *, reminder_id: str) -> dict[str, object]:
+        return await self.reminder_scheduler.cancel_reminder(
+            reminder_id=reminder_id,
+        )
 
     def notify_delivery(self) -> None:
         self.held_recovery_source.notify_delivery()
@@ -1578,30 +1603,58 @@ class GlobalInboxRuntime:
         }
 
     async def run(self) -> None:
-        await self.recover_current_turn()
-        await self.recover_orphaned_turns()
-        if self._defer_requeued_resume:
-            # Consume the recovery wake without immediately feeding the same
-            # failed durable union through the initial-turn path.
-            await self.coalescer.wait_for_burst()
-        elif await self.store.get_pending(limit=1):
-            notice = await self.store.get_notice_state()
-            if notice.is_due_for(self.adapter.get_provider_session_id()):
-                remaining = (
-                    max(
-                        0.0,
-                        (notice.first_pending_deadline_ms - int(time.time() * 1000))
-                        / 1000,
+        reminder_task = asyncio.create_task(self.reminder_scheduler.run())
+        try:
+            await self.recover_current_turn()
+            await self.recover_orphaned_turns()
+            if self._defer_requeued_recovery:
+                # Consume the recovery wake without immediately feeding the same
+                # failed durable union through the initial-turn path.
+                await self.coalescer.wait_for_burst()
+            elif await self.store.get_pending(limit=1):
+                notice = await self.store.get_notice_state()
+                if notice.is_due_for(self.adapter.get_provider_session_id()):
+                    remaining = (
+                        max(
+                            0.0,
+                            (notice.first_pending_deadline_ms - int(time.time() * 1000))
+                            / 1000,
+                        )
+                        if notice.first_pending_deadline_ms is not None
+                        else 0.0
                     )
-                    if notice.first_pending_deadline_ms is not None
-                    else 0.0
+                    self.coalescer.notify(delay_seconds=remaining)
+            while not self._stopping:
+                burst_task = asyncio.create_task(self.coalescer.wait_for_burst())
+                done, _pending = await asyncio.wait(
+                    {burst_task, reminder_task},
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-                self.coalescer.notify(delay_seconds=remaining)
-        while not self._stopping:
-            await self.coalescer.wait_for_burst()
-            if self._stopping:
-                break
-            await self.process_once()
+                if reminder_task in done:
+                    if not burst_task.done():
+                        burst_task.cancel()
+                        try:
+                            await burst_task
+                        except asyncio.CancelledError:
+                            pass
+                    # A scheduler error is an owning-runtime error, never a
+                    # silently disabled timer loop.
+                    await reminder_task
+                    if self._stopping:
+                        return
+                    raise RuntimeError("reminder scheduler exited unexpectedly")
+                await burst_task
+                if self._stopping:
+                    break
+                await self.process_once()
+        finally:
+            self.reminder_scheduler.stop()
+            if not reminder_task.done():
+                reminder_task.cancel()
+            try:
+                await reminder_task
+            except asyncio.CancelledError:
+                pass
 
     async def recover_orphaned_turns(self) -> int:
         """Requeue active DB Turns left without a resumable crash join."""
@@ -1634,6 +1687,7 @@ class GlobalInboxRuntime:
 
     def stop(self) -> None:
         self._stopping = True
+        self.reminder_scheduler.stop()
         self.coalescer.notify()
 
     def _target_summary(
@@ -2411,7 +2465,7 @@ class GlobalInboxRuntime:
             diagnostic: str,
             state: str = "degraded",
             *,
-            defer_requeued_resume: bool = False,
+            defer_requeued_recovery: bool = False,
         ) -> bool:
             requeued = False
             if run is not None and durable_ids:
@@ -2515,7 +2569,7 @@ class GlobalInboxRuntime:
                 )
                 requeued = True
             self.health = RuntimeHealth(state, diagnostic)
-            self._defer_requeued_resume = defer_requeued_resume and requeued
+            self._defer_requeued_recovery = defer_requeued_recovery and requeued
             self._clear_terminal_turn()
             if requeued:
                 self.notify()
@@ -2598,7 +2652,7 @@ class GlobalInboxRuntime:
         self.health = RuntimeHealth("in_progress", "resuming durable crash join")
         if not hasattr(self.run_turn, "handle_global_inbox_retry"):
             return await unwind(
-                "crash resume retry unavailable", defer_requeued_resume=True
+                "crash recovery retry unavailable", defer_requeued_recovery=True
             )
         try:
             retries = 0
@@ -2618,18 +2672,18 @@ class GlobalInboxRuntime:
                         return await unwind(
                             "crash resume auth failure",
                             "auth_failed",
-                            defer_requeued_resume=True,
+                            defer_requeued_recovery=True,
                         )
                     if not isinstance(exc, AgentAPIError):
                         return await unwind(
                             f"crash resume unsafe failure: {type(exc).__name__}",
-                            defer_requeued_resume=True,
+                            defer_requeued_recovery=True,
                         )
                     if retries >= self.max_api_retries:
                         return await unwind(
                             "crash resume retry budget exhausted",
                             "api_error_abandoned",
-                            defer_requeued_resume=True,
+                            defer_requeued_recovery=True,
                         )
                     retries += 1
                     await self.retry_sleep(min(2 ** (retries - 1), 4))
@@ -2679,5 +2733,5 @@ class GlobalInboxRuntime:
         except Exception as exc:
             return await unwind(
                 f"crash resume terminal failure: {type(exc).__name__}",
-                defer_requeued_resume=True,
+                defer_requeued_recovery=True,
             )

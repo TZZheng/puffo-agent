@@ -57,6 +57,36 @@ def _dm_payload(envelope_id: str, sender: str, recipient: str, sent_at: int | No
 
 
 @pytest.mark.asyncio
+async def test_due_reminder_occurrence_is_delivered_once_across_duplicate_ticks():
+    """A durable due occurrence has one local Inbox event across duplicate ticks."""
+    store = _temp_store()
+    reminder = await store.create_reminder(
+        content="review the launch notes",
+        target="channel:sp_1:ch_1",
+        intended_at_ms=1_000,
+    )
+
+    await asyncio.gather(
+        store.deliver_due_reminders(now_ms=2_000),
+        store.deliver_due_reminders(now_ms=2_000),
+    )
+
+    event_id = f"reminder-occurrence:{reminder.occurrence_id}"
+    pending = await store.get_pending()
+    assert [item.envelope_id for item in pending] == [event_id]
+    delivered = await store.get_reminder(reminder.reminder_id)
+    assert delivered is not None and delivered.state == "delivered"
+    assert delivered.delivered_event_id == event_id
+
+    await store.deliver_due_reminders(now_ms=3_000)
+    await store.close()
+    await store.open()
+    assert [item.envelope_id for item in await store.get_pending()] == [event_id]
+    assert (await store.get_reminder(reminder.reminder_id)).state == "delivered"
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_open_initializes_once():
     store = _temp_store()
 
@@ -1719,4 +1749,212 @@ async def test_inbox_page_traverses_more_than_fifty_with_complete_metadata(tmp_p
     assert ids == [f"deep-{seq:03d}" for seq in range(1, 74)]
     assert remaining == [56, 39, 22, 5, 0]
     assert len(await store.get_pending()) == 73
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reminder_schema_migrates_additively_without_changing_existing_inbox(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "pre-reminder.db"
+    store = MessageStore(path, now_ms=lambda: 1_000)
+    await store.store_receipt(
+        _channel_payload("server-before", sent_at=1),
+        server_seq=1,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    await store.store_local_event(
+        _channel_payload("local-before", sent_at=2), reason="test",
+    )
+    await store.start_turn(turn_id="empty-turn", provider_session_id="provider")
+    notice_before = await store.get_notice_state()
+    await store.close()
+
+    # Simulate the exact pre-slice file: all existing Inbox tables/data stay,
+    # only the additive reminder table is absent.
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TABLE reminder_occurrences")
+    connection.commit()
+    connection.close()
+
+    reopened = MessageStore(path, now_ms=lambda: 2_000)
+    await reopened.open()
+    db = await reopened._ensure_db()
+    async with db.execute("PRAGMA table_info(reminder_occurrences)") as cursor:
+        columns = {row["name"] for row in await cursor.fetchall()}
+    assert columns == {
+        "reminder_id", "occurrence_id", "target", "content", "intended_at_ms",
+        "state", "created_at_ms", "claimed_at_ms", "actual_fire_at_ms",
+        "cancelled_at_ms", "delivered_at_ms", "delivered_event_id",
+    }
+    async with db.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'reminder_occurrences'"
+    ) as cursor:
+        schema = (await cursor.fetchone())["sql"]
+    assert "'scheduled','claimed','cancelled','delivered'" in schema.replace(" ", "")
+    assert [item.envelope_id for item in await reopened.get_pending()] == [
+        "server-before", "local-before",
+    ]
+    assert await reopened.get_notice_state() == notice_before
+    run = await reopened.get_turn_run("empty-turn")
+    assert run is not None and run.state == ProcessingState.IN_TURN.value
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_reminder_identity_projection_order_and_reopen_are_stable(tmp_path):
+    now = [1_000]
+    path = tmp_path / "reminders.db"
+    store = MessageStore(path, now_ms=lambda: now[0])
+    later = await store.create_reminder(
+        content="later exact text",
+        target="channel:sp_1:ch_1:thread:root_1",
+        intended_at_ms=5_000,
+    )
+    earlier = await store.create_reminder(
+        content="earlier exact text",
+        target="dm:peer_1",
+        intended_at_ms=2_000,
+    )
+    assert later.reminder_id and later.occurrence_id
+    assert later.reminder_id != later.occurrence_id
+    assert earlier.reminder_id != earlier.occurrence_id
+    listed = await store.list_reminders(limit=50)
+    assert [item.reminder_id for item in listed] == [
+        earlier.reminder_id, later.reminder_id,
+    ]
+    assert later.as_dict() == {
+        "reminder_id": later.reminder_id,
+        "occurrence_id": later.occurrence_id,
+        "state": "scheduled",
+        "target": "channel:sp_1:ch_1:thread:root_1",
+        "content": "later exact text",
+        "intended_at": "1970-01-01T00:00:05.000Z",
+        "actual_fire_at": None,
+        "created_at": "1970-01-01T00:00:01.000Z",
+        "cancelled_at": None,
+        "delivered_at": None,
+    }
+    await store.close()
+
+    reopened = MessageStore(path, now_ms=lambda: now[0])
+    restored = await reopened.get_reminder(later.reminder_id)
+    assert restored == later
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_reminder_restart_boundaries_and_cancellation_are_atomic(tmp_path, monkeypatch):
+    now = [1_000]
+    path = tmp_path / "reminder-boundaries.db"
+    store = MessageStore(path, now_ms=lambda: now[0])
+    scheduled = await store.create_reminder(
+        content="scheduled", target="channel:sp:ch", intended_at_ms=2_000,
+    )
+    claimed = await store.create_reminder(
+        content="claimed", target="channel:sp:ch", intended_at_ms=1_000,
+    )
+    assert [item.reminder_id for item in await store.claim_due_reminders(now_ms=1_000)] == [
+        claimed.reminder_id
+    ]
+    await store.close()
+
+    reopened = MessageStore(path, now_ms=lambda: 3_000)
+    # A scheduled and a previously claimed occurrence both recover to one
+    # durable event, never a second intent/occurrence.
+    recovered = await reopened.deliver_due_reminders(now_ms=3_000)
+    assert {item.reminder_id for item in recovered} == {
+        scheduled.reminder_id, claimed.reminder_id,
+    }
+    assert len(await reopened.get_pending()) == 2
+
+    rollback = await reopened.create_reminder(
+        content="rollback", target="channel:sp:ch", intended_at_ms=1,
+    )
+    original_insert = reopened._insert_local_event_in_transaction
+
+    async def fail_insert(*_args, **_kwargs):
+        raise RuntimeError("injected reminder delivery rollback")
+
+    monkeypatch.setattr(reopened, "_insert_local_event_in_transaction", fail_insert)
+    with pytest.raises(RuntimeError, match="rollback"):
+        await reopened.deliver_due_reminders(now_ms=3_000)
+    incomplete = await reopened.get_reminder(rollback.reminder_id)
+    assert incomplete is not None and incomplete.state == "claimed"
+    assert await reopened.get_message_by_envelope(
+        f"reminder-occurrence:{rollback.occurrence_id}"
+    ) is None
+    monkeypatch.setattr(reopened, "_insert_local_event_in_transaction", original_insert)
+    await reopened.close()
+
+    # The interrupted transaction leaves a recoverable claimed fact on disk,
+    # not a partial Inbox event. Recovery after a real reopen owns delivery.
+    reopened = MessageStore(path, now_ms=lambda: 3_001)
+    incomplete = await reopened.get_reminder(rollback.reminder_id)
+    assert incomplete is not None and incomplete.state == "claimed"
+    assert await reopened.get_message_by_envelope(
+        f"reminder-occurrence:{rollback.occurrence_id}"
+    ) is None
+    assert [item.reminder_id for item in await reopened.deliver_due_reminders(now_ms=3_001)] == [
+        rollback.reminder_id
+    ]
+
+    cancelled = await reopened.create_reminder(
+        content="cancel", target="channel:sp:ch", intended_at_ms=4_000,
+    )
+    first_cancel = await reopened.cancel_reminder(cancelled.reminder_id, cancelled_at_ms=3_100)
+    second_cancel = await reopened.cancel_reminder(cancelled.reminder_id, cancelled_at_ms=3_200)
+    assert first_cancel.state == second_cancel.state == "cancelled"
+    assert second_cancel.cancelled_at_ms == 3_100
+    assert not await reopened.deliver_due_reminders(now_ms=5_000)
+    assert await reopened.get_message_by_envelope(
+        f"reminder-occurrence:{cancelled.occurrence_id}"
+    ) is None
+
+    claimed_cancel = await reopened.create_reminder(
+        content="claimed cancel", target="channel:sp:ch", intended_at_ms=1,
+    )
+    await reopened.claim_due_reminders(now_ms=3_500)
+    claimed_cancelled = await reopened.cancel_reminder(claimed_cancel.reminder_id)
+    assert claimed_cancelled.state == "cancelled"
+    assert not await reopened.deliver_due_reminders(now_ms=5_000)
+    assert await reopened.get_message_by_envelope(
+        f"reminder-occurrence:{claimed_cancel.occurrence_id}"
+    ) is None
+
+    delivered = await reopened.create_reminder(
+        content="history stays", target="channel:sp:ch", intended_at_ms=1,
+    )
+    await reopened.deliver_due_reminders(now_ms=5_000)
+    after_delivery_cancel = await reopened.cancel_reminder(delivered.reminder_id)
+    assert after_delivery_cancel.state == "delivered"
+    assert await reopened.get_message_by_envelope(
+        f"reminder-occurrence:{delivered.occurrence_id}"
+    ) is not None
+    await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_claimed_cancel_delivery_race_serializes_to_one_valid_terminal_state():
+    store = _temp_store()
+    reminder = await store.create_reminder(
+        content="race", target="channel:sp:ch", intended_at_ms=1,
+    )
+    await store.claim_due_reminders(now_ms=1)
+    cancel, delivered = await asyncio.gather(
+        store.cancel_reminder(reminder.reminder_id, cancelled_at_ms=2),
+        store.deliver_due_reminders(now_ms=2),
+    )
+    terminal = await store.get_reminder(reminder.reminder_id)
+    assert terminal is not None
+    event = await store.get_message_by_envelope(
+        f"reminder-occurrence:{reminder.occurrence_id}"
+    )
+    if terminal.state == "cancelled":
+        assert event is None and delivered == () and cancel.state == "cancelled"
+    else:
+        assert terminal.state == "delivered" and event is not None
+        assert cancel.state == "delivered"
     await store.close()

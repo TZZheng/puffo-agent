@@ -628,6 +628,64 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         return result
 
     @mcp.tool()
+    async def create_reminder(
+        content: str,
+        target: str,
+        intended_at: str,
+    ) -> dict[str, Any]:
+        """Create one durable local reminder for a canonical Inbox target.
+
+        ``intended_at`` is an explicit-offset RFC3339 timestamp. The result
+        is a provider-neutral reminder object; a due occurrence enters the
+        ordinary durable Inbox and leaves any action decision to the model.
+        """
+        runtime = getattr(cfg, "inbox_runtime", None)
+        if runtime is None:
+            runtime = getattr(
+                getattr(cfg, "message_client", None), "global_runtime", None,
+            )
+        if runtime is not None:
+            return await runtime.create_reminder(
+                content=content, target=target, intended_at=intended_at,
+            )
+        if cfg.rpc_client is not None:
+            return await cfg.rpc_client.create_reminder(
+                content=content, target=target, intended_at=intended_at,
+            )
+        raise RuntimeError("global Inbox runtime is unavailable")
+
+    @mcp.tool()
+    async def list_reminders(
+        state: str = "",
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List locally durable one-shot reminders in intended-time order."""
+        runtime = getattr(cfg, "inbox_runtime", None)
+        if runtime is None:
+            runtime = getattr(
+                getattr(cfg, "message_client", None), "global_runtime", None,
+            )
+        if runtime is not None:
+            return await runtime.list_reminders(state=state, limit=limit)
+        if cfg.rpc_client is not None:
+            return await cfg.rpc_client.list_reminders(state=state, limit=limit)
+        raise RuntimeError("global Inbox runtime is unavailable")
+
+    @mcp.tool()
+    async def cancel_reminder(reminder_id: str) -> dict[str, Any]:
+        """Idempotently cancel a local reminder that has not delivered."""
+        runtime = getattr(cfg, "inbox_runtime", None)
+        if runtime is None:
+            runtime = getattr(
+                getattr(cfg, "message_client", None), "global_runtime", None,
+            )
+        if runtime is not None:
+            return await runtime.cancel_reminder(reminder_id=reminder_id)
+        if cfg.rpc_client is not None:
+            return await cfg.rpc_client.cancel_reminder(reminder_id=reminder_id)
+        raise RuntimeError("global Inbox runtime is unavailable")
+
+    @mcp.tool()
     async def whoami() -> str:
         """Return your own identity: display name, slug, device_id, and
         subkey info."""

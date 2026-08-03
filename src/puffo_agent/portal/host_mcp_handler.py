@@ -606,6 +606,45 @@ async def read_inbox(
     )
 
 
+async def create_reminder(
+    ctx: HostMcpContext,
+    *,
+    content: str,
+    target: str,
+    intended_at: str,
+) -> dict[str, object]:
+    """Resolve reminder creation against the warm worker's one Inbox runtime."""
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global Inbox runtime is unavailable")
+    return await runtime.create_reminder(
+        content=content, target=target, intended_at=intended_at,
+    )
+
+
+async def list_reminders(
+    ctx: HostMcpContext,
+    *,
+    state: str = "",
+    limit: int = 50,
+) -> dict[str, object]:
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global Inbox runtime is unavailable")
+    return await runtime.list_reminders(state=state, limit=limit)
+
+
+async def cancel_reminder(
+    ctx: HostMcpContext,
+    *,
+    reminder_id: str,
+) -> dict[str, object]:
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global Inbox runtime is unavailable")
+    return await runtime.cancel_reminder(reminder_id=reminder_id)
+
+
 async def request_command_permission(
     ctx: HostMcpContext,
     *,

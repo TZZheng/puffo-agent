@@ -1,0 +1,142 @@
+"""Provider-neutral durable timer service for one-shot local reminders."""
+from __future__ import annotations
+
+import asyncio
+import re
+import time
+from datetime import datetime, timezone
+from typing import Awaitable, Callable
+
+from .message_store import (
+    MAX_REMINDER_LIST_LIMIT,
+    REMINDER_STATES,
+    MessageStore,
+    ReminderOccurrence,
+    reminder_time_to_rfc3339,
+)
+
+
+_RFC3339_OFFSET = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def normalize_reminder_timestamp(value: str) -> tuple[int, str]:
+    """Parse an explicit-offset RFC3339 value and return canonical UTC data."""
+    if not isinstance(value, str) or not _RFC3339_OFFSET.fullmatch(value):
+        raise ValueError("intended_at must be a non-empty RFC3339 timestamp")
+    source = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(source)
+    except ValueError as exc:
+        raise ValueError("intended_at must be RFC3339 with an explicit UTC offset") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("intended_at must include an explicit UTC offset")
+    utc = parsed.astimezone(timezone.utc)
+    milliseconds = int(utc.timestamp() * 1000)
+    return milliseconds, reminder_time_to_rfc3339(milliseconds)
+
+
+class ReminderScheduler:
+    """Wake only around the next durable local reminder deadline.
+
+    The scheduler has no model/provider policy.  It commits a structured
+    local Inbox event through ``MessageStore`` and then uses the same runtime
+    ``notify`` seam as an incoming message.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: MessageStore,
+        notify: Callable[[], None],
+        now_ms: Callable[[], int] = _now_ms,
+        wait_for_change: Callable[[asyncio.Event, float | None], Awaitable[None]] | None = None,
+    ) -> None:
+        self.store = store
+        self._notify = notify
+        self._now_ms = now_ms
+        self._wait_for_change = wait_for_change
+        self._wakeup = asyncio.Event()
+        self._stopping = False
+
+    def signal(self) -> None:
+        """Recompute the durable deadline after a create or cancellation."""
+        self._wakeup.set()
+
+    def stop(self) -> None:
+        """Idempotently end a pending wait without owning a worker task."""
+        self._stopping = True
+        self._wakeup.set()
+
+    async def create_reminder(
+        self, *, content: str, target: str, intended_at: str,
+    ) -> dict[str, object]:
+        intended_at_ms, _canonical = normalize_reminder_timestamp(intended_at)
+        reminder = await self.store.create_reminder(
+            content=content,
+            target=target,
+            intended_at_ms=intended_at_ms,
+        )
+        self.signal()
+        return reminder.as_dict()
+
+    async def list_reminders(
+        self, *, state: str = "", limit: int = 50,
+    ) -> dict[str, object]:
+        if not isinstance(state, str) or (state and state not in REMINDER_STATES):
+            raise ValueError("state must be empty or one of scheduled, claimed, cancelled, delivered")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_REMINDER_LIST_LIMIT:
+            raise ValueError(
+                f"limit must be between 1 and {MAX_REMINDER_LIST_LIMIT}"
+            )
+        reminders = await self.store.list_reminders(state=state, limit=limit)
+        return {"reminders": [item.as_dict() for item in reminders]}
+
+    async def cancel_reminder(self, *, reminder_id: str) -> dict[str, object]:
+        reminder = await self.store.cancel_reminder(reminder_id)
+        self.signal()
+        return reminder.as_dict()
+
+    async def process_due_once(self) -> tuple[ReminderOccurrence, ...]:
+        """Deliver due or restart-recovered claims and wake after each commit set."""
+        delivered = await self.store.deliver_due_reminders(now_ms=int(self._now_ms()))
+        for _occurrence in delivered:
+            self._notify()
+        return delivered
+
+    async def _wait_until_changed_or_due(self, deadline_ms: int | None) -> None:
+        if self._wakeup.is_set():
+            self._wakeup.clear()
+            return
+        timeout: float | None = None
+        if deadline_ms is not None:
+            timeout = max(0.0, (deadline_ms - int(self._now_ms())) / 1000)
+        if self._wait_for_change is not None:
+            await self._wait_for_change(self._wakeup, timeout)
+            self._wakeup.clear()
+            return
+        try:
+            if timeout is None:
+                await self._wakeup.wait()
+            else:
+                await asyncio.wait_for(self._wakeup.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            self._wakeup.clear()
+
+    async def run(self) -> None:
+        """Recover claims first, then wait only for a durable deadline/change."""
+        while not self._stopping:
+            await self.process_due_once()
+            if self._stopping:
+                break
+            deadline = await self.store.next_reminder_deadline(
+                now_ms=int(self._now_ms())
+            )
+            await self._wait_until_changed_or_due(deadline)

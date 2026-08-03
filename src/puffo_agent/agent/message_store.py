@@ -5,8 +5,10 @@ import base64
 import json
 import sqlite3
 import time
+import uuid
 import weakref
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -152,6 +154,25 @@ INSERT OR IGNORE INTO inbox_notice_state(
     singleton, generation, pending_count, first_pending_deadline_ms,
     last_delivered_generation
 ) VALUES (1, 0, 0, NULL, 0);
+
+-- One row is both the immutable one-shot reminder intent and its only
+-- occurrence. This table intentionally represents a single trigger only.
+CREATE TABLE IF NOT EXISTS reminder_occurrences (
+    reminder_id TEXT PRIMARY KEY,
+    occurrence_id TEXT NOT NULL UNIQUE,
+    target TEXT NOT NULL,
+    content TEXT NOT NULL,
+    intended_at_ms INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('scheduled','claimed','cancelled','delivered')),
+    created_at_ms INTEGER NOT NULL,
+    claimed_at_ms INTEGER,
+    actual_fire_at_ms INTEGER,
+    cancelled_at_ms INTEGER,
+    delivered_at_ms INTEGER,
+    delivered_event_id TEXT UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_reminder_occurrences_due
+    ON reminder_occurrences (state, intended_at_ms, occurrence_id);
 """
 
 
@@ -264,6 +285,93 @@ class TurnRun:
     message_ids: tuple[str, ...]
     started_at: int
     completed_at: int | None
+
+
+@dataclass(frozen=True)
+class ReminderOccurrence:
+    """The durable Agent-owned fact for one single-fire reminder."""
+
+    reminder_id: str
+    occurrence_id: str
+    target: str
+    content: str
+    intended_at_ms: int
+    state: str
+    created_at_ms: int
+    claimed_at_ms: int | None
+    actual_fire_at_ms: int | None
+    cancelled_at_ms: int | None
+    delivered_at_ms: int | None
+    delivered_event_id: str | None
+
+    def as_dict(self) -> dict[str, Any]:
+        """The stable, provider-neutral reminder tool result."""
+        return {
+            "reminder_id": self.reminder_id,
+            "occurrence_id": self.occurrence_id,
+            "state": self.state,
+            "target": self.target,
+            "content": self.content,
+            "intended_at": reminder_time_to_rfc3339(self.intended_at_ms),
+            "actual_fire_at": (
+                reminder_time_to_rfc3339(self.actual_fire_at_ms)
+                if self.actual_fire_at_ms is not None else None
+            ),
+            "created_at": reminder_time_to_rfc3339(self.created_at_ms),
+            "cancelled_at": (
+                reminder_time_to_rfc3339(self.cancelled_at_ms)
+                if self.cancelled_at_ms is not None else None
+            ),
+            "delivered_at": (
+                reminder_time_to_rfc3339(self.delivered_at_ms)
+                if self.delivered_at_ms is not None else None
+            ),
+        }
+
+
+REMINDER_STATES = frozenset({"scheduled", "claimed", "cancelled", "delivered"})
+MAX_REMINDER_LIST_LIMIT = 100
+
+
+def reminder_time_to_rfc3339(value: int) -> str:
+    """Render epoch milliseconds in one canonical UTC representation."""
+    return (
+        datetime.fromtimestamp(int(value) / 1000, tz=timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def parse_reminder_target(target: str) -> tuple[str, str, str, str]:
+    """Validate and decompose a canonical local Inbox target.
+
+    Returns ``(kind, space_id, channel_id, thread_root_id_or_peer)``.  The
+    one-shot contract deliberately accepts only the target forms which the
+    Inbox already projects; it does not infer a provider route from prose.
+    """
+    if not isinstance(target, str) or not target or target != target.strip():
+        raise ValueError("target must be a non-empty canonical Inbox target")
+    parts = target.split(":")
+    valid_segment = lambda value: bool(value) and value == value.strip()
+    if parts[0] == "dm" and len(parts) == 2 and valid_segment(parts[1]):
+        return ("dm", "", "", parts[1])
+    if (
+        parts[0] == "channel"
+        and len(parts) == 3
+        and valid_segment(parts[1])
+        and valid_segment(parts[2])
+    ):
+        return ("channel", parts[1], parts[2], "")
+    if (
+        parts[0] == "channel"
+        and len(parts) == 5
+        and valid_segment(parts[1])
+        and valid_segment(parts[2])
+        and parts[3] == "thread"
+        and valid_segment(parts[4])
+    ):
+        return ("channel", parts[1], parts[2], parts[4])
+    raise ValueError("invalid reminder target")
 
 
 class LifecycleConflict(Exception):
@@ -1061,42 +1169,8 @@ class MessageStore:
                     assert message is not None
                     return message
 
-            async with db.execute(
-                """SELECT MAX(server_seq) FROM messages
-                   WHERE receipt_disposition = ? AND processing_state = ?
-                     AND server_seq IS NOT NULL""",
-                (ReceiptDisposition.ELIGIBLE.value, ProcessingState.PENDING.value),
-            ) as cursor:
-                frontier_row = await cursor.fetchone()
-            frontier = (
-                int(frontier_row[0]) if frontier_row[0] is not None else None
-            )
-            async with db.execute(
-                "SELECT next_ordinal FROM local_ordinal_allocator WHERE singleton = 1"
-            ) as cursor:
-                ordinal_row = await cursor.fetchone()
-            ordinal = int(ordinal_row[0])
-            await db.execute(
-                "UPDATE local_ordinal_allocator SET next_ordinal = ? WHERE singleton = 1",
-                (ordinal + 1,),
-            )
-            await db.execute(
-                """INSERT INTO messages
-                   (envelope_id, envelope_kind, sender_slug, channel_id, space_id,
-                    recipient_slug, content_type, content, sent_at, received_at,
-                    thread_root_id, reply_to_id, is_encrypted, receipt_disposition,
-                    receipt_reason, processing_state, local_ordinal, after_server_seq)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                values + (
-                    ReceiptDisposition.LOCAL_RUNTIME.value,
-                    reason,
-                    ProcessingState.PENDING.value,
-                    ordinal,
-                    frontier,
-                ),
-            )
-            await self._refresh_notice_state(
-                db, activated_at=int(values[9])
+            await self._insert_local_event_in_transaction(
+                db, values=values, reason=reason,
             )
             await db.commit()
         except Exception:
@@ -1105,6 +1179,421 @@ class MessageStore:
         message = await self._get_message_by_envelope_unlocked(db, envelope_id)
         assert message is not None
         return message
+
+    async def _insert_local_event_in_transaction(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        values: tuple[Any, ...],
+        reason: str,
+    ) -> None:
+        """Insert one local pending event while a caller owns ``BEGIN IMMEDIATE``.
+
+        Reminder delivery needs this exact insertion plus an occurrence state
+        transition in one SQLite transaction.  Keeping allocation here avoids
+        nesting ``store_local_event`` transactions while preserving the same
+        local frontier, ordinal, and notice-generation semantics for every
+        local event type.
+        """
+        async with db.execute(
+            """SELECT MAX(server_seq) FROM messages
+               WHERE receipt_disposition = ? AND processing_state = ?
+                 AND server_seq IS NOT NULL""",
+            (ReceiptDisposition.ELIGIBLE.value, ProcessingState.PENDING.value),
+        ) as cursor:
+            frontier_row = await cursor.fetchone()
+        frontier = int(frontier_row[0]) if frontier_row[0] is not None else None
+        async with db.execute(
+            "SELECT next_ordinal FROM local_ordinal_allocator WHERE singleton = 1"
+        ) as cursor:
+            ordinal_row = await cursor.fetchone()
+        ordinal = int(ordinal_row[0])
+        await db.execute(
+            "UPDATE local_ordinal_allocator SET next_ordinal = ? WHERE singleton = 1",
+            (ordinal + 1,),
+        )
+        await db.execute(
+            """INSERT INTO messages
+               (envelope_id, envelope_kind, sender_slug, channel_id, space_id,
+                recipient_slug, content_type, content, sent_at, received_at,
+                thread_root_id, reply_to_id, is_encrypted, receipt_disposition,
+                receipt_reason, processing_state, local_ordinal, after_server_seq)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            values + (
+                ReceiptDisposition.LOCAL_RUNTIME.value,
+                reason,
+                ProcessingState.PENDING.value,
+                ordinal,
+                frontier,
+            ),
+        )
+        await self._refresh_notice_state(db, activated_at=int(values[9]))
+
+    @staticmethod
+    def _reminder_from_row(row: aiosqlite.Row) -> ReminderOccurrence:
+        return ReminderOccurrence(
+            reminder_id=str(row["reminder_id"]),
+            occurrence_id=str(row["occurrence_id"]),
+            target=str(row["target"]),
+            content=str(row["content"]),
+            intended_at_ms=int(row["intended_at_ms"]),
+            state=str(row["state"]),
+            created_at_ms=int(row["created_at_ms"]),
+            claimed_at_ms=(
+                int(row["claimed_at_ms"])
+                if row["claimed_at_ms"] is not None else None
+            ),
+            actual_fire_at_ms=(
+                int(row["actual_fire_at_ms"])
+                if row["actual_fire_at_ms"] is not None else None
+            ),
+            cancelled_at_ms=(
+                int(row["cancelled_at_ms"])
+                if row["cancelled_at_ms"] is not None else None
+            ),
+            delivered_at_ms=(
+                int(row["delivered_at_ms"])
+                if row["delivered_at_ms"] is not None else None
+            ),
+            delivered_event_id=(
+                str(row["delivered_event_id"])
+                if row["delivered_event_id"] is not None else None
+            ),
+        )
+
+    @staticmethod
+    def _valid_reminder_time(value: int) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    async def create_reminder(
+        self,
+        *,
+        content: str,
+        target: str,
+        intended_at_ms: int,
+        reminder_id: str | None = None,
+        occurrence_id: str | None = None,
+        created_at_ms: int | None = None,
+    ) -> ReminderOccurrence:
+        """Durably create one immutable, single-fire reminder intent."""
+        if not isinstance(content, str) or not content:
+            raise ValueError("reminder content must be a non-empty string")
+        parse_reminder_target(target)
+        if not self._valid_reminder_time(intended_at_ms):
+            raise ValueError("intended_at_ms must be an integer epoch milliseconds")
+        if created_at_ms is None:
+            created_at_ms = int(self._now_ms())
+        if not self._valid_reminder_time(created_at_ms):
+            raise ValueError("created_at_ms must be an integer epoch milliseconds")
+        reminder_id = reminder_id or f"reminder-{uuid.uuid4()}"
+        occurrence_id = occurrence_id or f"occurrence-{uuid.uuid4()}"
+        if (
+            not isinstance(reminder_id, str)
+            or not reminder_id
+            or not isinstance(occurrence_id, str)
+            or not occurrence_id
+            or reminder_id == occurrence_id
+        ):
+            raise ValueError("reminder and occurrence identities must be distinct")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                await db.execute(
+                    """INSERT INTO reminder_occurrences
+                       (reminder_id, occurrence_id, target, content, intended_at_ms,
+                        state, created_at_ms)
+                       VALUES (?, ?, ?, ?, ?, 'scheduled', ?)""",
+                    (
+                        reminder_id,
+                        occurrence_id,
+                        target,
+                        content,
+                        intended_at_ms,
+                        created_at_ms,
+                    ),
+                )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+            reminder = await self._get_reminder_unlocked(db, reminder_id)
+            assert reminder is not None
+            return reminder
+
+    async def _get_reminder_unlocked(
+        self, db: aiosqlite.Connection, reminder_id: str,
+    ) -> ReminderOccurrence | None:
+        async with db.execute(
+            "SELECT * FROM reminder_occurrences WHERE reminder_id = ?",
+            (reminder_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return self._reminder_from_row(row) if row is not None else None
+
+    async def get_reminder(self, reminder_id: str) -> ReminderOccurrence | None:
+        if not isinstance(reminder_id, str) or not reminder_id:
+            raise ValueError("reminder_id must be a non-empty string")
+        async with self._inbox_lock:
+            return await self._get_reminder_unlocked(
+                await self._ensure_db(), reminder_id,
+            )
+
+    async def list_reminders(
+        self, *, state: str = "", limit: int = 50,
+    ) -> tuple[ReminderOccurrence, ...]:
+        if not isinstance(state, str) or (state and state not in REMINDER_STATES):
+            raise ValueError("state must be empty or a reminder state")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_REMINDER_LIST_LIMIT:
+            raise ValueError(
+                f"limit must be between 1 and {MAX_REMINDER_LIST_LIMIT}"
+            )
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            if state:
+                query = (
+                    "SELECT * FROM reminder_occurrences WHERE state = ? "
+                    "ORDER BY intended_at_ms, occurrence_id LIMIT ?"
+                )
+                params: tuple[Any, ...] = (state, limit)
+            else:
+                query = (
+                    "SELECT * FROM reminder_occurrences "
+                    "ORDER BY intended_at_ms, occurrence_id LIMIT ?"
+                )
+                params = (limit,)
+            async with db.execute(query, params) as cursor:
+                rows = await cursor.fetchall()
+            return tuple(self._reminder_from_row(row) for row in rows)
+
+    async def next_reminder_deadline(
+        self, *, now_ms: int | None = None,
+    ) -> int | None:
+        """Return the next scheduled deadline, or now when recovery is claimed."""
+        now = int(self._now_ms()) if now_ms is None else now_ms
+        if not self._valid_reminder_time(now):
+            raise ValueError("now_ms must be an integer epoch milliseconds")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            async with db.execute(
+                "SELECT 1 FROM reminder_occurrences WHERE state = 'claimed' LIMIT 1"
+            ) as cursor:
+                if await cursor.fetchone() is not None:
+                    return now
+            async with db.execute(
+                """SELECT intended_at_ms FROM reminder_occurrences
+                   WHERE state = 'scheduled'
+                   ORDER BY intended_at_ms, occurrence_id LIMIT 1"""
+            ) as cursor:
+                row = await cursor.fetchone()
+            return int(row["intended_at_ms"]) if row is not None else None
+
+    async def claim_due_reminders(
+        self, *, now_ms: int | None = None,
+    ) -> tuple[ReminderOccurrence, ...]:
+        """Claim every due scheduled occurrence without changing its identity."""
+        now = int(self._now_ms()) if now_ms is None else now_ms
+        if not self._valid_reminder_time(now):
+            raise ValueError("now_ms must be an integer epoch milliseconds")
+        async with self._inbox_lock:
+            return await self._claim_due_reminders_unlocked(now)
+
+    async def _claim_due_reminders_unlocked(
+        self, now_ms: int,
+    ) -> tuple[ReminderOccurrence, ...]:
+        db = await self._ensure_db()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute(
+                """SELECT reminder_id FROM reminder_occurrences
+                   WHERE state = 'scheduled' AND intended_at_ms <= ?
+                   ORDER BY intended_at_ms, occurrence_id""",
+                (now_ms,),
+            ) as cursor:
+                rows = await cursor.fetchall()
+            claimed_ids: list[str] = []
+            for row in rows:
+                reminder_id = str(row["reminder_id"])
+                cursor = await db.execute(
+                    """UPDATE reminder_occurrences
+                       SET state = 'claimed', claimed_at_ms = ?, actual_fire_at_ms = ?
+                       WHERE reminder_id = ? AND state = 'scheduled'""",
+                    (now_ms, now_ms, reminder_id),
+                )
+                if cursor.rowcount == 1:
+                    claimed_ids.append(reminder_id)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        claimed: list[ReminderOccurrence] = []
+        for reminder_id in claimed_ids:
+            occurrence = await self._get_reminder_unlocked(db, reminder_id)
+            assert occurrence is not None
+            claimed.append(occurrence)
+        return tuple(claimed)
+
+    @staticmethod
+    def _reminder_event_payload(reminder: ReminderOccurrence) -> dict[str, Any]:
+        kind, space_id, channel_id, tail = parse_reminder_target(reminder.target)
+        actual_fire_at_ms = reminder.actual_fire_at_ms
+        if actual_fire_at_ms is None:
+            raise LifecycleConflict("claimed reminder is missing actual fire time")
+        content = {
+            "event_type": "reminder",
+            "reminder_id": reminder.reminder_id,
+            "occurrence_id": reminder.occurrence_id,
+            "target": reminder.target,
+            "content": reminder.content,
+            "intended_at": reminder_time_to_rfc3339(reminder.intended_at_ms),
+            "actual_fire_at": reminder_time_to_rfc3339(actual_fire_at_ms),
+        }
+        if kind == "dm":
+            return {
+                "envelope_id": f"reminder-occurrence:{reminder.occurrence_id}",
+                "envelope_kind": "dm",
+                # ``target_projection`` and ``route_for`` use this peer.
+                "sender_slug": tail,
+                "recipient_slug": "",
+                "content_type": "application/puffo-reminder+json",
+                "content": content,
+                "sent_at": actual_fire_at_ms,
+            }
+        return {
+            "envelope_id": f"reminder-occurrence:{reminder.occurrence_id}",
+            "envelope_kind": "channel",
+            "sender_slug": "reminder",
+            "channel_id": channel_id,
+            "space_id": space_id,
+            "content_type": "application/puffo-reminder+json",
+            "content": content,
+            "sent_at": actual_fire_at_ms,
+            "thread_root_id": tail or None,
+        }
+
+    async def _deliver_claimed_reminder_unlocked(
+        self,
+        reminder_id: str,
+        *,
+        now_ms: int,
+    ) -> ReminderOccurrence | None:
+        db = await self._ensure_db()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            reminder = await self._get_reminder_unlocked(db, reminder_id)
+            if reminder is None or reminder.state != "claimed":
+                await db.rollback()
+                return None
+            event_id = f"reminder-occurrence:{reminder.occurrence_id}"
+            async with db.execute(
+                "SELECT receipt_disposition, content FROM messages WHERE envelope_id = ?",
+                (event_id,),
+            ) as cursor:
+                existing = await cursor.fetchone()
+            if existing is None:
+                payload = self._reminder_event_payload(reminder)
+                await self._insert_local_event_in_transaction(
+                    db,
+                    values=self._payload_values(payload, now_ms),
+                    reason="reminder occurrence",
+                )
+            else:
+                # This state is impossible after a normal crash because the
+                # insert and terminal occurrence update commit together.  If
+                # a pre-existing row is encountered, fail closed unless it is
+                # exactly a local reminder event for this occurrence.
+                try:
+                    existing_content = json.loads(existing["content"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    existing_content = None
+                if (
+                    existing["receipt_disposition"]
+                    != ReceiptDisposition.LOCAL_RUNTIME.value
+                    or not isinstance(existing_content, dict)
+                    or existing_content.get("event_type") != "reminder"
+                    or existing_content.get("occurrence_id")
+                    != reminder.occurrence_id
+                ):
+                    raise LifecycleConflict(
+                        "reminder delivery event identity belongs to another row"
+                    )
+            cursor = await db.execute(
+                """UPDATE reminder_occurrences
+                   SET state = 'delivered', delivered_event_id = ?, delivered_at_ms = ?
+                   WHERE reminder_id = ? AND state = 'claimed'""",
+                (event_id, now_ms, reminder_id),
+            )
+            if cursor.rowcount != 1:
+                raise LifecycleConflict("reminder delivery lost claimed ownership")
+            await db.commit()
+        except Exception:
+            await db.rollback()
+            raise
+        delivered = await self._get_reminder_unlocked(db, reminder_id)
+        assert delivered is not None
+        return delivered
+
+    async def deliver_due_reminders(
+        self, *, now_ms: int | None = None,
+    ) -> tuple[ReminderOccurrence, ...]:
+        """Atomically enqueue every claimed/due occurrence at most once.
+
+        A claimed occurrence is included even when it was claimed by a worker
+        that restarted before delivery.  Every individual delivery commits the
+        local Inbox row and terminal occurrence state together.
+        """
+        now = int(self._now_ms()) if now_ms is None else now_ms
+        if not self._valid_reminder_time(now):
+            raise ValueError("now_ms must be an integer epoch milliseconds")
+        async with self._inbox_lock:
+            await self._claim_due_reminders_unlocked(now)
+            db = await self._ensure_db()
+            async with db.execute(
+                """SELECT reminder_id FROM reminder_occurrences WHERE state = 'claimed'
+                   ORDER BY intended_at_ms, occurrence_id"""
+            ) as cursor:
+                rows = await cursor.fetchall()
+            delivered: list[ReminderOccurrence] = []
+            for row in rows:
+                occurrence = await self._deliver_claimed_reminder_unlocked(
+                    str(row["reminder_id"]), now_ms=now,
+                )
+                if occurrence is not None:
+                    delivered.append(occurrence)
+            return tuple(delivered)
+
+    async def cancel_reminder(
+        self, reminder_id: str, *, cancelled_at_ms: int | None = None,
+    ) -> ReminderOccurrence:
+        """Idempotently cancel work that has not terminally delivered."""
+        if not isinstance(reminder_id, str) or not reminder_id:
+            raise ValueError("reminder_id must be a non-empty string")
+        cancelled_at = int(self._now_ms()) if cancelled_at_ms is None else cancelled_at_ms
+        if not self._valid_reminder_time(cancelled_at):
+            raise ValueError("cancelled_at_ms must be an integer epoch milliseconds")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                reminder = await self._get_reminder_unlocked(db, reminder_id)
+                if reminder is None:
+                    raise ValueError("unknown reminder_id")
+                if reminder.state in {"scheduled", "claimed"}:
+                    cursor = await db.execute(
+                        """UPDATE reminder_occurrences
+                           SET state = 'cancelled', cancelled_at_ms = ?
+                           WHERE reminder_id = ? AND state IN ('scheduled', 'claimed')""",
+                        (cancelled_at, reminder_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise LifecycleConflict("reminder cancellation lost ownership")
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+            result = await self._get_reminder_unlocked(db, reminder_id)
+            assert result is not None
+            return result
 
     async def quarantine_pending(self, envelope_id: str, *, reason: str) -> bool:
         async with self._inbox_lock:

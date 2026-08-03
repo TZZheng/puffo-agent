@@ -117,6 +117,34 @@ class PuffoRpcClient:
         except aiohttp.ClientError as exc:
             raise RuntimeError(f"rpc {route} transport error: {exc}") from exc
 
+    async def _post_object(
+        self, route: str, body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """POST a strict object result without inheriting send semantics."""
+        path = (
+            f"/v1/rpc/{urllib.parse.quote(self.agent_id, safe='')}/"
+            f"{route.lstrip('/')}"
+        )
+        session = await self._get_session()
+        try:
+            async with session.post(f"{self.base_url}{path}", json=body) as resp:
+                try:
+                    data = await resp.json()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"rpc {route} returned non-JSON (status {resp.status})"
+                    ) from exc
+                if resp.status >= 400:
+                    error = data.get("error") if isinstance(data, dict) else None
+                    raise RuntimeError(
+                        str(error or f"rpc {route} failed ({resp.status})")
+                    )
+                if not isinstance(data, dict):
+                    raise RuntimeError(f"rpc {route} returned a non-object")
+                return data
+        except aiohttp.ClientError as exc:
+            raise RuntimeError(f"rpc {route} transport error: {exc}") from exc
+
     async def send_message(
         self,
         *,
@@ -222,6 +250,56 @@ class PuffoRpcClient:
                 return data
         except aiohttp.ClientError as exc:
             raise RuntimeError(f"rpc read-inbox transport error: {exc}") from exc
+
+    @staticmethod
+    def _validate_reminder_object(data: dict[str, Any]) -> dict[str, Any]:
+        required = {
+            "reminder_id", "occurrence_id", "state", "target", "content",
+            "intended_at", "actual_fire_at", "created_at", "cancelled_at",
+            "delivered_at",
+        }
+        if set(data) != required or data.get("state") not in {
+            "scheduled", "claimed", "cancelled", "delivered",
+        } or not all(
+            isinstance(data.get(key), str)
+            for key in (
+                "reminder_id", "occurrence_id", "state", "target", "content",
+                "intended_at", "created_at",
+            )
+        ):
+            raise RuntimeError("rpc reminder returned an invalid structured result")
+        return data
+
+    async def create_reminder(
+        self, *, content: str, target: str, intended_at: str,
+    ) -> dict[str, Any]:
+        return self._validate_reminder_object(await self._post_object(
+            "create-reminder",
+            {"content": content, "target": target, "intended_at": intended_at},
+        ))
+
+    async def list_reminders(
+        self, *, state: str = "", limit: int = 50,
+    ) -> dict[str, Any]:
+        data = await self._post_object(
+            "list-reminders", {"state": state, "limit": limit},
+        )
+        reminders = data.get("reminders")
+        if set(data) != {"reminders"} or not isinstance(reminders, list):
+            raise RuntimeError("rpc list reminders returned an invalid structured result")
+        validated: list[dict[str, Any]] = []
+        for item in reminders:
+            if not isinstance(item, dict):
+                raise RuntimeError("rpc list reminders returned an invalid item")
+            validated.append(self._validate_reminder_object(item))
+        return {
+            "reminders": validated,
+        }
+
+    async def cancel_reminder(self, *, reminder_id: str) -> dict[str, Any]:
+        return self._validate_reminder_object(await self._post_object(
+            "cancel-reminder", {"reminder_id": reminder_id},
+        ))
 
     async def install_mcp(
         self,

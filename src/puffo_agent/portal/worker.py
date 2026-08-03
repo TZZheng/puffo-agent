@@ -563,6 +563,7 @@ def _build_chat_local_tool_dispatch(client) -> dict:
         cfg,
         allowed=frozenset({
             "read_inbox", "send_message", "send_message_with_attachments",
+            "create_reminder", "list_reminders", "cancel_reminder",
         }),
     )
 

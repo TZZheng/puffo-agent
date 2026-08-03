@@ -3765,6 +3765,170 @@ async def test_notice_restart_suppresses_same_session_and_rediscovers_once_for_r
 
 
 @pytest.mark.asyncio
+async def test_mixed_message_and_due_reminder_share_one_notice_read_and_turn(tmp_path):
+    store = await make_store(tmp_path)
+    ordinary_body = "ordinary message body remains unchanged"
+    await receipt(store, "ordinary", 1, content=ordinary_body)
+    reminder = await store.create_reminder(
+        content="exact Agent-authored reminder content",
+        target="channel:sp-1:ch-1",
+        intended_at_ms=1,
+    )
+    await store.deliver_due_reminders(now_ms=2)
+
+    adapter = ToolReturnAdapter()
+    observed: dict[str, object] = {}
+
+    async def run(planned):
+        assert ordinary_body not in planned.provider_input
+        assert "exact Agent-authored reminder content" not in planned.provider_input
+        summary = json.loads(
+            planned.provider_input.split("\n", 2)[1]
+        )
+        assert summary["message_count"] == 2
+        assert summary["targets"] == [{"target": "channel:sp-1:ch-1", "count": 2}]
+        await adapter.admit()
+        observed["page"] = await runtime.read_inbox(limit=50)
+        observed["ids"] = tuple(runtime.active.message_ids)
+
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=run, workspace=tmp_path,
+    )
+    assert await runtime.process_once()
+    page = observed["page"]
+    assert observed["ids"] == (
+        "ordinary", f"reminder-occurrence:{reminder.occurrence_id}",
+    )
+    assert len(page["messages"]) == 2
+    ordinary, reminder_block = page["messages"]
+    assert ordinary_body in ordinary and "[seq=1 time=" in ordinary
+    assert "event_type=reminder" in reminder_block
+    for expected in (
+        reminder.reminder_id,
+        reminder.occurrence_id,
+        "channel:sp-1:ch-1",
+        "exact Agent-authored reminder content",
+        "intended_at=\"1970-01-01T00:00:00.001Z\"",
+        "actual_fire_at=\"1970-01-01T00:00:00.002Z\"",
+    ):
+        assert expected in reminder_block
+    assert all(
+        forbidden not in reminder_block.lower()
+        for forbidden in ("execute", "skip", "apologize", "reply", "silence")
+    )
+    notice = (await store.get_notice_state())
+    assert notice.pending_count == 0
+    for item_id in observed["ids"]:
+        item = await store.get_message_by_envelope(item_id)
+        assert item is not None and item.processing_state is ProcessingState.PROCESSED
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_different_target_reminder_still_uses_one_global_notice_and_turn(tmp_path):
+    store = await make_store(tmp_path)
+    ordinary_body = "ordinary body for the first target"
+    await receipt(store, "ordinary", 1, content=ordinary_body)
+    reminder = await store.create_reminder(
+        content="exact content for the second target",
+        target="channel:sp-1:ch-2",
+        intended_at_ms=1,
+    )
+    await store.deliver_due_reminders(now_ms=2)
+
+    adapter = ToolReturnAdapter()
+    observed: dict[str, object] = {}
+    turns = 0
+
+    async def run(planned):
+        nonlocal turns
+        turns += 1
+        assert ordinary_body not in planned.provider_input
+        assert "exact content for the second target" not in planned.provider_input
+        summary = json.loads(planned.provider_input.split("\n", 2)[1])
+        assert summary["message_count"] == 2
+        assert summary["targets"] == [
+            {"target": "channel:sp-1:ch-1", "count": 1},
+            {"target": "channel:sp-1:ch-2", "count": 1},
+        ]
+        await adapter.admit()
+        observed["page"] = await runtime.read_inbox(limit=50)
+        observed["ids"] = tuple(runtime.active.message_ids)
+
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=run, workspace=tmp_path,
+    )
+    assert await runtime.process_once()
+    assert not await runtime.process_once()
+    assert turns == 1
+    assert observed["ids"] == (
+        "ordinary", f"reminder-occurrence:{reminder.occurrence_id}",
+    )
+    page = observed["page"]
+    assert len(page["messages"]) == 2
+    assert ordinary_body in page["messages"][0]
+    assert "event_type=reminder" in page["messages"][1]
+    assert "target=\"channel:sp-1:ch-2\"" in page["messages"][1]
+    assert "exact content for the second target" in page["messages"][1]
+    for item_id in observed["ids"]:
+        item = await store.get_message_by_envelope(item_id)
+        assert item is not None and item.processing_state is ProcessingState.PROCESSED
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_owns_reminder_scheduler_start_and_stop(tmp_path):
+    store = await make_store(tmp_path)
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    class Scheduler:
+        async def run(self):
+            started.set()
+            await stopped.wait()
+
+        def stop(self):
+            stopped.set()
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+        reminder_scheduler=Scheduler(),
+    )
+    task = asyncio.create_task(runtime.run())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    runtime.stop()
+    await asyncio.wait_for(task, timeout=1)
+    assert stopped.is_set()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_surfaces_owned_reminder_scheduler_failure(tmp_path):
+    store = await make_store(tmp_path)
+
+    class FailingScheduler:
+        async def run(self):
+            raise RuntimeError("timer storage failed")
+
+        def stop(self):
+            return None
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+        reminder_scheduler=FailingScheduler(),
+    )
+    with pytest.raises(RuntimeError, match="timer storage failed"):
+        await runtime.run()
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_changed_pending_generation_replaces_accepted_notice_without_losing_unread_rows(
     tmp_path,
 ):

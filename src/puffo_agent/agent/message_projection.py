@@ -107,7 +107,32 @@ def _attachment_count(message: Any) -> int | None:
     return None
 
 
+def _reminder_event(message: Any) -> Mapping[str, Any] | None:
+    """Return a locally durable reminder event without reclassifying messages."""
+    content = _content(message)
+    return content if content.get("event_type") == "reminder" else None
+
+
+def format_reminder_event(message: Any) -> str:
+    """Project a reminder fact without sender prose or behavioral advice."""
+    event = _reminder_event(message)
+    if event is None:
+        raise ValueError("message is not a reminder event")
+    fields = [
+        "event_type=reminder",
+        f"reminder_id={_quoted(event.get('reminder_id', ''))}",
+        f"occurrence_id={_quoted(event.get('occurrence_id', ''))}",
+        f"target={_quoted(event.get('target', ''))}",
+        f"intended_at={_quoted(event.get('intended_at', ''))}",
+        f"actual_fire_at={_quoted(event.get('actual_fire_at', ''))}",
+        f"id={_quoted(_value(message, 'envelope_id', 'unknown'))}",
+    ]
+    return f"[reminder {' '.join(fields)}]\n{str(event.get('content', ''))}"
+
+
 def format_message_row(message: Any, *, current_agent_aliases: Sequence[str] = (), reply_count: int | None = None) -> str:
+    if _reminder_event(message) is not None:
+        return format_reminder_event(message)
     seq = _value(message, "server_seq", None)
     seq_text = str(seq) if isinstance(seq, int) else "unsequenced"
     aliases = {_normalized_slug(alias) for alias in current_agent_aliases if alias}

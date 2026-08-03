@@ -427,6 +427,142 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
 
 
 @pytest.mark.asyncio
+async def test_reminder_tools_have_exact_semantic_schemas_and_live_dispatch():
+    cfg, _, _ = _setup()
+    calls: list[tuple[str, dict]] = []
+    reminder = {
+        "reminder_id": "reminder-1",
+        "occurrence_id": "occurrence-1",
+        "state": "scheduled",
+        "target": "channel:sp:ch",
+        "content": "exact content",
+        "intended_at": "2026-08-02T12:00:00.000Z",
+        "actual_fire_at": None,
+        "created_at": "2026-08-02T11:00:00.000Z",
+        "cancelled_at": None,
+        "delivered_at": None,
+    }
+
+    class Runtime:
+        async def create_reminder(self, **kwargs):
+            calls.append(("create", kwargs))
+            return reminder
+
+        async def list_reminders(self, **kwargs):
+            calls.append(("list", kwargs))
+            return {"reminders": [reminder]}
+
+        async def cancel_reminder(self, **kwargs):
+            calls.append(("cancel", kwargs))
+            return {**reminder, "state": "cancelled", "cancelled_at": "2026-08-02T11:01:00.000Z"}
+
+    cfg.inbox_runtime = Runtime()
+    mcp = _build_tools(cfg)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    assert set(tools).issuperset({
+        "create_reminder", "list_reminders", "cancel_reminder",
+    })
+    assert set(tools["create_reminder"].inputSchema["properties"]) == {
+        "content", "target", "intended_at",
+    }
+    assert set(tools["list_reminders"].inputSchema["properties"]) == {
+        "state", "limit",
+    }
+    assert set(tools["cancel_reminder"].inputSchema["properties"]) == {
+        "reminder_id",
+    }
+    forbidden = {
+        "recurrence", "provider", "server", "schedule_wake", "pause",
+        "resume", "execute", "skip", "apologize", "reply", "silence",
+        "state_machine", "actual_fire_at", "occurrence_id",
+    }
+    for name in ("create_reminder", "list_reminders", "cancel_reminder"):
+        assert set(tools[name].inputSchema["properties"]).isdisjoint(forbidden)
+
+    assert (await mcp.call_tool("create_reminder", {
+        "content": "exact content", "target": "channel:sp:ch",
+        "intended_at": "2026-08-02T12:00:00Z",
+    }))[1] == reminder
+    assert (await mcp.call_tool("list_reminders", {
+        "state": "scheduled", "limit": 3,
+    }))[1] == {"reminders": [reminder]}
+    cancelled = (await mcp.call_tool("cancel_reminder", {
+        "reminder_id": "reminder-1",
+    }))[1]
+    assert cancelled["state"] == "cancelled"
+    assert calls == [
+        ("create", {
+            "content": "exact content", "target": "channel:sp:ch",
+            "intended_at": "2026-08-02T12:00:00Z",
+        }),
+        ("list", {"state": "scheduled", "limit": 3}),
+        ("cancel", {"reminder_id": "reminder-1"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reminder_tools_fall_back_to_configured_loopback_rpc_client():
+    """The subprocess MCP surface must use the same semantic objects."""
+    cfg, _, _ = _setup()
+    calls: list[tuple[str, dict]] = []
+    scheduled = {
+        "reminder_id": "reminder-1",
+        "occurrence_id": "occurrence-1",
+        "state": "scheduled",
+        "target": "channel:sp:ch",
+        "content": "exact content",
+        "intended_at": "2026-08-02T12:00:00.000Z",
+        "actual_fire_at": None,
+        "created_at": "2026-08-02T11:00:00.000Z",
+        "cancelled_at": None,
+        "delivered_at": None,
+    }
+    cancelled = {
+        **scheduled,
+        "state": "cancelled",
+        "cancelled_at": "2026-08-02T11:01:00.000Z",
+    }
+
+    class Rpc:
+        async def create_reminder(self, **kwargs):
+            calls.append(("create", kwargs))
+            return scheduled
+
+        async def list_reminders(self, **kwargs):
+            calls.append(("list", kwargs))
+            return {"reminders": [scheduled]}
+
+        async def cancel_reminder(self, **kwargs):
+            calls.append(("cancel", kwargs))
+            return cancelled
+
+    # No warm in-process runtime is available on the subprocess MCP path.
+    cfg.inbox_runtime = None
+    cfg.message_client = None
+    cfg.rpc_client = Rpc()
+    mcp = _build_tools(cfg)
+
+    assert (await mcp.call_tool("create_reminder", {
+        "content": "exact content", "target": "channel:sp:ch",
+        "intended_at": "2026-08-02T12:00:00Z",
+    }))[1] == scheduled
+    assert (await mcp.call_tool("list_reminders", {
+        "state": "scheduled", "limit": 3,
+    }))[1] == {"reminders": [scheduled]}
+    assert (await mcp.call_tool("cancel_reminder", {
+        "reminder_id": "reminder-1",
+    }))[1] == cancelled
+    assert calls == [
+        ("create", {
+            "content": "exact content", "target": "channel:sp:ch",
+            "intended_at": "2026-08-02T12:00:00Z",
+        }),
+        ("list", {"state": "scheduled", "limit": 3}),
+        ("cancel", {"reminder_id": "reminder-1"}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_semantic_rpc_unavailable_returns_structured_failure():
     cfg, http, _ = _setup()
     cfg.send_coordinator = None

@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from puffo_agent.mcp._host_mcp import PuffoRpcClient
 from puffo_agent.portal import rpc_service
 from puffo_agent.portal.host_mcp_handler import HostMcpContext
 
@@ -284,6 +285,172 @@ async def test_read_inbox_rejects_hidden_unknown_or_invalid_fields_before_resolv
         "/v1/rpc/agent_a/read-inbox",
         json=body,
     )
+    assert response.status == 400
+    assert resolver_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reminder_routes_are_strict_and_return_structured_objects(
+    app_client_factory, monkeypatch,
+):
+    captured: list[tuple[str, dict[str, object]]] = []
+    reminder = {
+        "reminder_id": "reminder-1",
+        "occurrence_id": "occurrence-1",
+        "state": "scheduled",
+        "target": "channel:sp:ch",
+        "content": "exact content",
+        "intended_at": "2026-08-02T12:00:00.000Z",
+        "actual_fire_at": None,
+        "created_at": "2026-08-02T11:00:00.000Z",
+        "cancelled_at": None,
+        "delivered_at": None,
+    }
+
+    async def create(_ctx, **kwargs):
+        captured.append(("create", kwargs))
+        return reminder
+
+    async def list_(_ctx, **kwargs):
+        captured.append(("list", kwargs))
+        return {"reminders": [reminder]}
+
+    async def cancel(_ctx, **kwargs):
+        captured.append(("cancel", kwargs))
+        return {**reminder, "state": "cancelled"}
+
+    monkeypatch.setattr(rpc_service.host_mcp_handler, "create_reminder", create)
+    monkeypatch.setattr(rpc_service.host_mcp_handler, "list_reminders", list_)
+    monkeypatch.setattr(rpc_service.host_mcp_handler, "cancel_reminder", cancel)
+    rpc_service.set_rpc_resolver(lambda aid: _stub_ctx(aid))
+    client = await app_client_factory()
+
+    response = await client.post(
+        "/v1/rpc/agent_a/create-reminder",
+        json={
+            "content": "exact content", "target": "channel:sp:ch",
+            "intended_at": "2026-08-02T14:00:00+02:00",
+        },
+    )
+    assert response.status == 200 and await response.json() == reminder
+    response = await client.post(
+        "/v1/rpc/agent_a/list-reminders",
+        json={"state": "scheduled", "limit": 3},
+    )
+    assert response.status == 200 and await response.json() == {"reminders": [reminder]}
+    response = await client.post(
+        "/v1/rpc/agent_a/cancel-reminder",
+        json={"reminder_id": "reminder-1"},
+    )
+    assert response.status == 200 and (await response.json())["state"] == "cancelled"
+    assert captured == [
+        ("create", {
+            "content": "exact content", "target": "channel:sp:ch",
+            "intended_at": "2026-08-02T12:00:00.000Z",
+        }),
+        ("list", {"state": "scheduled", "limit": 3}),
+        ("cancel", {"reminder_id": "reminder-1"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_puffo_rpc_client_round_trips_all_reminder_objects(
+    app_client_factory, monkeypatch,
+):
+    """Exercise the real loopback client used by a subprocess MCP server."""
+    captured: list[tuple[str, dict[str, object]]] = []
+    scheduled = {
+        "reminder_id": "reminder-1",
+        "occurrence_id": "occurrence-1",
+        "state": "scheduled",
+        "target": "channel:sp:ch",
+        "content": "exact content",
+        "intended_at": "2026-08-02T12:00:00.000Z",
+        "actual_fire_at": None,
+        "created_at": "2026-08-02T11:00:00.000Z",
+        "cancelled_at": None,
+        "delivered_at": None,
+    }
+    cancelled = {
+        **scheduled,
+        "state": "cancelled",
+        "cancelled_at": "2026-08-02T11:01:00.000Z",
+    }
+
+    async def create(_ctx, **kwargs):
+        captured.append(("create", kwargs))
+        return scheduled
+
+    async def list_(_ctx, **kwargs):
+        captured.append(("list", kwargs))
+        return {"reminders": [scheduled]}
+
+    async def cancel(_ctx, **kwargs):
+        captured.append(("cancel", kwargs))
+        return cancelled
+
+    monkeypatch.setattr(rpc_service.host_mcp_handler, "create_reminder", create)
+    monkeypatch.setattr(rpc_service.host_mcp_handler, "list_reminders", list_)
+    monkeypatch.setattr(rpc_service.host_mcp_handler, "cancel_reminder", cancel)
+    rpc_service.set_rpc_resolver(lambda aid: _stub_ctx(aid))
+    app_client = await app_client_factory()
+    client = PuffoRpcClient(str(app_client.make_url("")).rstrip("/"), "agent_a")
+    try:
+        assert await client.create_reminder(
+            content="exact content",
+            target="channel:sp:ch",
+            intended_at="2026-08-02T14:00:00+02:00",
+        ) == scheduled
+        assert await client.list_reminders(state="scheduled", limit=3) == {
+            "reminders": [scheduled],
+        }
+        assert await client.cancel_reminder(reminder_id="reminder-1") == cancelled
+    finally:
+        await client.close()
+    assert captured == [
+        ("create", {
+            "content": "exact content", "target": "channel:sp:ch",
+            "intended_at": "2026-08-02T12:00:00.000Z",
+        }),
+        ("list", {"state": "scheduled", "limit": 3}),
+        ("cancel", {"reminder_id": "reminder-1"}),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("route", "body"),
+    [
+        ("create-reminder", {
+            "content": "x", "target": "channel:sp:ch",
+            "intended_at": "2026-08-02T12:00:00",  # no explicit offset
+        }),
+        ("create-reminder", {
+            "content": "x", "target": "channel:sp:ch",
+            "intended_at": "2026-08-02 12:00:00Z",  # not RFC3339
+        }),
+        ("create-reminder", {
+            "content": "x", "target": "not-a-target",
+            "intended_at": "2026-08-02T12:00:00Z",
+        }),
+        ("create-reminder", {
+            "content": "x", "target": "channel:sp:ch",
+            "intended_at": "2026-08-02T12:00:00Z", "provider": "no",
+        }),
+        ("list-reminders", {"state": "recurring"}),
+        ("list-reminders", {"limit": 0}),
+        ("list-reminders", {"state": "", "cloud": True}),
+        ("cancel-reminder", {"reminder_id": ""}),
+        ("cancel-reminder", {"reminder_id": "one", "occurrence_id": "two"}),
+    ],
+)
+async def test_reminder_routes_reject_invalid_or_hidden_fields_before_resolver(
+    app_client_factory, route, body,
+):
+    resolver_calls = []
+    rpc_service.set_rpc_resolver(lambda aid: resolver_calls.append(aid))
+    client = await app_client_factory()
+    response = await client.post(f"/v1/rpc/agent_a/{route}", json=body)
     assert response.status == 400
     assert resolver_calls == []
 

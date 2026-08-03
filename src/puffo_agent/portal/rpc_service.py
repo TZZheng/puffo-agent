@@ -13,6 +13,8 @@ from typing import Awaitable, Callable, Optional
 
 from aiohttp import web
 
+from ..agent.message_store import MAX_REMINDER_LIST_LIMIT, REMINDER_STATES, parse_reminder_target
+from ..agent.reminder_scheduler import normalize_reminder_timestamp
 from . import host_mcp_handler
 from ._port import bind_tcp_with_fallback
 from .host_mcp_handler import HostMcpContext
@@ -348,6 +350,118 @@ async def read_inbox_route(request: web.Request) -> web.Response:
         return web.json_response({"error": str(exc)}, status=400)
 
 
+def _warm_context(agent_id: str) -> HostMcpContext | None:
+    resolver = _RPC_RESOLVER
+    return resolver(agent_id) if resolver is not None else None
+
+
+async def create_reminder_route(request: web.Request) -> web.Response:
+    """Strict loopback route for the semantic local reminder create tool."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    if not isinstance(body, dict) or set(body) != {"content", "target", "intended_at"}:
+        return web.json_response(
+            {"error": "create_reminder accepts only content, target, and intended_at"},
+            status=400,
+        )
+    content, target, intended_at = (
+        body["content"], body["target"], body["intended_at"],
+    )
+    if not isinstance(content, str) or not content:
+        return web.json_response(
+            {"error": "content must be a non-empty string"}, status=400,
+        )
+    if not isinstance(target, str) or not isinstance(intended_at, str):
+        return web.json_response(
+            {"error": "target and intended_at must be strings"}, status=400,
+        )
+    try:
+        parse_reminder_target(target)
+        _ms, canonical_intended_at = normalize_reminder_timestamp(intended_at)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    ctx = _warm_context(request.match_info["agent_id"])
+    if ctx is None:
+        return web.json_response({"error": "no warm worker"}, status=503)
+    try:
+        result = await host_mcp_handler.create_reminder(
+            ctx,
+            content=content,
+            target=target,
+            intended_at=canonical_intended_at,
+        )
+    except (RuntimeError, ValueError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        logger.exception("rpc-service: create reminder failed")
+        return web.json_response({"error": f"handler raised: {exc}"}, status=500)
+    return web.json_response(result)
+
+
+async def list_reminders_route(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    if not isinstance(body, dict) or set(body) - {"state", "limit"}:
+        return web.json_response(
+            {"error": "list_reminders accepts only state and limit"}, status=400,
+        )
+    state = body.get("state", "")
+    limit = body.get("limit", 50)
+    if not isinstance(state, str) or (state and state not in REMINDER_STATES):
+        return web.json_response(
+            {"error": "state must be empty or a reminder state"}, status=400,
+        )
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_REMINDER_LIST_LIMIT:
+        return web.json_response(
+            {"error": f"limit must be between 1 and {MAX_REMINDER_LIST_LIMIT}"},
+            status=400,
+        )
+    ctx = _warm_context(request.match_info["agent_id"])
+    if ctx is None:
+        return web.json_response({"error": "no warm worker"}, status=503)
+    try:
+        return web.json_response(
+            await host_mcp_handler.list_reminders(ctx, state=state, limit=limit)
+        )
+    except (RuntimeError, ValueError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        logger.exception("rpc-service: list reminders failed")
+        return web.json_response({"error": f"handler raised: {exc}"}, status=500)
+
+
+async def cancel_reminder_route(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    if not isinstance(body, dict) or set(body) != {"reminder_id"}:
+        return web.json_response(
+            {"error": "cancel_reminder accepts only reminder_id"}, status=400,
+        )
+    reminder_id = body["reminder_id"]
+    if not isinstance(reminder_id, str) or not reminder_id:
+        return web.json_response(
+            {"error": "reminder_id must be a non-empty string"}, status=400,
+        )
+    ctx = _warm_context(request.match_info["agent_id"])
+    if ctx is None:
+        return web.json_response({"error": "no warm worker"}, status=503)
+    try:
+        return web.json_response(
+            await host_mcp_handler.cancel_reminder(ctx, reminder_id=reminder_id)
+        )
+    except (RuntimeError, ValueError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        logger.exception("rpc-service: cancel reminder failed")
+        return web.json_response({"error": f"handler raised: {exc}"}, status=500)
+
+
 def build_app(cfg: RpcServiceConfig) -> web.Application:
     app = web.Application()
     app.router.add_post(
@@ -377,6 +491,18 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/read-inbox",
         read_inbox_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/create-reminder",
+        create_reminder_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/list-reminders",
+        list_reminders_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/cancel-reminder",
+        cancel_reminder_route,
     )
     return app
 
