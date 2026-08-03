@@ -476,6 +476,21 @@ def _host_local_token(cfg: dict) -> str | None:
     return None
 
 
+def filter_container_mcp_servers(
+    servers: dict[str, dict],
+) -> tuple[dict[str, dict], list[tuple[str, str]]]:
+    """Drop MCP entries whose executable or args are host-only paths."""
+    reachable: dict[str, dict] = {}
+    unreachable: list[tuple[str, str]] = []
+    for name, cfg in servers.items():
+        token = _host_local_token(cfg)
+        if token is None:
+            reachable[name] = cfg
+        else:
+            unreachable.append((name, token))
+    return reachable, unreachable
+
+
 def sync_host_mcp_servers(
     host_home: Path, agent_home: Path,
 ) -> tuple[int, list[tuple[str, str]]]:
@@ -855,8 +870,7 @@ class DaemonConfig:
     default_provider: str = "anthropic"
     anthropic: ProviderConfig = field(default_factory=ProviderConfig)
     openai: ProviderConfig = field(default_factory=ProviderConfig)
-    # Required for cli-docker + harness=gemini-cli agents; passed
-    # through as GEMINI_API_KEY to the containerised gemini CLI.
+    # Google provider defaults for chat-local/sdk-local runtimes.
     google: ProviderConfig = field(default_factory=ProviderConfig)
     skills_dir: str = ""  # absolute path; empty = no shared skills
     reconcile_interval_seconds: float = 2.0
@@ -1019,19 +1033,17 @@ class RuntimeConfig:
     # cli-local Claude Code permission mode. Only ``bypassPermissions``
     # is supported today; see LocalCLIAdapter._sanitise_permission_mode.
     permission_mode: str = "bypassPermissions"
-    # codex (cli-local) sandbox policy: read-only | workspace-write |
+    # codex sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
     # "" = harness default; codex → config.toml, claude-code → --effort
     inference_level: str = ""
-    # codex (cli-local) per-turn wall-clock budget in seconds (default 30 min);
+    # codex per-turn wall-clock budget in seconds (default 30 min);
     # raise it for agents running even longer reasoning/complex tasks.
     task_timeout_seconds: float = 1800.0
-    # Agent engine (CLI kinds only): ``claude-code`` (stream-json + resume +
-    # puffo MCP), ``hermes`` (one-shot ``hermes chat -q``), ``gemini-cli``
-    # (declared, unimplemented). Hermes OAuth bills to Anthropic
-    # extra_usage, not a Claude subscription.
-    harness: str = "claude-code"  # claude-code | hermes
+    # Agent engine. cli-docker accepts claude-code/codex; cli-local also
+    # accepts hermes. Hermes OAuth bills to Anthropic extra_usage.
+    harness: str = "claude-code"
     # sdk only: cap on agentic-loop iterations per turn. 10 is fine
     # for short Q&A; multi-step work often needs 30-50. CLI kinds
     # delegate turn-bounding to the claude CLI itself.
@@ -1110,8 +1122,7 @@ class AgentConfig:
         provider = rt.get("provider", "")
         harness = rt.get("harness", "claude-code")
 
-        # Fail fast on invalid triples (e.g. gemini-cli + anthropic,
-        # or reserved kind=cli-sandbox).
+        # Fail fast on invalid runtime/provider/harness triples.
         result = validate_triple(kind, provider, harness)
         if not result.ok:
             raise RuntimeError(

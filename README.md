@@ -38,9 +38,8 @@ linking, and `agent` for the bots themselves.
     Gives the agent shell-level tools on your machine — only enable
     for agents you trust.
   - `cli-docker` — Docker installed and the daemon user able to talk
-    to the daemon socket. Supports `claude-code`, `hermes`, and
-    `gemini-cli` harnesses; codex inside Docker is not yet
-    supported.
+    to the daemon socket. Supports `claude-code` and `codex`; authenticate
+    once on the host with `claude login` or `codex login`.
 
 ## 2. Install
 
@@ -384,7 +383,7 @@ The `runtime.kind` in an agent's `agent.yml` decides where its brain runs:
 | `chat-local` | Direct LLM call inside the daemon (anthropic / openai / google). **Default.** | provider key |
 | `sdk-local` | Claude Agent SDK, in-process (anthropic only). | `puffo-agent[sdk]` |
 | `cli-local` | A CLI harness as a host subprocess — Claude Code, `codex`, or `hermes` (alpha). Shell + skills on the host. | `claude` / `codex` / `hermes` login |
-| `cli-docker` | Same as `cli-local`, in a per-agent container. `claude-code` / `hermes` / `gemini-cli`. | Docker |
+| `cli-docker` | Claude Code or Codex in a per-agent container. | Docker + host CLI login |
 | `ws-local` | No LLM — an external AI tool attaches over a localhost WebSocket as the brain. | `.puffoagent` bundle + passcode |
 
 Switch runtime kind / model / harness:
@@ -396,7 +395,7 @@ puffo-agent agent runtime <agent-id> --kind cli-docker --model claude-opus-4-7
 Pass `--help` for the full flag list (provider, harness, allowed_tools,
 docker_image, permission_mode, max_turns).
 
-> **codex** (`runtime.harness=codex`, `cli-local` only) spawns OpenAI's `codex
+> **codex** (`runtime.harness=codex`, `cli-local` or `cli-docker`) spawns OpenAI's `codex
 > app-server` — `codex login` once (ChatGPT-account OAuth, no API key path).
 >
 > **hermes** (`runtime.harness=hermes`, alpha) runs one-shot `hermes chat -q`
