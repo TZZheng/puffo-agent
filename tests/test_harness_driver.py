@@ -182,6 +182,14 @@ async def _next_matching(stream, type_: str):
     raise AssertionError(f"event stream ended before {type_}")
 
 
+async def _wait_until(predicate, *, timeout: float = 2.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("condition did not become true")
+        await asyncio.sleep(0.001)
+
+
 def test_contract_has_full_common_method_surface():
     expected = {
         "open", "start_turn", "steer_turn", "cancel_turn",
@@ -839,17 +847,16 @@ async def test_metadata_notice_through_real_manager_reads_paginated_exact_union(
                 }]},
             })
         admitted.append(f"message-{page_number}")
-        for _ in range(100):
-            if runtime.active.message_ids == admitted:
-                try:
-                    persisted = json.loads(
-                        runtime.current_turn_path.read_text()
-                    )
-                except (FileNotFoundError, json.JSONDecodeError):
-                    persisted = {}
-                if persisted.get("message_ids") == admitted:
-                    break
-            await asyncio.sleep(0)
+        def admission_is_persisted():
+            if runtime.active.message_ids != admitted:
+                return False
+            try:
+                persisted = json.loads(runtime.current_turn_path.read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                return False
+            return persisted.get("message_ids") == admitted
+
+        await _wait_until(admission_is_persisted)
         assert runtime.active.message_ids == admitted
         persisted = json.loads(runtime.current_turn_path.read_text())
         assert persisted["message_ids"] == admitted

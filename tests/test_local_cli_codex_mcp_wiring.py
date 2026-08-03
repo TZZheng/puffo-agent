@@ -134,6 +134,9 @@ def test_ensure_codex_session_honors_CODEX_HOME_env_for_host_read(
 def test_runtime_reasoning_level_round_trips_and_pins_codex_config(
     tmp_path, monkeypatch,
 ):
+    host_home = tmp_path / "host"
+    host_home.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: host_home))
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
     agent_id = "agent-reasoning-pin"
     AgentConfig(
@@ -151,7 +154,10 @@ def test_runtime_reasoning_level_round_trips_and_pins_codex_config(
     assert loaded.runtime.inference_level == "high"
 
     adapter = _make_adapter(tmp_path, inference_level=loaded.runtime.inference_level)
-    adapter._ensure_codex_session()
+    # This test verifies generated config, not provider startup. Keep it
+    # independent of the developer machine's Codex login and binary.
+    with pytest.raises(RuntimeError, match="codex needs auth"):
+        adapter._ensure_codex_session()
 
     codex_home = (
         Path(os.environ["PUFFO_AGENT_HOME"])

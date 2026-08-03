@@ -102,12 +102,12 @@ class ContractDriver(HarnessDriver):
         return None
 
 
-async def _wait_until(predicate, *, steps: int = 100) -> None:
-    for _ in range(steps):
-        if predicate():
-            return
-        await asyncio.sleep(0)
-    raise AssertionError("condition did not become true")
+async def _wait_until(predicate, *, timeout: float = 2.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("condition did not become true")
+        await asyncio.sleep(0.001)
 
 
 def _tool_text(result) -> str:
