@@ -110,13 +110,15 @@ Bridge Agents use the same DTO through the existing keyless boundary:
 
 PUT sends `revision`, `reminder_id`, RFC3339 `due_at`, `lifecycle`,
 `lifecycle_at`, `payload_format`, and base64url `opaque_payload`. The Server
-snapshot returns active scheduled rows as `{occurrences,next_after}` ordered by
+current-state snapshot returns scheduled rows and payload-free `cancelled` or
+`delivered` terminal tombstones as `{occurrences,next_after}` ordered by
 occurrence ID. On startup and reconnect, the Agent consumes every page,
-strictly validates/decrypts the envelope, and materializes only missing or
-byte-identical scheduled rows. A snapshot never deletes a local-only row,
+strictly validates and decrypts scheduled envelopes, materializes only missing
+or byte-identical scheduled rows, and applies terminal tombstones without
+creating an Inbox event or turn. A snapshot never deletes a local-only row,
 overwrites an immutable conflict, or regresses local `claimed`, `cancelled`, or
 `delivered` state. One changed batch signals the existing scheduler so overdue
-reconstruction takes the normal late Reminder Inbox path.
+scheduled reconstruction takes the normal late Reminder Inbox path.
 
 Server-acknowledged occurrences remain ineligible for local delivery until the
 startup or reconnect snapshot completes. When one becomes due, each runtime
