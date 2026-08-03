@@ -66,6 +66,32 @@ async def test_scheduler_recovers_claimed_work_after_reopen(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_scheduler_notifies_committed_deliveries_once_per_batch(tmp_path):
+    store = MessageStore(tmp_path / "batch.db", now_ms=lambda: 2_000)
+    commits: list[str] = []
+    scheduler = ReminderScheduler(
+        store=store,
+        notify=lambda: None,
+        now_ms=lambda: 2_000,
+        on_deliveries_committed=lambda: commits.append("committed"),
+    )
+    for reminder_id in ("reminder-one", "reminder-two"):
+        await store.create_reminder(
+            reminder_id=reminder_id,
+            occurrence_id=f"occurrence-{reminder_id}",
+            content="due",
+            target="dm:peer",
+            intended_at_ms=1_000,
+        )
+
+    assert len(await scheduler.process_due_once()) == 2
+    assert commits == ["committed"]
+    assert await scheduler.process_due_once() == ()
+    assert commits == ["committed"]
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_earlier_create_replans_wait_and_stop_has_no_leaked_task(tmp_path):
     now = [1_000]
     waits: list[float | None] = []

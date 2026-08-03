@@ -72,12 +72,14 @@ class ReminderScheduler:
         now_ms: Callable[[], int] = _now_ms,
         wait_for_change: Callable[[asyncio.Event, float | None], Awaitable[None]] | None = None,
         delivery_authorizer: ReminderDeliveryAuthorizer | None = None,
+        on_deliveries_committed: Callable[[], None] | None = None,
     ) -> None:
         self.store = store
         self._notify = notify
         self._now_ms = now_ms
         self._wait_for_change = wait_for_change
         self._delivery_authorizer = delivery_authorizer
+        self._on_deliveries_committed = on_deliveries_committed
         self._authorization_retry_after_ms: int | None = None
         self._wakeup = asyncio.Event()
         self._stopping = False
@@ -98,6 +100,12 @@ class ReminderScheduler:
         self._delivery_authorizer = authorizer
         self._authorization_retry_after_ms = None
         self.signal()
+
+    def set_deliveries_committed_callback(
+        self, callback: Callable[[], None] | None,
+    ) -> None:
+        """Set a provider-neutral notification for a committed delivery batch."""
+        self._on_deliveries_committed = callback
 
     async def create_reminder(
         self, *, content: str, target: str, intended_at: str,
@@ -146,6 +154,8 @@ class ReminderScheduler:
             )
         for _occurrence in delivered:
             self._notify()
+        if delivered and self._on_deliveries_committed is not None:
+            self._on_deliveries_committed()
         return delivered
 
     async def _wait_until_changed_or_due(self, deadline_ms: int | None) -> None:

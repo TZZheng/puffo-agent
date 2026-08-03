@@ -1959,6 +1959,9 @@ class Worker:
             global_runtime.reminder_scheduler.set_delivery_authorizer(
                 reminder_sync.authorize_due_delivery,
             )
+            global_runtime.reminder_scheduler.set_deliveries_committed_callback(
+                reminder_sync.signal_delivery_committed,
+            )
             client.add_connected_callback(reminder_sync.on_transport_connected)
             # Reconcile Server current-state before the local scheduler can
             # deliver overdue work. This closes the restore race where an old

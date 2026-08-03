@@ -45,6 +45,7 @@ SNAPSHOT_PAGE_LIMIT = 100
 MAX_SNAPSHOT_PAGES = 10_000
 RETRY_BASE_MS = 1_000
 RETRY_CAP_MS = 60_000
+DELIVERY_CLAIM_RETRY_MS = 5_000
 SYNC_IDLE_SECONDS = 30.0
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -315,6 +316,10 @@ class ReminderSync:
         self._snapshot_requested = True
         self._wakeup.set()
 
+    def signal_delivery_committed(self) -> None:
+        """Wake the outbox cadence after the scheduler commits delivery."""
+        self._wakeup.set()
+
     async def on_transport_connected(self) -> None:
         """Provider-neutral callback: signal only, never do HTTP in WS code."""
         self._delivery_ready = False
@@ -433,7 +438,7 @@ class ReminderSync:
         self, candidates: tuple[ReminderSyncRecord, ...],
     ) -> ReminderDeliveryAuthorization:
         """Acquire Server custody before the scheduler enters local delivery."""
-        retry_after = int(self._now_ms()) + RETRY_BASE_MS
+        retry_after = int(self._now_ms()) + DELIVERY_CLAIM_RETRY_MS
         blocked = False
         authorized: list[str] = []
         for candidate in candidates:

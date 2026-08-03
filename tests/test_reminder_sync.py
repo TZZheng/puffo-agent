@@ -301,6 +301,8 @@ async def test_acquired_claim_delivers_and_terminal_put_carries_same_claim_id(tm
     assert await sync.upload_pending_once() == 1
     assert await sync.reconcile_snapshot() == 0
     scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+    scheduler.set_deliveries_committed_callback(sync.signal_delivery_committed)
+    sync._wakeup.clear()
 
     assert [item.occurrence_id for item in await scheduler.process_due_once()] == [
         reminder.occurrence_id
@@ -309,6 +311,7 @@ async def test_acquired_claim_delivers_and_terminal_put_carries_same_claim_id(tm
     record = await store.get_reminder_sync_record(reminder.occurrence_id)
     assert record is not None and record.delivery_claim_id == claim_id
     assert record.delivery_claim_acquired
+    assert sync._wakeup.is_set()
     assert await sync.upload_pending_once() == 1
     delivered_put = transport.calls[-1][2]
     assert delivered_put is not None and delivered_put["delivery_claim_id"] == claim_id
@@ -325,8 +328,11 @@ async def test_held_or_terminal_claim_never_creates_a_local_inbox_event(tmp_path
     assert await sync.upload_pending_once() == 1
     assert await sync.reconcile_snapshot() == 0
     scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+    commits: list[str] = []
+    scheduler.set_deliveries_committed_callback(lambda: commits.append("committed"))
     transport.claim_status = "held"
     assert await scheduler.process_due_once() == ()
+    assert commits == []
     assert await store.get_message_by_envelope(f"reminder-occurrence:{reminder.occurrence_id}") is None
 
     transport.claim_status = "terminal"
