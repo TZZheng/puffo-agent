@@ -10,7 +10,11 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
-from puffo_agent.agent.message_store import MessageStore, reminder_time_to_rfc3339
+from puffo_agent.agent.message_store import (
+    LifecycleConflict,
+    MessageStore,
+    reminder_time_to_rfc3339,
+)
 from puffo_agent.agent.reminder_scheduler import ReminderScheduler
 from puffo_agent.agent.reminder_sync import (
     ENVELOPE_ALGORITHM,
@@ -63,6 +67,7 @@ class _RecordingTransport:
         response = {"occurrence_id": path.rsplit("/", 1)[-1], **body}
         if body["lifecycle"] != "scheduled":
             response.pop("opaque_payload")
+            response.pop("delivery_claim_id", None)
         return response
 
     async def put(self, path: str, body: dict[str, object]) -> dict[str, object]:
@@ -86,7 +91,7 @@ class _RecordingTransport:
         lifecycle = "delivered" if self.claim_status == "terminal" else "scheduled"
         return {
             "occurrence_id": path.split("/")[-2],
-            "revision": body["revision"],
+            "revision": body["revision"] + (1 if self.claim_status == "terminal" else 0),
             "lifecycle": lifecycle,
             "status": self.claim_status,
         }
@@ -331,7 +336,46 @@ async def test_held_or_terminal_claim_never_creates_a_local_inbox_event(tmp_path
     )]
     assert await scheduler.process_due_once() == ()
     assert (await store.get_reminder(reminder.reminder_id)).state == "delivered"
+    assert transport.claims[-1][1]["revision"] == 1
     assert await store.get_message_by_envelope(f"reminder-occurrence:{reminder.occurrence_id}") is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_preclaim_row_can_acquire_delivery_claim(tmp_path):
+    transport = _RecordingTransport()
+    sync, store, scheduler, _keys = _sync(tmp_path, transport)
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+    await store.claim_due_reminders(now_ms=2_000)
+    assert await sync.upload_pending_once() == 1
+    assert await sync.reconcile_snapshot() == 0
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+
+    assert [item.occurrence_id for item in await scheduler.process_due_once()] == [
+        reminder.occurrence_id
+    ]
+    assert len(transport.claims) == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_acknowledged_persisted_delivery_claim_rejects_cancellation(tmp_path):
+    transport = _RecordingTransport()
+    sync, store, scheduler, _keys = _sync(tmp_path, transport)
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+    assert await sync.upload_pending_once() == 1
+    assert await sync.reconcile_snapshot() == 0
+    scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
+    transport.claim_status = "held"
+    assert await scheduler.process_due_once() == ()
+
+    with pytest.raises(LifecycleConflict):
+        await store.cancel_reminder(reminder.reminder_id)
+    assert (await store.get_reminder(reminder.reminder_id)).state == "scheduled"
     await store.close()
 
 

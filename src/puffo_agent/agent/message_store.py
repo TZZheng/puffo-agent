@@ -2351,6 +2351,16 @@ class MessageStore:
                 reminder = await self._get_reminder_unlocked(db, reminder_id)
                 if reminder is None:
                     raise ValueError("unknown reminder_id")
+                record = await self._get_reminder_sync_by_occurrence_unlocked(
+                    db, reminder.occurrence_id,
+                )
+                assert record is not None
+                if (
+                    record.server_ack_revision >= 1
+                    and record.delivery_claim_id is not None
+                    and reminder.state in {"scheduled", "claimed"}
+                ):
+                    raise LifecycleConflict("reminder cancellation conflicts with delivery claim")
                 if reminder.state in {"scheduled", "claimed"}:
                     cursor = await db.execute(
                         """UPDATE reminder_occurrences

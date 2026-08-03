@@ -415,16 +415,17 @@ class ReminderSync:
             raise ReminderContractError("invalid reminder delivery claim")
         if response.get("occurrence_id") != record.occurrence_id:
             raise ReminderContractError("invalid reminder delivery claim")
-        if type(response.get("revision")) is not int or response["revision"] != record.revision:
+        revision = response.get("revision")
+        if type(revision) is not int:
             raise ReminderContractError("invalid reminder delivery claim")
         lifecycle = response.get("lifecycle")
         status = response.get("status")
         if status not in {"acquired", "held", "terminal"}:
             raise ReminderContractError("invalid reminder delivery claim")
         if status == "terminal":
-            if lifecycle not in {"cancelled", "delivered"}:
+            if lifecycle not in {"cancelled", "delivered"} or revision < record.revision:
                 raise ReminderContractError("invalid reminder delivery claim")
-        elif lifecycle != "scheduled":
+        elif revision != record.revision or lifecycle != "scheduled":
             raise ReminderContractError("invalid reminder delivery claim")
         return status
 
@@ -448,7 +449,7 @@ class ReminderSync:
                 authorized.append(candidate.occurrence_id)
                 continue
             if (
-                candidate.state != "scheduled"
+                candidate.state not in {"scheduled", "claimed"}
                 or candidate.server_ack_revision < candidate.revision
             ):
                 blocked = True
@@ -509,9 +510,6 @@ class ReminderSync:
             "lifecycle_at", "payload_format",
         }
         allowed = required | {"opaque_payload"}
-        if record.server_lifecycle == "delivered" and record.delivery_claim_id is not None:
-            required = required | {"delivery_claim_id"}
-            allowed = required
         if frozenset(response) not in {frozenset(required), frozenset(allowed)}:
             raise ReminderContractError("invalid reminder response")
         if response.get("occurrence_id") != record.occurrence_id:
@@ -540,9 +538,6 @@ class ReminderSync:
             # Current Server terminals omit this field.  If a compatible
             # implementation does return it, it must be the immutable bytes.
             raise ReminderContractError("invalid reminder response")
-        if record.server_lifecycle == "delivered" and record.delivery_claim_id is not None:
-            if response.get("delivery_claim_id") != record.delivery_claim_id:
-                raise ReminderContractError("invalid reminder response")
 
     async def _record_retry(
         self, record: ReminderSyncRecord, category: str,
