@@ -6,7 +6,27 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Codex is now supported by `runtime.kind=cli-docker`.** Each agent
+  runs `codex app-server` in its own container while reusing the
+  operator's `codex login` credentials. Per-agent Codex state, skills,
+  Puffo MCP tools, and container-reachable host MCP registrations are
+  mounted or synchronized into the runtime.
+
+### Changed
+
+- **`cli-docker` now supports only Claude Code and Codex.** Gemini CLI
+  and Hermes were removed from the Docker runtime matrix and bundled
+  image. Hermes remains available through `cli-local`.
+
 ### Fixed
+
+- **Puffo MCP tools now start inside `cli-docker`.** The image pins the
+  MCP SDK below 2.0 and includes the complete non-GUI dependency set
+  required by the in-container Puffo MCP server. Previously the server
+  exited during import, leaving tools such as
+  `mcp__puffo__send_message` unavailable to Claude Code.
 
 - **Skill ids ending in a newline are no longer accepted.** The daemon
   validated ids with Python's `$`, which also matches immediately before

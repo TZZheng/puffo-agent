@@ -38,8 +38,9 @@ linking, and `agent` for the bots themselves.
     Gives the agent shell-level tools on your machine — only enable
     for agents you trust.
   - `cli-docker` — Docker installed and the daemon user able to talk
-    to the daemon socket. Supports `claude-code` and `codex`; authenticate
-    once on the host with `claude login` or `codex login`.
+    to the daemon socket. The `docker` command must also be available
+    on the daemon's `$PATH`. Supports `claude-code` and `codex`;
+    authenticate once on the host with `claude login` or `codex login`.
 
 ## 2. Install
 
@@ -383,13 +384,19 @@ The `runtime.kind` in an agent's `agent.yml` decides where its brain runs:
 | `chat-local` | Direct LLM call inside the daemon (anthropic / openai / google). **Default.** | provider key |
 | `sdk-local` | Claude Agent SDK, in-process (anthropic only). | `puffo-agent[sdk]` |
 | `cli-local` | A CLI harness as a host subprocess — Claude Code, `codex`, or `hermes` (alpha). Shell + skills on the host. | `claude` / `codex` / `hermes` login |
-| `cli-docker` | Claude Code or Codex in a per-agent container. | Docker + host CLI login |
+| `cli-docker` | Claude Code or Codex in a per-agent container. Host credentials, skills, and container-reachable MCP registrations sync on startup. | Docker + host CLI login |
 | `ws-local` | No LLM — an external AI tool attaches over a localhost WebSocket as the brain. | `.puffoagent` bundle + passcode |
 
 Switch runtime kind / model / harness:
 
 ```bash
-puffo-agent agent runtime <agent-id> --kind cli-docker --model claude-opus-4-7
+# Claude Code
+puffo-agent agent runtime <agent-id> --kind cli-docker \
+  --harness claude-code --provider anthropic --model claude-opus-4-7
+
+# Codex
+puffo-agent agent runtime <agent-id> --kind cli-docker \
+  --harness codex --provider openai --model gpt-5.4
 ```
 
 Pass `--help` for the full flag list (provider, harness, allowed_tools,
@@ -397,6 +404,9 @@ docker_image, permission_mode, max_turns).
 
 > **codex** (`runtime.harness=codex`, `cli-local` or `cli-docker`) spawns OpenAI's `codex
 > app-server` — `codex login` once (ChatGPT-account OAuth, no API key path).
+>
+> The Docker runtime supports only `claude-code` and `codex`; Gemini and
+> Hermes remain available through their supported non-Docker runtimes.
 >
 > **hermes** (`runtime.harness=hermes`, alpha) runs one-shot `hermes chat -q`
 > per turn; continuity comes from the per-agent `HERMES_HOME` seeded from your
