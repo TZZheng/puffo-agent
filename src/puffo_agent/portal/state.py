@@ -994,6 +994,10 @@ class RuntimeConfig:
     kind: str = "chat-local"      # chat-local | sdk-local | cli-local | cli-docker
     provider: str = ""            # empty = default for kind
     model: str = ""
+    # Per-agent reasoning effort. Empty means harness default; when set,
+    # adapters pin the generated provider config instead of inheriting an
+    # operator-wide value that may be invalid for this agent's model.
+    inference_level: str = ""
     api_key: str = ""
     # OpenAI/Anthropic-compatible base URL for the LLM plane. Set this
     # to route model calls through a proxy — e.g. Shan's LiteLLM virtual
@@ -1137,6 +1141,7 @@ class AgentConfig:
                 kind=kind,
                 provider=provider,
                 model=rt.get("model", ""),
+                inference_level=rt.get("inference_level", ""),
                 api_key=rt.get("api_key", ""),
                 llm_base_url=rt.get("llm_base_url", ""),
                 allowed_tools=list(rt.get("allowed_tools") or []),

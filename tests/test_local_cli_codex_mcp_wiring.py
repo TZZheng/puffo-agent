@@ -15,12 +15,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
 from puffo_agent.agent.harness import CodexHarness
+from puffo_agent.portal.state import AgentConfig, RuntimeConfig
 
 
 def _make_adapter(
     tmp_path: Path,
     *,
     puffo_core_env: dict | None = None,
+    inference_level: str = "",
 ) -> LocalCLIAdapter:
     agent_id = "agent-puf266-wiring"
     adapter = LocalCLIAdapter(
@@ -33,6 +35,7 @@ def _make_adapter(
         agent_home_dir=str(tmp_path / "agents" / agent_id),
         harness=CodexHarness(),
         permission_mode="bypassPermissions",
+        inference_level=inference_level,
     )
     adapter.puffo_core_mcp_env = puffo_core_env
     return adapter
@@ -126,3 +129,35 @@ def test_ensure_codex_session_honors_CODEX_HOME_env_for_host_read(
     servers = doc.get("mcp_servers") or {}
     assert "fs_custom" in servers
     assert "fs_default_should_be_ignored" not in servers
+
+
+def test_runtime_reasoning_level_round_trips_and_pins_codex_config(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    agent_id = "agent-reasoning-pin"
+    AgentConfig(
+        id=agent_id,
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="openai",
+            harness="codex",
+            model="gpt-5.5",
+            inference_level="high",
+        ),
+    ).save()
+
+    loaded = AgentConfig.load(agent_id)
+    assert loaded.runtime.inference_level == "high"
+
+    adapter = _make_adapter(tmp_path, inference_level=loaded.runtime.inference_level)
+    adapter._ensure_codex_session()
+
+    codex_home = (
+        Path(os.environ["PUFFO_AGENT_HOME"])
+        / "agents"
+        / adapter.agent_id
+        / ".codex"
+    )
+    doc = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert doc["model_reasoning_effort"] == "high"

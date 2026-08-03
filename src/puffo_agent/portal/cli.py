@@ -1084,6 +1084,20 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if args.harness is not None:
         cfg.runtime.harness = args.harness
         touched = True
+    if args.inference_level is not None:
+        from ..mcp.config import supported_inference_levels
+
+        levels = supported_inference_levels(cfg.runtime.harness)
+        if args.inference_level and args.inference_level not in levels:
+            print(
+                f"error: inference level {args.inference_level!r} is not "
+                f"supported by {cfg.runtime.harness!r}; expected one of "
+                f"{', '.join(levels)}",
+                file=sys.stderr,
+            )
+            return 2
+        cfg.runtime.inference_level = args.inference_level
+        touched = True
     if args.max_turns is not None:
         if args.max_turns < 1:
             print("error: --max-turns must be >= 1", file=sys.stderr)
@@ -1099,6 +1113,7 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
         print(f"  provider:         {cfg.runtime.provider or '(default)'}")
         print(f"  harness:          {cfg.runtime.harness}  (cli-local / cli-docker only)")
         print(f"  model:            {cfg.runtime.model or '(default)'}")
+        print(f"  inference_level:  {cfg.runtime.inference_level or '(harness default)'}")
         print(f"  api_key:          {'(set)' if cfg.runtime.api_key else '(inherit)'}")
         print(f"  allowed_tools:    {cfg.runtime.allowed_tools or '[]'}")
         print(f"  docker_image:     {cfg.runtime.docker_image or '(bundled default)'}")
@@ -1118,6 +1133,8 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     cfg.save()
     print(f"agent {agent_id!r} runtime updated:")
     print(f"  kind={cfg.runtime.kind} model={cfg.runtime.model or '(default)'}")
+    if cfg.runtime.inference_level:
+        print(f"  inference_level={cfg.runtime.inference_level}")
     if cfg.runtime.allowed_tools:
         print(f"  allowed_tools={cfg.runtime.allowed_tools}")
     if cfg.runtime.docker_image:
@@ -1828,6 +1845,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     runtime.add_argument("--model", help="Model override (empty string clears)")
+    runtime.add_argument(
+        "--inference-level",
+        default=None,
+        help=(
+            "Per-agent reasoning effort (values depend on harness; empty "
+            "string clears and restores the harness default)"
+        ),
+    )
     runtime.add_argument("--api-key", help="Runtime API key (sdk-local / chat-local)")
     runtime.add_argument(
         "--allowed-tools",
