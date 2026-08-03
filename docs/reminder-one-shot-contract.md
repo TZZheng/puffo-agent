@@ -62,13 +62,21 @@ work before waiting, and waits only until the next durable deadline or a
 create/cancel signal. This covers an online local Agent and a local worker that
 restarts later.
 
-A separate Server contract is needed only if product scope requires firing
-while no owning Agent process is running, cross-device timer election or
-transfer, or cross-machine wake. Such a contract must keep plaintext content
-local and define opaque timer/delivery identity separately.
+The next Server contract extends this local behavior so an offline Agent can
+catch up and reconstruct local reminder state. The Agent encrypts the private
+payload with its remote-data DEK (the current Core architecture calls this
+`MessageBackupDEK`) directly through AEAD with a unique nonce. It does not
+derive a Reminder-specific key and does not reuse the local SQLCipher
+`DatabaseDek`. The Server receives only opaque ciphertext plus the minimum
+plaintext occurrence, lifecycle, and scheduling metadata needed to index and
+wake due work.
+
+Cross-device timer election and transfer remain outside the first Server
+snapshot contract.
 
 ## Non-goals
 
 This slice has no editing, rescheduling, recurrence, snooze, browser surface,
-Server storage/API, cloud sandbox lifecycle scheduling, or provider-specific
-scheduler behavior.
+cloud sandbox lifecycle scheduling, cross-device election, or
+provider-specific scheduler behavior. Server storage/API and Agent snapshot
+reconciliation are delivered as a separate reviewed slice.
