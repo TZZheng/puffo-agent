@@ -1109,6 +1109,61 @@ def test_thread_start_carries_configured_sandbox(tmp_path):
     asyncio.run(_run())
 
 
+THREAD_CWD_SCRIPT = '''\
+absorb_initialize()
+
+msg = r()
+assert msg["method"] == "thread/start"
+assert msg["params"]["cwd"] == "/workspace", msg["params"]
+w({"jsonrpc": "2.0", "id": msg["id"],
+   "result": {"thread": {"id": "conv_container", "createdAt": "2026-08-03T00:00:00Z"}}})
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+'''
+
+
+def test_thread_start_uses_thread_cwd_without_changing_process_cwd(tmp_path):
+    fake = _write_fake(tmp_path, THREAD_CWD_SCRIPT)
+    cs = CodexSession(
+        agent_id="docker-codex",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+        thread_cwd="/workspace",
+    )
+
+    async def _run():
+        await cs.warm("system prompt")
+        await cs.aclose()
+
+    asyncio.run(_run())
+    persisted = json.loads(cs.session_file.read_text(encoding="utf-8"))
+    assert persisted["thread_cwd"] == "/workspace"
+
+
+def test_explicit_thread_cwd_rotates_legacy_persisted_thread(tmp_path):
+    session_file = tmp_path / "codex_session.json"
+    session_file.write_text(
+        json.dumps({
+            "conversation_id": "legacy",
+            "sandbox": "danger-full-access",
+        }),
+        encoding="utf-8",
+    )
+
+    cs = CodexSession(
+        agent_id="docker-codex",
+        session_file=session_file,
+        argv=["codex", "app-server"],
+        thread_cwd="/workspace",
+    )
+
+    assert cs._conversation_id == ""
+
+
 def test_sanitise_sandbox_falls_back_on_unknown():
     from puffo_agent.agent.adapters.local_cli import _sanitise_sandbox
 

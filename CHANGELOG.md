@@ -22,6 +22,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Codex shell commands now run in the cli-docker workspace.** The
+  app-server process runs through `docker exec`, but new threads
+  previously inherited the daemon's host cwd. On Windows that passed a
+  `C:\\...` path into the Linux container, so even read-only commands
+  failed before shell creation. Container threads now use `/workspace`
+  and rotate legacy sessions that persisted the invalid cwd.
+
 - **Puffo MCP tools now start inside `cli-docker`.** The image pins the
   MCP SDK below 2.0 and includes the complete non-GUI dependency set
   required by the in-container Puffo MCP server. Previously the server

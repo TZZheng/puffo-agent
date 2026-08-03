@@ -130,6 +130,8 @@ def test_codex_session_runs_app_server_inside_container(tmp_path):
         "-e", "CODEX_HOME=/home/agent/.codex",
         "puffo-docker-codex", "codex", "app-server",
     ]
+    assert session.cwd is None
+    assert session.thread_cwd == "/workspace"
     assert session.sandbox == "workspace-write"
     assert session.task_timeout_seconds == 321
     assert session.model == "gpt-5.4"

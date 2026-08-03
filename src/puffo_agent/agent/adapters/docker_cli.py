@@ -322,6 +322,7 @@ class DockerCLIAdapter(Adapter):
                 self.container_name, "codex", "app-server",
             ],
             cwd=None,
+            thread_cwd="/workspace",
             permission_mode=self.permission_mode,
             sandbox=self.sandbox,
             model=self.model,
