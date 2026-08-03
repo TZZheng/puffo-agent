@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -1787,6 +1788,9 @@ async def test_reminder_schema_migrates_additively_without_changing_existing_inb
         "reminder_id", "occurrence_id", "target", "content", "intended_at_ms",
         "state", "created_at_ms", "claimed_at_ms", "actual_fire_at_ms",
         "cancelled_at_ms", "delivered_at_ms", "delivered_event_id",
+        "revision", "server_ack_revision", "payload_format", "opaque_payload",
+        "sync_retry_after_ms", "sync_retry_count", "sync_permanent_revision",
+        "sync_permanent_code",
     }
     async with db.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' "
@@ -1801,6 +1805,130 @@ async def test_reminder_schema_migrates_additively_without_changing_existing_inb
     run = await reopened.get_turn_run("empty-turn")
     assert run is not None and run.state == ProcessingState.IN_TURN.value
     await reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_reminder_sync_schema_backfills_old_lifecycles_without_losing_facts(tmp_path):
+    """The remote outbox is additive to the accepted local reminder table."""
+    path = tmp_path / "old-reminders.db"
+    bootstrap = MessageStore(path, now_ms=lambda: 1_000)
+    await bootstrap.store_receipt(
+        _channel_payload("existing-inbox", sent_at=1),
+        server_seq=1,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    await bootstrap.close()
+
+    connection = sqlite3.connect(path)
+    connection.execute("DROP TABLE reminder_occurrences")
+    connection.execute(
+        """CREATE TABLE reminder_occurrences (
+            reminder_id TEXT PRIMARY KEY,
+            occurrence_id TEXT NOT NULL UNIQUE,
+            target TEXT NOT NULL,
+            content TEXT NOT NULL,
+            intended_at_ms INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            claimed_at_ms INTEGER,
+            actual_fire_at_ms INTEGER,
+            cancelled_at_ms INTEGER,
+            delivered_at_ms INTEGER,
+            delivered_event_id TEXT UNIQUE
+        )"""
+    )
+    rows = [
+        ("scheduled", "occ-scheduled", "scheduled", None, None, None, None),
+        ("claimed", "occ-claimed", "claimed", 20, 20, None, None),
+        ("cancelled", "occ-cancelled", "cancelled", None, None, 30, None),
+        ("delivered", "occ-delivered", "delivered", 40, 40, None, 50),
+    ]
+    for reminder_id, occurrence_id, state, claimed_at, fire_at, cancelled_at, delivered_at in rows:
+        connection.execute(
+            """INSERT INTO reminder_occurrences
+               (reminder_id, occurrence_id, target, content, intended_at_ms,
+                state, created_at_ms, claimed_at_ms, actual_fire_at_ms,
+                cancelled_at_ms, delivered_at_ms, delivered_event_id)
+               VALUES (?, ?, 'dm:peer', 'old exact content', 10, ?, 1, ?, ?, ?, ?, ?)""",
+            (
+                reminder_id, occurrence_id, state, claimed_at, fire_at,
+                cancelled_at, delivered_at,
+                f"reminder-occurrence:{occurrence_id}" if delivered_at else None,
+            ),
+        )
+    connection.commit()
+    connection.close()
+
+    store = MessageStore(path, now_ms=lambda: 1_000)
+    await store.open()
+    db = await store._ensure_db()
+    async with db.execute(
+        """SELECT occurrence_id, state, revision, server_ack_revision,
+                  payload_format, opaque_payload, sync_retry_count,
+                  sync_permanent_code
+           FROM reminder_occurrences ORDER BY occurrence_id"""
+    ) as cursor:
+        migrated = {row["occurrence_id"]: dict(row) for row in await cursor.fetchall()}
+    assert migrated["occ-scheduled"]["revision"] == 1
+    assert migrated["occ-claimed"]["revision"] == 1
+    assert migrated["occ-cancelled"]["revision"] == 2
+    assert migrated["occ-delivered"]["revision"] == 2
+    assert all(row["server_ack_revision"] == 0 for row in migrated.values())
+    assert all(row["payload_format"] is None for row in migrated.values())
+    assert [item.envelope_id for item in await store.get_pending()] == ["existing-inbox"]
+    assert (await store.get_reminder("delivered")).delivered_event_id == (
+        "reminder-occurrence:occ-delivered"
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reminder_sync_revisions_and_acknowledgments_are_transactional(tmp_path):
+    store = MessageStore(tmp_path / "messages.db", now_ms=lambda: 2_000)
+    created = await store.create_reminder(
+        reminder_id="reminder-state", occurrence_id="occurrence-state",
+        target="dm:peer", content="exact private", intended_at_ms=1_000,
+        created_at_ms=500,
+    )
+    record = await store.get_reminder_sync_record(created.occurrence_id)
+    assert record is not None and (record.state, record.revision, record.server_ack_revision) == (
+        "scheduled", 1, 0,
+    )
+    await store.claim_due_reminders(now_ms=2_000)
+    record = await store.get_reminder_sync_record(created.occurrence_id)
+    assert record is not None and (record.state, record.revision) == ("claimed", 1)
+
+    await store.schedule_reminder_sync_retry(
+        occurrence_id=created.occurrence_id, revision=1, retry_after_ms=9_000,
+    )
+    cancelled = await store.cancel_reminder(created.reminder_id, cancelled_at_ms=2_000)
+    assert cancelled.state == "cancelled"
+    record = await store.get_reminder_sync_record(created.occurrence_id)
+    assert record is not None and (record.revision, record.sync_retry_count) == (2, 0)
+    assert not await store.acknowledge_reminder_sync_revision(
+        occurrence_id=created.occurrence_id, revision=1,
+    )
+    assert await store.acknowledge_reminder_sync_revision(
+        occurrence_id=created.occurrence_id, revision=2,
+    )
+    await store.cancel_reminder(created.reminder_id, cancelled_at_ms=2_100)
+    record = await store.get_reminder_sync_record(created.occurrence_id)
+    assert record is not None and (record.revision, record.server_ack_revision) == (2, 2)
+
+    delivered = await store.create_reminder(
+        reminder_id="reminder-delivered", occurrence_id="occurrence-delivered",
+        target="dm:peer", content="deliver exactly once", intended_at_ms=1_000,
+        created_at_ms=500,
+    )
+    await store.deliver_due_reminders(now_ms=2_000)
+    delivered_record = await store.get_reminder_sync_record(delivered.occurrence_id)
+    assert delivered_record is not None
+    assert (delivered_record.state, delivered_record.revision) == ("delivered", 2)
+    assert [item.envelope_id for item in await store.get_pending()] == [
+        f"reminder-occurrence:{delivered.occurrence_id}"
+    ]
+    await store.close()
 
 
 @pytest.mark.asyncio
