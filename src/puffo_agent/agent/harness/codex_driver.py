@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
+from ..errors import AgentAPIError
 from .driver import (
     CancelCapability,
     CancelReceipt,
@@ -36,7 +38,6 @@ from .driver import (
     TurnStarted,
 )
 
-
 CODEX_CAPABILITIES = DriverCapabilities(
     session_resume=True,
     inflight_turn_recovery=False,
@@ -48,6 +49,81 @@ CODEX_CAPABILITIES = DriverCapabilities(
 )
 
 logger = logging.getLogger(__name__)
+
+
+_SENSITIVE_ERROR_FIELD = re.compile(
+    r"(?i)(?P<prefix>[\"']?(?:api[_-]?key|access[_-]?token|"
+    r"refresh[_-]?token|authorization)[\"']?\s*[:=]\s*)"
+    r"(?P<value>(?:bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s,}\]]+))"
+)
+_BEARER_VALUE = re.compile(
+    r"(?i)\bbearer\s+(?:\"[^\"]*\"|'[^']*'|[^\s,}\]]+)"
+)
+_TOKENISH = re.compile(
+    r"(?i)\b(?:sk[_-][a-z0-9_-]{12,}|eyJ[a-zA-Z0-9_-]{12,}"
+    r"\.[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)?)"
+)
+_AUTH_ERROR = re.compile(
+    r"(?i)(?:\b401\b|\b403\b|authentication|authenticate|unauthori[sz]ed|"
+    r"invalid(?:ated)?[ _-]?(?:api[ _-]?key|token|credential)|"
+    r"token[ _-]?(?:invalidated|revoked)|(?:re-)?login)"
+)
+_RETRYABLE_PROVIDER_ERROR = re.compile(
+    r"(?i)(?:\b408\b|\b425\b|\b429\b|\b5\d\d\b|rate[ _-]?limit|"
+    r"too many requests|quota|temporar(?:y|ily)|timed? ?out|timeout|"
+    r"unavailable|overloaded|connection (?:reset|refused))"
+)
+
+
+def _safe_jsonrpc_error_message(message: Any) -> str:
+    """Keep a bounded diagnostic while never copying credential-shaped text."""
+    if not isinstance(message, str):
+        return "(missing or invalid provider message)"
+    compact = " ".join(message.split())
+    redacted = _SENSITIVE_ERROR_FIELD.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]", compact
+    )
+    redacted = _BEARER_VALUE.sub("Bearer [REDACTED]", redacted)
+    redacted = _TOKENISH.sub("[REDACTED]", redacted)
+    return redacted[:300] or "(empty provider message)"
+
+
+def _safe_jsonrpc_error_code(code: Any) -> str:
+    if isinstance(code, bool) or not isinstance(code, (str, int)):
+        return "unknown"
+    return _safe_jsonrpc_error_message(str(code))[:64]
+
+
+def _jsonrpc_error_context(error: Any) -> str:
+    """Return only classification fields; this value is never surfaced."""
+    if not isinstance(error, dict):
+        return str(error or "")[:2048]
+    values: list[str] = []
+    for key in ("code", "message", "type", "status"):
+        value = error.get(key)
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            values.append(str(value))
+    data = error.get("data")
+    if isinstance(data, dict):
+        for key in ("code", "message", "type", "status", "error"):
+            value = data.get(key)
+            if isinstance(value, (str, int)) and not isinstance(value, bool):
+                values.append(str(value))
+    return " ".join(values)[:2048]
+
+
+def _classify_jsonrpc_error(error: Any) -> Exception:
+    """Translate a Codex JSON-RPC error into Global Inbox recovery semantics."""
+    error_obj = error if isinstance(error, dict) else {}
+    code = _safe_jsonrpc_error_code(error_obj.get("code"))
+    message = _safe_jsonrpc_error_message(error_obj.get("message", error))
+    detail = f"Codex JSON-RPC error code={code}: {message}"
+    context = _jsonrpc_error_context(error)
+    if _AUTH_ERROR.search(context):
+        return AgentAPIError(detail, is_auth=True)
+    if _RETRYABLE_PROVIDER_ERROR.search(context):
+        return AgentAPIError(detail, is_auth=False)
+    return RuntimeError(detail)
 
 
 class CodexAppServerDriver(HarnessDriver):
@@ -280,7 +356,9 @@ class CodexAppServerDriver(HarnessDriver):
                     future = self._pending.get(frame["id"])
                     if future is not None and not future.done():
                         if "error" in frame:
-                            future.set_exception(RuntimeError("Codex request failed"))
+                            future.set_exception(
+                                _classify_jsonrpc_error(frame["error"])
+                            )
                         else:
                             future.set_result(frame.get("result"))
                     continue

@@ -204,6 +204,7 @@ async def test_supported_worker_driver_registers_live_encrypted_controls_and_eve
         outbox=outbox,
         logical_session_ref="logical-session",
     )
+    assert facade.manager.spec.task_timeout_seconds == adapter.task_timeout_seconds
     try:
         started = await facade.manager.start_turn(TurnInput("hello"))
         await fake.queue.put(HarnessEvent(

@@ -50,6 +50,7 @@ class RuntimeManager:
         self, driver: HarnessDriver, spec: RuntimeSpec, *,
         agent_id: str = "", session_ref: SessionRef | None = None,
         native_session_id: str = "",
+        driver_name: str = "",
         event_sink: Callable[[HarnessEvent], Awaitable[None]] | None = None,
         before_start: Callable[[], Awaitable[None] | None] | None = None,
     ):
@@ -62,6 +63,7 @@ class RuntimeManager:
             f"session_{uuid.uuid4().hex}"
         )
         self.native_session_id = native_session_id
+        self.driver_name = driver_name or type(driver).__name__
         self.opened: RuntimeOpened | None = None
         self.active_turn_ref: TurnRef | None = None
         self.native_turn_id = ""
@@ -76,6 +78,12 @@ class RuntimeManager:
         self._continuation_admissions: list[ToolResultAdmission] = []
 
     async def open(self, *, resume: bool = True) -> RuntimeOpened:
+        async with self._command_lock:
+            return await self._open_locked(resume=resume)
+
+    async def _open_locked(self, *, resume: bool = True) -> RuntimeOpened:
+        if self._closed:
+            raise RuntimeStateError("runtime is closed")
         if self.opened is not None:
             return self.opened
         native_resume = (
@@ -98,7 +106,7 @@ class RuntimeManager:
             if self._closed:
                 raise RuntimeStateError("runtime is closed")
             if self.opened is None:
-                await self.open()
+                await self._open_locked()
             if self.active_turn_ref is not None:
                 raise RuntimeStateError("one provider turn is already active")
             if self.before_start is not None:
@@ -127,31 +135,36 @@ class RuntimeManager:
             return replace(receipt, turn_ref=logical)
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput) -> Any:
-        self._validate_active(turn)
-        assert self._active_driver_turn_ref is not None
-        receipt = await self.driver.steer_turn(
-            self._active_driver_turn_ref, input
-        )
-        if isinstance(receipt, UnsupportedCapability):
-            return receipt
-        return replace(receipt, turn_ref=turn)
+        async with self._command_lock:
+            self._validate_active(turn)
+            assert self._active_driver_turn_ref is not None
+            receipt = await self.driver.steer_turn(
+                self._active_driver_turn_ref, input
+            )
+            if isinstance(receipt, UnsupportedCapability):
+                return receipt
+            return replace(receipt, turn_ref=turn)
 
     async def cancel_turn(self, turn: TurnRef) -> Any:
-        self._validate_active(turn)
-        assert self._active_driver_turn_ref is not None
-        receipt = await self.driver.cancel_turn(self._active_driver_turn_ref)
-        if isinstance(receipt, UnsupportedCapability):
-            return receipt
-        return replace(receipt, turn_ref=turn)
+        async with self._command_lock:
+            self._validate_active(turn)
+            assert self._active_driver_turn_ref is not None
+            receipt = await self.driver.cancel_turn(
+                self._active_driver_turn_ref
+            )
+            if isinstance(receipt, UnsupportedCapability):
+                return receipt
+            return replace(receipt, turn_ref=turn)
 
     async def resolve_permission(
         self, turn: TurnRef, permission: PermissionRef,
         decision: PermissionDecision,
     ) -> PermissionReceipt | UnsupportedCapability:
-        self._validate_active(turn)
-        if permission not in self._permission_refs:
-            raise RuntimeStateError("unknown or stale permission reference")
-        return await self.driver.resolve_permission(permission, decision)
+        async with self._command_lock:
+            self._validate_active(turn)
+            if permission not in self._permission_refs:
+                raise RuntimeStateError("unknown or stale permission reference")
+            return await self.driver.resolve_permission(permission, decision)
 
     async def wait_terminal(self, turn: TurnRef) -> HarnessEvent:
         future = self._terminal.get(turn)
@@ -164,14 +177,99 @@ class RuntimeManager:
                 self._terminal.pop(turn, None)
 
     async def reload_resources(self, *, preserve_session: bool) -> None:
+        async with self._command_lock:
+            if self.active_turn_ref is not None:
+                raise RuntimeStateError("cannot reload while a turn is active")
+            await self._retire_runtime_locked(
+                preserve_session=preserve_session
+            )
+            await self._open_locked(resume=preserve_session)
+
+    async def abandon_turn(
+        self,
+        turn: TurnRef,
+        *,
+        reason: str,
+        retryable: bool = True,
+    ) -> HarnessEvent:
+        """Publish one canonical terminal and release the active Turn."""
+        async with self._command_lock:
+            self._validate_active(turn)
+            event = HarnessEvent(
+                type=HarnessEventType.TURN_ABANDONED,
+                driver=self.driver_name,
+                session_ref=self.session_ref,
+                turn_ref=turn,
+                native_session_id=self.native_session_id,
+                native_turn_id=self.native_turn_id,
+                data={
+                    "outcome": "abandoned",
+                    "error_code": reason,
+                    "retryable": retryable,
+                },
+            )
+            await self._publish_terminal_locked(event, turn)
+            return event
+
+    async def timeout_turn(
+        self,
+        turn: TurnRef,
+        *,
+        cancel_timeout: float = 1.0,
+    ) -> HarnessEvent | None:
+        """Atomically abandon a timed-out Turn and retire its runtime."""
+        async with self._command_lock:
+            if self.active_turn_ref != turn:
+                return None
+            assert self._active_driver_turn_ref is not None
+            try:
+                await asyncio.wait_for(
+                    self.driver.cancel_turn(self._active_driver_turn_ref),
+                    timeout=cancel_timeout,
+                )
+            except Exception:
+                logger.info(
+                    "provider turn %s did not acknowledge timeout interrupt",
+                    turn,
+                    exc_info=True,
+                )
+            event = HarnessEvent(
+                type=HarnessEventType.TURN_ABANDONED,
+                driver=self.driver_name,
+                session_ref=self.session_ref,
+                turn_ref=turn,
+                native_session_id=self.native_session_id,
+                native_turn_id=self.native_turn_id,
+                data={
+                    "outcome": "abandoned",
+                    "error_code": "turn_timeout",
+                    "retryable": True,
+                },
+            )
+            try:
+                await self._publish_terminal_locked(event, turn)
+            finally:
+                await self._retire_runtime_locked(preserve_session=False)
+            return event
+
+    async def retire_runtime(self, *, preserve_session: bool) -> None:
+        """Stop a provider runtime without eagerly opening its replacement."""
+        async with self._command_lock:
+            if self.active_turn_ref is not None:
+                raise RuntimeStateError("cannot retire while a turn is active")
+            await self._retire_runtime_locked(
+                preserve_session=preserve_session
+            )
+
+    async def _retire_runtime_locked(self, *, preserve_session: bool) -> None:
         if self.active_turn_ref is not None:
-            raise RuntimeStateError("cannot reload while a turn is active")
+            raise RuntimeStateError("cannot retire while a turn is active")
         await self._stop_reader()
         await self.driver.close()
         self.opened = None
         if not preserve_session:
             self.session_ref = SessionRef(f"session_{uuid.uuid4().hex}")
-        await self.open(resume=preserve_session)
+            self.native_session_id = ""
 
     def events(self) -> AsyncIterator[HarnessEvent]:
         queue: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
@@ -190,15 +288,17 @@ class RuntimeManager:
         return iterate()
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        if self.agent_id:
-            unregister_runtime_manager(self.agent_id, self)
-        await self.driver.close()
-        await self._stop_reader()
-        for queue in tuple(self._subscribers):
-            queue.put_nowait(None)
+        async with self._command_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self.agent_id:
+                unregister_runtime_manager(self.agent_id, self)
+            await self._stop_reader()
+            await self.driver.close()
+            self.opened = None
+            for queue in tuple(self._subscribers):
+                queue.put_nowait(None)
 
     async def _stop_reader(self) -> None:
         if self._reader is not None:
@@ -209,52 +309,172 @@ class RuntimeManager:
     async def _consume_events(self) -> None:
         try:
             async for native in self.driver.events():
-                logical_turn = (
-                    self._turn_refs.get(native.turn_ref)
-                    if native.turn_ref is not None
-                    else None
-                )
-                # A provider may push turn.started before its start response.
-                # During that narrow window there is exactly one pending
-                # logical Turn, so attribution is still unambiguous.
-                if (
-                    logical_turn is None
-                    and native.turn_ref is not None
-                    and self.active_turn_ref is not None
-                    and self._active_driver_turn_ref is None
-                ):
-                    logical_turn = self.active_turn_ref
-                event = replace(
-                    native, session_ref=self.session_ref, turn_ref=logical_turn
-                )
-                await self._admit_matching_tool_result(native)
-                if event.type in {
-                    HarnessEventType.PERMISSION_REQUESTED,
-                    "turn.permission_requested",
+                event_type = getattr(native.type, "value", native.type)
+                if event_type in {
+                    "runtime.ready",
+                    "runtime.warning",
+                    "session.opened",
+                    "session.resumed",
                 }:
-                    value = event.data.get("permission_ref")
-                    if value:
-                        self._permission_refs.add(PermissionRef(str(value)))
-                if self.event_sink is not None:
-                    await self.event_sink(event)
-                for queue in tuple(self._subscribers):
-                    queue.put_nowait(event)
-                if event.type in {
-                    HarnessEventType.TURN_COMPLETED,
-                    HarnessEventType.TURN_ABANDONED,
-                    "turn.completed",
-                    "turn.abandoned",
-                } and logical_turn is not None:
-                    future = self._terminal.get(logical_turn)
-                    if future is not None and not future.done():
-                        future.set_result(event)
-                    self.active_turn_ref = None
-                    self._active_driver_turn_ref = None
-                    self.native_turn_id = ""
-                    self._permission_refs.clear()
-                    self._continuation_admissions.clear()
+                    self.driver_name = native.driver or self.driver_name
+                    await self._publish_event(replace(
+                        native,
+                        session_ref=self.session_ref,
+                        turn_ref=None,
+                    ))
+                    continue
+                async with self._command_lock:
+                    should_stop = await self._consume_event_locked(native)
+                if should_stop:
+                    return
+            if not self._closed:
+                async with self._command_lock:
+                    await self._fail_runtime_locked(
+                        "runtime_event_stream_ended"
+                    )
         except asyncio.CancelledError:
             raise
+        except Exception:
+            logger.exception("provider runtime event processing failed")
+            async with self._command_lock:
+                await self._fail_runtime_locked(
+                    "runtime_event_processing_failed"
+                )
+        finally:
+            if self._reader is asyncio.current_task():
+                self._reader = None
+
+    async def _consume_event_locked(self, native: HarnessEvent) -> bool:
+        self.driver_name = native.driver or self.driver_name
+        logical_turn = (
+            self._turn_refs.get(native.turn_ref)
+            if native.turn_ref is not None
+            else None
+        )
+        event = replace(
+            native, session_ref=self.session_ref, turn_ref=logical_turn
+        )
+        await self._admit_matching_tool_result(native)
+        if event.type in {
+            HarnessEventType.PERMISSION_REQUESTED,
+            "turn.permission_requested",
+        }:
+            value = event.data.get("permission_ref")
+            if value:
+                self._permission_refs.add(PermissionRef(str(value)))
+        if event.type in {
+            HarnessEventType.RUNTIME_EXITED,
+            "runtime.exited",
+        }:
+            await self._publish_event(event)
+            active = self.active_turn_ref
+            try:
+                if active is not None:
+                    abandoned = HarnessEvent(
+                        type=HarnessEventType.TURN_ABANDONED,
+                        driver=self.driver_name,
+                        session_ref=self.session_ref,
+                        turn_ref=active,
+                        native_session_id=self.native_session_id,
+                        native_turn_id=self.native_turn_id,
+                        occurred_at=event.occurred_at,
+                        data={
+                            "outcome": "abandoned",
+                            "error_code": "runtime_exited",
+                            "retryable": True,
+                        },
+                    )
+                    await self._publish_terminal_locked(abandoned, active)
+            finally:
+                await self.driver.close()
+                self.opened = None
+            return True
+        if event.type in {
+            HarnessEventType.TURN_COMPLETED,
+            HarnessEventType.TURN_ABANDONED,
+            "turn.completed",
+            "turn.abandoned",
+        } and logical_turn is not None:
+            await self._publish_terminal_locked(event, logical_turn)
+        else:
+            await self._publish_event(event)
+        return False
+
+    async def _publish_event(self, event: HarnessEvent) -> None:
+        if self.event_sink is not None:
+            await self.event_sink(event)
+        self._fanout_event(event)
+
+    async def _publish_terminal_locked(
+        self, event: HarnessEvent, turn: TurnRef
+    ) -> None:
+        delivered = event
+        persistence_error: Exception | None = None
+        try:
+            if self.event_sink is not None:
+                await self.event_sink(event)
+        except Exception as exc:
+            persistence_error = exc
+            delivered = HarnessEvent(
+                type=HarnessEventType.TURN_ABANDONED,
+                driver=event.driver,
+                session_ref=event.session_ref,
+                turn_ref=turn,
+                native_session_id=event.native_session_id,
+                native_turn_id=event.native_turn_id,
+                occurred_at=event.occurred_at,
+                data={
+                    "outcome": "abandoned",
+                    "error_code": "event_persistence_failed",
+                    "retryable": True,
+                },
+            )
+        finally:
+            self._fanout_event(delivered)
+            self._complete_turn(delivered, turn)
+        if persistence_error is not None:
+            raise persistence_error
+
+    def _fanout_event(self, event: HarnessEvent) -> None:
+        for queue in tuple(self._subscribers):
+            queue.put_nowait(event)
+
+    async def _fail_runtime_locked(self, reason: str) -> None:
+        active = self.active_turn_ref
+        if active is not None:
+            abandoned = HarnessEvent(
+                type=HarnessEventType.TURN_ABANDONED,
+                driver=self.driver_name,
+                session_ref=self.session_ref,
+                turn_ref=active,
+                native_session_id=self.native_session_id,
+                native_turn_id=self.native_turn_id,
+                data={
+                    "outcome": "abandoned",
+                    "error_code": reason,
+                    "retryable": True,
+                },
+            )
+            self._fanout_event(abandoned)
+            self._complete_turn(abandoned, active)
+        try:
+            await self.driver.close()
+        except Exception:
+            logger.exception("failed to close provider runtime after %s", reason)
+        finally:
+            self.opened = None
+
+    def _complete_turn(self, event: HarnessEvent, turn: TurnRef) -> None:
+        future = self._terminal.get(turn)
+        if future is not None and not future.done():
+            future.set_result(event)
+        if self._active_driver_turn_ref is not None:
+            self._turn_refs.pop(self._active_driver_turn_ref, None)
+        self.active_turn_ref = None
+        self._active_driver_turn_ref = None
+        self.native_turn_id = ""
+        self._permission_refs.clear()
+        self._continuation_admissions.clear()
 
     def register_continuation(
         self,
@@ -384,39 +604,74 @@ class RuntimeManagerAdapter(Adapter):
             ))
         self.assistant_text_parts = []
         metadata: dict[str, Any] = {"turn_ref": str(turn)}
-        async for event in stream:
-            if event.turn_ref != turn:
-                continue
-            event_type = (
-                event.type.value
-                if isinstance(event.type, HarnessEventType) else event.type
+        timeout_seconds = float(
+            getattr(
+                getattr(self.manager, "spec", None),
+                "task_timeout_seconds",
+                600.0,
             )
-            if event_type == "turn.assistant_delta":
-                text = event.data.get("text")
-                if isinstance(text, str):
-                    self.assistant_text_parts.append(text)
-                    if ctx.on_progress is not None:
-                        await ctx.on_progress(text)
-            if event_type in {"turn.completed", "turn.abandoned"}:
-                outcome = str(event.data.get("outcome") or "succeeded")
-                if event_type == "turn.abandoned" or outcome != "succeeded":
-                    raise RuntimeStateError(
-                        f"provider turn ended with outcome {outcome}"
+        )
+        timeout = asyncio.timeout(timeout_seconds)
+        try:
+            async with timeout:
+                async for event in stream:
+                    if event.turn_ref != turn:
+                        continue
+                    event_type = (
+                        event.type.value
+                        if isinstance(event.type, HarnessEventType) else event.type
                     )
-                metadata.update({
-                    key: value for key, value in event.data.items()
-                    if key in {
-                        "input_tokens", "output_tokens", "tool_calls",
-                        "provider_session_id", "send_message_targets",
-                    }
-                })
-                return TurnResult(
-                    reply="".join(self.assistant_text_parts),
-                    input_tokens=int(metadata.get("input_tokens", 0)),
-                    output_tokens=int(metadata.get("output_tokens", 0)),
-                    tool_calls=int(metadata.get("tool_calls", 0)),
-                    metadata=metadata,
-                )
+                    if event_type == "turn.assistant_delta":
+                        text = event.data.get("text")
+                        if isinstance(text, str):
+                            self.assistant_text_parts.append(text)
+                            if ctx.on_progress is not None:
+                                await ctx.on_progress(text)
+                    if event_type in {"turn.completed", "turn.abandoned"}:
+                        outcome = str(event.data.get("outcome") or "succeeded")
+                        if event_type == "turn.abandoned" or outcome != "succeeded":
+                            raise RuntimeStateError(
+                                f"provider turn ended with outcome {outcome}"
+                            )
+                        metadata.update({
+                            key: value for key, value in event.data.items()
+                            if key in {
+                                "input_tokens", "output_tokens", "tool_calls",
+                                "provider_session_id", "send_message_targets",
+                            }
+                        })
+                        return TurnResult(
+                            reply="".join(self.assistant_text_parts),
+                            input_tokens=int(metadata.get("input_tokens", 0)),
+                            output_tokens=int(metadata.get("output_tokens", 0)),
+                            tool_calls=int(metadata.get("tool_calls", 0)),
+                            metadata=metadata,
+                        )
+        except TimeoutError:
+            if not timeout.expired():
+                raise
+            logger.warning(
+                "provider turn %s exceeded %.3fs timeout",
+                turn,
+                timeout_seconds,
+            )
+            await self.manager.timeout_turn(turn)
+            label = (
+                f"{timeout_seconds / 60:g} minute"
+                if timeout_seconds >= 60 and timeout_seconds % 60 == 0
+                else f"{timeout_seconds:g} second"
+            )
+            return TurnResult(
+                reply=f"Task exceeded the {label} timeout.",
+                metadata={
+                    **metadata,
+                    "runtime_turn_timeout": True,
+                },
+            )
+        finally:
+            close_stream = getattr(stream, "aclose", None)
+            if close_stream is not None:
+                await close_stream()
         return TurnResult(reply="", metadata={"stream_error": "runtime_exited"})
 
     def register_continuation_callback(

@@ -104,6 +104,7 @@ class RuntimeSpec:
     environment: Mapping[str, str] = field(default_factory=dict)
     permission_mode: str = "bypassPermissions"
     sandbox: str = "danger-full-access"
+    task_timeout_seconds: float = 600.0
 
 
 @dataclass(frozen=True, slots=True)

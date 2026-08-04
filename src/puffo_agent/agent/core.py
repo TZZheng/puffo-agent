@@ -6,26 +6,10 @@ from ._logging import agent_logger
 from ._time import ms_to_iso as _ms_to_iso
 from .adapters import Adapter, TurnContext
 from .adapters.base import STATUS_PREVIEW_CHARS, is_silent
+from .errors import AgentAPIError
 from .memory import MemoryManager
 
 MAX_LOG_ENTRIES = 60
-
-
-class AgentAPIError(Exception):
-    """Raised when adapter output contains ``API Error``. Signals the
-    consumer to suppress the reply, mark the turn errored, and
-    re-enqueue the triggering message after a 15-45s backoff so
-    transient provider failures recover without operator intervention.
-
-    ``is_auth`` is set when the error is an auth failure (expired/revoked
-    OAuth, invalid key). Retrying that is pointless, so the consumer
-    skips the kick-retries and the worker flips ``auth_failed`` + DMs the
-    operator instead.
-    """
-
-    def __init__(self, message: str, *, is_auth: bool = False) -> None:
-        super().__init__(message)
-        self.is_auth = is_auth
 
 
 def _format_assistant_fallback(text_parts: list[str], joined_reply: str) -> str:

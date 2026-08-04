@@ -1035,9 +1035,12 @@ class RuntimeConfig:
     # Same token, different ledger.
     harness: str = "claude-code"  # claude-code | hermes
     # sdk only: cap on agentic-loop iterations per turn. 10 is fine
-    # for short Q&A; multi-step work often needs 30-50. CLI kinds
-    # delegate turn-bounding to the claude CLI itself.
+    # for short Q&A; multi-step work often needs 30-50. CLI kinds use
+    # the separate wall-time limit below instead of this iteration cap.
     max_turns: int = 10
+    # cli-local: maximum wall time for one provider turn. The Runtime
+    # Manager interrupts and retires a driver that does not terminate.
+    task_timeout_seconds: float = 600.0
 
 
 @dataclass

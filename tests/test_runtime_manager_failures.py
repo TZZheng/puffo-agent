@@ -1,0 +1,284 @@
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
+from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
+from puffo_agent.agent.harness.driver import (
+    CancelReceipt,
+    HarnessDriver,
+    HarnessEvent,
+    RuntimeOpened,
+    RuntimeRef,
+    RuntimeSpec,
+    SessionRef,
+    TurnInput,
+    TurnRef,
+    TurnStarted,
+    UnsupportedCapability,
+)
+from puffo_agent.agent.harness.runtime_manager import (
+    RuntimeManager,
+    RuntimeManagerAdapter,
+    RuntimeStateError,
+)
+
+
+class _ControllableDriver(HarnessDriver):
+    def __init__(self) -> None:
+        self.queue: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
+        self.started = asyncio.Event()
+        self.open_calls = 0
+        self.start_calls = 0
+        self.cancel_calls = 0
+        self.close_calls = 0
+        self.turn = TurnRef("")
+
+    async def open(self, spec, resume=None):
+        self.open_calls += 1
+        self.queue = asyncio.Queue()
+        native_session = f"native-session-{self.open_calls}"
+        return RuntimeOpened(
+            RuntimeRef(f"runtime-{self.open_calls}"),
+            SessionRef(native_session),
+            native_session,
+            bool(resume),
+            CODEX_CAPABILITIES,
+            SimpleNamespace(),
+        )
+
+    async def start_turn(self, input):
+        self.start_calls += 1
+        self.turn = TurnRef(f"driver-turn-{self.start_calls}")
+        self.started.set()
+        return TurnStarted(self.turn, f"native-turn-{self.start_calls}")
+
+    async def steer_turn(self, turn, input):
+        return UnsupportedCapability("steer")
+
+    async def cancel_turn(self, turn):
+        self.cancel_calls += 1
+        return CancelReceipt(True, turn)
+
+    async def context_status(self):
+        return UnsupportedCapability("context_status")
+
+    async def compact(self, request):
+        return UnsupportedCapability("compact")
+
+    async def resolve_permission(self, request, decision):
+        return UnsupportedCapability("permission")
+
+    def events(self):
+        async def iterate():
+            while True:
+                event = await self.queue.get()
+                if event is None:
+                    return
+                yield event
+
+        return iterate()
+
+    async def close(self):
+        self.close_calls += 1
+        await self.queue.put(None)
+
+
+class _PausedStartDriver(_ControllableDriver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_entered = asyncio.Event()
+        self.release_start = asyncio.Event()
+
+    async def start_turn(self, input):
+        self.start_calls += 1
+        self.turn = TurnRef(f"driver-turn-{self.start_calls}")
+        self.started.set()
+        self.start_entered.set()
+        await self.release_start.wait()
+        return TurnStarted(self.turn, f"native-turn-{self.start_calls}")
+
+
+class _PausedCancelDriver(_ControllableDriver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancel_entered = asyncio.Event()
+        self.release_cancel = asyncio.Event()
+
+    async def cancel_turn(self, turn):
+        self.cancel_calls += 1
+        self.cancel_entered.set()
+        await self.release_cancel.wait()
+        return CancelReceipt(True, turn)
+
+
+def _context():
+    return SimpleNamespace(
+        messages=[{"role": "user", "content": "current notice"}],
+        on_progress=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_exit_abandons_active_turn_and_allows_next_turn():
+    driver = _ControllableDriver()
+    persisted: list[HarnessEvent] = []
+
+    async def persist(event):
+        persisted.append(event)
+
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+        event_sink=persist,
+    )
+    adapter = RuntimeManagerAdapter(manager)
+
+    first = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await driver.queue.put(HarnessEvent(
+        type="runtime.exited",
+        driver="codex",
+        session_ref=SessionRef("native-session-1"),
+    ))
+
+    with pytest.raises(RuntimeStateError, match="outcome abandoned"):
+        await asyncio.wait_for(first, timeout=1)
+    assert manager.active_turn_ref is None
+    assert manager.opened is None
+    assert [str(event.type) for event in persisted][-1].endswith(
+        "TURN_ABANDONED"
+    )
+
+    driver.started = asyncio.Event()
+    second = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="codex",
+        session_ref=SessionRef("native-session-2"),
+        turn_ref=driver.turn,
+        data={"outcome": "succeeded"},
+    ))
+    assert (await asyncio.wait_for(second, timeout=1)).reply == ""
+    assert driver.start_calls == 2
+    await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_turn_timeout_interrupts_abandons_and_retires_runtime():
+    driver = _ControllableDriver()
+    persisted: list[HarnessEvent] = []
+
+    async def persist(event):
+        persisted.append(event)
+
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=0.01),
+        driver_name="codex",
+        event_sink=persist,
+    )
+    result = await asyncio.wait_for(
+        RuntimeManagerAdapter(manager).run_turn(_context()), timeout=1
+    )
+
+    assert result.metadata["runtime_turn_timeout"] is True
+    assert result.reply == "Task exceeded the 0.01 second timeout."
+    assert driver.cancel_calls == 1
+    assert driver.close_calls == 1
+    assert manager.active_turn_ref is None
+    assert manager.opened is None
+    terminal = persisted[-1]
+    assert str(terminal.type).endswith("TURN_ABANDONED")
+    assert terminal.data["error_code"] == "turn_timeout"
+
+
+@pytest.mark.asyncio
+async def test_runtime_exit_waits_for_start_registration_before_abandoning():
+    driver = _PausedStartDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+    )
+    running = asyncio.create_task(
+        RuntimeManagerAdapter(manager).run_turn(_context())
+    )
+
+    await asyncio.wait_for(driver.start_entered.wait(), timeout=1)
+    await driver.queue.put(HarnessEvent(
+        type="runtime.exited",
+        driver="codex",
+        session_ref=SessionRef("native-session-1"),
+    ))
+    await asyncio.sleep(0)
+    driver.release_start.set()
+
+    with pytest.raises(RuntimeStateError, match="outcome abandoned"):
+        await asyncio.wait_for(running, timeout=1)
+    assert manager.active_turn_ref is None
+    assert manager.opened is None
+
+
+@pytest.mark.asyncio
+async def test_timeout_cleanup_cannot_retire_the_next_turn_runtime():
+    driver = _PausedCancelDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+    )
+    first = await manager.start_turn(TurnInput("first"))
+    cleanup = asyncio.create_task(manager.timeout_turn(first.turn_ref))
+    await asyncio.wait_for(driver.cancel_entered.wait(), timeout=1)
+
+    replacement = asyncio.create_task(manager.start_turn(TurnInput("next")))
+    await asyncio.sleep(0)
+    assert replacement.done() is False
+
+    driver.release_cancel.set()
+    await asyncio.wait_for(cleanup, timeout=1)
+    second = await asyncio.wait_for(replacement, timeout=1)
+
+    assert driver.open_calls == 2
+    assert manager.opened is not None
+    assert manager.active_turn_ref == second.turn_ref
+    await manager.abandon_turn(second.turn_ref, reason="test_cleanup")
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_persistence_failure_unblocks_turn_and_retires_runtime():
+    driver = _ControllableDriver()
+
+    async def reject_terminal(event):
+        event_type = getattr(event.type, "value", event.type)
+        if event_type == "turn.completed":
+            raise RuntimeError("event store unavailable")
+
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+        event_sink=reject_terminal,
+    )
+    running = asyncio.create_task(
+        RuntimeManagerAdapter(manager).run_turn(_context())
+    )
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="codex",
+        session_ref=SessionRef("native-session-1"),
+        turn_ref=driver.turn,
+        data={"outcome": "succeeded"},
+    ))
+
+    with pytest.raises(RuntimeStateError, match="outcome abandoned"):
+        await asyncio.wait_for(running, timeout=1)
+    assert manager.active_turn_ref is None
+    assert manager.opened is None

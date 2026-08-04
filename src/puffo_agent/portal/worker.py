@@ -454,17 +454,54 @@ async def _promote_supported_local_driver(
             environment=environment,
             permission_mode=adapter.permission_mode,
             sandbox=adapter.sandbox,
+            task_timeout_seconds=adapter.task_timeout_seconds,
         ),
         agent_id=agent_cfg.id,
         session_ref=SessionRef(logical_session_ref),
         native_session_id=native_session_id,
+        driver_name=harness_name,
         event_sink=persist_event,
         before_start=require_initial_capacity,
     )
-    await adapter.aclose()
     facade = RuntimeManagerAdapter(manager)
-    await facade.warm(system_prompt)
+    try:
+        await facade.warm(system_prompt)
+        await adapter.aclose()
+    except BaseException:
+        await facade.aclose()
+        raise
     return facade
+
+
+async def _promote_local_driver_after_warm(
+    adapter: Adapter,
+    agent_cfg: AgentConfig,
+    *,
+    warm_ok: bool,
+    system_prompt: str,
+    outbox,
+    logical_session_ref: str,
+) -> Adapter:
+    """Promote only a healthy prepared adapter; otherwise retain fallback."""
+    if not warm_ok:
+        return adapter
+    try:
+        return await _promote_supported_local_driver(
+            adapter,
+            agent_cfg,
+            system_prompt=system_prompt,
+            outbox=outbox,
+            logical_session_ref=logical_session_ref,
+        )
+    except Exception as exc:
+        logger.warning(
+            "agent %s: driver promotion failed; retaining legacy adapter "
+            "for first-turn retry: %s",
+            agent_cfg.id,
+            exc,
+            exc_info=True,
+        )
+        return adapter
 
 
 def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
@@ -1559,21 +1596,17 @@ class Worker:
                     self._adapter.get_provider_session_id() or ""
                 ),
             )
-            try:
-                self._adapter = await _promote_supported_local_driver(
-                    self._adapter,
-                    self.agent_cfg,
-                    system_prompt=claude_md,
-                    outbox=runtime_event_outbox,
-                    logical_session_ref=runtime_session_ref,
-                )
-                # PuffoAgent is constructed before the durable runtime boundary
-                # so its memory/message setup remains unchanged. From this
-                # point onward provider turns go exclusively through Manager.
-                puffo.adapter = self._adapter
-            except Exception:
-                runtime_event_outbox.close()
-                raise
+            self._adapter = await _promote_local_driver_after_warm(
+                self._adapter,
+                self.agent_cfg,
+                warm_ok=warm_ok,
+                system_prompt=claude_md,
+                outbox=runtime_event_outbox,
+                logical_session_ref=runtime_session_ref,
+            )
+            # PuffoAgent is constructed before the durable runtime boundary;
+            # keep it aligned whether promotion succeeded or fell back.
+            puffo.adapter = self._adapter
 
         if warm_ok:
             await self._run_post_warm_gate(agent_id)
