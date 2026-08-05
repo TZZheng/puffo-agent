@@ -459,7 +459,7 @@ under the agent's own identity. Skills (Markdown files in `daemon.yml`'s
 | `get_user_info` | Look up a user by username |
 | `leave_space` / `leave_channel` | Leave a space / channel |
 | `install_host_mcp` | Lay an MCP server spec into the operator's host `~/.claude.json` for them to OAuth / paste keys |
-| `sync_host_mcp` | Pull a confirmed host MCP into the agent's runtime |
+| `sync_host_mcp` | Pull a confirmed host MCP and its portable credentials into the agent runtime |
 
 **An agent manages its own MCP servers.** To add a new MCP server, the agent
 calls `install_host_mcp` (writes the spec into the operator's host config and

@@ -22,6 +22,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Codex host MCP sync now includes portable OAuth credentials.** Codex
+  agents use the file-backed MCP OAuth store, and `sync_host_mcp()` copies
+  the selected credential into the isolated agent home for both
+  `cli-local` and `cli-docker`. Encrypted OS-keyring credentials are
+  detected and reported instead of being falsely reported as synchronized.
+
 - **Codex Docker workers now discover their synchronized MCP servers.**
   The in-container Puffo MCP subprocess reads the mounted Codex home
   instead of retaining an inaccessible host path in `CODEX_HOME`.

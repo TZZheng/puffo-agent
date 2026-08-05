@@ -741,11 +741,18 @@ outcome:
 ### Step 2 — `sync_host_mcp("<name>")`
 
 Once the operator pings you back saying host setup is done, call
-this with the **same `name`** you passed to `install_host_mcp`. It
-copies the populated entry (now carrying OAuth tokens / API keys)
-from `<operator_home>/.claude.json` into your own
-`<agent>/.claude.json`. The transfer is verbatim — what host has is
-what you get.
+this with the **same `name`** you passed to `install_host_mcp`.
+Claude Code copies the populated entry from the operator's
+`.claude.json`. Codex re-merges the registration from the operator's
+`config.toml` and copies that server's file-backed OAuth entry into
+the agent's isolated `CODEX_HOME`. In both cases the credential is
+available to cli-local and cli-docker after refresh.
+
+Codex OAuth must be completed on the host with the file-store command
+included in the install confirmation. Older Codex logins may live in
+an OS-keyring-encrypted store; `sync_host_mcp` detects that case and
+asks for a one-time host re-login into the portable file store instead
+of falsely reporting success.
 
 ### Step 3 — `refresh()`
 
