@@ -690,10 +690,6 @@ async def test_schema_migration_is_idempotent_and_checks_new_columns():
             "UPDATE messages SET processing_state = 'invalid' WHERE envelope_id = 'legacy'"
         )
     await db.rollback()
-    async with db.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_processing_state'"
-    ) as cur:
-        assert await cur.fetchone() is not None
     await store.close()
 
 

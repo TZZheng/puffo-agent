@@ -1171,6 +1171,9 @@ class AgentConfig:
                 sandbox=rt.get("sandbox", "danger-full-access"),
                 harness=harness,
                 max_turns=int(rt.get("max_turns", 10)),
+                task_timeout_seconds=float(
+                    rt.get("task_timeout_seconds", 600.0)
+                ),
             ),
             profile=raw.get("profile", "profile.md"),
             memory_dir=raw.get("memory_dir", "memory"),

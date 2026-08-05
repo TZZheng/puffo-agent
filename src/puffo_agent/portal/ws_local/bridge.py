@@ -1,12 +1,12 @@
-"""Bridge the daemon's serial message consumer to a connected tool.
+"""Bridge the durable global inbox runtime to a connected local tool.
 
-``PuffoCoreMessageClient._consume_queue`` dispatches one thread batch at
-a time and advances its durable cursor only when the callback returns;
-a callback that *raises* leaves the cursor untouched, so the server
-redelivers on the next subscribe. ``WsLocalBridge.dispatch`` rides that
-contract: it sends the batch as a bundle and blocks until the tool acks
-(→ return → cursor advances), or until the session dies (→ raise →
-cursor preserved → redelivery). Ack timing is the tool's to choose.
+``GlobalInboxRuntime`` plans and admits one turn at a time.
+``WsLocalBridge.dispatch_planned`` sends that frozen plan and blocks until
+the tool acknowledges it; disconnects requeue the active message ids.
+
+``dispatch`` is retained as the frozen v1 single-root wire adapter. Current
+daemon scheduling uses only ``dispatch_planned``; removing v1 requires a
+separate protocol deprecation.
 
 The bridge owns no transport or crypto — the ``WsLocalSession`` runs the
 frame loop, relays replies, and judges liveness; the bridge only couples

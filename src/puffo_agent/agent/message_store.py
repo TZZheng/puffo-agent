@@ -64,18 +64,6 @@ CREATE TABLE IF NOT EXISTS messages (
     is_encrypted INTEGER NOT NULL DEFAULT 1
 );
 
--- Per-thread cursor used by the thread-batched priority queue. After
--- ``on_message_batch`` finishes successfully, the consumer advances
--- this to the ``sent_at`` of the last message in the dispatched
--- batch. The listen handler then drops any inbound message whose
--- ``sent_at`` is <= the stored cursor, so server-side pending-message
--- redeliveries after a daemon restart don't re-trigger the agent on
--- already-processed threads.
-CREATE TABLE IF NOT EXISTS thread_processing_state (
-    root_id TEXT PRIMARY KEY,
-    last_processed_sent_at INTEGER NOT NULL
-);
-
 -- One row per channel the agent has been auto-prompted to introduce
 -- itself in. Gate set in ``_accept_invite`` so a daemon restart (or a
 -- server-side invite redelivery) can't trigger a second intro.
@@ -3732,46 +3720,6 @@ class MessageStore:
         async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
         return [self._row_to_msg(r) for r in (rows if ascending_cursor else reversed(rows))]
-
-    async def get_last_processed_sent_at(self, root_id: str) -> int:
-        """``sent_at`` of the last message in the most recently
-        dispatched batch for this thread, or ``0`` if the agent has
-        never processed it. Used at enqueue time to drop redelivered
-        messages whose work has already been done.
-        """
-        if not root_id:
-            return 0
-        db = await self._ensure_db()
-        async with db.execute(
-            "SELECT last_processed_sent_at FROM thread_processing_state "
-            "WHERE root_id = ?",
-            (root_id,),
-        ) as cursor:
-            row = await cursor.fetchone()
-        return int(row[0]) if row else 0
-
-    async def mark_thread_processed(
-        self, root_id: str, sent_at: int,
-    ) -> None:
-        """Upsert the per-thread cursor. ``MAX(existing, new)`` so
-        out-of-order writes (extremely unlikely but cheap to guard)
-        never regress the cursor.
-        """
-        if not root_id:
-            return
-        async with self._inbox_lock:
-            db = await self._ensure_db()
-            await db.execute(
-                """INSERT INTO thread_processing_state (root_id, last_processed_sent_at)
-                   VALUES (?, ?)
-                   ON CONFLICT(root_id) DO UPDATE SET
-                     last_processed_sent_at = MAX(
-                       thread_processing_state.last_processed_sent_at,
-                       excluded.last_processed_sent_at
-                     )""",
-                (root_id, sent_at),
-            )
-            await db.commit()
 
     async def has_channel_intro_been_prompted(self, channel_id: str) -> bool:
         """True iff the agent already had a self-introduction prompted

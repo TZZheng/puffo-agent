@@ -340,10 +340,29 @@ def _http_sends(http):
     return [b for m, p, b in http.calls if m == "POST_UNSIGNED"]
 
 
-async def _drive_listen_until(client, *, on_message, done: asyncio.Event, timeout=5.0):
+class _RuntimeWake:
+    def __init__(self, done: asyncio.Event, expected: int):
+        self.done = done
+        self.expected = expected
+        self.count = 0
+
+    def notify(self) -> None:
+        self.count += 1
+        if self.count >= self.expected:
+            self.done.set()
+
+    def notify_delivery(self) -> None:
+        return None
+
+
+async def _drive_listen_until(
+    client, *, done: asyncio.Event, notifications: int = 1, timeout=5.0,
+):
     """Run ``_listen_bridge`` as a task until ``done`` fires, then cancel
     it cleanly. Returns nothing — assertions read the store / bridge."""
-    task = asyncio.ensure_future(client._listen_bridge(on_message))
+    previous_runtime = client.global_runtime
+    client.global_runtime = _RuntimeWake(done, notifications)
+    task = asyncio.ensure_future(client._listen_bridge())
     try:
         await asyncio.wait_for(done.wait(), timeout=timeout)
     finally:
@@ -352,13 +371,7 @@ async def _drive_listen_until(client, *, on_message, done: asyncio.Event, timeou
             await task
         except (asyncio.CancelledError, Exception):
             pass
-
-
-@pytest.fixture(autouse=True)
-def _no_jitter(monkeypatch):
-    # The consumer sleeps random.uniform(0, 1.5) before dispatch; zero it
-    # so batch-callback tests don't wait seconds.
-    monkeypatch.setattr(pcc_mod.random, "uniform", lambda a, b: 0.0)
+        client.global_runtime = previous_runtime
 
 
 # --------------------------------------------------------------------------
@@ -396,14 +409,9 @@ async def test_a_inbound_stores_like_native_without_decrypt(tmp_path, monkeypatc
     # --- bridge path ---
     bridge = FakeBridge(scripted=[frame])
     client = _bridge_client(tmp_path, bridge, db="bridge.db")
-    surfaced: list[tuple] = []
     done = asyncio.Event()
 
-    async def on_message(root_id, batch, channel_meta):
-        surfaced.append((root_id, batch, channel_meta))
-        done.set()
-
-    await _drive_listen_until(client, on_message=on_message, done=done)
+    await _drive_listen_until(client, done=done)
 
     bridge_row = await client.store.get_message_by_envelope(ENV_ID)
     assert bridge_row is not None, "bridge inbound frame was not persisted"
@@ -420,12 +428,8 @@ async def test_a_inbound_stores_like_native_without_decrypt(tmp_path, monkeypatc
     assert bridge_row.server_seq is None
     assert bridge_row.local_ordinal == 1
 
-    # decrypt never ran, and the message surfaced to the agent.
+    # Decrypt never ran, and the production runtime wake fired.
     assert decrypt_calls == []
-    assert len(surfaced) == 1
-    root_id, batch, channel_meta = surfaced[0]
-    assert any(m["envelope_id"] == ENV_ID for m in batch)
-    assert channel_meta["channel_id"] == CHANNEL
 
 
 @pytest.mark.asyncio
@@ -583,10 +587,7 @@ async def test_a_inbound_dm_frame_routes_as_dm(tmp_path):
     client = _bridge_client(tmp_path, bridge, db="dm.db")
     done = asyncio.Event()
 
-    async def on_message(root_id, batch, channel_meta):
-        done.set()
-
-    await _drive_listen_until(client, on_message=on_message, done=done)
+    await _drive_listen_until(client, done=done)
 
     row = await client.store.get_message_by_envelope("env_dm_1")
     assert row is not None
@@ -691,11 +692,7 @@ async def test_pending_stream_101_drains_same_connection_stores_once_and_acks(tm
     client = _bridge_client(tmp_path, bridge, db="pending-101.db")
     done = asyncio.Event()
 
-    async def on_message(*_args):
-        if len(await client.store.get_channel_history("ch_a", limit=200)) == 101:
-            done.set()
-
-    await _drive_listen_until(client, on_message=on_message, done=done)
+    await _drive_listen_until(client, done=done, notifications=101)
     if client._ack_tasks:
         await asyncio.gather(*tuple(client._ack_tasks))
     stored = await client.store.get_channel_history("ch_a", limit=200)
@@ -905,11 +902,7 @@ async def test_inbound_thread_ids_surface_on_stored_row(tmp_path):
     client = _bridge_client(tmp_path, bridge, db="in_thread.db")
     done = asyncio.Event()
 
-    async def on_message(root_id, batch, channel_meta):
-        if any(m.get("envelope_id") == "env_reply_in" for m in batch):
-            done.set()
-
-    await _drive_listen_until(client, on_message=on_message, done=done)
+    await _drive_listen_until(client, done=done, notifications=2)
 
     row = await client.store.get_message_by_envelope("env_reply_in")
     assert row is not None
@@ -939,17 +932,13 @@ async def test_enrichment_prefers_frame_display_name_no_http(tmp_path):
     client = _bridge_client(tmp_path, bridge, db="enrich_named.db")
     client.http.get = _recording_get  # type: ignore[method-assign]
 
-    surfaced: list = []
     done = asyncio.Event()
 
-    async def on_message(root_id, batch, channel_meta):
-        surfaced.append(batch)
-        done.set()
+    await _drive_listen_until(client, done=done)
 
-    await _drive_listen_until(client, on_message=on_message, done=done)
-
-    named = [m for m in surfaced[0] if m["envelope_id"] == "env_named"][0]
-    assert named["sender_display_name"] == "Alice Cooper"
+    named = await client.store.get_message_by_envelope("env_named")
+    assert named is not None
+    assert named.content["sender_display_name"] == "Alice Cooper"
     # No /identities/profiles GET at all — resolution came off the frame.
     assert not any("identities/profiles" in p for p in calls), calls
     # The pre-seed actually populated the profile cache.
@@ -969,18 +958,14 @@ async def test_enrichment_degrades_without_frame_name(tmp_path):
     }])
     client = _bridge_client(tmp_path, bridge, db="enrich_unnamed.db")
 
-    surfaced: list = []
     done = asyncio.Event()
 
-    async def on_message(root_id, batch, channel_meta):
-        surfaced.append(batch)
-        done.set()
+    await _drive_listen_until(client, done=done)
 
-    await _drive_listen_until(client, on_message=on_message, done=done)
-
-    named = [m for m in surfaced[0] if m["envelope_id"] == "env_unnamed"][0]
-    assert named["sender_display_name"] == ""  # degraded
-    assert named["sender_slug"] == "bob-0001"
+    named = await client.store.get_message_by_envelope("env_unnamed")
+    assert named is not None
+    assert named.content["sender_display_name"] == ""  # degraded
+    assert named.sender_slug == "bob-0001"
 
 
 def test_preseed_frame_display_name_unit(tmp_path):
@@ -1082,16 +1067,10 @@ async def test_c_connect_drives_one_fetch_pending_and_survives_pending_delivered
     bridge = FakeBridge(scripted=scripted)
     client = _bridge_client(tmp_path, bridge, db="c.db")
 
-    seen_roots: list[str] = []
     done = asyncio.Event()
 
-    async def on_message(root_id, batch, channel_meta):
-        seen_roots.append(root_id)
-        if len(seen_roots) >= 2:
-            done.set()
-
     with caplog.at_level(logging.INFO, logger="puffo_agent.agent.puffo_core_client"):
-        await _drive_listen_until(client, on_message=on_message, done=done)
+        await _drive_listen_until(client, done=done, notifications=2)
 
     # Exactly one connect + one fetch_pending drove the cold-start drain.
     assert bridge.connect_count == 1
@@ -1139,11 +1118,8 @@ async def test_c_uncorrelated_error_frame_does_not_crash_loop(tmp_path, caplog):
     client = _bridge_client(tmp_path, bridge, db="c_err.db")
     done = asyncio.Event()
 
-    async def on_message(root_id, batch, channel_meta):
-        done.set()
-
     with caplog.at_level(logging.WARNING, logger="puffo_agent.agent.puffo_core_client"):
-        await _drive_listen_until(client, on_message=on_message, done=done)
+        await _drive_listen_until(client, done=done)
 
     assert "bridge error category=INTERNAL" in caplog.text
     assert all(sentinel not in caplog.text for sentinel in sentinels)
@@ -1364,12 +1340,9 @@ async def test_d_native_inbound_still_decrypts_before_storing(tmp_path, monkeypa
 
     client._key_cache.get_signing_keys = _fake_signing_keys  # type: ignore[method-assign]
 
-    async def on_message(*a):
-        return
-
     # Native listen() wires handle_envelope onto the (recording) WS and
     # returns because run() is a no-op.
-    await client.listen(on_message)
+    await client.listen()
     assert len(_RecordingWs.instances) == 1
     handle_envelope = _RecordingWs.instances[0].on_message
     assert handle_envelope is not None
@@ -1549,22 +1522,18 @@ async def test_inbound_attachments_surface_and_download_by_blob_id(tmp_path):
     client = _bridge_client(
         tmp_path, bridge, db="att_in.db", workspace=str(tmp_path),
     )
-    surfaced: list = []
     done = asyncio.Event()
 
-    async def on_message(root_id, batch, channel_meta):
-        surfaced.append(batch)
-        done.set()
-
-    await _drive_listen_until(client, on_message=on_message, done=done)
+    await _drive_listen_until(client, done=done)
 
     # Fetched by blob_id, no decrypt.
     assert bridge.downloaded == [BLOB]
     saved = tmp_path / ".puffo" / "inbox" / "env_att_in" / "report.txt"
     assert saved.is_file()
     assert saved.read_bytes() == DATA
-    msg = [m for m in surfaced[0] if m["envelope_id"] == "env_att_in"][0]
-    assert str(saved) in msg["attachments"]
+    msg = await client.store.get_message_by_envelope("env_att_in")
+    assert msg is not None
+    assert str(saved) in msg.content["attachment_paths"]
 
 
 @pytest.mark.asyncio
@@ -1591,22 +1560,18 @@ async def test_fetch_pending_backfill_carries_attachments(tmp_path):
     client = _bridge_client(
         tmp_path, bridge, db="att_bf.db", workspace=str(tmp_path),
     )
-    surfaced: list = []
     done = asyncio.Event()
 
-    async def on_message(root_id, batch, channel_meta):
-        surfaced.append(batch)
-        done.set()
-
-    await _drive_listen_until(client, on_message=on_message, done=done)
+    await _drive_listen_until(client, done=done)
 
     # The backfill drive fired exactly one fetch_pending.
     assert bridge.fetch_pending_count == 1
     assert bridge.downloaded == [BLOB]
     saved = tmp_path / ".puffo" / "inbox" / "env_att_bf" / "bf.txt"
     assert saved.is_file() and saved.read_bytes() == DATA
-    msg = [m for m in surfaced[0] if m["envelope_id"] == "env_att_bf"][0]
-    assert str(saved) in msg["attachments"]
+    msg = await client.store.get_message_by_envelope("env_att_bf")
+    assert msg is not None
+    assert str(saved) in msg.content["attachment_paths"]
 
 
 @pytest.mark.asyncio
@@ -1635,25 +1600,18 @@ async def test_inbound_missing_blob_skipped_loop_survives(tmp_path):
     client = _bridge_client(
         tmp_path, bridge, db="missing_blob.db", workspace=str(tmp_path),
     )
-    surfaced: dict[str, dict] = {}
     done = asyncio.Event()
 
-    async def on_message(root_id, batch, channel_meta):
-        for m in batch:
-            surfaced[m["envelope_id"]] = m
-        if "env_after_missing" in surfaced:
-            done.set()
-
-    await _drive_listen_until(client, on_message=on_message, done=done)
+    await _drive_listen_until(client, done=done, notifications=2)
 
     # Download was attempted then skipped.
     assert bridge.downloaded == ["blob_missing"]
     # Both messages delivered — the loop survived the missing blob.
-    assert await client.store.get_message_by_envelope("env_missing_blob") is not None
+    missing = await client.store.get_message_by_envelope("env_missing_blob")
+    assert missing is not None
     assert await client.store.get_message_by_envelope("env_after_missing") is not None
-    assert "env_missing_blob" in surfaced and "env_after_missing" in surfaced
     # The message with the missing blob carries no attachment path.
-    assert surfaced["env_missing_blob"]["attachments"] == []
+    assert missing.content["attachment_paths"] == []
     # No blob dir/file was written for the skipped ref.
     assert not (tmp_path / ".puffo" / "inbox" / "env_missing_blob" / "x.bin").exists()
 
@@ -1737,20 +1695,13 @@ async def test_e_native_attachments_still_encrypt_and_signed_http(
 
 
 # --------------------------------------------------------------------------
-# (F1) handled bridge messages are acked exactly once; the shared tail
-#      (native's whole inbound path) never acks.
+# (F1) handled bridge messages are acked exactly once.
 # --------------------------------------------------------------------------
 
 
 async def _open_dispatch_client(tmp_path, bridge, *, db):
-    """A bridge client with the minimal per-listen() state so
-    ``_dispatch_bridge_frame`` / ``_handle_plaintext_payload`` can run
-    without spinning up the full listen loop (mirrors the reference-path
-    setup in test (a))."""
+    """Open a bridge client without spinning up the full listen loop."""
     client = _bridge_client(tmp_path, bridge, db=db)
-    client._queue = asyncio.PriorityQueue()
-    client._queue_seq = 0
-    client._thread_state = {}
     await client.store.open()
     return client
 
@@ -1795,10 +1746,7 @@ async def test_f1_ack_over_full_listen_loop(tmp_path):
     client = _bridge_client(tmp_path, bridge, db="ack_live.db")
     done = asyncio.Event()
 
-    async def on_message(root_id, batch, channel_meta):
-        done.set()
-
-    await _drive_listen_until(client, on_message=on_message, done=done)
+    await _drive_listen_until(client, done=done)
     # Drain any ack task still in flight after the loop was cancelled.
     if client._ack_tasks:
         await asyncio.gather(*client._ack_tasks, return_exceptions=True)
@@ -1828,65 +1776,6 @@ async def test_f1_failing_message_handling_skips_ack(tmp_path):
     assert bridge.acked == []
 
 
-@pytest.mark.asyncio
-async def test_f1_shared_tail_does_not_ack_native_untouched(tmp_path):
-    """The ack lives ONLY in ``_dispatch_bridge_frame``. The shared
-    ``_handle_plaintext_payload`` tail — the entirety of native's inbound
-    path — issues no ack. Proven with a bridge PRESENT: even then,
-    driving the tail directly acks nothing."""
-    bridge = FakeBridge()
-    client = await _open_dispatch_client(tmp_path, bridge, db="tail_noack.db")
-
-    payload = MessagePayload(
-        payload_type="puffo.message", version=1,
-        envelope_id="env_tail", envelope_kind="channel",
-        sender_slug="alice-0001", sender_subkey_id="", sent_at=1,
-        message_nonce="", content_type="text/plain", content="hi",
-        is_visible_to_human=True, space_id="sp_1", channel_id="ch_a",
-    )
-    await client._handle_plaintext_payload(payload)
-    await asyncio.sleep(0)
-
-    assert client._ack_tasks == set()
-    assert bridge.acked == []
-
-
-@pytest.mark.asyncio
-async def test_f1_native_config_client_never_acks(tmp_path):
-    """A genuinely native client (``bridge_client=None``) has no bridge to
-    ack against and never schedules an ack task when its inbound tail
-    runs."""
-    ks = _native_keystore(tmp_path)
-    http = PuffoCoreHttpClient("http://127.0.0.1:1", ks, "bot-0001")
-    store = MessageStore(str(tmp_path / "native_noack.db"))
-    client = PuffoCoreMessageClient(
-        slug="bot-0001", device_id="dev_test", space_id="sp_home",
-        keystore=ks, http_client=http, message_store=store,
-    )  # no bridge → native
-    assert client._bridge is None
-    client._queue = asyncio.PriorityQueue()
-    client._queue_seq = 0
-    client._thread_state = {}
-    await client.store.open()
-
-    async def _empty_get(path, *a, **k):
-        return {}
-
-    client.http.get = _empty_get  # type: ignore[method-assign]
-
-    payload = MessagePayload(
-        payload_type="puffo.message", version=1,
-        envelope_id="env_native_tail", envelope_kind="channel",
-        sender_slug="alice-0001", sender_subkey_id="", sent_at=1,
-        message_nonce="", content_type="text/plain", content="hi",
-        is_visible_to_human=True, space_id="sp_1", channel_id="ch_a",
-    )
-    await client._handle_plaintext_payload(payload)
-    await asyncio.sleep(0)
-
-    assert client._ack_tasks == set()
-
-
 # --------------------------------------------------------------------------
 # (F6) the inbound bridge blob_id filename fallback is basename-sanitised
 # --------------------------------------------------------------------------
@@ -1910,14 +1799,9 @@ async def test_f6_blob_id_fallback_sanitised_stays_in_inbox(tmp_path):
     client = _bridge_client(
         tmp_path, bridge, db="f6.db", workspace=str(tmp_path),
     )
-    surfaced: list = []
     done = asyncio.Event()
 
-    async def on_message(root_id, batch, channel_meta):
-        surfaced.append(batch)
-        done.set()
-
-    await _drive_listen_until(client, on_message=on_message, done=done)
+    await _drive_listen_until(client, done=done)
 
     inbox = (tmp_path / ".puffo" / "inbox" / "env_f6").resolve()
     saved = inbox / "escape"
@@ -1928,9 +1812,10 @@ async def test_f6_blob_id_fallback_sanitised_stays_in_inbox(tmp_path):
     # The pre-fix bug would have written one level up (a sibling of the
     # envelope dir); assert that escaped location does NOT exist.
     assert not (tmp_path / ".puffo" / "inbox" / "escape").exists()
-    # Surfaced attachment path points at the sanitised in-inbox file.
-    msg = [m for m in surfaced[0] if m["envelope_id"] == "env_f6"][0]
-    assert str(saved) in msg["attachments"]
+    # Durable model-facing content points at the sanitised in-inbox file.
+    msg = await client.store.get_message_by_envelope("env_f6")
+    assert msg is not None
+    assert str(saved) in msg.content["attachment_paths"]
 
 
 def test_message_payload_to_dict_omits_attachments():
@@ -2068,12 +1953,7 @@ async def test_added_to_space_over_full_listen_loop(tmp_path, monkeypatch):
     )
     client = _bridge_client(tmp_path, bridge, db="ats_live.db")
 
-    async def on_message(root_id, batch, channel_meta):  # pragma: no cover
-        pass
-
-    await _drive_listen_until(
-        client, on_message=on_message, done=bridge.refreshed,
-    )
+    await _drive_listen_until(client, done=bridge.refreshed)
     if client._ack_tasks:
         await asyncio.gather(*client._ack_tasks, return_exceptions=True)
 

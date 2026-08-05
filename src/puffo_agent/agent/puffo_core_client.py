@@ -1,18 +1,13 @@
-"""Bridge between puffo-core WS/HTTP and the worker's on_message
-interface. Handles message reception, decryption, local storage,
-and encrypted reply posting.
-"""
+"""Puffo Core message transport, durable receipt storage, and sending."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import random
 import re
 import time
 import uuid
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Optional
 
 from ..crypto.encoding import base64url_decode
@@ -82,23 +77,6 @@ _MENTION_RE = re.compile(
 # Operators wanting "right now" can fire the MCP get_user_profile
 # tool which force-refreshes regardless of TTL.
 _PROFILE_CACHE_TTL_SECONDS = 10 * 60
-
-# Compatibility-only queue definitions retained for the bridge's legacy unit
-# fixtures. Production receive paths are scheduled by GlobalInboxRuntime.
-PRIORITY_MENTIONED_HUMAN = 1
-PRIORITY_MENTIONED_BOT = 2
-PRIORITY_HUMAN = 3
-PRIORITY_BOT = 4
-
-
-@dataclass
-class _ThreadEntry:
-    current_priority: int
-    current_seq: int
-    messages: list[dict] = field(default_factory=list)
-    in_queue: bool = True
-    channel_meta: dict = field(default_factory=dict)
-    dispatching_ids: set[str] = field(default_factory=set)
 
 # Healthy data resolves in one hop (a root's own thread_root_id is NULL);
 # deeper chains are corrupt and the reply is admitted as its own root.
@@ -214,16 +192,6 @@ def _parse_operator_pubkey(identity_cert_json: Optional[str]) -> Optional[bytes]
     if len(op_pk) != 32:
         return None
     return op_pk
-
-
-def _compute_priority(direct: bool, sender_is_bot: bool) -> int:
-    if direct and not sender_is_bot:
-        return PRIORITY_MENTIONED_HUMAN
-    if direct and sender_is_bot:
-        return PRIORITY_MENTIONED_BOT
-    if not sender_is_bot:
-        return PRIORITY_HUMAN
-    return PRIORITY_BOT
 
 
 # Hard cap on the preview length embedded in the redaction
@@ -1193,9 +1161,7 @@ class PuffoCoreMessageClient:
             return False
         return await self._ws.recover_pending_until(envelope_id)
 
-    async def _listen_bridge(
-        self, legacy_test_callback: Callable[..., Any] | None = None,
-    ) -> None:
+    async def _listen_bridge(self) -> None:
         """Bridge-transport lifecycle loop: connect → fetch_pending →
         drain frames → reconnect, with the same backoff schedule as the
         native ``PuffoCoreWsClient.run()`` (start at INITIAL_BACKOFF,
@@ -1222,9 +1188,7 @@ class PuffoCoreMessageClient:
                     backoff = INITIAL_BACKOFF
                     await bridge.send_fetch_pending()
                     async for frame in bridge.frames():
-                        await self._dispatch_bridge_frame(
-                            frame, legacy_test_callback=legacy_test_callback,
-                        )
+                        await self._dispatch_bridge_frame(frame)
                 finally:
                     await bridge.close()
             except asyncio.CancelledError:
@@ -1241,8 +1205,6 @@ class PuffoCoreMessageClient:
     async def _dispatch_bridge_frame(
         self,
         frame: dict,
-        *,
-        legacy_test_callback: Callable[..., Any] | None = None,
     ) -> Any:
         """Route one inbound bridge frame off ``frames()``.
 
@@ -1286,7 +1248,6 @@ class PuffoCoreMessageClient:
                     acknowledge = await self._store_bridge_payload(
                         payload,
                         server_seq=sequence,
-                        legacy_test_callback=legacy_test_callback,
                     )
                     # F1: ack the delivered envelope now that it handled
                     # cleanly. A handling exception above skips this (still
@@ -1513,7 +1474,6 @@ class PuffoCoreMessageClient:
         payload: MessagePayload,
         *,
         server_seq: int | None = None,
-        legacy_test_callback: Callable[..., Any] | None = None,
     ) -> bool:
         """Persist one keyless bridge message into the global durable inbox.
 
@@ -1731,333 +1691,14 @@ class PuffoCoreMessageClient:
                 runtime.notify_delivery()
             if committed:
                 runtime.notify()
-        elif legacy_test_callback is not None:
-            content = row["content"]
-            root_id = thread_root_id or payload.envelope_id
-            message = {
-                "channel_id": channel_id,
-                "channel_name": channel_name,
-                "space_id": space_id,
-                "space_name": space_name,
-                "sender_slug": payload.sender_slug,
-                "sender_display_name": sender_display_name,
-                "sender_email": "",
-                "text": llm_text,
-                "root_id": thread_root_id or "",
-                "is_dm": is_dm,
-                "attachments": content["attachment_paths"],
-                "sender_is_bot": payload.sender_type == "agent" or bool(sender_owner_slug),
-                "sender_owner_slug": sender_owner_slug,
-                "sender_type": payload.sender_type,
-                "mentions": mentions,
-                "envelope_id": payload.envelope_id,
-                "sent_at": payload.sent_at,
-                "is_visible_to_human": payload.is_visible_to_human,
-            }
-            result = legacy_test_callback(
-                root_id,
-                [message],
-                {
-                    "channel_id": channel_id,
-                    "channel_name": channel_name,
-                    "space_id": space_id,
-                    "space_name": space_name,
-                    "is_dm": is_dm,
-                },
-            )
-            if asyncio.iscoroutine(result):
-                await result
         return True
 
-    async def _handle_plaintext_payload(self, payload: MessagePayload) -> None:
-        """Persist + surface a decoded message payload to the agent.
-
-        Shared tail of the inbound path: native ``handle_envelope``
-        calls this after ``decrypt_message`` produces ``payload``, and
-        the T23 bridge listener calls it with a payload built straight
-        from a plaintext ``message`` frame (no decrypt). Everything from
-        here down is crypto-agnostic — it only touches ``payload`` +
-        ``self`` (store, caches, thread queue), and every HTTP-backed
-        enrichment helper it calls degrades to empty/None offline, so
-        the keyless bridge path renders ids-for-names rather than
-        crashing.
-        """
-        # PUF-227-A: strict cache-validation invariant for incoming
-        # ids. Any thread_root_id / reply_to_id that doesn't point
-        # to a same-channel parent in our local message_store gets
-        # wiped to None before storage — the agent's local view
-        # never honors a thread linkage that can't be resolved here.
-        # Catches the Scout-class symptom: a server / UI / sender
-        # that stamps a cross-channel id can't poison the recipient
-        # daemon's thread state.
-        validated_thread_root_id = await self._validate_incoming_parent_id(
-            payload.thread_root_id, payload.channel_id, payload.space_id,
-        )
-        validated_reply_to_id = await self._validate_incoming_parent_id(
-            payload.reply_to_id, payload.channel_id, payload.space_id,
-        )
-        await self.store.store({
-            "envelope_id": payload.envelope_id,
-            "envelope_kind": payload.envelope_kind,
-            "sender_slug": payload.sender_slug,
-            "channel_id": payload.channel_id,
-            "space_id": payload.space_id,
-            "recipient_slug": payload.recipient_slug,
-            "content_type": payload.content_type,
-            "content": payload.content,
-            "sent_at": payload.sent_at,
-            "thread_root_id": validated_thread_root_id,
-            "reply_to_id": validated_reply_to_id,
-        })
-        # Rebind for downstream code (root_id resolution at the
-        # batch-coalesce step, channel_meta construction, etc.) so
-        # admit-time wipes propagate through the agent prompt.
-        payload_thread_root_id = validated_thread_root_id
-        payload_reply_to_id = validated_reply_to_id
-
-        # Self-echo lands here too now (see ``handle_envelope``'s
-        # opening comment). Persist it — so ``get_channel_history``
-        # / ``get_thread_history`` show the agent's own posts —
-        # then stop before any of the LLM-facing pipeline below
-        # runs. The agent already produced this message; queueing
-        # it again would feed the agent its own words and trip a
-        # turn-by-turn echo loop.
-        if payload.sender_slug == self.slug:
-            return
-
-        # Daemon-side intercept: ``y``/``n`` from the operator on an
-        # outstanding invite-DM accepts/rejects without waking the
-        # LLM. A threaded reply answers just that invite; a direct
-        # (top-level) reply answers all pending invites at once.
-        if (
-            payload.envelope_kind == "dm"
-            and payload.sender_slug == self.operator_slug
-        ):
-            text_raw = str(payload.content) if payload.content else ""
-            targets, is_direct = self._resolve_invite_targets(
-                payload_thread_root_id, text_raw,
-            )
-            handled_labels = (
-                await self._apply_invite_replies(targets, text_raw)
-                if targets else []
-            )
-            if handled_labels:
-                # Handled inline — don't queue for the LLM.
-                self._last_dm_sender = payload.sender_slug
-                if is_direct:
-                    await self._send_invite_bulk_summary(
-                        handled_labels, text_raw, payload_thread_root_id or "",
-                    )
-                return
-            # Same gate for agent-initiated leave requests, but
-            # threaded-only — each leave is confirmed in its own
-            # thread (no direct/bulk path).
-            if await self._maybe_handle_leave_reply(
-                thread_root_id=payload_thread_root_id or "", text=text_raw,
-            ):
-                self._last_dm_sender = payload.sender_slug
-                return
-
-        channel_id = payload.channel_id or ""
-        is_dm = payload.envelope_kind == "dm"
-        # ``puffo/message+attachments/v1`` carries
-        # ``{ text, attachments: [...] }``; other content types
-        # use the plain-string path.
-        attachment_paths: list[str] = []
-        if payload.content_type == "puffo/message+attachments/v1" and isinstance(
-            payload.content, dict,
-        ):
-            raw_text = str(payload.content.get("text") or "")
-            metas_raw = payload.content.get("attachments") or []
-            if isinstance(metas_raw, list):
-                attachment_paths = await self._save_inbound_attachments(
-                    envelope_id=payload.envelope_id, metas_raw=metas_raw,
-                )
-        else:
-            raw_text = str(payload.content) if payload.content else ""
-
-        # Keyless-bridge attachments: the server holds the blob store, so
-        # an inbound bridge ``message`` frame carries top-level
-        # ``attachments`` = [{ blob_id, filename, mime_type, size_bytes }]
-        # (surfaced onto ``payload.attachments`` by
-        # ``_payload_from_bridge_frame``). Download each by ``blob_id``
-        # via the keyless GET — no decrypt — and save into the same
-        # inbox the native content-type block fills, so the agent's
-        # ``attachments`` message field is populated identically. Native
-        # payloads never set ``payload.attachments`` (it's excluded from
-        # ``to_payload_dict`` and only the bridge mapper sets it) and
-        # ``self._bridge`` is None on native, so this branch is
-        # bridge-only. Per-ref failures log + skip inside the helper.
-        if (
-            self._bridge is not None
-            and isinstance(payload.attachments, list)
-            and payload.attachments
-        ):
-            attachment_paths.extend(
-                await self._save_inbound_bridge_attachments(
-                    envelope_id=payload.envelope_id,
-                    refs=payload.attachments,
-                )
-            )
-
-        # Stash the sender so `send_fallback_message("")` can route replies.
-        # Always overwrite — first-write would pin replies to a
-        # stale peer when a different person DMs us.
-        if is_dm:
-            self._last_dm_sender = payload.sender_slug
-        elif payload.channel_id and payload.space_id:
-            # Remember which space owns this channel so replies
-            # resolve members in the right space (cross-space
-            # invites would otherwise fail).
-            self._channel_space[payload.channel_id] = payload.space_id
-
-        # Parse all ``@<slug>`` and scope to space members
-        # (matches the web client). Self is always kept.
-        self_slug_lower = self.slug.lower()
-        seen: set[str] = set()
-        parsed: list[str] = []
-        for m in _MENTION_RE.finditer(raw_text):
-            slug = m.group(1).lower()
-            if slug in seen:
-                continue
-            seen.add(slug)
-            parsed.append(slug)
-        is_mention = self_slug_lower in seen
-        space_members = (
-            await self._get_space_members(payload.space_id)
-            if payload.space_id
-            else {}
-        )
-        mentions: list[dict] = []
-        for slug in parsed:
-            if slug == self_slug_lower:
-                mentions.append({"username": self.slug, "is_bot": True, "is_self": True})
-                continue
-            if space_members and slug not in space_members:
-                continue
-            is_bot = space_members.get(slug) == "agent"
-            mentions.append({"username": slug, "is_bot": is_bot, "is_self": False})
-
-        # Self-mention rewrite: `@<our-slug>` → `@you(<our-slug>)`
-        # (the documented "addressed to you" signal).
-        clean_text = raw_text.replace(
-            f"@{self.slug}", f"@you({self.slug})",
-        ).strip() if is_mention else raw_text
-
-        # Resolve human-readable names so the LLM sees ``space:``/
-        # ``channel:`` instead of bare ids. Cached per session. DMs
-        # render an explicit "Direct message" label.
-        space_id = payload.space_id or ""
-        space_name = (
-            await self._resolve_space_name(space_id) if space_id else ""
-        )
-        if is_dm:
-            channel_name = "Direct message"
-        elif channel_id:
-            channel_name = await self._resolve_channel_name(
-                space_id, channel_id,
-            )
-        else:
-            channel_name = channel_id
-
-        direct = is_dm or is_mention
-        sender_is_bot = False  # puffo-core has no is_bot flag yet
-        priority = _compute_priority(direct, sender_is_bot)
-
-        # Thread-batched queue: every message coalesces under
-        # its ``root_id`` (the envelope's ``thread_root_id``, or
-        # the message itself when it's a top-level post). The
-        # PriorityQueue holds one slot per root; new arrivals on
-        # the same thread either join the existing batch
-        # (priority same or lower) or bump the slot to the new
-        # higher priority. The agent processes one whole thread
-        # at a time in ``on_message_batch``.
-        # PUF-227-A: route on the VALIDATED thread_root_id. If
-        # admit-time validation wiped it (parent not in cache or
-        # cross-channel), the message gets a fresh per-envelope
-        # root_id and lands in its own batch — never inheriting a
-        # stale channel_meta from an unrelated thread.
-        root_id = payload_thread_root_id or payload.envelope_id
-
-        # Cross-restart dedup: after a daemon restart the server
-        # redelivers anything in /messages/pending. If we already
-        # dispatched a batch that covers ``payload.sent_at``,
-        # skip — the agent has seen this.
-        last_processed = await self.store.get_last_processed_sent_at(root_id)
-        if payload.sent_at <= last_processed:
-            self._log.info(
-                "handle_envelope: cursor-rejected duplicate envelope=%s "
-                "(sent_at=%d <= last_processed=%d, root=%s)",
-                payload.envelope_id, payload.sent_at,
-                last_processed, root_id,
-            )
-            return
-
-        # Per-session display-name cache turns this into ~1 HTTP
-        # call per distinct sender per session; same helper the
-        # invite-DM flow already uses. Empty string on miss.
-        sender_display_name = await self._fetch_display_name(
-            payload.sender_slug,
-        )
-
-        # Long-message redaction. Operators paste big chunks of
-        # code or transcripts that, combined with the agent's
-        # system prompt + thread history, can blow past the LLM
-        # context window — historically observable as the agent
-        # getting stuck in a "Prompt is too long" retry loop the
-        # restart path didn't recover from. The full envelope
-        # stays in messages.db; only the in-prompt view collapses
-        # to a placeholder pointing at ``get_post_segment``.
-        llm_text = _maybe_redact_long_text(
-            clean_text,
-            envelope_id=payload.envelope_id,
-            sender_slug=payload.sender_slug,
-            sender_display_name=sender_display_name,
-            max_inline_chars=self._max_inline_chars,
-            segment_chars=self._segment_chars,
-            agent_slug=self.slug,
-        )
-
-        msg_dict = {
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "space_id": space_id,
-            "space_name": space_name,
-            "sender_slug": payload.sender_slug,
-            "sender_display_name": sender_display_name,
-            "sender_email": "",
-            "text": llm_text,
-            "root_id": payload_thread_root_id or "",
-            "is_dm": is_dm,
-            "attachments": attachment_paths,
-            "sender_is_bot": sender_is_bot,
-            "mentions": mentions,
-            "envelope_id": payload.envelope_id,
-            "sent_at": payload.sent_at,
-            "is_visible_to_human": payload.is_visible_to_human,
-        }
-        channel_meta = {
-            "channel_id": channel_id,
-            "channel_name": channel_name,
-            "space_id": space_id,
-            "space_name": space_name,
-            "is_dm": is_dm,
-        }
-
-        await self._admit_thread_message(
-            root_id=root_id,
-            priority=priority,
-            msg_dict=msg_dict,
-            channel_meta=channel_meta,
-        )
-
     def _payload_from_bridge_frame(self, frame: dict) -> MessagePayload | None:
-        """Map a plaintext bridge ``message`` frame onto a
-        ``MessagePayload`` so it can flow through the same
-        ``_handle_plaintext_payload`` tail the native decrypt path uses.
+        """Map a plaintext bridge ``message`` frame to ``MessagePayload``.
 
         The server holds all crypto on the bridge transport, so the
-        frame body is already plaintext — there is no decrypt step.
+        frame body is already plaintext. ``_store_bridge_payload`` then
+        projects it into the same durable inbox schema as native delivery.
         Every routing field is read with ``.get()`` and a benign
         fallback so a wire-field rename or a sparse frame degrades to a
         skip (bad ``envelope_id``) rather than a ``KeyError`` mid-loop.
@@ -2110,459 +1751,14 @@ class PuffoCoreMessageClient:
             thread_root_id=frame.get("thread_root_id"),
             reply_to_id=frame.get("reply_to_id"),
             # Keyless-bridge attachments ride the frame top level as
-            # ``[{ blob_id, filename, mime_type, size_bytes }]``; the
-            # shared inbound tail downloads each blob by id (no decrypt).
+            # ``[{ blob_id, filename, mime_type, size_bytes }]``; storage
+            # downloads each blob by id without a decrypt step.
             # Native frames never carry this key, so it stays None there.
             attachments=frame.get("attachments"),
             sender_owner_slug=owner,
             sender_type=sender_type,
         )
 
-    async def _admit_thread_message(
-        self,
-        *,
-        root_id: str,
-        priority: int,
-        msg_dict: dict,
-        channel_meta: dict,
-    ) -> None:
-        """Add (or coalesce) a message into the thread-batched queue.
-
-        Cases (all keyed on ``root_id``):
-
-        - **New root** (no entry yet): build a fresh ``_ThreadEntry``
-          with this message as the only element and push a heap tuple.
-        - **Reopen** (entry exists but ``in_queue`` is False — a
-          previous batch was already dispatched): reset the entry with
-          this message as the new cursor and push a fresh heap tuple.
-        - **In-queue, same-or-lower priority** (priority numeric value
-          unchanged or larger): append to the existing batch. The
-          cursor (``messages[0]``) stays pinned; the heap tuple
-          doesn't move.
-        - **In-queue, higher priority** (smaller numeric value): append
-          to the batch AND push a new heap tuple with the upgraded
-          priority and a fresh seq. The old tuple is left in the heap
-          and gets skipped on pop via the ``current_seq`` mismatch
-          check in ``_consume_queue``.
-
-        Caller must have already filtered out messages whose
-        ``sent_at`` is at or below
-        ``store.get_last_processed_sent_at(root_id)``; this method
-        doesn't re-check the durable cursor.
-        """
-        entry = self._thread_state.get(root_id)
-        incoming_id = msg_dict.get("envelope_id", "")
-
-        # Cross-batch dedup: skip a duplicate of an envelope the
-        # consumer just claimed and is sending to the agent right
-        # now. Without this, the reopen branch below would create a
-        # fresh ``entry.messages = [dup]`` slot and the duplicate
-        # gets dispatched as the next batch — agent sees the same
-        # envelope across two turns. See ``_ThreadEntry`` docstring.
-        if entry is not None and incoming_id and incoming_id in entry.dispatching_ids:
-            self._log.info(
-                "_admit_thread_message: dispatching_ids-rejected duplicate "
-                "envelope=%s root=%s", incoming_id, root_id,
-            )
-            return
-
-        if entry is None or not entry.in_queue:
-            self._queue_seq += 1
-            if entry is None:
-                entry = _ThreadEntry(
-                    current_priority=priority,
-                    current_seq=self._queue_seq,
-                    messages=[msg_dict],
-                    in_queue=True,
-                    channel_meta=channel_meta,
-                )
-                self._thread_state[root_id] = entry
-            else:
-                entry.current_priority = priority
-                entry.current_seq = self._queue_seq
-                entry.messages = [msg_dict]
-                entry.in_queue = True
-                entry.channel_meta = channel_meta
-            await self._queue.put((priority, entry.current_seq, root_id))
-            return
-
-        # Dedup by envelope_id within the live batch. The same wire
-        # envelope can land here twice when the server's pending-
-        # message redelivery overlaps with live WS delivery (e.g.
-        # after a daemon restart or brief WS reconnect). sqlite-side
-        # INSERT OR IGNORE in MessageStore.store already covers the
-        # durable table, but the in-memory batch is independent and
-        # would otherwise feed the agent the same post N times.
-        if incoming_id and any(
-            m.get("envelope_id") == incoming_id for m in entry.messages
-        ):
-            self._log.info(
-                "_admit_thread_message: in-batch-rejected duplicate "
-                "envelope=%s root=%s (pending batch=%d)",
-                incoming_id, root_id, len(entry.messages),
-            )
-            return
-
-        entry.messages.append(msg_dict)
-        if priority < entry.current_priority:
-            self._queue_seq += 1
-            entry.current_priority = priority
-            entry.current_seq = self._queue_seq
-            await self._queue.put((priority, entry.current_seq, root_id))
-
-    # Upper bound on consecutive AgentAPIError retries for a single
-    # batch before we give up. claude-code's rate limit usually lifts
-    # well inside 3 × (15-45s) of backoff; staying any longer is
-    # bad for everything else queued behind this thread.
-    MAX_API_ERROR_RETRIES = 3
-
-    async def _do_api_error_retries(
-        self,
-        *,
-        root_id: str,
-        entry: "_ThreadEntry",
-        batch: list[dict],
-        channel_meta: dict,
-        on_api_error_retry: Optional[Callable[..., Coroutine[Any, Any, Any]]],
-        on_api_error_abandon: Optional[Callable[..., Coroutine[Any, Any, Any]]],
-        on_turn_success: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
-        last_envelope: str,
-        is_auth: bool = False,
-    ) -> None:
-        """Loop the API-Error kick-retry path until the agent
-        succeeds, the retry cap is hit, or a non-retry exception
-        bubbles up. The original ``batch`` doesn't go back into
-        ``entry.messages`` — the kick path tells claude-code (via
-        --resume) to re-attempt its previous turn; if --resume is
-        gone, the adapter falls back to the payload internally.
-
-        Mid-dispatch arrivals: any new messages that landed on the
-        same thread during the failed dispatch were admitted via
-        ``_admit_thread_message``'s reopen branch and are now in
-        ``entry.messages`` with a fresh queue tuple. We don't touch
-        them; the consumer picks them up after this retry loop
-        exits.
-
-        Cursor is NOT advanced on the failed batch — if a later
-        message succeeds on this thread it'll mark a higher
-        ``sent_at`` past the failed one, effectively leaving the
-        failed envelope readable via ``get_channel_history`` for the
-        agent if it wants to backfill.
-        """
-        # Reset the in-flight set for this slot. The failed batch is
-        # no longer "currently dispatching"; future duplicates of
-        # those envelopes need to be caught by the cursor (advanced
-        # by the kick's successful dispatch) or by in-batch dedup.
-        entry.dispatching_ids = set()
-
-        if is_auth:
-            # Retrying is pointless until re-login (worker already set
-            # auth_failed + DMed). Don't fire the abandon callback — it
-            # would overwrite auth_failed; cursor stays un-advanced so
-            # the batch redelivers on recovery.
-            self._log.warning(
-                "agent reply was an auth error for thread %s (last envelope "
-                "%s); skipping kick-retries until operator re-login",
-                root_id, last_envelope,
-            )
-            return
-
-        if on_api_error_retry is None:
-            self._log.warning(
-                "agent reply contained 'API Error' for thread %s "
-                "(last envelope %s); no retry callback wired, "
-                "abandoning batch",
-                root_id, last_envelope,
-            )
-            await self._fire_api_error_abandon(
-                on_api_error_abandon=on_api_error_abandon,
-                root_id=root_id,
-                batch=batch,
-                channel_meta=channel_meta,
-                attempts=0,
-            )
-            return
-
-        for attempt in range(1, self.MAX_API_ERROR_RETRIES + 1):
-            delay = random.uniform(15.0, 45.0)
-            self._log.warning(
-                "agent reply contained 'API Error' for thread %s "
-                "(last envelope %s); kick-retry %d/%d in %.1fs",
-                root_id, last_envelope, attempt,
-                self.MAX_API_ERROR_RETRIES, delay,
-            )
-            try:
-                await asyncio.sleep(delay)
-            except asyncio.CancelledError:
-                raise
-            try:
-                await on_api_error_retry(root_id, batch, channel_meta)
-                # Success path: no exception. The agent processed
-                # the retry. Advance cursor past the failed batch
-                # so we don't re-trigger on redelivery.
-                if batch:
-                    tail_sent_at = batch[-1].get("sent_at", 0)
-                    try:
-                        await self.store.mark_thread_processed(
-                            root_id, tail_sent_at,
-                        )
-                    except Exception:
-                        self._log.exception(
-                            "mark_thread_processed(%s, %d) failed "
-                            "after kick-retry; agent may re-process "
-                            "after restart",
-                            root_id, tail_sent_at,
-                        )
-                self._log.info(
-                    "agent thread %s recovered after kick-retry %d/%d",
-                    root_id, attempt, self.MAX_API_ERROR_RETRIES,
-                )
-                await self._fire_turn_success(
-                    on_turn_success=on_turn_success,
-                    root_id=root_id,
-                    batch=batch,
-                    channel_meta=channel_meta,
-                )
-                return
-            except AgentAPIError:
-                # Still rate-limited; loop with another backoff.
-                continue
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self._log.exception(
-                    "kick-retry %d/%d for thread %s raised; abandoning",
-                    attempt, self.MAX_API_ERROR_RETRIES, root_id,
-                )
-                await self._fire_api_error_abandon(
-                    on_api_error_abandon=on_api_error_abandon,
-                    root_id=root_id,
-                    batch=batch,
-                    channel_meta=channel_meta,
-                    attempts=attempt,
-                )
-                return
-        self._log.warning(
-            "agent thread %s exhausted %d kick-retries (last envelope %s); "
-            "abandoning the batch — agent will see these messages via "
-            "get_channel_history on the next dispatch",
-            root_id, self.MAX_API_ERROR_RETRIES, last_envelope,
-        )
-        await self._fire_api_error_abandon(
-            on_api_error_abandon=on_api_error_abandon,
-            root_id=root_id,
-            batch=batch,
-            channel_meta=channel_meta,
-            attempts=self.MAX_API_ERROR_RETRIES,
-        )
-
-    async def _fire_api_error_abandon(
-        self,
-        *,
-        on_api_error_abandon: Optional[Callable[..., Coroutine[Any, Any, Any]]],
-        root_id: str,
-        batch: list[dict],
-        channel_meta: dict,
-        attempts: int,
-    ) -> None:
-        """PUF-252: state-honesty hook fired exactly once per
-        abandoned batch. ``attempts`` is the number of kick-retries
-        that actually fired (0 when no retry callback was wired, or
-        an internal raise short-circuited the loop before any
-        attempt completed). The worker uses this to flip
-        ``runtime.health`` so FB-197 (status dot) + FB-198 (restart
-        lever) on Nova's lane can surface the "agent went silent"
-        signal."""
-        if on_api_error_abandon is None:
-            return
-        try:
-            await on_api_error_abandon(root_id, batch, channel_meta, attempts)
-        except Exception:
-            self._log.exception(
-                "on_api_error_abandon callback raised for thread %s; "
-                "the abandon itself stands -- the callback's job is "
-                "purely observational",
-                root_id,
-            )
-
-    async def _fire_turn_success(
-        self,
-        *,
-        on_turn_success: Optional[Callable[..., Coroutine[Any, Any, Any]]],
-        root_id: str,
-        batch: list[dict],
-        channel_meta: dict,
-    ) -> None:
-        """Recovery-side matched-pair for ``_fire_api_error_abandon``."""
-        if on_turn_success is None:
-            return
-        try:
-            await on_turn_success(root_id, batch, channel_meta)
-        except Exception:
-            self._log.exception(
-                "on_turn_success callback raised for thread %s",
-                root_id,
-            )
-
-    async def _consume_queue(
-        self,
-        on_message_batch: Callable[..., Coroutine[Any, Any, Any]],
-        on_api_error_retry: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-        on_api_error_abandon: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-        on_turn_success: Callable[..., Coroutine[Any, Any, Any]] | None = None,
-    ) -> None:
-        """Drain the priority queue serially. One turn at a time so
-        the underlying session keeps a coherent conversation history;
-        concurrent turns would interleave context.
-
-        Each pop yields a ``root_id``. We look up the per-thread
-        entry, drop the message batch out (claim it), and dispatch
-        the whole list as one agent invocation. While the agent is
-        running, new arrivals on the same thread create a fresh
-        entry that will be picked up on the next pop — the agent
-        won't re-see messages it already processed.
-        """
-        while True:
-            try:
-                _priority, popped_seq, root_id = await self._queue.get()
-            except asyncio.CancelledError:
-                return
-
-            entry = self._thread_state.get(root_id)
-            if entry is None or not entry.in_queue or entry.current_seq != popped_seq:
-                # Stale heap entry: a higher-priority arrival
-                # already pushed a fresh tuple for this root, or
-                # the slot has been closed since we popped. Drop
-                # and continue.
-                continue
-
-            # Claim the batch atomically — mark the slot closed
-            # before dispatch so concurrent arrivals open a fresh
-            # entry instead of stacking into a batch the agent is
-            # already chewing through. Record the batch's
-            # envelope_ids in ``dispatching_ids`` so that a duplicate
-            # arriving mid-dispatch can be rejected at admit time
-            # (the durable cursor hasn't advanced yet, so it can't
-            # catch it).
-            batch = entry.messages
-            channel_meta = entry.channel_meta
-            entry.messages = []
-            entry.in_queue = False
-            entry.dispatching_ids = {
-                m.get("envelope_id") for m in batch if m.get("envelope_id")
-            }
-
-            # Safety net: paranoid in-batch dedup right before
-            # dispatch. ``_admit_thread_message``'s in-queue dedup
-            # plus ``dispatching_ids`` should already guarantee
-            # ``batch`` is duplicate-free, but if some upstream race
-            # we haven't characterised slips a duplicate envelope_id
-            # past both, we must NOT hand the same envelope to the
-            # agent twice in one turn. The warning log lets us spot
-            # the offending path if it ever fires.
-            seen_ids: set[str] = set()
-            deduped: list[dict] = []
-            dropped: list[str] = []
-            for m in batch:
-                mid = m.get("envelope_id", "")
-                if mid and mid in seen_ids:
-                    dropped.append(mid)
-                    continue
-                if mid:
-                    seen_ids.add(mid)
-                deduped.append(m)
-            if dropped:
-                self._log.warning(
-                    "consumer dropped %d in-batch duplicate envelope_id(s) "
-                    "for thread %s before dispatch: %s",
-                    len(dropped), root_id, dropped,
-                )
-                batch = deduped
-
-            # Pre-dispatch jitter. When several agents on the same
-            # host get activated by the same message (e.g. a channel
-            # broadcast), unblocked dispatch sends them all into the
-            # claude-code API at once and trips its rate limit. A
-            # 0.0–1.5s random sleep here desynchronises them; each
-            # agent picks independently. Messages that arrive during
-            # the sleep land in the next batch because in_queue is
-            # already False.
-            try:
-                await asyncio.sleep(random.uniform(0.0, 1.5))
-            except asyncio.CancelledError:
-                raise
-
-            try:
-                await on_message_batch(root_id, batch, channel_meta)
-            except AgentAPIError as exc:
-                # Adapter surfaced "API Error" — most commonly
-                # claude-code's transient rate-limit error. The
-                # original user input is already in claude-code's
-                # ``--resume``-backed transcript from the failed
-                # dispatch; the retry just needs to nudge the agent
-                # to try again, NOT re-send the payload (which would
-                # accumulate visible duplicates in the agent's
-                # transcript on every retry).
-                #
-                # The retry path uses a small kick message ("session
-                # errored on rate limiting, please resume processing")
-                # via ``on_api_error_retry``; if ``--resume`` is no
-                # longer valid the adapter falls back to the original
-                # payload on its own so the agent has something to
-                # work from. Auth errors skip retries entirely (the
-                # worker already flipped auth_failed + DMed).
-                last_envelope = batch[-1].get("envelope_id", "") if batch else ""
-                await self._do_api_error_retries(
-                    root_id=root_id,
-                    entry=entry,
-                    batch=batch,
-                    channel_meta=channel_meta,
-                    on_api_error_retry=on_api_error_retry,
-                    on_api_error_abandon=on_api_error_abandon,
-                    on_turn_success=on_turn_success,
-                    last_envelope=last_envelope,
-                    is_auth=getattr(exc, "is_auth", False),
-                )
-                continue
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self._log.exception(
-                    "on_message_batch handler failed for thread %s (%d messages)",
-                    root_id, len(batch),
-                )
-                # Treat poison-message style failures as terminal for
-                # the batch — don't loop forever. The sqlite cursor
-                # stays untouched so a restart can retry, but we mark
-                # the slot done in-memory so live arrivals keep
-                # flowing for other threads.
-                continue
-
-            # Success: persist the cursor so a restart-then-redeliver
-            # doesn't re-trigger this thread. ``batch[-1].sent_at`` is
-            # the high-water mark we just covered.
-            if batch:
-                tail_sent_at = batch[-1].get("sent_at", 0)
-                try:
-                    await self.store.mark_thread_processed(root_id, tail_sent_at)
-                except Exception:
-                    self._log.exception(
-                        "mark_thread_processed(%s, %d) failed; agent "
-                        "may re-process this thread after a restart",
-                        root_id, tail_sent_at,
-                    )
-            # Cursor now covers the dispatched batch — duplicates of
-            # any of its envelopes will be caught by the handle_envelope
-            # cursor check from this point on, so the in-memory
-            # dispatching_ids set has done its job and can be released.
-            entry.dispatching_ids = set()
-
-            await self._fire_turn_success(
-                on_turn_success=on_turn_success,
-                root_id=root_id,
-                batch=batch,
-                channel_meta=channel_meta,
-            )
     async def _invite_poll_loop(self) -> None:
         """Poll ``/invites`` to catch invites the WS can't reach (the
         server only fans events to existing space members, which the

@@ -7,11 +7,11 @@ single-WS slot, hand back the live agent context, then run the tool
 attached — the session frame-loop and the message consumer together —
 until either ends, and always free the slot on the way out.
 
-The daemon supplies the collaborators: ``make_session`` builds the
-session wired to the ``bridge``; ``start_consumer`` runs the agent's
-``PuffoCoreMessageClient.listen`` with the bridge's dispatch callback;
-``agent_context`` reads the live role + profile.md. Attaching a tool is
-what brings the agent online (point 4) — no tool, no consumer.
+The daemon supplies the collaborators: ``make_session`` builds the session
+wired to the bridge and its ``GlobalInboxRuntime``;
+``start_consumer`` runs the durable message listener and scheduler;
+``agent_context`` reads the live role + profile.md. Attaching a tool is what
+brings the agent online — no tool, no consumer.
 """
 
 from __future__ import annotations
