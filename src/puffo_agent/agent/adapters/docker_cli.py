@@ -521,6 +521,8 @@ class DockerCLIAdapter(Adapter):
         env["PUFFO_RUNTIME_KIND"] = "cli-docker"
         env["PUFFO_HARNESS"] = self.harness.name()
         env["PYTHONPATH"] = "/opt/puffoagent-pkg"
+        if self.harness.name() == "codex":
+            env["CODEX_HOME"] = "/home/agent/.codex"
         return env
 
     def _prepare_codex_config(self, host_home: Path) -> None:

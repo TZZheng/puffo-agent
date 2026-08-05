@@ -116,6 +116,37 @@ def test_prepare_codex_config_syncs_auth_and_container_reachable_mcps(tmp_path):
     assert 'PUFFO_HARNESS = "codex"' in config
 
 
+def test_container_codex_mcp_reads_container_mounted_codex_home(tmp_path):
+    adapter = _adapter(tmp_path, harness=CodexHarness())
+    adapter.puffo_core_mcp_env = {
+        "CODEX_HOME": str(adapter.codex_home),
+        "PUFFO_CORE_SLUG": "agent-slug",
+    }
+
+    env = adapter._container_puffo_mcp_env()
+
+    assert env is not None
+    assert env["CODEX_HOME"] == "/home/agent/.codex"
+
+
+def test_prepare_codex_config_uses_container_codex_home_for_puffo_mcp(tmp_path):
+    host_home = tmp_path / "host"
+    host_codex = host_home / ".codex"
+    host_codex.mkdir(parents=True)
+    (host_codex / "auth.json").write_text("{}", encoding="utf-8")
+    adapter = _adapter(tmp_path, harness=CodexHarness())
+    adapter.puffo_core_mcp_env = {
+        "CODEX_HOME": str(adapter.codex_home),
+        "PUFFO_CORE_SLUG": "agent-slug",
+    }
+
+    adapter._prepare_codex_config(host_home)
+
+    config = (adapter.codex_home / "config.toml").read_text(encoding="utf-8")
+    assert 'CODEX_HOME = "/home/agent/.codex"' in config
+    assert str(adapter.codex_home).replace("\\", "\\\\") not in config
+
+
 def test_codex_session_runs_app_server_inside_container(tmp_path):
     adapter = _adapter(
         tmp_path,

@@ -22,6 +22,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Codex Docker workers now discover their synchronized MCP servers.**
+  The in-container Puffo MCP subprocess reads the mounted Codex home
+  instead of retaining an inaccessible host path in `CODEX_HOME`.
+
 - **Docker Desktop is now discovered even when it is missing from the
   daemon's `PATH`.** Docker uses the same cached resolver as Claude Code
   and Codex, including an explicit `PUFFO_DOCKER_BIN` override,
