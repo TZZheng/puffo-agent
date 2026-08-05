@@ -154,6 +154,14 @@ def _call_tool(server, tool_name, **kwargs):
     return _run(tool.fn(**kwargs))
 
 
+def test_sync_host_mcp_description_explains_codex_file_oauth(tmp_path):
+    server, _ = _build_mcp_with_harness("codex", tmp_path=tmp_path)
+    description = server._tool_manager._tools["sync_host_mcp"].description
+
+    assert 'mcp_oauth_credentials_store="file"' in description
+    assert "OS-keyring-encrypted" in description
+
+
 def test_install_skill_blocked_under_hermes(tmp_path):
     server, _ = _build_mcp_with_harness("hermes")
     with pytest.raises(RuntimeError, match="only supported under the claude-code harness"):

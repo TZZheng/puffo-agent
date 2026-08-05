@@ -1218,6 +1218,13 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         ``install_host_mcp`` once the operator finishes OAuth on host,
         then call ``refresh()`` so the CLI respawns and picks up the MCP.
 
+        Codex OAuth must be created on the host with
+        ``mcp_oauth_credentials_store="file"`` (for example,
+        ``codex -c 'mcp_oauth_credentials_store="file"' mcp login NAME``).
+        OS-keyring-encrypted Codex OAuth cannot be copied into an
+        isolated agent home; the returned result explains the one-time
+        host re-login required when that legacy storage is detected.
+
         If the host config doesn't have the entry yet, returns an
         error asking you to call ``install_host_mcp`` first (and
         relay the result to the operator).
