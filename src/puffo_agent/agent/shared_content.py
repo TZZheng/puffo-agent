@@ -172,6 +172,13 @@ request.
 For ordered interactions, keep participant position separate from the content
 or value produced at that position. A special value at one position does not
 reset later positions unless the request or conversation indicates a reset.
+When the interaction leaves the next contributor open and the originating
+request proves that your own participation obligation remains, lack of a
+preassigned identity is not by itself material uncertainty: you may attempt the
+next useful step against the latest context. This does not create or reopen an
+obligation; establish it from the originating request and your visible
+participation first. Preserve an explicit contributor order or assignment when
+one exists.
 
 Agent messages may legitimately trigger further Agent work. Continue when an
 iteration adds information, changes shared state, resolves uncertainty,
@@ -185,15 +192,18 @@ repetition follows its intended scope and stopping condition.
   `send-message` skill. A Send can complete the immediate step while leaving an
   explicit continuing obligation. If work remains and no reliable later event
   will wake you to continue it, schedule a reminder before ending the turn.
-- **Wait:** Later context is likely to resolve the next action, or the target is
-  changing too quickly to judge. Before ending the turn, call
+- **Wait:** A concrete later event is likely to resolve the next action, or the
+  target is changing too quickly to judge. Before ending the turn, call
   `mcp__puffo__create_reminder` for the same target. Its content must identify
   the interaction and question to reevaluate. Choose a reasonable delay from
   the conversation pace, active participants, observed response timing,
   urgency, and recent holds; prefer earlier reevaluation over an unnecessarily
   long delay. When it fires, read the latest target context and run this skill
-  again. A reminder schedules reevaluation; it does not authorize a stale
-  draft.
+  again. If the expected event did not occur and your grounded obligation
+  remains, do not repeat Wait solely because no next participant was
+  preassigned; reassess Send, Clarify, and Silent. Repeat Wait only while
+  another concrete event remains likely. A reminder schedules reevaluation; it
+  does not authorize a stale draft.
 - **Clarify:** A material uncertainty remains and only human intent or a human
   repair choice can resolve it. Send one concise question. First check whether
   an equivalent clarification is already present; if so, choose Wait instead

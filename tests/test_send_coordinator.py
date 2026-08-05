@@ -466,6 +466,43 @@ async def test_native_held_response_accepts_exact_frozen_contract():
 
 
 @pytest.mark.asyncio
+async def test_native_held_response_accepts_current_blocker_metadata_contract():
+    coordinator, _, _ = await coordinator_fixture()
+    response = {
+        "state": "held",
+        "envelope_id": "msg_exact",
+        "context_baseline_seq": 3,
+        "seen_seq": 4,
+        "latest_seq": 5,
+        "latest_envelope_id": "msg_latest",
+        "blocking_seq": 5,
+        "blocking_envelope_id": "msg_latest",
+        "blocking_sender_slug": "agent-peer",
+    }
+    freshness = {
+        "mode": "require_current",
+        "context_baseline_seq": 3,
+        "seen_seq": 4,
+    }
+
+    result = coordinator._validate_channel_response(
+        response, {"envelope_id": "msg_exact"}, freshness,
+    )
+
+    assert result.state == "held"
+    assert result.blocking_seq == 5
+    assert result.blocking_envelope_id == "msg_latest"
+    assert result.blocking_sender_slug == "agent-peer"
+
+    response["blocking_seq"] = 6
+    rejected = coordinator._validate_channel_response(
+        response, {"envelope_id": "msg_exact"}, freshness,
+    )
+    assert rejected.state == "failed"
+    assert rejected.error_kind == "protocol"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
     [

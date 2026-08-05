@@ -34,6 +34,22 @@ logger = logging.getLogger(__name__)
 CHANNEL_SEND_PATH = "/v2/agent-runtime/messages:send"
 KEYLESS_CHANNEL_SEND_PATH = "/v2/cloud-agents/agent-runtime/messages:send"
 _KNOWN_ERROR_STATUSES = {400, 401, 403, 404, 405, 409, 413, 429, 500, 503}
+_LEGACY_HELD_RESPONSE_FIELDS = frozenset({
+    "state",
+    "envelope_id",
+    "context_baseline_seq",
+    "seen_seq",
+    "latest_seq",
+    "latest_envelope_id",
+})
+_BLOCKING_HELD_RESPONSE_FIELDS = frozenset({
+    "blocking_seq",
+    "blocking_envelope_id",
+    "blocking_sender_slug",
+})
+_CURRENT_HELD_RESPONSE_FIELDS = (
+    _LEGACY_HELD_RESPONSE_FIELDS | _BLOCKING_HELD_RESPONSE_FIELDS
+)
 
 
 @dataclass(frozen=True)
@@ -118,6 +134,9 @@ class SendResult:
     seen_seq: Optional[int] = None
     latest_seq: Optional[int] = None
     latest_envelope_id: Optional[str] = None
+    blocking_seq: Optional[int] = None
+    blocking_envelope_id: Optional[str] = None
+    blocking_sender_slug: Optional[str] = None
     latest_seq_before_send: Optional[int] = None
     mode: Optional[str] = None
     missing_devices: list[str] = field(default_factory=list)
@@ -711,6 +730,10 @@ class SendCoordinator:
             )
         if state == "held":
             latest = raw.get("latest_seq")
+            latest_envelope_id = raw.get("latest_envelope_id")
+            has_blocker_metadata = any(
+                key in raw for key in _BLOCKING_HELD_RESPONSE_FIELDS
+            )
             if (
                 raw.get("seen_seq") != freshness["seen_seq"]
                 or (
@@ -721,8 +744,18 @@ class SendCoordinator:
                 or isinstance(latest, bool)
                 or not isinstance(latest, int)
                 or latest <= freshness["seen_seq"]
-                or not isinstance(raw.get("latest_envelope_id"), str)
-                or not raw.get("latest_envelope_id")
+                or not isinstance(latest_envelope_id, str)
+                or not latest_envelope_id
+                or (
+                    has_blocker_metadata
+                    and (
+                        not _BLOCKING_HELD_RESPONSE_FIELDS.issubset(raw)
+                        or raw.get("blocking_seq") != latest
+                        or raw.get("blocking_envelope_id") != latest_envelope_id
+                        or not isinstance(raw.get("blocking_sender_slug"), str)
+                        or not raw.get("blocking_sender_slug", "").strip()
+                    )
+                )
             ):
                 return SendResult(
                     state="failed", error="invalid coordinated keyless hold",
@@ -733,7 +766,10 @@ class SendCoordinator:
                 context_baseline_seq=freshness["context_baseline_seq"],
                 seen_seq=freshness["seen_seq"],
                 latest_seq=latest,
-                latest_envelope_id=raw["latest_envelope_id"],
+                latest_envelope_id=latest_envelope_id,
+                blocking_seq=raw.get("blocking_seq"),
+                blocking_envelope_id=raw.get("blocking_envelope_id"),
+                blocking_sender_slug=raw.get("blocking_sender_slug"),
             )
         return SendResult(
             state="failed", error="unknown coordinated keyless state",
@@ -1034,13 +1070,10 @@ class SendCoordinator:
                 missing_devices=missing,
             )
 
-        if set(raw) != {
-            "state",
-            "envelope_id",
-            "context_baseline_seq",
-            "seen_seq",
-            "latest_seq",
-            "latest_envelope_id",
+        response_fields = frozenset(raw)
+        if response_fields not in {
+            _LEGACY_HELD_RESPONSE_FIELDS,
+            _CURRENT_HELD_RESPONSE_FIELDS,
         }:
             return SendResult(
                 state="failed", error="held response fields mismatch",
@@ -1072,11 +1105,24 @@ class SendCoordinator:
                 state="failed", error="held response watermark mismatch",
                 error_kind="protocol",
             )
+        if response_fields == _CURRENT_HELD_RESPONSE_FIELDS and (
+            raw["blocking_seq"] != values["latest_seq"]
+            or raw["blocking_envelope_id"] != raw["latest_envelope_id"]
+            or not isinstance(raw["blocking_sender_slug"], str)
+            or not raw["blocking_sender_slug"].strip()
+        ):
+            return SendResult(
+                state="failed", error="held response blocker metadata mismatch",
+                error_kind="protocol",
+            )
         return SendResult(
             state="held", envelope_id=str(envelope_id),
             context_baseline_seq=freshness["context_baseline_seq"],
             seen_seq=values["seen_seq"], latest_seq=values["latest_seq"],
             latest_envelope_id=raw["latest_envelope_id"],
+            blocking_seq=raw.get("blocking_seq"),
+            blocking_envelope_id=raw.get("blocking_envelope_id"),
+            blocking_sender_slug=raw.get("blocking_sender_slug"),
         )
 
     async def _send_dm(self, request: SemanticSendRequest, recipient_slug: str) -> dict[str, Any]:
