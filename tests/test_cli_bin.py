@@ -79,6 +79,31 @@ def test_claude_resolver_uses_its_own_env(tmp_path, monkeypatch):
     assert cli_bin.resolve_claude_bin() == str(fake_claude)
 
 
+def test_docker_env_override_wins(tmp_path, monkeypatch):
+    fake = _make_exe(tmp_path, "fake_docker")
+    monkeypatch.setenv("PUFFO_DOCKER_BIN", str(fake))
+    monkeypatch.setattr("shutil.which", lambda name, path=None: "/other/docker")
+    assert cli_bin.resolve_docker_bin() == str(fake)
+
+
+def test_docker_bundle_path_hit_when_paths_miss(tmp_path, monkeypatch):
+    bundled = _make_exe(tmp_path, "docker_bundled")
+    monkeypatch.delenv("PUFFO_DOCKER_BIN", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
+    monkeypatch.setattr(cli_bin, "_docker_bundle_paths", lambda: [bundled])
+    assert cli_bin.resolve_docker_bin() == str(bundled)
+
+
+def test_windows_docker_bundle_paths_include_per_user_desktop(monkeypatch):
+    monkeypatch.setattr(cli_bin.sys, "platform", "win32")
+    paths = [str(path).lower() for path in cli_bin._docker_bundle_paths()]
+    assert any(
+        "programs\\dockerdesktop\\resources\\bin\\docker.exe" in path
+        for path in paths
+    )
+    assert any("docker\\docker\\resources\\bin\\docker.exe" in path for path in paths)
+
+
 @pytest.mark.parametrize("platform_value,want_first", [
     ("darwin", "/Applications/ChatGPT.app/Contents/Resources/codex"),
     ("win32", "codex.exe"),  # contains-check

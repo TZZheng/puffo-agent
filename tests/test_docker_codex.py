@@ -137,6 +137,26 @@ def test_codex_session_runs_app_server_inside_container(tmp_path):
     assert session.model == "gpt-5.4"
 
 
+def test_resolved_docker_path_is_used_for_harness_commands(tmp_path):
+    docker_bin = r"C:\Docker Desktop\resources\bin\docker.exe"
+
+    claude_adapter = _adapter(tmp_path)
+    claude_adapter._docker_bin = docker_bin
+    assert claude_adapter._build_command([])[0] == docker_bin
+
+    codex_adapter = _adapter(tmp_path, harness=CodexHarness())
+    codex_adapter._docker_bin = docker_bin
+    assert codex_adapter._ensure_codex_session().argv[0] == docker_bin
+
+
+def test_ensure_started_fails_when_docker_resolver_misses(tmp_path, monkeypatch):
+    adapter = _adapter(tmp_path)
+    monkeypatch.setattr(docker_cli, "resolve_docker_bin", lambda: None)
+
+    with pytest.raises(RuntimeError, match="PUFFO_DOCKER_BIN"):
+        asyncio.run(adapter._ensure_started())
+
+
 @pytest.mark.parametrize("token_value, forwarded", [
     ("super-secret", True),
     (None, False),

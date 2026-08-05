@@ -28,9 +28,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
 from pathlib import Path
 
+from ..cli_bin import resolve_docker_bin
 from ...mcp.config import (
     INFERENCE_LEVELS,
     write_cli_mcp_config,
@@ -201,6 +201,7 @@ class DockerCLIAdapter(Adapter):
         self._desired_installed = False
         self._started_lock = asyncio.Lock()
         self._started = False
+        self._docker_bin = "docker"
         self._session: ClaudeSession | None = None
         self._codex_session: CodexSession | None = None
         # Set post-construction by worker.py. When non-None, claude-
@@ -300,7 +301,8 @@ class DockerCLIAdapter(Adapter):
         # ``-t 5`` shortens docker's 10s SIGTERM grace; stays within
         # Worker.stop's 30s asyncio.wait_for even on slow Windows.
         await _run_cmd(
-            ["docker", "stop", "-t", "5", self.container_name], check=False,
+            [self._docker_bin, "stop", "-t", "5", self.container_name],
+            check=False,
         )
         self._started = False
 
@@ -316,7 +318,7 @@ class DockerCLIAdapter(Adapter):
     def _ensure_codex_session(self) -> CodexSession:
         if self._codex_session is not None:
             return self._codex_session
-        argv = ["docker", "exec", "-i"]
+        argv = [self._docker_bin, "exec", "-i"]
         for name in self._codex_bearer_env_names:
             argv.extend(["-e", name])
         argv.extend([
@@ -366,7 +368,7 @@ class DockerCLIAdapter(Adapter):
         extra_args: list[str],
         env_overrides: dict[str, str] | None = None,
     ) -> list[str]:
-        cmd: list[str] = ["docker", "exec", "-i"]
+        cmd: list[str] = [getattr(self, "_docker_bin", "docker"), "exec", "-i"]
         # ``env_overrides`` flows in before the container name so
         # docker treats each ``-e KEY=VALUE`` as an exec flag.
         for key, value in (env_overrides or {}).items():
@@ -436,7 +438,7 @@ class DockerCLIAdapter(Adapter):
         """
         rc, _, _ = await _run_cmd(
             [
-                "docker", "exec", self.container_name,
+                self._docker_bin, "exec", self.container_name,
                 "test", "-f",
                 "/opt/puffoagent-pkg/puffo_agent/__init__.py",
             ],
@@ -451,7 +453,10 @@ class DockerCLIAdapter(Adapter):
         if harness == "codex":
             checks.append("test -f /home/agent/.codex/config.toml")
         rc, _, _ = await _run_cmd(
-            ["docker", "exec", self.container_name, "sh", "-c", " && ".join(checks)],
+            [
+                self._docker_bin, "exec", self.container_name,
+                "sh", "-c", " && ".join(checks),
+            ],
             check=False,
         )
         return rc == 0
@@ -463,7 +468,7 @@ class DockerCLIAdapter(Adapter):
         """
         rc, out, _ = await _run_cmd(
             [
-                "docker", "inspect",
+                self._docker_bin, "inspect",
                 "-f", "{{.State.Status}}",
                 self.container_name,
             ],
@@ -557,12 +562,16 @@ class DockerCLIAdapter(Adapter):
         async with self._started_lock:
             if self._started:
                 return
-            if shutil.which("docker") is None:
+            docker_bin = resolve_docker_bin()
+            if docker_bin is None:
                 raise RuntimeError(
-                    "docker binary not found on PATH. install Docker Desktop "
+                    "docker binary not found. Tried $PUFFO_DOCKER_BIN, "
+                    "$PATH, the persistent user PATH, and known Docker "
+                    "Desktop install locations. Install Docker Desktop "
                     "(Windows/macOS) or docker-ce (Linux) to use runtime "
                     "kind 'cli-docker'."
                 )
+            self._docker_bin = docker_bin
             # Keep both harness homes ready so switching harnesses does not
             # require rebuilding the container.
             host_home = Path.home()
@@ -659,13 +668,13 @@ class DockerCLIAdapter(Adapter):
                     "agent %s: starting existing container %r (was %s)",
                     self.agent_id, self.container_name, state,
                 )
-                await _run_cmd(["docker", "start", self.container_name])
+                await _run_cmd([self._docker_bin, "start", self.container_name])
             elif state == "paused":
                 logger.info(
                     "agent %s: unpausing container %r",
                     self.agent_id, self.container_name,
                 )
-                await _run_cmd(["docker", "unpause", self.container_name])
+                await _run_cmd([self._docker_bin, "unpause", self.container_name])
             else:
                 # state == "" — no container with this name.
                 await self._ensure_image()
@@ -693,7 +702,7 @@ class DockerCLIAdapter(Adapter):
                     layout_current, package_current, harness_current,
                 )
                 await _run_cmd(
-                    ["docker", "rm", "-f", self.container_name],
+                    [self._docker_bin, "rm", "-f", self.container_name],
                     check=False,
                 )
                 await self._ensure_image()
@@ -709,7 +718,7 @@ class DockerCLIAdapter(Adapter):
             self._started = True
 
     async def _ensure_image(self) -> None:
-        if await _image_exists_locally(self.image):
+        if await _image_exists_locally(self._docker_bin, self.image):
             return
         if self.image != DEFAULT_IMAGE:
             raise RuntimeError(
@@ -721,7 +730,7 @@ class DockerCLIAdapter(Adapter):
         # races in BuildKit's exporter and the loser crashes with
         # "image already exists". First wins; others wait and re-check.
         async with _BUILD_LOCK:
-            if await _image_exists_locally(self.image):
+            if await _image_exists_locally(self._docker_bin, self.image):
                 logger.info(
                     "agent %s: image %s was built by another worker "
                     "during our wait — skipping rebuild",
@@ -737,7 +746,7 @@ class DockerCLIAdapter(Adapter):
     async def _build_image(self) -> None:
         from ..._proc import no_window_kwargs
         proc = await asyncio.create_subprocess_exec(
-            "docker", "build", "-t", self.image, "-",
+            self._docker_bin, "build", "-t", self.image, "-",
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
@@ -772,7 +781,7 @@ class DockerCLIAdapter(Adapter):
         #   6. puffoagent pkg       — host package for in-container imports
         #   7. .puffo-agent-state   — keystore + message DB
         cmd = [
-            "docker", "run", "-d",
+            self._docker_bin, "run", "-d",
             "--name", self.container_name,
             "-e", f"PUFFO_AGENT_ID={self.agent_id}",
             "-v", f"{self.workspace_dir}:/workspace",
@@ -833,9 +842,9 @@ class DockerCLIAdapter(Adapter):
 _BUILD_LOCK = asyncio.Lock()
 
 
-async def _image_exists_locally(tag: str) -> bool:
+async def _image_exists_locally(docker_bin: str, tag: str) -> bool:
     rc, _, _ = await _run_cmd(
-        ["docker", "image", "inspect", tag], check=False,
+        [docker_bin, "image", "inspect", tag], check=False,
     )
     return rc == 0
 

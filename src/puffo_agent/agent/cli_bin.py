@@ -1,5 +1,4 @@
-"""Resolve ``codex`` and ``claude`` binaries with broader-than-PATH
-search.
+"""Resolve host CLI binaries with broader-than-PATH search.
 
 A daemon started by a LaunchAgent (macOS) / Windows service / before a
 shell-profile refresh inherits a narrow, stale PATH that misses
@@ -44,6 +43,11 @@ def resolve_codex_bin() -> str | None:
 def resolve_claude_bin() -> str | None:
     """Return the absolute path of the ``claude`` binary, or ``None``."""
     return _resolve("claude", "PUFFO_CLAUDE_BIN", _claude_bundle_paths())
+
+
+def resolve_docker_bin() -> str | None:
+    """Return the absolute path of the ``docker`` binary, or ``None``."""
+    return _resolve("docker", "PUFFO_DOCKER_BIN", _docker_bundle_paths())
 
 
 def resolve_hermes_bin() -> str | None:
@@ -237,6 +241,27 @@ def _claude_bundle_paths() -> list[Path]:
         "/opt/Claude/claude",
         "/opt/claude/claude",
         "/usr/lib/claude/claude",
+    )
+
+
+def _docker_bundle_paths() -> list[Path]:
+    if sys.platform == "darwin":
+        return _expand(
+            "/Applications/Docker.app/Contents/Resources/bin/docker",
+            "~/Applications/Docker.app/Contents/Resources/bin/docker",
+            "/usr/local/bin/docker",
+            "/opt/homebrew/bin/docker",
+        )
+    if sys.platform == "win32":
+        return _expand(
+            r"%LOCALAPPDATA%\Programs\DockerDesktop\resources\bin\docker.exe",
+            r"%PROGRAMFILES%\Docker\Docker\resources\bin\docker.exe",
+            r"%PROGRAMDATA%\DockerDesktop\version-bin\docker.exe",
+        )
+    return _expand(
+        "/usr/bin/docker",
+        "/usr/local/bin/docker",
+        "/snap/bin/docker",
     )
 
 
