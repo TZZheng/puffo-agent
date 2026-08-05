@@ -9,7 +9,6 @@ local tools live in ``host_tools.py``.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import urllib.parse
 from dataclasses import dataclass
@@ -37,7 +36,16 @@ from ..crypto.message import (
 from ..crypto.primitives import Ed25519KeyPair
 from ..limits import MESSAGE_SEGMENT_CHARS
 from ..agent.context_controller import MODEL_VISIBLE_READ_RECEIPT_PREFIX
-from ..agent.message_projection import format_message_group, target_label
+from ..agent.message_projection import (
+    CONTEXT_VERSION,
+    channel_projection,
+    format_message_group,
+    identity_projection,
+    iso_time,
+    sender_type,
+    space_projection,
+    target_ref,
+)
 from ..agent._logging import log_runtime_event
 from ..agent.send_coordinator import (
     SemanticSendRequest,
@@ -242,6 +250,29 @@ async def _read_profiles(cfg: Any, slugs_csv: str) -> Any:
     return await cfg.http_client.get(
         f"/identities/profiles?slugs={quoted}"
     )
+
+
+async def _read_profile_map(
+    cfg: Any, slugs: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Best-effort profile enrichment without making roster reads fragile."""
+    normalized = list(dict.fromkeys(slug.lstrip("@") for slug in slugs if slug))
+    profiles: dict[str, dict[str, Any]] = {}
+    for offset in range(0, len(normalized), 100):
+        batch = normalized[offset : offset + 100]
+        try:
+            data = await _read_profiles(cfg, ",".join(batch))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("profile enrichment failed for channel roster: %s", exc)
+            continue
+        rows = data.get("profiles", []) if isinstance(data, dict) else []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            slug = str(row.get("slug") or "").lstrip("@")
+            if slug:
+                profiles[slug] = row
+    return profiles
 
 
 async def _send_keyless(cfg: Any, body: dict) -> dict:
@@ -686,69 +717,62 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         raise RuntimeError("global Inbox runtime is unavailable")
 
     @mcp.tool()
-    async def whoami() -> str:
-        """Return your own identity: display name, slug, device_id, and
-        subkey info."""
+    async def whoami() -> dict[str, Any]:
+        """Return a structured self-identity and runtime summary."""
+        profile: dict[str, Any] = {}
+        try:
+            data = await _read_profiles(cfg, cfg.slug)
+            profiles = data.get("profiles", []) if isinstance(data, dict) else []
+            if profiles and isinstance(profiles[0], dict):
+                profile = profiles[0]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("whoami: failed to fetch own profile: %s", exc)
+
+        projected_identity = identity_projection(
+            cfg.slug,
+            display_name=profile.get("display_name"),
+            identity_type="agent",
+            owner_slug=profile.get("owner_slug"),
+            role=profile.get("role"),
+            self_identity=True,
+            bio=profile.get("bio") or None,
+            avatar_url=profile.get("avatar_url") or None,
+        )
         if cfg.keyless:
-            # T23 keyless bridge transport: the sandbox holds no local
-            # keystore, so build identity from the config instead of
-            # ``load_identity``/``load_session``. display_name resolves
-            # over the unsigned profiles route; the signing subkey is
-            # managed server-side.
-            lines = []
-            try:
-                data = await _read_profiles(cfg, cfg.slug)
-                profiles = (
-                    data.get("profiles", []) if isinstance(data, dict) else []
-                )
-                display_name = (
-                    (profiles[0].get("display_name") or "").strip()
-                    if profiles else ""
-                )
-                if display_name:
-                    lines.append(f"display_name: {display_name}")
-            except Exception as exc:
-                logger.warning(
-                    "whoami: failed to fetch own display_name: %s", exc,
-                )
-            lines += [
-                f"slug:      {cfg.slug}",
-                f"device_id: {cfg.device_id}",
-                f"server:    {cfg.http_client.server_url}",
-                "subkey:    (managed server-side; keyless transport)",
-            ]
-            return "\n".join(lines)
+            return {
+                "context_version": CONTEXT_VERSION,
+                "identity": projected_identity,
+                "runtime": {
+                    "device_id": cfg.device_id,
+                    "server_url": cfg.http_client.server_url,
+                    "transport": "keyless",
+                    "subkey_management": "server",
+                    "subkey_id": None,
+                    "subkey_expires_at": None,
+                },
+            }
 
         identity = cfg.keystore.load_identity(cfg.slug)
-        lines = []
-        # display_name lives on the server (the local keystore only has
-        # the slug); fetch best-effort so whoami still works if offline.
-        try:
-            data = await cfg.http_client.get(
-                "/identities/profiles?slugs="
-                f"{urllib.parse.quote(cfg.slug, safe='')}"
-            )
-            profiles = data.get("profiles", []) if isinstance(data, dict) else []
-            display_name = (
-                (profiles[0].get("display_name") or "").strip()
-                if profiles else ""
-            )
-            if display_name:
-                lines.append(f"display_name: {display_name}")
-        except Exception as exc:
-            logger.warning("whoami: failed to fetch own display_name: %s", exc)
-        lines += [
-            f"slug:      {identity.slug}",
-            f"device_id: {identity.device_id}",
-            f"server:    {identity.server_url}",
-        ]
+        subkey_id: str | None = None
+        subkey_expires_at: str | None = None
         try:
             sess = cfg.keystore.load_session(cfg.slug)
-            lines.append(f"subkey_id: {sess.subkey_id}")
-            lines.append(f"expires:   {_ts_to_iso(sess.expires_at)}")
+            subkey_id = sess.subkey_id
+            subkey_expires_at = _ts_to_iso(sess.expires_at)
         except FileNotFoundError:
-            lines.append("subkey:    (no active session)")
-        return "\n".join(lines)
+            pass
+        return {
+            "context_version": CONTEXT_VERSION,
+            "identity": projected_identity,
+            "runtime": {
+                "device_id": identity.device_id,
+                "server_url": identity.server_url,
+                "transport": "signed",
+                "subkey_management": "local",
+                "subkey_id": subkey_id,
+                "subkey_expires_at": subkey_expires_at,
+            },
+        }
 
     @mcp.tool()
     async def send_message(
@@ -1075,28 +1099,31 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         return f"{result}\n{receipt_marker}" if receipt_marker else result
 
     @mcp.tool()
-    async def list_spaces() -> str:
-        """List spaces this agent is a member of (id + name).
+    async def list_spaces() -> dict[str, Any]:
+        """List authoritative space memberships as structured context.
 
         ``GET /spaces`` is server-filtered to memberships the
         agent actually has, so the result reflects authoritative
         permissions — channels can be enumerated for any space
         listed here via ``list_channels_in_space``."""
         data = await _read_spaces(cfg)
-        spaces_entries = (data or {}).get("spaces", []) or []
-        if not spaces_entries:
-            return "(not a member of any space)"
-        lines: list[str] = []
-        for sp in spaces_entries:
-            sid = sp.get("space_id", "")
-            name = sp.get("name", "") or sid
-            if sid:
-                lines.append(f"- {sid}  {name}")
-        return "\n".join(lines) if lines else "(not a member of any space)"
+        spaces_entries = (
+            data.get("spaces", []) if isinstance(data, dict) else []
+        ) or []
+        spaces = [
+            space_projection(space)
+            for space in spaces_entries
+            if isinstance(space, dict) and space.get("space_id")
+        ]
+        return {
+            "context_version": CONTEXT_VERSION,
+            "count": len(spaces),
+            "spaces": spaces,
+        }
 
     @mcp.tool()
-    async def list_channels_in_space(space_id: str) -> str:
-        """List channels in a single space the agent is a member of.
+    async def list_channels_in_space(space_id: str) -> dict[str, Any]:
+        """List authoritative channel memberships for one space.
 
         ``GET /spaces/<space_id>/channels`` is server-filtered to the
         agent's actual channel memberships; this tool just formats the
@@ -1116,65 +1143,64 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         channels = (
             data.get("channels", []) if isinstance(data, dict) else []
         ) or []
-        if not channels:
-            return "(no channels — agent may not be a member of this space yet)"
-        lines: list[str] = []
-        for ch in channels:
-            cid = ch.get("channel_id", "")
-            name = ch.get("name", "") or cid
-            if cid:
-                lines.append(f"- {cid}  {name}")
-        return "\n".join(lines) if lines else "(no channels)"
+        projected = [
+            channel_projection(channel, space_id=sid)
+            for channel in channels
+            if isinstance(channel, dict) and channel.get("channel_id")
+        ]
+        return {
+            "context_version": CONTEXT_VERSION,
+            "space_id": sid,
+            "count": len(projected),
+            "channels": projected,
+        }
 
     @mcp.tool()
-    async def list_channels_in_all_spaces() -> str:
-        """List channels in every space the agent is a member of.
-
-        Output is grouped by space::
-
-            Space sp_X (Team):
-              - ch_a  general
-              - ch_b  random
-            Space sp_Y (Other):
-              - ch_c  general
+    async def list_channels_in_all_spaces() -> dict[str, Any]:
+        """List channels in every authoritative space membership.
 
         Convenience over ``list_spaces`` + ``list_channels_in_space``
         for the case where the LLM wants the full membership picture
         in one tool call. Walks one ``GET /spaces`` plus one
         ``GET /spaces/<sp>/channels`` per space."""
         spaces_data = await _read_spaces(cfg)
-        spaces_entries = (spaces_data or {}).get("spaces", []) or []
-        if not spaces_entries:
-            return "(not a member of any space)"
-        lines: list[str] = []
+        spaces_entries = (
+            spaces_data.get("spaces", [])
+            if isinstance(spaces_data, dict)
+            else []
+        ) or []
+        projected_spaces: list[dict[str, Any]] = []
+        channel_count = 0
         for sp in spaces_entries:
+            if not isinstance(sp, dict):
+                continue
             space_id = sp.get("space_id", "")
-            space_name = sp.get("name", "") or space_id
             if not space_id:
                 continue
             ch_data = await _read_space_channels(cfg, space_id)
             channels = (
                 ch_data.get("channels", []) if isinstance(ch_data, dict) else []
-            )
-            lines.append(f"Space {space_id} ({space_name}):")
-            if not channels:
-                lines.append("  (no channels)")
-                continue
-            for ch in channels:
-                cid = ch.get("channel_id", "")
-                name = ch.get("name", "") or cid
-                if cid:
-                    lines.append(f"  - {cid}  {name}")
-        return "\n".join(lines) if lines else "(no channels)"
+            ) or []
+            projected_channels = [
+                channel_projection(channel, space_id=space_id)
+                for channel in channels
+                if isinstance(channel, dict) and channel.get("channel_id")
+            ]
+            channel_count += len(projected_channels)
+            projected_spaces.append({
+                **space_projection(sp),
+                "channels": projected_channels,
+            })
+        return {
+            "context_version": CONTEXT_VERSION,
+            "space_count": len(projected_spaces),
+            "channel_count": channel_count,
+            "spaces": projected_spaces,
+        }
 
     @mcp.tool()
-    async def list_channel_members(channel: str) -> str:
-        """List channel members with role, identity type, and agent owner.
-
-        Each line includes ``slug``, ``role``, ``identity_type``, and
-        ``owner_slug``. ``owner_slug`` is null when the identity has no
-        owning human account.
-        """
+    async def list_channel_members(channel: str) -> dict[str, Any]:
+        """List channel members as stable identity objects."""
         channel_ref = channel.strip()
         if channel_ref.startswith("#"):
             raise RuntimeError(
@@ -1191,23 +1217,41 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         # Both transports read the exact channel-scoped roster. See
         # ``_read_channel_members``.
         data = await _read_channel_members(cfg, space_id, channel_id)
-        rows = []
-        for m in data.get("members", []):
-            slug = m.get("slug", "?")
-            role = m.get("role") or "member"
-            identity_type = m.get("identity_type") or "unknown"
-            owner_slug = m.get("owner_slug") or None
-            rows.append(
-                f"- {slug}  ({role}) "
-                f"identity_type={json.dumps(identity_type)} "
-                f"owner_slug={json.dumps(owner_slug)}"
-            )
-        return "\n".join(rows) or "(empty channel)"
+        roster = data.get("members", []) if isinstance(data, dict) else []
+        roster = [member for member in roster if isinstance(member, dict)]
+        profiles = await _read_profile_map(
+            cfg,
+            [str(member.get("slug") or "") for member in roster],
+        )
+        members = []
+        for member in roster:
+            slug = str(member.get("slug") or "").lstrip("@")
+            if not slug:
+                continue
+            profile = profiles.get(slug, {})
+            members.append(identity_projection(
+                slug,
+                display_name=profile.get("display_name"),
+                identity_type=member.get("identity_type") or "unknown",
+                owner_slug=member.get("owner_slug"),
+                role=member.get("role") or "member",
+                self_identity=slug == cfg.slug.lstrip("@"),
+            ))
+        return {
+            "context_version": CONTEXT_VERSION,
+            "target": {
+                "target_type": "channel",
+                "target_ref": f"channel:{space_id}:{channel_id}",
+                "space_id": space_id,
+                "channel_id": channel_id,
+            },
+            "count": len(members),
+            "members": members,
+        }
 
     @mcp.tool()
-    async def get_user_info(username: str) -> str:
-        """Look up a user by slug or @-handle.
-        Returns slug, display name, bio, and avatar URL when set.
+    async def get_user_info(username: str) -> dict[str, Any]:
+        """Look up one identity by unique slug and return fresh profile context.
 
         Always fetches fresh from puffo-server (bypasses the daemon's
         TTL'd profile cache) and writes the result back to that cache
@@ -1223,7 +1267,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         data = await _read_profiles(cfg, slug)
         profiles = data.get("profiles", []) if isinstance(data, dict) else []
         if not profiles:
-            return f"(no profile for {slug})"
+            return {
+                "context_version": CONTEXT_VERSION,
+                "found": False,
+                "identity": f"@{slug}",
+            }
         p = profiles[0]
         # Server returns ``display_name`` (was previously read as
         # ``username`` here, which silently dropped the field for
@@ -1244,14 +1292,28 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
                 "get_user_info: failed to refresh daemon cache for %s: %s",
                 slug, exc,
             )
-        lines = [f"slug: {p.get('slug', slug)}"]
-        if display_name:
-            lines.append(f"display_name: {display_name}")
-        if bio:
-            lines.append(f"bio: {bio}")
-        if avatar_url:
-            lines.append(f"avatar_url: {avatar_url}")
-        return "\n".join(lines)
+        owner_slug = p.get("owner_slug")
+        identity_type = (
+            "agent"
+            if owner_slug or slug == cfg.slug.lstrip("@")
+            else "unknown"
+        )
+        return {
+            "context_version": CONTEXT_VERSION,
+            "found": True,
+            "identity": identity_projection(
+                p.get("slug", slug),
+                display_name=display_name,
+                identity_type=identity_type,
+                owner_slug=owner_slug,
+                role=p.get("role"),
+                self_identity=slug == cfg.slug.lstrip("@"),
+                role_short=p.get("role_short") or None,
+                bio=bio or None,
+                avatar_url=avatar_url or None,
+                profile_updated_at=p.get("profile_updated_at"),
+            ),
+        }
 
     @mcp.tool()
     async def get_post(post_ref: str) -> str:
@@ -1282,7 +1344,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         envelope_id: str,
         segment: int,
         segment_size: int = MESSAGE_SEGMENT_CHARS,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Page a long message body back in chunks.
 
         When the daemon redacts an oversize inbound message it
@@ -1295,13 +1357,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         the placeholder preview usually tells you whether the
         content is worth paging through.
 
-        Returns: ``segment <i>/<total> (chars <start>..<end> of <total>):
-        \n<chunk body>``. Out-of-range segment numbers return
-        ``segment out of range`` so the agent knows it overshot.
-
-        Special cases:
-          * unknown envelope_id → "message <id> not found in local storage"
-          * empty content       → "message <id> has no text body"
+        Returns a structured source and segment range. Missing, empty, and
+        out-of-range results use an explicit ``state`` field.
 
         ``segment_size`` defaults to the daemon's default redaction
         page size; pass the value the placeholder cited if the operator
@@ -1317,7 +1374,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
         msg = await cfg.data_client.get_message_by_envelope(envelope_id)
         if msg is None:
-            return f"message {envelope_id} not found in local storage"
+            return {
+                "context_version": CONTEXT_VERSION,
+                "state": "not_found",
+                "message_id": envelope_id,
+            }
 
         # ``content`` carries either a bare string (plain message)
         # or the ``puffo/message+attachments/v1`` dict shape; pull
@@ -1327,17 +1388,24 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         text = _history_text(content)
 
         if not text:
-            return f"message {envelope_id} has no text body"
+            return {
+                "context_version": CONTEXT_VERSION,
+                "state": "empty",
+                "message_id": envelope_id,
+            }
 
         total = len(text)
         # ceil(total / segment_size); at least 1 when total > 0.
         seg_count = (total + segment_size - 1) // segment_size
         if segment >= seg_count:
-            return (
-                f"segment {segment} out of range (envelope_id={envelope_id} "
-                f"has {seg_count} segment(s) at segment_size={segment_size}, "
-                "indexed 0..{0})".format(seg_count - 1)
-            )
+            return {
+                "context_version": CONTEXT_VERSION,
+                "state": "out_of_range",
+                "message_id": envelope_id,
+                "requested_segment_index": segment,
+                "segment_count": seg_count,
+                "segment_size": segment_size,
+            }
         start = segment * segment_size
         end = min(start + segment_size, total)
         chunk = text[start:end]
@@ -1353,12 +1421,32 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             tool_name="get_post_segment",
             tool_arguments=tool_arguments,
         )
-        result = (
-            f"source {target_label(msg, current_agent_aliases=(cfg.slug,))} envelope_id={msg.envelope_id}\n"
-            f"segment {segment}/{seg_count - 1} "
-            f"(chars {start}..{end - 1} of {total}):\n{chunk}"
-        )
-        return f"{result}\n{receipt_marker}" if receipt_marker else result
+        result: dict[str, Any] = {
+            "context_version": CONTEXT_VERSION,
+            "state": "ok",
+            "source": {
+                "target_ref": target_ref(
+                    msg, current_agent_aliases=(cfg.slug,),
+                ),
+                "message_id": msg.envelope_id,
+                "sender_identity": f"@{str(msg.sender_slug).lstrip('@')}",
+                "sender_type": sender_type(
+                    msg, current_agent_aliases=(cfg.slug,),
+                ),
+                "sent_at": iso_time(msg),
+            },
+            "segment": {
+                "index": segment,
+                "count": seg_count,
+                "char_start": start,
+                "char_end_exclusive": end,
+                "total_chars": total,
+                "text": chunk,
+            },
+        }
+        if receipt_marker:
+            result["admission_receipt"] = receipt_marker
+        return result
 
     @mcp.tool()
     async def send_message_with_attachments(
@@ -1829,7 +1917,7 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         )
 
     @mcp.tool()
-    async def get_dm_allowlists() -> str:
+    async def get_dm_allowlists() -> dict[str, Any]:
         """List your DM allowlist (peers whose DMs skip the approval
         gate). Per-agent — every identity keeps its own list; this
         reads yours only."""
@@ -1839,12 +1927,14 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             for e in (data.get("entries") or [])
             if e.get("peer_slug")
         )
-        if not slugs:
-            return "DM allowlist is empty."
-        return "DM allowlist:\n" + "\n".join(f"- {s}" for s in slugs)
+        return {
+            "context_version": CONTEXT_VERSION,
+            "count": len(slugs),
+            "identities": [f"@{slug.lstrip('@')}" for slug in slugs],
+        }
 
     @mcp.tool()
-    async def get_dm_blocklists() -> str:
+    async def get_dm_blocklists() -> dict[str, Any]:
         """List your DM blocklist (senders whose messages are silently
         dropped). Per-agent — every identity keeps its own list; this
         reads yours only."""
@@ -1854,9 +1944,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
             for b in (data.get("blocks") or [])
             if b.get("target") == "user" and b.get("id")
         )
-        if not slugs:
-            return "DM blocklist is empty."
-        return "DM blocklist:\n" + "\n".join(f"- {s}" for s in slugs)
+        return {
+            "context_version": CONTEXT_VERSION,
+            "count": len(slugs),
+            "identities": [f"@{slug.lstrip('@')}" for slug in slugs],
+        }
 
     @mcp.tool()
     async def add_dm_allowlist(slug: str) -> str:

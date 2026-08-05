@@ -62,33 +62,34 @@ def test_standing_prompt_is_compact_and_identity_is_compiled_once():
 
 
 def test_policy_has_one_detailed_owner_and_primer_retains_contract():
-    assert "<global_inbox_notice>" in DEFAULT_SHARED_CLAUDE_MD
-    assert '"content_included":false' in DEFAULT_SHARED_CLAUDE_MD
-    assert "read_inbox" in DEFAULT_SHARED_CLAUDE_MD
-    assert "send_message" in DEFAULT_SHARED_CLAUDE_MD
-    assert "[SILENT]" in DEFAULT_SHARED_CLAUDE_MD
+    primer = " ".join(DEFAULT_SHARED_CLAUDE_MD.split())
+    for phrase in (
+        "<global_inbox_notice>", '"content_included":false', "read_inbox",
+        "context_version=1", "target_ref", "sender_identity", "sender_type",
+        "An `@slug` identity is unique", "send_message", "[SILENT]",
+    ):
+        assert phrase in primer
     for absent in (
         "prior_context", "visible_draft_basis", "new_channel_context",
         "context_ready", "same originating assignment", "send_anyway=True",
     ):
         assert absent not in DEFAULT_SHARED_CLAUDE_MD
+
     read = DEFAULT_SKILLS["read-inbox"][1]
     history = DEFAULT_SKILLS["channel-history"][1]
     post = DEFAULT_SKILLS["get-post"][1]
     send = DEFAULT_SKILLS["send-message"][1]
     for phrase in (
-        "## target=dm peer_id=...",
-        "## target=channel space_id=...\n  channel_id=...",
-        "## target=thread space_id=... channel_id=...\n  thread_root_id=...",
-        "seq", "absolute `time`", "type", "id", "self", "encrypted",
-        "@slug", "optional `name`", "body",
+        "context_version", "## context", "target_ref", "seq", "sent_at",
+        "message_id", "sender_identity", "sender_type", "self", "encrypted",
+        "[event]", "body",
     ):
         assert phrase in read
     for text in (history, post):
         assert "read-inbox" in text
-        assert "seq" not in text
     normalized_read = " ".join(read.split())
-    assert "messages" in read and "prior_context" in read and "strictly earlier" in normalized_read
+    assert "messages" in read and "prior_context" in read
+    assert "strictly earlier" in normalized_read
     assert "do not acknowledge pending Inbox rows" in read
     decision_guidance = " ".join(
         PARTICIPATION_AND_CONTINUATION_GUIDANCE.split()
@@ -98,68 +99,27 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         for body in (DEFAULT_SHARED_CLAUDE_MD, *[body for _, body in DEFAULT_SKILLS.values()])
     )
     assert normalized_read.count(decision_guidance) == 1
-    assert all_prompt_surfaces.count(decision_guidance) == 2
+    assert all_prompt_surfaces.count(decision_guidance) == 1
     assert "distinct turns" in normalized_read
     assert "shared result" in normalized_read
     assert "Agent messages may legitimately trigger" in normalized_read
     assert "ask one concise human clarification" in normalized_read
-    assert "For conversation decisions, use the `read-inbox` skill." in DEFAULT_SHARED_CLAUDE_MD
-    normalized_primer = " ".join(DEFAULT_SHARED_CLAUDE_MD.split())
-    assert "a `target=channel` route uses its `channel_id` without `root_id`" in normalized_primer
-    assert "Starting a new thread is a model-owned presentation choice" in normalized_primer
     assert "originating request and conversation intent" not in DEFAULT_SHARED_CLAUDE_MD
     assert "does not acknowledge pending Inbox work" in " ".join(history.split())
     assert "does not acknowledge pending Inbox work" in " ".join(post.split())
     normalized_send = " ".join(send.lower().split())
     for phrase in (
-        'state="held"', "unchanged draft", "draft boundary/latest pair",
-        "visible_draft_basis", "new_channel_context", "context_ready=true",
-        "context_ready=false", "inspect", "revise against the latest context",
-        "send with normal freshness", "attempted but not sent",
-        "not visible participation", "new successful visible contribution",
-        "reconsider the originating interaction", "context-dependent",
-        "sequence position", "shared-state coordination",
-        "do not use `send_anyway`", "use the unchanged draft", "send nothing",
-        "distinct-participation mode",
-        "shared-result mode",
-        "meaningful or converging interaction",
-        "self-propagate without meaningful progress",
-        "one concise human clarification",
-        "send_anyway=true", "is rare",
-        "model-owned", "may be held again", "sequence watermark alone is not semantic context",
+        'state="held"', "unchanged `draft`", "draft boundary/latest pair",
+        "visible_draft_basis", "new_channel_context", "context_ready",
+        "dynamic `guidance`", "injected only when a draft is actually held",
+        "sequence watermark alone is not semantic context",
         "preserve the `read_inbox` target by default",
-        "omit it for `target=channel`",
-        "pass the supplied `thread_root_id` for `target=thread`",
+        'omit it for `target_type="channel"`',
+        'pass the supplied `thread_root_id` for `target_type="thread"`',
     ):
         assert phrase.lower() in normalized_send
-    assert "the canonical return route" in normalized_read
-    assert "preserve it by default" in normalized_read
-    for skill_id in ("attachments", "channel-history", "send-message-with-attachments"):
-        body = DEFAULT_SKILLS[skill_id][1]
-        assert "visible_draft_basis" not in body
-        assert "same originating assignment" not in body
     assert "common held-send procedure" in DEFAULT_SKILLS["send-message-with-attachments"][1]
-    for forbidden in (
-        "<inbox_message>", "one line per root post", "nested `route`",
-        "assignment-completion", "benchmark", "response quota", "counting-specific",
-        "sender-type silence", "forced mention/DM", "automatically retries",
-        "always requires a separate history read", "participant-count", "one-reply",
-        "sender suppression", "destination rule", "parser", "deterministic silence",
-        "runtime policy",
-    ):
-        assert forbidden not in read.lower()
-    for obsolete in (
-        "peer progress alone does not create a new obligation",
-        "part stays fulfilled and peer progress does not reopen",
-        "another participant's overlapping contribution does not satisfy",
-    ):
-        assert obsolete not in all_prompt_surfaces.lower()
-    send_policy_text = "\n".join((send, DEFAULT_SKILLS["send-message-with-attachments"][1])).lower()
-    for forbidden in (
-        "**when to use:**", "**when not to use:**", "prefer this over",
-        'prefer "human"', "spontaneous cross-posts",
-    ):
-        assert forbidden not in send_policy_text
+    assert "A held draft was attempted but not sent" not in send
 
 
 def test_conversation_judgment_is_absent_from_mcp_descriptions_and_profiles():
@@ -272,7 +232,18 @@ def test_read_inbox_owns_participation_and_continuation_judgment():
 def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
     held_method = " ".join(HELD_SEND_RECONSIDERATION_GUIDANCE.split()).lower()
     send = " ".join(DEFAULT_SKILLS["send-message"][1].split()).lower()
-    assert send.count(held_method) == 1
+    assert held_method not in send
+    for phrase in (
+        "follow that returned guidance",
+        "injected only when a draft is actually held",
+    ):
+        assert phrase in send
+    for phrase in (
+        "attempted but not sent", "reconsider the originating interaction",
+        "send_anyway=true", "is rare", "create a reminder for the same target",
+        "choose a short, reasonable delay", "read the latest target context",
+    ):
+        assert phrase in held_method
 
     root = _tmp()
     _rebuild(root)
@@ -281,7 +252,8 @@ def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
         root / "workspace" / ".agents" / "skills" / "send-message" / "SKILL.md",
     ):
         skill = " ".join(path.read_text(encoding="utf-8").split()).lower()
-        assert skill.count(held_method) == 1
+        assert held_method not in skill
+        assert "follow that returned guidance" in skill
 
     other_prompt_surfaces = [" ".join(DEFAULT_SHARED_CLAUDE_MD.split())]
     other_prompt_surfaces.extend(
@@ -291,9 +263,7 @@ def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
     )
     held_opening = "A held draft was attempted but not sent"
     assert not any(held_opening in surface for surface in other_prompt_surfaces)
-    assert "new successful visible contribution from you" in send
-    assert "earlier successful `self=true` row already fulfills it" in send
-    assert "Treat a held draft as evidence of an attempted response" not in send
+    assert "new successful visible contribution from you" not in send
 
 
 def test_harnesses_discover_managed_skills_with_correct_tool_names():

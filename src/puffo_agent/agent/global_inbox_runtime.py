@@ -42,7 +42,7 @@ from .message_store import (
     StoredMessage,
 )
 from ._logging import log_runtime_event
-from .message_projection import format_message_group
+from .message_projection import CONTEXT_VERSION, format_message_group
 from .reminder_scheduler import ReminderScheduler
 
 logger = logging.getLogger(__name__)
@@ -232,14 +232,18 @@ def route_for(item: StoredMessage) -> MessageRoute:
     if item.envelope_kind == "dm":
         peer = item.sender_slug or item.recipient_slug or ""
         return MessageRoute(item.envelope_id, "dm", dm_peer=peer)
-    # Intro prompts self-reference only to remain non-replyable in local
-    # history. They still must authorize the top-level send they request.
+    content = item.content if isinstance(item.content, Mapping) else {}
+    is_membership_event = str(content.get("event_type") or "").startswith(
+        ("channel_member_", "space_member_"),
+    )
+    # Intro prompts and membership events self-reference only to remain
+    # non-replyable in local history. They still belong to the channel route.
     is_intro_prompt = (
         item.sender_slug == "system"
         and item.envelope_id.startswith("intro-prompt-")
         and item.thread_root_id == item.envelope_id
     )
-    if item.thread_root_id and not is_intro_prompt:
+    if item.thread_root_id and not (is_intro_prompt or is_membership_event):
         return MessageRoute(
             item.envelope_id,
             "thread",
@@ -1593,6 +1597,7 @@ class GlobalInboxRuntime:
                     outcome="staged",
                 )
         return {
+            "context_version": CONTEXT_VERSION,
             "messages": blocks,
             "prior_context": prior_context,
             "next_cursor": next_cursor,

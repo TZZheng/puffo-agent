@@ -4218,10 +4218,33 @@ class PuffoCoreMessageClient:
         envelope_id = (
             f"membership-{action}-{channel_id}-{actor_slug}-{envelope_id_suffix}"
         )
-        prompt_text = (
-            f"[puffo-agent system message] Channel membership update: "
-            f"{body} This is an announcement, for your context."
+        event_types = {
+            "joined": "channel_member_joined",
+            "left": "channel_member_left",
+            "removed": "channel_member_removed",
+            "joined_space": "space_member_joined",
+            "left_space": "space_member_left",
+            "removed_from_space": "space_member_removed",
+        }
+        is_space_event = action.endswith("_space")
+        subject_ref = (
+            f"space:{space_id}"
+            if is_space_event
+            else f"channel:{space_id}:{channel_id}"
         )
+        event_content = {
+            "event_type": event_types[action],
+            "text": body,
+            "actor_slug": actor_slug,
+            "actor_display_name": actor_display,
+            "inviter_slug": inviter_slug,
+            "initiator_slug": kicker_slug,
+            "subject_ref": subject_ref,
+            "space_id": space_id,
+            "space_name": space_name,
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+        }
 
         store_payload = {
             "envelope_id": envelope_id,
@@ -4229,8 +4252,8 @@ class PuffoCoreMessageClient:
             "sender_slug": "system",
             "channel_id": channel_id,
             "space_id": space_id,
-            "content_type": "text/plain",
-            "content": prompt_text,
+            "content_type": "application/vnd.puffo.runtime-event+json",
+            "content": event_content,
             "sent_at": now_ms,
             "thread_root_id": envelope_id,
             "reply_to_id": None,

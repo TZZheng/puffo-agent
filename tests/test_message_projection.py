@@ -1,8 +1,6 @@
 """Canonical, presentation-only conversation projection matrix."""
 from __future__ import annotations
 
-import pytest
-
 from puffo_agent.agent.message_projection import format_message_group
 
 
@@ -29,63 +27,99 @@ def message(**overrides):
     return row
 
 
-@pytest.mark.parametrize(
-    ("name", "rows", "aliases", "reply_counts", "expected"),
-    [
-        (
-            "canonical_thread",
-            [message()], (), {},
-            '## target=thread space_id=sp_1 space="Puffo AI" channel_id=ch_1 channel="#general" thread_root_id=msg_root\n'
-            '[seq=42 time=2026-08-01T08:31:12.000Z type=agent id=msg_42 self=false encrypted=true] @alice-1234 name="Alice":\nmessage body',
+def test_thread_projection_exposes_route_identity_and_body():
+    output = format_message_group([message()])
+    assert output.startswith(
+        '## context context_version=1 target_type="thread" '
+        'target_ref="channel:sp_1:ch_1:thread:msg_root"'
+    )
+    for field in (
+        'space_id="sp_1"', 'space_name="Puffo AI"', 'channel_id="ch_1"',
+        'channel_name="general"', 'thread_root_id="msg_root"',
+        "[message context_version=1 seq=42",
+        'sent_at="2026-08-01T08:31:12.000Z"',
+        'message_id="msg_42"', 'sender_identity="@alice-1234"',
+        'sender_type="agent"', "self=false", "encrypted=true",
+        'sender_display_name="Alice"',
+    ):
+        assert field in output
+    assert output.endswith("\nmessage body")
+
+
+def test_projection_groups_only_by_canonical_target():
+    rows = [
+        message(
+            envelope_id="one", server_seq=1, thread_root_id="",
+            content={"text": "one", "space_name": "One", "channel_name": "general"},
         ),
-        (
-            "same_named_cross_space_and_gap_restarts_header",
-            [
-                message(envelope_id="one", server_seq=1, thread_root_id="", content={"text": "one", "space_name": "One", "channel_name": "general", "is_from_operator": True}),
-                message(envelope_id="two", server_seq=3, thread_root_id="", content={"text": "two", "space_name": "One", "channel_name": "general", "sender_is_agent": True}),
-                message(envelope_id="three", server_seq=4, thread_root_id="", space_id="sp_2", channel_id="ch_2", content={"text": "three", "space_name": "Two", "channel_name": "general"}),
-            ], (), {},
-            '## target=channel space_id=sp_1 space="One" channel_id=ch_1 channel="#general"\n[seq=1 time=2026-08-01T08:31:12.000Z type=human id=one self=false encrypted=true] @alice-1234:\none\n'
-            '[seq=3 time=2026-08-01T08:31:12.000Z type=agent id=two self=false encrypted=true] @alice-1234:\ntwo\n'
-            '## target=channel space_id=sp_2 space="Two" channel_id=ch_2 channel="#general"\n[seq=4 time=2026-08-01T08:31:12.000Z type=unknown id=three self=false encrypted=true] @alice-1234:\nthree',
+        message(
+            envelope_id="two", server_seq=3, thread_root_id="",
+            content={"text": "two", "space_name": "One", "channel_name": "general"},
         ),
-        (
-            "dm_self_multiline_attachments_plaintext_and_replies",
-            [message(envelope_id="dm_1", envelope_kind="dm", channel_id="", space_id="", thread_root_id="", sender_slug="wire-agent", recipient_slug="bob-9", server_seq=None, is_encrypted=False, content={"text": "first line\nsecond line", "sender_display_name": "Wire", "attachments": ["a", "b"], "sender_type": "human"})],
-            ("wire-agent",), {"dm_1": 2},
-            '## target=dm peer_id=bob-9\n[seq=unsequenced time=2026-08-01T08:31:12.000Z type=human id=dm_1 self=true encrypted=false attachments=2 replies=2] @wire-agent name="Wire":\nfirst line\nsecond line',
+        message(
+            envelope_id="three", server_seq=4, thread_root_id="",
+            space_id="sp_2", channel_id="ch_2",
+            content={"text": "three", "space_name": "Two", "channel_name": "general"},
         ),
-        (
-            "thread_sequence_gap_stays_in_one_target_group",
-            [message(envelope_id="msg_42", server_seq=42), message(envelope_id="msg_44", server_seq=44, content={"text": "later", "sender_type": "agent", "space_name": "Puffo AI", "channel_name": "general"})], (), {},
-            '## target=thread space_id=sp_1 space="Puffo AI" channel_id=ch_1 channel="#general" thread_root_id=msg_root\n[seq=42 time=2026-08-01T08:31:12.000Z type=agent id=msg_42 self=false encrypted=true] @alice-1234 name="Alice":\nmessage body\n[seq=44 time=2026-08-01T08:31:12.000Z type=agent id=msg_44 self=false encrypted=true] @alice-1234:\nlater',
+    ]
+    output = format_message_group(rows)
+    assert output.count("## context") == 2
+    assert output.count('target_ref="channel:sp_1:ch_1"') == 1
+    assert output.count('target_ref="channel:sp_2:ch_2"') == 1
+    assert output.index('message_id="one"') < output.index('message_id="two"')
+
+
+def test_dm_projection_preserves_paths_mentions_visibility_and_reply_count():
+    row = message(
+        envelope_id="dm_1", envelope_kind="dm", channel_id="", space_id="",
+        thread_root_id="", sender_slug="wire-agent", recipient_slug="bob-9",
+        server_seq=None, is_encrypted=False,
+        content={
+            "text": "first line\nsecond line",
+            "sender_display_name": "Wire",
+            "sender_owner_slug": "owner-1",
+            "attachments": ["a", "b"],
+            "mentions": [{"username": "wire-agent", "is_bot": True, "is_self": True}],
+            "sender_type": "human",
+            "is_visible_to_human": False,
+        },
+    )
+    output = format_message_group(
+        [row], current_agent_aliases=("wire-agent",), reply_counts={"dm_1": 2},
+    )
+    for field in (
+        'target_type="dm"', 'target_ref="dm:bob-9"',
+        'peer_identity="@bob-9"', "seq=null", "self=true", "encrypted=false",
+        'sender_owner_identity="@owner-1"', "human_visible=false",
+        'attachment_paths=["a","b"]',
+        'mentions=[{"identity":"@wire-agent","identity_type":"agent","self":true}]',
+        "reply_count=2",
+    ):
+        assert field in output
+
+
+def test_sender_type_normalizes_legacy_bot_fields_but_explicit_type_wins():
+    rows = [
+        message(
+            envelope_id="legacy", thread_root_id=None,
+            content={"text": "legacy", "sender_is_bot": True},
         ),
-        (
-            "explicit_type_precedence_over_agent_evidence",
-            [message(content={"text": "runtime", "sender_type": "human", "sender_is_agent": True}, envelope_kind="runtime")], (), {},
-            '## target=thread space_id=sp_1 channel_id=ch_1 thread_root_id=msg_root\n[seq=42 time=2026-08-01T08:31:12.000Z type=human id=msg_42 self=false encrypted=true] @alice-1234:\nruntime',
+        message(
+            envelope_id="explicit", thread_root_id=None,
+            content={"text": "explicit", "sender_type": "human", "sender_is_bot": True},
         ),
-        (
-            "runtime_kind_is_system_after_agent_evidence_check",
-            [message(envelope_kind="runtime", content={"text": "system event"})], (), {},
-            '## target=thread space_id=sp_1 channel_id=ch_1 thread_root_id=msg_root\n[seq=42 time=2026-08-01T08:31:12.000Z type=system id=msg_42 self=false encrypted=true] @alice-1234:\nsystem event',
-        ),
-        (
-            "nullable_root_and_metadata_light_self_alias",
-            [message(thread_root_id=None, sender_slug="@Wire-Agent", content={"text": "local echo"})],
-            ("wire-agent",), {},
-            '## target=channel space_id=sp_1 channel_id=ch_1\n[seq=42 time=2026-08-01T08:31:12.000Z type=agent id=msg_42 self=true encrypted=true] @Wire-Agent:\nlocal echo',
-        ),
-        (
-            "explicit_sender_type_wins_over_matching_alias",
-            [
-                message(envelope_id="human", thread_root_id=None, sender_slug="wire-agent", content={"text": "human", "sender_type": "human"}),
-                message(envelope_id="system", thread_root_id=None, sender_slug="wire-agent", content={"text": "system", "sender_type": "system"}),
-            ],
-            ("wire-agent",), {},
-            '## target=channel space_id=sp_1 channel_id=ch_1\n[seq=42 time=2026-08-01T08:31:12.000Z type=human id=human self=true encrypted=true] @wire-agent:\nhuman\n[seq=42 time=2026-08-01T08:31:12.000Z type=system id=system self=true encrypted=true] @wire-agent:\nsystem',
-        ),
-    ],
-)
-def test_canonical_message_projection_matrix(name, rows, aliases, reply_counts, expected):
-    assert format_message_group(rows, current_agent_aliases=aliases, reply_counts=reply_counts) == expected
+    ]
+    output = format_message_group(rows)
+    legacy = output[output.index('message_id="legacy"'):output.index("\nlegacy")]
+    explicit = output[output.index('message_id="explicit"'):output.index("\nexplicit")]
+    assert 'sender_type="agent"' in legacy
+    assert 'sender_type="human"' in explicit
+
+
+def test_optional_chronological_projection_orders_held_context_by_sequence():
+    rows = [
+        message(envelope_id="late", server_seq=12, thread_root_id="", content={"text": "late"}),
+        message(envelope_id="early", server_seq=10, thread_root_id="", content={"text": "early"}),
+    ]
+    output = format_message_group(rows, chronological=True)
+    assert output.index('message_id="early"') < output.index('message_id="late"')

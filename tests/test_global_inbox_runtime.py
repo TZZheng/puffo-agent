@@ -73,11 +73,13 @@ def runtime_events(caplog):
 
 
 def projection_metadata(block: str) -> dict[str, object]:
-    """Extract the legacy assertions' stable facts from a semantic row."""
-    row = next(line for line in block.splitlines() if line.startswith("[seq="))
+    """Extract stable facts from a context-versioned semantic row."""
+    row = next(
+        line for line in block.splitlines() if line.startswith("[message ")
+    )
     return {
-        "envelope_id": re.search(r"\bid=([^ ]+)", row).group(1),
-        "sender_slug": re.search(r"\] @([^ :]+)", row).group(1),
+        "envelope_id": re.search(r'\bmessage_id="([^"]+)"', row).group(1),
+        "sender_slug": re.search(r'\bsender_identity="@([^"]+)"', row).group(1),
         "is_self": " self=true" in row,
     }
 
@@ -3113,10 +3115,10 @@ def test_format_stored_message_marks_only_runtime_identity_aliases(tmp_path):
         format_stored_message(self_echo, current_agent_aliases=("wire-agent",))
     )["is_self"] is True
     rendered = format_stored_message(self_echo, current_agent_aliases=("wire-agent",))
-    assert "## target=channel" in rendered
-    assert "target=thread" not in rendered
+    assert 'target_type="channel"' in rendered
+    assert 'target_type="thread"' not in rendered
     assert "thread_root_id=None" not in rendered
-    assert " type=agent " in rendered
+    assert 'sender_type="agent"' in rendered
     assert projection_metadata(rendered)["is_self"] is True
 
     runtime = GlobalInboxRuntime(
@@ -3262,6 +3264,7 @@ async def _run_prior_context_delivery_case(tmp_path):
         )
         assert len(page["messages"]) == 1
         assert set(page) == {
+            "context_version",
             "messages",
             "prior_context",
             "next_cursor",
@@ -3808,8 +3811,9 @@ async def test_mixed_message_and_due_reminder_share_one_notice_read_and_turn(tmp
     )
     assert len(page["messages"]) == 2
     ordinary, reminder_block = page["messages"]
-    assert ordinary_body in ordinary and "[seq=1 time=" in ordinary
-    assert "event_type=reminder" in reminder_block
+    assert ordinary_body in ordinary
+    assert "[message context_version=1 seq=1" in ordinary
+    assert 'event_type="reminder"' in reminder_block
     for expected in (
         reminder.reminder_id,
         reminder.occurrence_id,
@@ -3987,8 +3991,8 @@ async def test_different_target_reminder_still_uses_one_global_notice_and_turn(t
     page = observed["page"]
     assert len(page["messages"]) == 2
     assert ordinary_body in page["messages"][0]
-    assert "event_type=reminder" in page["messages"][1]
-    assert "target=\"channel:sp-1:ch-2\"" in page["messages"][1]
+    assert 'event_type="reminder"' in page["messages"][1]
+    assert 'target_ref="channel:sp-1:ch-2"' in page["messages"][1]
     assert "exact content for the second target" in page["messages"][1]
     for item_id in observed["ids"]:
         item = await store.get_message_by_envelope(item_id)
@@ -4439,6 +4443,7 @@ async def test_read_inbox_byte_guard_repaginates_without_lifecycle_mutation(
     assert page["next_cursor"]
     assert page["remaining_count"] == 1
     assert set(page) == {
+        "context_version",
         "messages",
         "prior_context",
         "next_cursor",

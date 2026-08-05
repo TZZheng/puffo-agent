@@ -253,9 +253,18 @@ async def test_segment_returns_chunk_with_range_metadata():
         _StubMessage(envelope_id="env_5k", content=payload),
     ))
     out = await tool(envelope_id="env_5k", segment=1, segment_size=2000)
-    assert out.startswith("source target=dm peer_id=alice envelope_id=env_5k\n")
-    assert "segment 1/2 (chars 2000..3999 of 5000):\n" in out
-    assert out.rsplit("\n", 1)[-1] == payload[2000:4000]
+    assert out["context_version"] == 1
+    assert out["state"] == "ok"
+    assert out["source"]["target_ref"] == "dm:alice"
+    assert out["source"]["message_id"] == "env_5k"
+    assert out["segment"] == {
+        "index": 1,
+        "count": 3,
+        "char_start": 2000,
+        "char_end_exclusive": 4000,
+        "total_chars": 5000,
+        "text": payload[2000:4000],
+    }
 
 
 @pytest.mark.asyncio
@@ -268,11 +277,13 @@ async def test_segment_last_chunk_is_short():
         _StubMessage(envelope_id="env_4500", content=payload),
     ))
     out = await tool(envelope_id="env_4500", segment=2, segment_size=2000)
-    assert out.startswith("source target=dm peer_id=alice envelope_id=env_4500\n")
-    # Segment 2 covers chars 4000..4499 (500 chars).
-    assert "segment 2/2 (chars 4000..4499 of 4500):\n" in out
-    # Body part of the output is exactly the leftover slice.
-    body = out.rsplit("\n", 1)[-1]
+    assert out["source"]["target_ref"] == "dm:alice"
+    assert out["source"]["message_id"] == "env_4500"
+    assert out["segment"]["index"] == 2
+    assert out["segment"]["count"] == 3
+    assert out["segment"]["char_start"] == 4000
+    assert out["segment"]["char_end_exclusive"] == 4500
+    body = out["segment"]["text"]
     assert body == payload[4000:]
     assert len(body) == 500
 
@@ -289,9 +300,8 @@ async def test_segment_outbound_dm_source_names_other_peer():
         ),
     ))
     out = await tool(envelope_id="env_outbound", segment=0, segment_size=2000)
-    assert out.startswith(
-        "source target=dm peer_id=r2d2 envelope_id=env_outbound\n"
-    )
+    assert out["source"]["target_ref"] == "dm:r2d2"
+    assert out["source"]["message_id"] == "env_outbound"
 
 
 @pytest.mark.asyncio
@@ -304,8 +314,14 @@ async def test_segment_out_of_range_returns_explanation():
         _StubMessage(envelope_id="env_1500", content=payload),
     ))
     out = await tool(envelope_id="env_1500", segment=99, segment_size=2000)
-    assert "out of range" in out
-    assert "env_1500" in out
+    assert out == {
+        "context_version": 1,
+        "state": "out_of_range",
+        "message_id": "env_1500",
+        "requested_segment_index": 99,
+        "segment_count": 1,
+        "segment_size": 2000,
+    }
 
 
 @pytest.mark.asyncio
@@ -315,8 +331,11 @@ async def test_segment_unknown_envelope_id_returns_not_found():
     an exception."""
     tool = _collect_tool("get_post_segment", _StubDataClient(None))
     out = await tool(envelope_id="env_gone", segment=0, segment_size=2000)
-    assert "not found in local storage" in out
-    assert "env_gone" in out
+    assert out == {
+        "context_version": 1,
+        "state": "not_found",
+        "message_id": "env_gone",
+    }
 
 
 @pytest.mark.asyncio
@@ -333,8 +352,12 @@ async def test_segment_attachments_content_dict_segments_text():
         }),
     ))
     out = await tool(envelope_id="env_attach", segment=0, segment_size=2000)
-    assert "segment 0/1 (chars 0..1999 of 3000):\n" in out
-    assert payload[:2000] in out
+    assert out["segment"]["index"] == 0
+    assert out["segment"]["count"] == 2
+    assert out["segment"]["char_start"] == 0
+    assert out["segment"]["char_end_exclusive"] == 2000
+    assert out["segment"]["total_chars"] == 3000
+    assert out["segment"]["text"] == payload[:2000]
 
 
 @pytest.mark.asyncio
@@ -346,7 +369,11 @@ async def test_segment_empty_body_message_returns_marker():
         _StubMessage(envelope_id="env_blank", content=""),
     ))
     out = await tool(envelope_id="env_blank", segment=0, segment_size=2000)
-    assert "no text body" in out
+    assert out == {
+        "context_version": 1,
+        "state": "empty",
+        "message_id": "env_blank",
+    }
 
 
 @pytest.mark.asyncio

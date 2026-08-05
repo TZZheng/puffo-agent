@@ -26,6 +26,7 @@ from ..crypto.message import (
     encrypt_message_with_content_key,
 )
 from ..crypto.primitives import Ed25519KeyPair
+from .message_projection import CONTEXT_VERSION, format_message_group
 from .shared_content import HELD_SEND_RECONSIDERATION_GUIDANCE
 
 logger = logging.getLogger(__name__)
@@ -1323,34 +1324,47 @@ class SendCoordinator:
         async with self._held_lock:
             held = self._held_evidence.get(key)
             if held is None:
-                return {"context_ready": False}
+                return {
+                    "context_version": CONTEXT_VERSION,
+                    "context_ready": False,
+                }
             rows = list(held.recovered_messages)
+            target_type = "thread" if held.thread_root_id else "channel"
+            target_ref = f"channel:{space_id}:{channel_id}"
+            if held.thread_root_id:
+                target_ref += f":thread:{held.thread_root_id}"
             data: dict[str, Any] = {
                 "reconsideration": {
+                    "context_version": CONTEXT_VERSION,
                     "context_ready": bool(held.synchronized and rows),
                     "draft": held.draft,
                     "based_on_through_seq": held.based_on_through_seq,
                     "latest_seq": held.latest_seq,
                     "latest_envelope_id": held.latest_envelope_id,
                     "target": {
-                        "space_id": space_id, "channel_id": channel_id,
+                        "target_type": target_type,
+                        "target_ref": target_ref,
+                        "space_id": space_id,
+                        "channel_id": channel_id,
                         "thread_root_id": held.thread_root_id,
                     },
-                    "decision": HELD_SEND_RECONSIDERATION_GUIDANCE,
+                    "guidance": HELD_SEND_RECONSIDERATION_GUIDANCE,
                 },
             }
             if held.diagnostic:
                 data["reconsideration"]["diagnostic"] = held.diagnostic
         if rows:
-            from .message_projection import format_message_group
             aliases = (self.slug,)
             data["reconsideration"]["visible_draft_basis"] = format_message_group(
                 held.visible_draft_basis,
                 current_agent_aliases=aliases,
                 thread_root_id=held.thread_root_id,
+                chronological=True,
             )
             data["reconsideration"]["new_channel_context"] = format_message_group(
-                rows, current_agent_aliases=aliases,
+                rows,
+                current_agent_aliases=aliases,
+                chronological=True,
             )
         return data
 

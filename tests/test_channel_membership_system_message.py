@@ -7,6 +7,8 @@ import logging
 import pytest
 
 from puffo_agent.agent.message_store import MessageStore
+from puffo_agent.agent.message_projection import format_message_group
+from puffo_agent.agent.global_inbox_runtime import route_for
 from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 
 
@@ -56,19 +58,20 @@ async def _client(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("action", "fragment"),
+    ("action", "event_type", "fragment"),
     [
-        ("joined", "**Alice**(@alice) joined channel #general"),
-        ("left", "**Alice**(@alice) left channel #general"),
+        ("joined", "channel_member_joined", "**Alice**(@alice) joined channel #general"),
+        ("left", "channel_member_left", "**Alice**(@alice) left channel #general"),
         (
             "removed",
+            "channel_member_removed",
             "**Alice**(@alice) was removed from channel #general "
             "by **Operator**(@operator)",
         ),
     ],
 )
 async def test_membership_rendering_persists_and_wakes_work_once(
-    tmp_path, action, fragment
+    tmp_path, action, event_type, fragment
 ):
     client, store = await _client(tmp_path)
     await client._enqueue_membership_system_message(
@@ -82,7 +85,15 @@ async def test_membership_rendering_persists_and_wakes_work_once(
     assert len(rows) == 1
     assert rows[0].sender_slug == "system"
     assert rows[0].channel_id == "channel"
-    assert fragment in rows[0].content
+    assert rows[0].content["event_type"] == event_type
+    assert rows[0].content["actor_slug"] == "alice"
+    assert rows[0].content["subject_ref"] == "channel:space:channel"
+    assert fragment in rows[0].content["text"]
+    projected = format_message_group(rows)
+    assert 'target_type="channel"' in projected
+    assert f'event_type="{event_type}"' in projected
+    assert 'actor_identity="@alice"' in projected
+    assert route_for(rows[0]).kind == "channel"
     assert client.global_runtime.work == 1
     assert client.global_runtime.delivery == 0
     await store.close()
@@ -99,7 +110,8 @@ async def test_joined_membership_cites_inviter(tmp_path):
         event_id="event-inviter",
     )
     row = (await store.get_pending())[0]
-    assert "invited by **Operator**(@operator)" in row.content
+    assert "invited by **Operator**(@operator)" in row.content["text"]
+    assert row.content["inviter_slug"] == "operator"
     await store.close()
 
 

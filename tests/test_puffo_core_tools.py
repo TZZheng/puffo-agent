@@ -288,6 +288,13 @@ async def _call(mcp, name, args=None):
     return str(result)
 
 
+async def _call_structured(mcp, name, args=None):
+    result = await mcp.call_tool(name, args or {})
+    assert isinstance(result, tuple)
+    assert isinstance(result[1], dict)
+    return result[1]
+
+
 @pytest.mark.asyncio
 async def test_whoami():
     cfg, _, _ = _setup()
@@ -305,9 +312,10 @@ async def test_whoami_includes_display_name():
         "profiles": [{"slug": "agent-0001", "display_name": "Helper Bot"}],
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "whoami")
-    assert "display_name: Helper Bot" in result
-    assert "agent-0001" in result
+    result = await _call_structured(mcp, "whoami")
+    assert result["context_version"] == 1
+    assert result["identity"]["display_name"] == "Helper Bot"
+    assert result["identity"]["identity"] == "@agent-0001"
 
 
 @pytest.mark.asyncio
@@ -1448,7 +1456,8 @@ async def test_get_dm_history_from_local():
     assert "hi from alice" in result
     assert "hi back" in result
     assert "bob here" not in result   # a different peer is filtered out
-    assert "id=dm_2 self=true" in result
+    assert 'message_id="dm_2"' in result
+    assert "self=true" in result
     await ms.close()
 
 
@@ -1527,14 +1536,25 @@ async def test_list_spaces_returns_server_filtered_memberships():
     cfg, http, ms = _setup()
     http.responses["/spaces"] = {
         "spaces": [
-            {"space_id": "sp_team", "name": "Team"},
+            {
+                "space_id": "sp_team",
+                "name": "Team",
+                "description": "Core team",
+                "role": "member",
+                "joined_at": 1700000000000,
+            },
             {"space_id": "sp_other", "name": "Other"},
         ],
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_spaces")
-    assert "sp_team" in result and "Team" in result
-    assert "sp_other" in result and "Other" in result
+    result = await _call_structured(mcp, "list_spaces")
+    assert result["context_version"] == 1
+    assert result["count"] == 2
+    spaces = {space["space_id"]: space for space in result["spaces"]}
+    assert spaces["sp_team"]["name"] == "Team"
+    assert spaces["sp_team"]["description"] == "Core team"
+    assert spaces["sp_team"]["role"] == "member"
+    assert spaces["sp_other"]["name"] == "Other"
     # No per-space round-trips — list_spaces stays cheap.
     per_space_calls = [c for c in http.calls if "/channels" in c[1]]
     assert per_space_calls == []
@@ -1545,8 +1565,8 @@ async def test_list_spaces_returns_empty_marker_when_not_a_member():
     cfg, http, ms = _setup()
     http.responses["/spaces"] = {"spaces": []}
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_spaces")
-    assert "not a member" in result
+    result = await _call_structured(mcp, "list_spaces")
+    assert result == {"context_version": 1, "count": 0, "spaces": []}
 
 
 @pytest.mark.asyncio
@@ -1558,15 +1578,27 @@ async def test_list_channels_in_space_scopes_to_one_space():
     cfg.space_id = "sp_legacy"  # must be irrelevant
     http.responses["/spaces/sp_target/channels"] = {
         "channels": [
-            {"channel_id": "ch_g", "name": "general"},
+            {
+                "channel_id": "ch_g",
+                "name": "general",
+                "description": "Team discussion",
+                "is_public": True,
+                "owner_slug": "alice-0001",
+            },
             {"channel_id": "ch_r", "name": "random"},
         ],
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channels_in_space", {"space_id": "sp_target"})
+    result = await _call_structured(
+        mcp, "list_channels_in_space", {"space_id": "sp_target"},
+    )
 
-    assert "ch_g" in result and "general" in result
-    assert "ch_r" in result and "random" in result
+    channels = {channel["channel_id"]: channel for channel in result["channels"]}
+    assert channels["ch_g"]["name"] == "general"
+    assert channels["ch_g"]["description"] == "Team discussion"
+    assert channels["ch_g"]["visibility"] == "public"
+    assert channels["ch_g"]["owner_identity"] == "@alice-0001"
+    assert channels["ch_r"]["name"] == "random"
     # Exactly one round-trip; never to cfg.space_id or /spaces.
     assert ("GET", "/spaces/sp_target/channels", None) in http.calls
     assert not any(c[1] == "/spaces" for c in http.calls)
@@ -1590,8 +1622,12 @@ async def test_list_channels_in_space_tolerates_string_response():
     cfg, http, ms = _setup()
     http.responses["/spaces/sp_racy/channels"] = ""
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channels_in_space", {"space_id": "sp_racy"})
-    assert "no channels" in result
+    result = await _call_structured(
+        mcp, "list_channels_in_space", {"space_id": "sp_racy"},
+    )
+    assert result["space_id"] == "sp_racy"
+    assert result["count"] == 0
+    assert result["channels"] == []
 
 
 @pytest.mark.asyncio
@@ -1638,9 +1674,11 @@ async def test_list_channels_in_all_spaces_returns_empty_message_with_no_spaces(
     cfg, http, ms = _setup()
     http.responses["/spaces"] = {"spaces": []}
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channels_in_all_spaces")
+    result = await _call_structured(mcp, "list_channels_in_all_spaces")
 
-    assert "not a member" in result
+    assert result["space_count"] == 0
+    assert result["channel_count"] == 0
+    assert result["spaces"] == []
     per_space_calls = [c for c in http.calls if "/channels" in c[1]]
     assert per_space_calls == []
 
@@ -1691,11 +1729,11 @@ async def test_list_channels_in_all_spaces_tolerates_per_space_string_response()
         "channels": [{"channel_id": "ch_x", "name": "general"}],
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channels_in_all_spaces")
+    result = await _call_structured(mcp, "list_channels_in_all_spaces")
 
-    assert "sp_a" in result
-    assert "(no channels)" in result
-    assert "ch_x" in result
+    by_space = {space["space_id"]: space for space in result["spaces"]}
+    assert by_space["sp_a"]["channels"] == []
+    assert by_space["sp_b"]["channels"][0]["channel_id"] == "ch_x"
 
 
 @pytest.mark.asyncio
@@ -1723,15 +1761,30 @@ async def test_list_channel_members():
             },
         ]
     }
+    http.responses[
+        "/identities/profiles?slugs=alice-0001,agent-0001"
+    ] = {
+        "profiles": [
+            {"slug": "alice-0001", "display_name": "Alice"},
+            {"slug": "agent-0001", "display_name": "Helper"},
+        ],
+    }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channel_members", {"channel": "ch_abc"})
-    assert "alice-0001" in result
-    assert "agent-0001" in result
-    # Roles render as ``(owner)`` / ``(member)``.
-    assert "(owner)" in result
-    assert "(member)" in result
-    assert 'identity_type="human" owner_slug=null' in result
-    assert 'identity_type="agent" owner_slug="alice-0001"' in result
+    result = await _call_structured(
+        mcp, "list_channel_members", {"channel": "ch_abc"},
+    )
+    assert result["context_version"] == 1
+    assert result["target"]["target_ref"] == "channel:sp_test:ch_abc"
+    members = {member["identity"]: member for member in result["members"]}
+    assert members["@alice-0001"]["role"] == "owner"
+    assert members["@alice-0001"]["display_name"] == "Alice"
+    assert members["@alice-0001"]["identity_type"] == "human"
+    assert members["@alice-0001"]["owner_identity"] is None
+    assert members["@agent-0001"]["role"] == "member"
+    assert members["@agent-0001"]["display_name"] == "Helper"
+    assert members["@agent-0001"]["identity_type"] == "agent"
+    assert members["@agent-0001"]["owner_identity"] == "@alice-0001"
+    assert members["@agent-0001"]["self"] is True
 
 
 @pytest.mark.asyncio
@@ -1752,10 +1805,15 @@ async def test_get_user_info():
         }],
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "get_user_info", {"username": "@alice-0001"})
-    assert "alice-0001" in result
-    assert "Alice" in result
-    assert "A test user" in result
+    result = await _call_structured(
+        mcp, "get_user_info", {"username": "@alice-0001"},
+    )
+    assert result["context_version"] == 1
+    assert result["found"] is True
+    assert result["identity"]["identity"] == "@alice-0001"
+    assert result["identity"]["display_name"] == "Alice"
+    assert result["identity"]["identity_type"] == "unknown"
+    assert result["identity"]["bio"] == "A test user"
 
 
 @pytest.mark.asyncio
@@ -2548,9 +2606,10 @@ async def test_get_thread_history_presents_root_and_replies_under_one_thread_tar
     root = await ms.get_message_by_envelope("msg_root")
     assert root is not None and not root.thread_root_id
     result = await _call(_build_tools(cfg), "get_thread_history", {"root_id": "msg_root"})
-    header = "## target=thread space_id=sp_test channel_id=ch_1 thread_root_id=msg_root"
+    header = 'target_ref="channel:sp_test:ch_1:thread:msg_root"'
     assert result.count(header) == 1
-    assert "id=msg_root" in result and "id=msg_reply" in result
+    assert 'message_id="msg_root"' in result
+    assert 'message_id="msg_reply"' in result
 
 # Send-side thread-root rules, end to end through the send_message tool.
 
@@ -2968,11 +3027,14 @@ async def test_keyless_list_channel_members_uses_private_channel_roster():
         ],
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "list_channel_members", {"channel": "ch_abc"})
-    assert "alice-0001" in result and "(owner)" in result
-    assert "agent-0001" in result and "(member)" in result
-    assert 'identity_type="human" owner_slug=null' in result
-    assert 'identity_type="agent" owner_slug="alice-0001"' in result
+    result = await _call_structured(
+        mcp, "list_channel_members", {"channel": "ch_abc"},
+    )
+    members = {member["identity"]: member for member in result["members"]}
+    assert members["@alice-0001"]["role"] == "owner"
+    assert members["@alice-0001"]["identity_type"] == "human"
+    assert members["@agent-0001"]["role"] == "member"
+    assert members["@agent-0001"]["owner_identity"] == "@alice-0001"
     assert (
         "GET_UNSIGNED", "/v2/cloud-agents/spaces/sp_test/channels/ch_abc/members", None,
     ) in http.calls
@@ -3011,12 +3073,12 @@ async def test_keyless_whoami_needs_no_keystore():
         "profiles": [{"slug": "agent-0001", "display_name": "Cloud Bot"}],
     }
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "whoami")
-    assert "Cloud Bot" in result
-    assert "agent-0001" in result
-    assert "dev_test" in result
-    assert "sandbox.local" in result          # from http_client.server_url
-    assert "managed server-side" in result    # keyless subkey line
+    result = await _call_structured(mcp, "whoami")
+    assert result["identity"]["display_name"] == "Cloud Bot"
+    assert result["identity"]["identity"] == "@agent-0001"
+    assert result["runtime"]["device_id"] == "dev_test"
+    assert result["runtime"]["server_url"] == "http://sandbox.local"
+    assert result["runtime"]["subkey_management"] == "server"
     assert spy.loads == []                     # keystore never touched
 
 

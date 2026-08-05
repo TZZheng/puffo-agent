@@ -270,12 +270,25 @@ async def test_held_thread_basis_overrides_only_its_presentation_target():
     )
     output = await coordinator._held_context_output(key, "sp_1", "ch_a")
     reconsideration = output["reconsideration"]
-    assert reconsideration["decision"] == HELD_SEND_RECONSIDERATION_GUIDANCE
+    assert reconsideration["context_version"] == 1
+    assert reconsideration["guidance"] == HELD_SEND_RECONSIDERATION_GUIDANCE
+    assert reconsideration["target"] == {
+        "target_type": "thread",
+        "target_ref": "channel:sp_1:ch_a:thread:thread-root",
+        "space_id": "sp_1",
+        "channel_id": "ch_a",
+        "thread_root_id": "thread-root",
+    }
     assert reconsideration["visible_draft_basis"].count(
-        "## target=thread space_id=sp_1 channel_id=ch_a thread_root_id=thread-root"
+        'target_ref="channel:sp_1:ch_a:thread:thread-root"'
     ) == 1
-    assert "## target=channel space_id=sp_1 channel_id=ch_a" in reconsideration["new_channel_context"]
-    assert "## target=thread space_id=sp_1 channel_id=ch_other thread_root_id=other-root" in reconsideration["new_channel_context"]
+    latest = reconsideration["new_channel_context"]
+    assert 'target_ref="channel:sp_1:ch_a"' in latest
+    assert 'target_ref="channel:sp_1:ch_a:thread:thread-root"' in latest
+    assert 'target_ref="channel:sp_1:ch_other:thread:other-root"' in latest
+    assert latest.index('message_id="thread-root"') < latest.index(
+        'message_id="thread-reply"'
+    ) < latest.index('message_id="other-route"')
 
 
 @pytest.mark.asyncio
@@ -497,7 +510,11 @@ async def test_held_attempted_no_automatic_resend_and_preserves_watermarks():
     assert reconsideration["draft"] == "draft"
     assert reconsideration["based_on_through_seq"] == 2
     assert reconsideration["target"] == {
-        "space_id": "sp_1", "channel_id": "ch_a", "thread_root_id": "",
+        "target_type": "channel",
+        "target_ref": "channel:sp_1:ch_a",
+        "space_id": "sp_1",
+        "channel_id": "ch_a",
+        "thread_root_id": "",
     }
     assert len([c for c in http.calls if c[0] == "POST"]) == 1
     assert freshness.advances == []
