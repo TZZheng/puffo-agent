@@ -22,6 +22,20 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Docker Desktop is now discovered even when it is missing from the
+  daemon's `PATH`.** Docker uses the same cached resolver as Claude Code
+  and Codex, including an explicit `PUFFO_DOCKER_BIN` override,
+  reconstructed user `PATH`, and known desktop-app locations. Every
+  Docker subprocess uses the resolved absolute path, and the desktop
+  home page now shows that install location instead of the Hermes
+  “Coming soon” placeholder.
+
+- **`cli-docker` Codex setup now matches the selected harness.** CLI
+  creation resolves and validates Codex before persisting an OpenAI
+  Docker agent, host Codex skills are synchronized into its isolated
+  home, and remote MCP bearer-token environment variable names are
+  forwarded through `docker exec` without exposing their values.
+
 - **Codex shell commands now run in the cli-docker workspace.** The
   app-server process runs through `docker exec`, but new threads
   previously inherited the daemon's host cwd. On Windows that passed a
