@@ -4,10 +4,11 @@ from types import SimpleNamespace
 
 from puffo_agent.mcp.puffo_core_tools import register_core_tools
 from puffo_agent.agent.shared_content import (
+    DEFAULT_SKILL_DECIDE_RESPONSE,
     DEFAULT_SHARED_CLAUDE_MD,
     DEFAULT_SKILLS,
     HELD_SEND_RECONSIDERATION_GUIDANCE,
-    PARTICIPATION_AND_CONTINUATION_GUIDANCE,
+    INBOX_RESPONSE_DECISION_CUE,
     ensure_shared_primer,
     rebuild_agent_claude_md,
     rebuild_agent_codex_md,
@@ -67,6 +68,7 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         "<global_inbox_notice>", '"content_included":false', "read_inbox",
         "context_version=1", "target_ref", "sender_identity", "sender_type",
         "An `@slug` identity is unique", "send_message", "[SILENT]",
+        "decide-response", "Send, Wait, Clarify, and Silent",
     ):
         assert phrase in primer
     for absent in (
@@ -79,6 +81,7 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     history = DEFAULT_SKILLS["channel-history"][1]
     post = DEFAULT_SKILLS["get-post"][1]
     send = DEFAULT_SKILLS["send-message"][1]
+    decision = DEFAULT_SKILLS["decide-response"][1]
     for phrase in (
         "context_version", "## context", "target_ref", "seq", "sent_at",
         "message_id", "sender_identity", "sender_type", "self", "encrypted",
@@ -91,19 +94,18 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     assert "messages" in read and "prior_context" in read
     assert "strictly earlier" in normalized_read
     assert "do not acknowledge pending Inbox rows" in read
-    decision_guidance = " ".join(
-        PARTICIPATION_AND_CONTINUATION_GUIDANCE.split()
-    )
+    assert "apply the `decide-response` skill" in normalized_read
+    decision_guidance = " ".join(DEFAULT_SKILL_DECIDE_RESPONSE.split())
+    assert decision == DEFAULT_SKILL_DECIDE_RESPONSE
     all_prompt_surfaces = " ".join(
         " ".join(body.split())
         for body in (DEFAULT_SHARED_CLAUDE_MD, *[body for _, body in DEFAULT_SKILLS.values()])
     )
-    assert normalized_read.count(decision_guidance) == 1
     assert all_prompt_surfaces.count(decision_guidance) == 1
-    assert "distinct turns" in normalized_read
-    assert "shared result" in normalized_read
-    assert "Agent messages may legitimately trigger" in normalized_read
-    assert "ask one concise human clarification" in normalized_read
+    assert "Confidence is not evidence" in decision
+    assert "Agent messages may legitimately trigger" in decision
+    assert "Silence is not the fallback" in decision
+    assert "Confidence is not evidence" not in read
     assert "originating request and conversation intent" not in DEFAULT_SHARED_CLAUDE_MD
     assert "does not acknowledge pending Inbox work" in " ".join(history.split())
     assert "does not acknowledge pending Inbox work" in " ".join(post.split())
@@ -123,9 +125,7 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
 
 
 def test_conversation_judgment_is_absent_from_mcp_descriptions_and_profiles():
-    decision_guidance = " ".join(
-        PARTICIPATION_AND_CONTINUATION_GUIDANCE.split()
-    )
+    decision_guidance = " ".join(DEFAULT_SKILL_DECIDE_RESPONSE.split())
 
     class CapturingMCP:
         def __init__(self) -> None:
@@ -143,71 +143,71 @@ def test_conversation_judgment_is_absent_from_mcp_descriptions_and_profiles():
         "\n".join(tool.__doc__ or "" for tool in mcp.tools).split()
     )
     assert decision_guidance not in mcp_descriptions
-    assert "distinct-participation mode" not in mcp_descriptions
+    assert "Confidence is not evidence" not in mcp_descriptions
 
     claude, codex = _rebuild(_tmp())
     for generated_profile_surface in (claude, codex):
         normalized = " ".join(generated_profile_surface.split())
         assert decision_guidance not in normalized
-        assert "distinct-participation mode" not in normalized
+        assert "Confidence is not evidence" not in normalized
 
 
-def test_read_inbox_owns_participation_and_continuation_judgment():
-    decision_guidance = " ".join(
-        PARTICIPATION_AND_CONTINUATION_GUIDANCE.split()
-    )
+def test_decide_response_owns_response_judgment():
+    decision_guidance = " ".join(DEFAULT_SKILL_DECIDE_RESPONSE.split())
     read = " ".join(DEFAULT_SKILLS["read-inbox"][1].split())
-    assert read.count(decision_guidance) == 1
+    decision = " ".join(DEFAULT_SKILLS["decide-response"][1].split())
+    assert decision == decision_guidance
     for phrase in (
-        "message that originated the request",
+        "Privately reconstruct the current interaction",
         "Earlier unrelated activity is context",
-        "not evidence of turn position, assignment, or participation",
-        "interaction's participation shape",
+        "Separate facts in the context from assumptions",
+        "Confidence is not evidence",
+        "distinct participation",
+        "one shared result",
         "how many turns each participant is expected to take",
-        "one successful turn per identity",
+        "one successful visible turn per addressed identity",
         "Explicit repetition, multiple rounds, or later work may require more",
-        "track successful visible participation by identity",
-        "within that interaction",
-        "does not count as your visible contribution",
-        "normally completes your participation in that round",
-        "later peer progress alone does not reopen the same contribution",
+        "sender_identity",
+        "self=true",
+        "An attempted, held, or failed draft is not visible participation",
+        "later peer activity alone does not reopen it",
         "keep participant position separate from the content or value",
-        "does not by itself reset later positions",
-        "Agent messages may legitimately trigger further Agent work or replies",
-        "genuinely new work or a still-open step",
-        "Continue meaningful or converging interaction",
-        "repeat, oscillate, or self-propagate without meaningful progress",
-        "ask one concise human clarification",
+        "does not reset later positions",
+        "Agent messages may legitimately trigger further Agent work",
+        "repeat, oscillate, or self-propagate without progress",
+        "mcp__puffo__create_reminder",
+        "same target",
+        "Choose a reasonable delay",
+        "A reminder schedules reevaluation",
+        "only human intent or a human repair choice can resolve it",
         "equivalent clarification is already present",
+        "positively supports that no useful response is needed now",
+        "Silence is not the fallback",
     ):
-        assert phrase in read
-    for stale_generic_tail in (
-        "Evaluate pending messages together with relevant",
-        "useful new contribution",
-        "otherwise choose silence",
-        "peer activity is evidence to evaluate",
-        "Peer progress alone does not create a new obligation",
-        "peer progress does not reopen",
-    ):
-        assert stale_generic_tail not in read
+        assert phrase in decision
+    assert "apply the `decide-response` skill" in read
+    assert "Confidence is not evidence" not in read
+    assert "mcp__puffo__create_reminder" not in read
 
     root = _tmp()
     claude, codex = _rebuild(root)
     claude_skill = (
-        root / "workspace" / ".claude" / "skills" / "read-inbox" / "SKILL.md"
+        root / "workspace" / ".claude" / "skills" / "decide-response" / "SKILL.md"
     ).read_text(encoding="utf-8")
     codex_skill = (
-        root / "workspace" / ".agents" / "skills" / "read-inbox" / "SKILL.md"
+        root / "workspace" / ".agents" / "skills" / "decide-response" / "SKILL.md"
     ).read_text(encoding="utf-8")
     assert decision_guidance in " ".join(claude_skill.split())
-    assert decision_guidance in " ".join(codex_skill.split())
+    assert decision_guidance.replace("mcp__puffo__", "") in " ".join(
+        codex_skill.split()
+    )
     assert codex_skill == claude_skill.replace("mcp__puffo__", "")
 
     other_prompt_surfaces = [" ".join(surface.split()) for surface in (claude, codex)]
     other_prompt_surfaces.extend(
         " ".join(body.split())
         for skill_id, (_, body) in DEFAULT_SKILLS.items()
-        if skill_id not in {"read-inbox", "send-message"}
+        if skill_id != "decide-response"
     )
     assert not any(decision_guidance in surface for surface in other_prompt_surfaces)
 
@@ -229,6 +229,16 @@ def test_read_inbox_owns_participation_and_continuation_judgment():
     assert decision_guidance not in mcp_descriptions
 
 
+def test_inbox_decision_cue_is_short_and_points_to_the_skill():
+    cue = " ".join(INBOX_RESPONSE_DECISION_CUE.split())
+    assert "<puffo_runtime_instruction>" in cue
+    assert "read the pending content" in cue.lower()
+    assert "`decide-response` skill" in cue
+    assert "Send, Wait, Clarify, or Silent" in cue
+    assert "Confidence is not evidence" not in cue
+    assert len(INBOX_RESPONSE_DECISION_CUE.encode()) < 256
+
+
 def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
     held_method = " ".join(HELD_SEND_RECONSIDERATION_GUIDANCE.split()).lower()
     send = " ".join(DEFAULT_SKILLS["send-message"][1].split()).lower()
@@ -240,10 +250,11 @@ def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
         assert phrase in send
     for phrase in (
         "attempted but not sent", "reconsider the originating interaction",
-        "send_anyway=true", "is rare", "create a reminder for the same target",
-        "choose a short, reasonable delay", "read the latest target context",
+        "apply the `decide-response` skill", "send_anyway=true", "is rare",
+        "wait outcome follows that skill's reminder requirement",
     ):
         assert phrase in held_method
+    assert "Confidence is not evidence" not in held_method
 
     root = _tmp()
     _rebuild(root)
@@ -273,7 +284,7 @@ def test_harnesses_discover_managed_skills_with_correct_tool_names():
     assert "mcp__puffo__" not in codex
     assert "send_message" in codex
     ensure_shared_primer(root / "shared")
-    for skill_id in ("read-inbox", "send-message"):
+    for skill_id in ("read-inbox", "decide-response", "send-message"):
         claude_skill = root / "workspace" / ".claude" / "skills" / skill_id / "SKILL.md"
         codex_skill = root / "workspace" / ".agents" / "skills" / skill_id / "SKILL.md"
         for skill in (claude_skill, codex_skill):

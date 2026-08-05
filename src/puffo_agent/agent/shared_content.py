@@ -43,8 +43,8 @@ Pending messages wake you with metadata, not message bodies:
 ```
 
 Use `mcp__puffo__read_inbox` when you need the pending content. The
-`read-inbox` skill describes paging, prior context, and participation
-judgment.
+`read-inbox` skill describes paging and prior context. The `decide-response`
+skill owns the response judgment after you have read the relevant context.
 
 ## Context contract
 
@@ -67,6 +67,11 @@ message placeholder names `mcp__puffo__get_post_segment`; fetch only the
 segments you need.
 
 ## How to reply
+
+After reading relevant context, apply `decide-response` before each Puffo
+response decision. It owns Send, Wait, Clarify, and Silent. `[SILENT]` means
+the context supports no useful response now; unresolved material ambiguity
+calls for clarification, not silence. Wait requires a reminder.
 
 Choose explicitly: call `mcp__puffo__send_message` for a Puffo message, or
 write `[SILENT]` when you choose not to send. Preserve the Inbox
@@ -115,81 +120,98 @@ an agent to force).
 # ── Default skill markdowns ───────────────────────────────────────────────────
 
 
-PARTICIPATION_AND_CONTINUATION_GUIDANCE = """\
-Reconstruct the current interaction from the message that originated the
-request through the latest relevant rows. Earlier unrelated activity is
-context, not evidence of turn position, assignment, or participation, unless
-the interaction explicitly refers to it.
+INBOX_RESPONSE_DECISION_CUE = """\
+<puffo_runtime_instruction>
+Read the pending content, then apply the `decide-response` skill before
+choosing Send, Wait, Clarify, or Silent.
+</puffo_runtime_instruction>"""
 
-Infer the interaction's participation shape: who is addressed, whether it
-expects distinct turns or a shared result, how many turns each participant is
-expected to take, and what ends the round. In an ordered group interaction,
-when the request calls on the addressed participants to act in turn and gives
-no indication of repetition, normally treat one successful turn per identity
-as that round's shape. Explicit repetition, multiple rounds, or later work may
+
+DEFAULT_SKILL_DECIDE_RESPONSE = """\
+# Skill: decide-response
+
+Decide what to do after reading the relevant Puffo conversation context. Use
+this method before every choice to Send, Wait, Clarify, or remain Silent. It is
+a context-dependent judgment, not a fixed reply policy.
+
+## Establish the interaction
+
+Privately reconstruct the current interaction from the message that originated
+it through the latest relevant rows. Earlier unrelated activity is context,
+not evidence of assignment, turn position, or participation unless the current
+interaction refers to it.
+
+Identify the facts that determine the next useful action. Separate facts in the
+context from assumptions. If another reasonable interpretation of an
+unsupported assumption would materially change the user-visible result, the
+decision is not grounded yet. Confidence is not evidence.
+
+Infer who is addressed, whether the interaction expects distinct participation
+or one shared result, how many turns each participant is expected to take, and
+what completes it. When an ordered group request gives no indication of
+repetition, one successful visible turn per addressed identity normally
+completes that round. Explicit repetition, multiple rounds, or later work may
 require more.
 
-In distinct-participation mode, track successful visible participation by
-identity within that interaction. Another participant's response does not
-substitute for yours, and an attempted, held, or failed draft does not count as
-your visible contribution. A successful visible contribution that fulfills
-your expected turn or turns normally completes your participation in that
-round; later peer progress alone does not reopen the same contribution. In
-shared-result mode, an existing result may satisfy the request, so do not
-duplicate it.
+Use `sender_identity` and `self=true` to track visible participation within the
+current interaction. Another participant's response does not substitute for
+yours in distinct-participation mode. An attempted, held, or failed draft is
+not visible participation. A successful response that fulfills your expected
+turn normally completes it; later peer activity alone does not reopen it. In
+shared-result mode, an existing result may already satisfy the request.
 
 For ordered interactions, keep participant position separate from the content
-or value produced at that position. A special value assigned to one position
-does not by itself reset later positions; infer a reset only when the request or
-conversation indicates one.
+or value produced at that position. A special value at one position does not
+reset later positions unless the request or conversation indicates a reset.
 
-Agent messages may legitimately trigger further Agent work or replies. When
-considering another action, distinguish genuinely new work or a still-open
-step from replaying a contribution already completed. Judge whether another
-iteration remains meaningful: whether it adds information, changes shared
-state, resolves uncertainty, advances work, or moves toward a useful outcome.
-Continue meaningful or converging interaction. If it would only repeat,
-oscillate, or self-propagate without meaningful progress, stop, wait, or remain
-silent. Explicitly requested repetition follows its intended scope and stopping
-condition.
+Agent messages may legitimately trigger further Agent work. Continue when an
+iteration adds information, changes shared state, resolves uncertainty,
+advances work, or converges on a useful outcome. Stop when it would only
+repeat, oscillate, or self-propagate without progress. Explicitly requested
+repetition follows its intended scope and stopping condition.
 
-Use earlier `self=true` rows as evidence of what you already attempted or
-completed within that interaction. If the participation mode or value of
-continuing is materially ambiguous and the available context cannot resolve it,
-ask one concise human clarification. First check whether an equivalent
-clarification is already present; if so, wait for its answer instead of asking
-again."""
+## Choose the current outcome
+
+- **Send:** A useful response is grounded in the available context. Use the
+  `send-message` skill.
+- **Wait:** Later context is likely to resolve the next action, or the target is
+  changing too quickly to judge. Before ending the turn, call
+  `mcp__puffo__create_reminder` for the same target. Its content must identify
+  the interaction and question to reevaluate. Choose a reasonable delay from
+  the conversation pace, active participants, observed response timing,
+  urgency, and recent holds; prefer earlier reevaluation over an unnecessarily
+  long delay. When it fires, read the latest target context and run this skill
+  again. A reminder schedules reevaluation; it does not authorize a stale
+  draft.
+- **Clarify:** A material uncertainty remains and only human intent or a human
+  repair choice can resolve it. Send one concise question. First check whether
+  an equivalent clarification is already present; if so, choose Wait instead
+  of asking again.
+- **Silent:** The available context positively supports that no useful response
+  is needed now, such as completed participation or an already satisfied shared
+  result. Silence is not the fallback for unresolved work or missing material
+  information.
+"""
 
 
-HELD_SEND_RECONSIDERATION_GUIDANCE = f"""\
+HELD_SEND_RECONSIDERATION_GUIDANCE = """\
 A held draft was attempted but not sent. It is evidence for reconsideration,
 not visible participation, permission, or an obligation to send. Reconsider the
 originating interaction, the exact draft, its visible basis, and the latest
 context together. Separate the draft text from its purpose: newer context can
 make it wrong, redundant, unnecessary, or still needed.
 
-{PARTICIPATION_AND_CONTINUATION_GUIDANCE}
+Read the returned context and any additional target history you need, then
+apply the `decide-response` skill to choose Send, Wait, Clarify, or Silent. A
+Wait outcome follows that skill's reminder requirement.
 
-First decide whether the current interaction still expects a new successful
-visible contribution from you. If an earlier successful `self=true` row already
-fulfills it and the latest context creates no genuinely new work, send nothing.
-Otherwise judge whether the draft is context-dependent: can newer messages
-change its correctness, sequence position, target, necessity, interpretation,
-participation mode, or continuation value? This includes turn-taking and
-shared-state coordination. If so, revise against the latest context and send
-with normal freshness; do not use `send_anyway`. Use the unchanged draft with
-`send_anyway=True` only after confirming newer context cannot affect those
-semantics. `send_anyway=True` is rare and model-owned, never automatic;
-technical eligibility is not a recommendation. Revised or context-derived
-content uses normal freshness and may be held again.
-
-If the target is changing too quickly to judge, or drafts are repeatedly held,
-waiting can be appropriate. If you choose to wait for a later evaluation,
-create a reminder for the same target. Choose a short, reasonable delay from
-the current conversation pace, active participants, observed response timing,
-urgency, and recent holds; prefer an earlier reevaluation over an unnecessarily
-long delay. When the reminder fires, read the latest target context before
-deciding what to do."""
+If you choose Send, judge whether newer context can change the draft's
+correctness, sequence position, target, necessity, interpretation,
+participation mode, or continuation value. If it can, revise against the latest
+context and send with normal freshness; the revision may be held again. Use the
+unchanged draft with `send_anyway=True` only after confirming newer context
+cannot affect those semantics. `send_anyway=True` is rare and model-owned,
+never automatic; technical eligibility is not a recommendation."""
 
 
 DEFAULT_SKILL_SEND_MESSAGE = """\
@@ -406,7 +428,7 @@ was offline, are not in local storage and won't appear here.
 """
 
 
-DEFAULT_SKILL_READ_INBOX = f"""\
+DEFAULT_SKILL_READ_INBOX = """\
 # Skill: read_inbox
 
 Read pending Puffo messages after the runtime sends a
@@ -440,14 +462,9 @@ message bodies and is not enough context for a reply.
 - A notice is metadata only. It never substitutes for a content-bearing
   Inbox or history read. Use the `send-message` skill for held-send guidance.
 
-**Participation and continuation judgment:** Reconstruct the interaction from
-the pending page and relevant `prior_context`, including relevant `self=true`
-rows.
-
-{PARTICIPATION_AND_CONTINUATION_GUIDANCE}
-
-The final choice to send, remain silent, revise, clarify, or use `send_anyway`
-is model-owned.
+After reading enough relevant context, apply the `decide-response` skill. This
+tool owns retrieval and acknowledgement; it does not decide whether to Send,
+Wait, Clarify, remain Silent, or use `send_anyway`.
 
 **When to use:**
 - When a notice points to pending work relevant to the current decision.
@@ -997,6 +1014,10 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
     "read-inbox": (
         "Read pending Puffo Inbox work and supplementary route context after a metadata notice.",
         DEFAULT_SKILL_READ_INBOX,
+    ),
+    "decide-response": (
+        "Decide whether to send, wait with a reminder, clarify, or stay silent after reading Puffo context.",
+        DEFAULT_SKILL_DECIDE_RESPONSE,
     ),
     "channel-members": (
         "List a channel's member slugs + roles.",

@@ -33,7 +33,10 @@ from puffo_agent.agent.global_inbox_runtime import (
     format_stored_message,
     route_for,
 )
-from puffo_agent.agent.shared_content import DEFAULT_SHARED_CLAUDE_MD
+from puffo_agent.agent.shared_content import (
+    DEFAULT_SHARED_CLAUDE_MD,
+    INBOX_RESPONSE_DECISION_CUE,
+)
 from puffo_agent.agent.inbox_scheduler import (
     InboxNoticeDelivery,
     NoticeDeliveryCapability,
@@ -3628,6 +3631,8 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     assert '"content_included":false' in initial.provider_input
     assert '"read_tool":"read_inbox"' in initial.provider_input
     assert "channel:sp-1:ch-1" in initial.provider_input
+    assert initial.provider_input.endswith(INBOX_RESPONSE_DECISION_CUE)
+    assert "decide-response" in initial.provider_input
     assert plaintext not in initial_serialized
     assert attachment not in initial_serialized
 
