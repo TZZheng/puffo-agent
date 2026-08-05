@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from ...portal.state import (
     seed_claude_home,
     sync_host_claude_code_auth_view,
     sync_host_codex_auth_view,
+    sync_host_codex_skills,
     sync_host_enabled_plugins,
     sync_host_mcp_servers,
     sync_host_skills,
@@ -195,6 +197,7 @@ class DockerCLIAdapter(Adapter):
         self.puffo_core_slug = puffo_core_slug
         self.puffo_core_keys_dir = puffo_core_keys_dir
         self._desired_codex_extras: dict[str, dict] = {}
+        self._codex_bearer_env_names: tuple[str, ...] = ()
         self._desired_installed = False
         self._started_lock = asyncio.Lock()
         self._started = False
@@ -313,14 +316,17 @@ class DockerCLIAdapter(Adapter):
     def _ensure_codex_session(self) -> CodexSession:
         if self._codex_session is not None:
             return self._codex_session
+        argv = ["docker", "exec", "-i"]
+        for name in self._codex_bearer_env_names:
+            argv.extend(["-e", name])
+        argv.extend([
+            "-e", "CODEX_HOME=/home/agent/.codex",
+            self.container_name, "codex", "app-server",
+        ])
         self._codex_session = CodexSession(
             agent_id=self.agent_id,
             session_file=self.codex_home / "codex_session.json",
-            argv=[
-                "docker", "exec", "-i",
-                "-e", "CODEX_HOME=/home/agent/.codex",
-                self.container_name, "codex", "app-server",
-            ],
+            argv=argv,
             cwd=None,
             thread_cwd="/workspace",
             permission_mode=self.permission_mode,
@@ -523,6 +529,20 @@ class DockerCLIAdapter(Adapter):
             )
         extras = dict(self._desired_codex_extras)
         extras.update(host_mcps)
+        bearer_env_names = {
+            str(spec.get("bearer_token_env_var"))
+            for spec in extras.values()
+            if isinstance(spec, dict) and spec.get("bearer_token_env_var")
+        }
+        self._codex_bearer_env_names = tuple(sorted(
+            name for name in bearer_env_names if os.environ.get(name)
+        ))
+        for name in sorted(bearer_env_names - set(self._codex_bearer_env_names)):
+            logger.warning(
+                "agent %s: host Codex MCP bearer env %r is not set; "
+                "the MCP will start without authentication",
+                self.agent_id, name,
+            )
         env = self._container_puffo_mcp_env()
         write_codex_mcp_config(
             self.codex_home / "config.toml",
@@ -562,12 +582,16 @@ class DockerCLIAdapter(Adapter):
             # One-way sync of host skills + MCP registrations into
             # the per-agent home. Runs every start so host edits
             # propagate without daemon restart.
-            skill_count = sync_host_skills(host_home, self.agent_home_dir)
+            if self.harness.name() == "codex":
+                skill_count = sync_host_codex_skills(host_home, self.codex_home)
+                skills_dir = self.codex_home / "skills"
+            else:
+                skill_count = sync_host_skills(host_home, self.agent_home_dir)
+                skills_dir = self.agent_home_dir / ".claude" / "skills"
             if skill_count:
                 logger.info(
                     "agent %s: synced %d host skill(s) into %s",
-                    self.agent_id, skill_count,
-                    self.agent_home_dir / ".claude" / "skills",
+                    self.agent_id, skill_count, skills_dir,
                 )
             merged_mcp, unreachable = sync_host_mcp_servers(
                 host_home, self.agent_home_dir,

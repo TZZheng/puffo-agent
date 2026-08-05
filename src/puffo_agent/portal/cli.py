@@ -465,6 +465,14 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
 
     runtime_kind = args.runtime or "chat-local"
     provider = args.provider or "anthropic"
+    from .runtime_matrix import resolve_effective_harness, validate_triple
+    harness = resolve_effective_harness(
+        runtime_kind, provider, getattr(args, "harness", None) or "",
+    ) or "claude-code"
+    result = validate_triple(runtime_kind, provider, harness)
+    if not result.ok:
+        print(f"error: {result.error}", file=sys.stderr)
+        return 2
     api_key = _resolve_api_key_for_create(
         provider=provider,
         flag_value=args.api_key or "",
@@ -507,6 +515,7 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
             provider=args.provider or "",
             api_key=api_key,
             model=args.model or "",
+            harness=harness,
         ),
         profile="profile.md",
         memory_dir="memory",
@@ -1685,7 +1694,15 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument(
         "--provider",
         choices=["anthropic", "openai", "google"],
-        help="Model provider (default: anthropic; ignored for cli-local/cli-docker)",
+        help="Model provider (default: anthropic)",
+    )
+    create.add_argument(
+        "--harness",
+        choices=["claude-code", "hermes", "codex"],
+        help=(
+            "CLI harness. Defaults by provider/runtime; cli-docker supports "
+            "claude-code and codex"
+        ),
     )
     create.add_argument(
         "--api-key",

@@ -340,6 +340,10 @@ _HOST_SYNCED_MARKER_BODY = (
     "This skill is synced from the operator's ~/.claude/skills/ on "
     "every worker start. Do not edit; changes will be overwritten.\n"
 )
+_HOST_SYNCED_CODEX_MARKER_BODY = (
+    "This skill is synced from the operator's ~/.codex/skills/ on "
+    "every worker start. Do not edit; changes will be overwritten.\n"
+)
 _AGENT_INSTALLED_MARKER_BODY = (
     "This skill was installed by the agent via the install_skill "
     "MCP tool. It lives at project scope and survives host syncs.\n"
@@ -402,6 +406,16 @@ def sync_host_skills(host_home: Path, agent_home: Path) -> int:
         src=host_home / ".claude" / "skills",
         dst_root=agent_home / ".claude" / "skills",
         marker_body=_HOST_SYNCED_MARKER_BODY,
+    )
+
+
+def sync_host_codex_skills(host_home: Path, agent_codex_home: Path) -> int:
+    """Sync host ``~/.codex/skills/`` into the agent's isolated
+    ``$CODEX_HOME/skills/`` with the standard provenance semantics."""
+    return _sync_host_skills_dir(
+        src=host_home / ".codex" / "skills",
+        dst_root=agent_codex_home / "skills",
+        marker_body=_HOST_SYNCED_CODEX_MARKER_BODY,
     )
 
 

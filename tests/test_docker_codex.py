@@ -137,6 +137,44 @@ def test_codex_session_runs_app_server_inside_container(tmp_path):
     assert session.model == "gpt-5.4"
 
 
+@pytest.mark.parametrize("token_value, forwarded", [
+    ("super-secret", True),
+    (None, False),
+])
+def test_codex_session_forwards_only_available_bearer_env(
+    tmp_path, monkeypatch, token_value, forwarded,
+):
+    host_home = tmp_path / "host"
+    host_codex = host_home / ".codex"
+    host_codex.mkdir(parents=True)
+    (host_codex / "auth.json").write_text(
+        json.dumps({"tokens": {"refresh_token": "refresh-secret"}}),
+        encoding="utf-8",
+    )
+    (host_codex / "config.toml").write_text(
+        "\n".join([
+            "[mcp_servers.secure]",
+            'url = "https://mcp.example.test"',
+            'bearer_token_env_var = "SECURE_MCP_TOKEN"',
+        ]),
+        encoding="utf-8",
+    )
+    if token_value is not None:
+        monkeypatch.setenv("SECURE_MCP_TOKEN", token_value)
+    else:
+        monkeypatch.delenv("SECURE_MCP_TOKEN", raising=False)
+    adapter = _adapter(tmp_path, harness=CodexHarness())
+
+    adapter._prepare_codex_config(host_home)
+    argv = adapter._ensure_codex_session().argv
+
+    assert ("SECURE_MCP_TOKEN" in argv) is forwarded
+    if forwarded:
+        token_flag = argv.index("SECURE_MCP_TOKEN")
+        assert argv[token_flag - 1] == "-e"
+    assert "super-secret" not in argv
+
+
 def test_worker_uses_openai_defaults_and_forwards_desired_content(monkeypatch, tmp_path):
     from puffo_agent.portal.worker import build_adapter
 
