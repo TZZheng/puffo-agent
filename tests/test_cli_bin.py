@@ -1,6 +1,7 @@
 """Unit tests for ``puffo_agent.agent.cli_bin``."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -132,8 +133,7 @@ def test_darwin_bundle_paths_include_chatgpt_app(monkeypatch):
         and p != "/Applications/ChatGPT.app/Contents/Resources/codex"
         for p in paths
     ), "expected the ~/Applications ChatGPT.app path too"
-    # ChatGPT.app preferred over a leftover Codex.app copy — _first_existing
-    # takes the first hit.
+    # ChatGPT.app is preferred over a leftover Codex.app copy.
     assert paths.index("/Applications/ChatGPT.app/Contents/Resources/codex") < paths.index(
         "/Applications/Codex.app/Contents/Resources/codex"
     )
@@ -199,6 +199,33 @@ def test_resolved_path_survives_restart_via_disk_cache(tmp_path, monkeypatch):
     cli_bin._resolve_memcache.clear()
     monkeypatch.setattr("shutil.which", lambda name, path=None: None)
     assert cli_bin.resolve_codex_bin() == str(real)  # served from disk cache
+
+
+def test_live_path_beats_user_writable_disk_cache(tmp_path, monkeypatch):
+    cached = _make_exe(tmp_path, "cached_codex")
+    live = _make_exe(tmp_path, "live_codex")
+    cache_file = tmp_path / "home" / "resolved_clis.json"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_text(json.dumps({"codex": str(cached)}), encoding="utf-8")
+    monkeypatch.setattr(
+        "shutil.which",
+        lambda name, path=None: str(live) if path is None else None,
+    )
+    monkeypatch.setattr(cli_bin, "_codex_bundle_paths", lambda: [])
+
+    assert cli_bin.resolve_codex_bin() == str(live)
+
+
+def test_non_executable_disk_cache_entry_is_ignored(tmp_path, monkeypatch):
+    cached = _make_exe(tmp_path, "cached_codex")
+    cache_file = tmp_path / "home" / "resolved_clis.json"
+    cache_file.parent.mkdir(parents=True)
+    cache_file.write_text(json.dumps({"codex": str(cached)}), encoding="utf-8")
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
+    monkeypatch.setattr(cli_bin, "_codex_bundle_paths", lambda: [])
+    monkeypatch.setattr(cli_bin.os, "access", lambda path, mode: False)
+
+    assert cli_bin.resolve_codex_bin() is None
 
 
 def test_disk_cache_rejected_when_binary_gone(tmp_path, monkeypatch):

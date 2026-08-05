@@ -1571,8 +1571,11 @@ async def _process_refresh_flags(
     if host_sync_seen:
         try:
             if harness_name == "codex":
+                # TODO: Implement Codex host sync for both cli-local and
+                # cli-docker instead of requiring a worker restart.
                 logger.info(
-                    "agent %s: refresh_host_sync delegated to Codex adapter",
+                    "agent %s: refresh_host_sync for Codex is deferred until "
+                    "the worker restarts",
                     agent_id,
                 )
             else:

@@ -232,6 +232,7 @@ class CodexSession:
         self.argv = argv
         self.cwd = cwd
         self.thread_cwd = thread_cwd
+        self._effective_thread_cwd = thread_cwd or cwd
         self.env = env
         # ``bypassPermissions`` auto-approves every approval request.
         # The plan's v1 stance — other modes are deferred until the
@@ -264,15 +265,15 @@ class CodexSession:
                     self.agent_id, persisted_sandbox, self.sandbox,
                 )
                 self._conversation_id = ""
-            elif self.thread_cwd is not None:
+            elif self._effective_thread_cwd is not None:
                 persisted_thread_cwd = self._load_persisted_thread_cwd()
-                if persisted_thread_cwd != self.thread_cwd:
+                if persisted_thread_cwd != self._effective_thread_cwd:
                     logger.info(
-                        "agent %s: codex thread cwd changed (%s 鈫?%s); "
+                        "agent %s: codex thread cwd changed (%s → %s); "
                         "starting a fresh thread",
                         self.agent_id,
                         persisted_thread_cwd or "<unset>",
-                        self.thread_cwd,
+                        self._effective_thread_cwd,
                     )
                     self._conversation_id = ""
         # Latest system prompt; lets reload detect no-ops and respawn re-issue
@@ -624,7 +625,7 @@ class CodexSession:
                 json.dumps({
                     "conversation_id": cid,
                     "sandbox": self.sandbox,
-                    "thread_cwd": self.thread_cwd,
+                    "thread_cwd": self._effective_thread_cwd,
                 }),
                 encoding="utf-8",
             )
@@ -757,7 +758,7 @@ class CodexSession:
         # verified live). Sandbox default stays open: cli-local runs as the
         # operator's UID, the real boundary is cli-docker's container.
         new_conv_params: dict[str, Any] = {
-            "cwd": self.thread_cwd or self.cwd or os.getcwd(),
+            "cwd": self._effective_thread_cwd or os.getcwd(),
             "approvalPolicy": (
                 "never" if self.permission_mode == "bypassPermissions" else "untrusted"
             ),

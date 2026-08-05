@@ -284,6 +284,8 @@ class Daemon:
             try:
                 agent_cfg = self._load_agent_cfg_cached(agent_id)
             except Exception as exc:
+                # TODO: Cache invalid configs by mtime, stop any stale worker,
+                # publish an errored RuntimeState, and support lenient CLI repair.
                 logger.warning("agent %s: failed to load agent.yml: %s", agent_id, exc)
                 continue
 

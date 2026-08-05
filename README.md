@@ -405,8 +405,10 @@ docker_image, permission_mode, max_turns).
 > **codex** (`runtime.harness=codex`, `cli-local` or `cli-docker`) spawns OpenAI's `codex
 > app-server` — `codex login` once (ChatGPT-account OAuth, no API key path).
 >
-> The Docker runtime supports only `claude-code` and `codex`; Gemini and
-> Hermes remain available through their supported non-Docker runtimes.
+> The Docker runtime supports only `claude-code` and `codex`. Hermes remains
+> available through `cli-local`; Gemini CLI is no longer supported as a CLI
+> harness. Google models remain available through `chat-local` and
+> `sdk-local`.
 >
 > **hermes** (`runtime.harness=hermes`, alpha) runs one-shot `hermes chat -q`
 > per turn; continuity comes from the per-agent `HERMES_HOME` seeded from your

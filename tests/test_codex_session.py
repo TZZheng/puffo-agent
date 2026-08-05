@@ -395,7 +395,11 @@ while True:
 def test_resume_existing_conversation(tmp_path):
     fake = _write_fake(tmp_path, RESUME_SCRIPT)
     session_file = tmp_path / "codex_session.json"
-    session_file.write_text(json.dumps({"conversation_id": "conv_42"}))
+    session_file.write_text(json.dumps({
+        "conversation_id": "conv_42",
+        "sandbox": "danger-full-access",
+        "thread_cwd": str(tmp_path),
+    }))
 
     cs = CodexSession(
         agent_id="alice-test-0001",
@@ -1159,6 +1163,27 @@ def test_explicit_thread_cwd_rotates_legacy_persisted_thread(tmp_path):
         session_file=session_file,
         argv=["codex", "app-server"],
         thread_cwd="/workspace",
+    )
+
+    assert cs._conversation_id == ""
+
+
+def test_switch_from_docker_to_local_rotates_persisted_thread(tmp_path):
+    session_file = tmp_path / "codex_session.json"
+    session_file.write_text(
+        json.dumps({
+            "conversation_id": "docker-thread",
+            "sandbox": "danger-full-access",
+            "thread_cwd": "/workspace",
+        }),
+        encoding="utf-8",
+    )
+
+    cs = CodexSession(
+        agent_id="local-codex",
+        session_file=session_file,
+        argv=["codex", "app-server"],
+        cwd=str(tmp_path),
     )
 
     assert cs._conversation_id == ""

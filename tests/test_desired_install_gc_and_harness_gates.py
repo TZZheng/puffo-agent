@@ -426,6 +426,7 @@ async def test_docker_install_desired_passes_skills_and_mcps(
     await adapter._install_desired()
     assert calls["desired_skills"] == ["s1"]
     assert calls["desired_mcps"] == ["m1"]
+    assert calls["containerized"] is True
     # idempotent — a second call is a no-op
     calls.clear()
     await adapter._install_desired()

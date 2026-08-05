@@ -80,6 +80,10 @@ CLAUDE_CODE_NPM_VERSION = "2.1.117"
 # protocol exercised by ``CodexSession``.
 CODEX_NPM_VERSION = "0.145.0"
 
+DOCKER_COMMAND_TIMEOUT_SECONDS = 60.0
+DOCKER_BUILD_TIMEOUT_SECONDS = 900.0
+_PROBE_FALSE_EXIT = 42
+
 # Kept minimal. The claude CLI refuses --dangerously-skip-permissions
 # as root, so we create a non-root ``agent`` user. UID doesn't need
 # to match the host: Docker Desktop's VFS maps bind-mount perms.
@@ -371,6 +375,9 @@ class DockerCLIAdapter(Adapter):
         cmd: list[str] = [getattr(self, "_docker_bin", "docker"), "exec", "-i"]
         # ``env_overrides`` flows in before the container name so
         # docker treats each ``-e KEY=VALUE`` as an exec flag.
+        # SECURITY: values are visible in the process list and in command
+        # errors. Never pass secrets here; use Docker's name-only ``-e NAME``
+        # passthrough, as the Codex bearer-token path does.
         for key, value in (env_overrides or {}).items():
             cmd.extend(["-e", f"{key}={value}"])
         cmd.extend([
@@ -420,7 +427,7 @@ class DockerCLIAdapter(Adapter):
         )
         return []
 
-    async def _puffo_pkg_mount_is_current(self) -> bool:
+    async def _puffo_pkg_mount_is_current(self) -> bool | None:
         """``True`` iff the existing container's
         ``/opt/puffoagent-pkg`` bind mount still resolves to a
         directory containing the ``puffo_agent`` package.
@@ -439,14 +446,15 @@ class DockerCLIAdapter(Adapter):
         rc, _, _ = await _run_cmd(
             [
                 self._docker_bin, "exec", self.container_name,
-                "test", "-f",
-                "/opt/puffoagent-pkg/puffo_agent/__init__.py",
+                "sh", "-c",
+                "test -f /opt/puffoagent-pkg/puffo_agent/__init__.py "
+                f"&& exit 0 || exit {_PROBE_FALSE_EXIT}",
             ],
             check=False,
         )
-        return rc == 0
+        return _probe_result(rc)
 
-    async def _container_harness_is_current(self) -> bool:
+    async def _container_harness_is_current(self) -> bool | None:
         harness = self.harness.name()
         command = "claude" if harness == "claude-code" else "codex"
         checks = [f"command -v {command} >/dev/null"]
@@ -455,27 +463,30 @@ class DockerCLIAdapter(Adapter):
         rc, _, _ = await _run_cmd(
             [
                 self._docker_bin, "exec", self.container_name,
-                "sh", "-c", " && ".join(checks),
+                "sh", "-c",
+                f"if {' && '.join(checks)}; then exit 0; "
+                f"else exit {_PROBE_FALSE_EXIT}; fi",
             ],
             check=False,
         )
-        return rc == 0
+        return _probe_result(rc)
 
-    async def _container_state(self) -> str:
+    async def _container_state(self) -> str | None:
         """Docker-reported container State.Status (``running``,
-        ``exited``, ``paused``, ``created``, ``dead``), or ``""``
-        when the container doesn't exist.
+        ``exited``, ``paused``, ``created``, ``dead``), ``""`` when
+        the container doesn't exist, or ``None`` when Docker could not
+        answer the probe.
         """
         rc, out, _ = await _run_cmd(
             [
-                self._docker_bin, "inspect",
-                "-f", "{{.State.Status}}",
-                self.container_name,
+                self._docker_bin, "container", "ls", "--all",
+                "--filter", f"name=^/{self.container_name}$",
+                "--format", "{{.State}}",
             ],
             check=False,
         )
         if rc != 0:
-            return ""
+            return None
         return out.decode("utf-8", errors="replace").strip()
 
     async def _install_desired(self) -> None:
@@ -496,6 +507,7 @@ class DockerCLIAdapter(Adapter):
             server_url=self.puffo_core_server_url,
             slug=self.puffo_core_slug,
             keys_dir=self.puffo_core_keys_dir,
+            containerized=True,
         )
         if codex_extras:
             self._desired_codex_extras = codex_extras
@@ -657,6 +669,11 @@ class DockerCLIAdapter(Adapter):
             # next turn instead of paying container boot + image
             # pull every restart.
             state = await self._container_state()
+            if state is None:
+                raise RuntimeError(
+                    f"could not inspect Docker container {self.container_name!r}; "
+                    "refusing to create or replace it while Docker is unavailable"
+                )
             existed = state != ""
             if state == "running":
                 logger.info(
@@ -675,10 +692,14 @@ class DockerCLIAdapter(Adapter):
                     self.agent_id, self.container_name,
                 )
                 await _run_cmd([self._docker_bin, "unpause", self.container_name])
-            else:
-                # state == "" — no container with this name.
+            elif state == "":
                 await self._ensure_image()
                 await self._start_container()
+            else:
+                raise RuntimeError(
+                    f"Docker container {self.container_name!r} is in transient "
+                    f"state {state!r}; refusing to replace it"
+                )
 
             layout_marker = self.agent_home_dir / ".docker-layout"
             try:
@@ -694,6 +715,12 @@ class DockerCLIAdapter(Adapter):
             harness_current = (
                 await self._container_harness_is_current() if existed else True
             )
+            if package_current is None or harness_current is None:
+                raise RuntimeError(
+                    f"could not validate existing Docker container "
+                    f"{self.container_name!r}; refusing to remove it after a "
+                    "failed probe"
+                )
             if existed and not (layout_current and package_current and harness_current):
                 logger.warning(
                     "agent %s: recreating stale container %r "
@@ -703,11 +730,16 @@ class DockerCLIAdapter(Adapter):
                 )
                 await _run_cmd(
                     [self._docker_bin, "rm", "-f", self.container_name],
-                    check=False,
                 )
                 await self._ensure_image()
                 await self._start_container()
-            if not await self._container_harness_is_current():
+            final_harness_probe = await self._container_harness_is_current()
+            if final_harness_probe is None:
+                raise RuntimeError(
+                    f"could not verify harness {self.harness.name()!r} in "
+                    f"Docker container {self.container_name!r}"
+                )
+            if not final_harness_probe:
                 raise RuntimeError(
                     f"docker image {self.image!r} does not provide a working "
                     f"{self.harness.name()} harness"
@@ -752,7 +784,12 @@ class DockerCLIAdapter(Adapter):
             stderr=asyncio.subprocess.STDOUT,
             **no_window_kwargs(),
         )
-        stdout, _ = await proc.communicate(DOCKERFILE.encode())
+        stdout, _ = await _communicate_with_timeout(
+            proc,
+            input_data=DOCKERFILE.encode(),
+            timeout_seconds=DOCKER_BUILD_TIMEOUT_SECONDS,
+            operation="docker build",
+        )
         if proc.returncode != 0:
             tail = stdout.decode("utf-8", errors="replace")[-1500:]
             raise RuntimeError(f"docker build failed:\n{tail}")
@@ -842,6 +879,52 @@ class DockerCLIAdapter(Adapter):
 _BUILD_LOCK = asyncio.Lock()
 
 
+def _probe_result(returncode: int) -> bool | None:
+    if returncode == 0:
+        return True
+    if returncode == _PROBE_FALSE_EXIT:
+        return False
+    return None
+
+
+async def _communicate_with_timeout(
+    proc: asyncio.subprocess.Process,
+    *,
+    input_data: bytes | None = None,
+    timeout_seconds: float,
+    operation: str,
+) -> tuple[bytes, bytes]:
+    communicate_task = asyncio.create_task(proc.communicate(input_data))
+    try:
+        return await asyncio.wait_for(
+            asyncio.shield(communicate_task), timeout=timeout_seconds,
+        )
+    except TimeoutError as exc:
+        await _kill_and_reap(proc, communicate_task)
+        raise RuntimeError(
+            f"{operation} timed out after {timeout_seconds:g}s; "
+            "the child process was terminated"
+        ) from exc
+    except asyncio.CancelledError:
+        await _kill_and_reap(proc, communicate_task)
+        raise
+
+
+async def _kill_and_reap(
+    proc: asyncio.subprocess.Process,
+    communicate_task: asyncio.Task[tuple[bytes, bytes]],
+) -> None:
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+    try:
+        await communicate_task
+    except (BrokenPipeError, ConnectionResetError):
+        await proc.wait()
+
+
 async def _image_exists_locally(docker_bin: str, tag: str) -> bool:
     rc, _, _ = await _run_cmd(
         [docker_bin, "image", "inspect", tag], check=False,
@@ -849,7 +932,12 @@ async def _image_exists_locally(docker_bin: str, tag: str) -> bool:
     return rc == 0
 
 
-async def _run_cmd(cmd: list[str], check: bool = True) -> tuple[int, bytes, bytes]:
+async def _run_cmd(
+    cmd: list[str],
+    check: bool = True,
+    *,
+    timeout_seconds: float = DOCKER_COMMAND_TIMEOUT_SECONDS,
+) -> tuple[int, bytes, bytes]:
     from ..._proc import no_window_kwargs
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -857,7 +945,11 @@ async def _run_cmd(cmd: list[str], check: bool = True) -> tuple[int, bytes, byte
         stderr=asyncio.subprocess.PIPE,
         **no_window_kwargs(),
     )
-    stdout, stderr = await proc.communicate()
+    stdout, stderr = await _communicate_with_timeout(
+        proc,
+        timeout_seconds=timeout_seconds,
+        operation=" ".join(cmd[:2]),
+    )
     if check and proc.returncode != 0:
         raise RuntimeError(
             f"command failed ({proc.returncode}): {' '.join(cmd)}\n"
