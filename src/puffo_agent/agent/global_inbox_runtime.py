@@ -1448,17 +1448,20 @@ class GlobalInboxRuntime:
 
         prior_context: list[str] = []
         prior_context_ids: list[str] = []
+        prior_context_has_more = False
         if selected:
             anchors: dict[tuple[str, ...], StoredMessage] = {}
             for item in selected:
                 anchors.setdefault(route_for(item).target, item)
             prior_rows: dict[str, StoredMessage] = {}
             for anchor in anchors.values():
-                for item in await self.store.get_prior_context(
+                prior_page = await self.store.get_prior_context_page(
                     anchor,
                     limit=PRIOR_CONTEXT_MAX_ITEMS,
                     max_bytes=PRIOR_CONTEXT_MAX_BYTES,
-                ):
+                )
+                prior_context_has_more = prior_context_has_more or prior_page.has_more
+                for item in prior_page.items:
                     prior_rows.setdefault(item.envelope_id, item)
             prior_byte_count = 0
             for item in sorted(prior_rows.values(), key=self.store._inbox_order):
@@ -1468,6 +1471,7 @@ class GlobalInboxRuntime:
                     len(prior_context) >= PRIOR_CONTEXT_MAX_ITEMS
                     or prior_byte_count + block_bytes > PRIOR_CONTEXT_MAX_BYTES
                 ):
+                    prior_context_has_more = True
                     continue
                 prior_context.append(block)
                 prior_context_ids.append(item.envelope_id)
@@ -1601,6 +1605,7 @@ class GlobalInboxRuntime:
             "context_version": CONTEXT_VERSION,
             "messages": blocks,
             "prior_context": prior_context,
+            "prior_context_has_more": prior_context_has_more,
             "next_cursor": next_cursor,
             "has_more": has_more,
             "remaining_count": remaining_count,

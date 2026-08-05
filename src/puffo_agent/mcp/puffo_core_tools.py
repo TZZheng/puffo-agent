@@ -625,7 +625,8 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
         target is an optional canonical target; cursor is the opaque next
         cursor; limit is 1..50. Results contain ``messages``, bounded
-        read-only ``prior_context``, ``next_cursor``, and ``has_more``.
+        read-only ``prior_context``, ``prior_context_has_more``,
+        ``next_cursor``, and ``has_more``.
         See the managed ``read-inbox`` skill for interpretation and paging.
         """
         arguments: dict[str, Any] = {}

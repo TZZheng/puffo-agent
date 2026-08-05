@@ -304,6 +304,12 @@ class InboxPage:
 
 
 @dataclass(frozen=True)
+class PriorContextPage:
+    items: tuple["StoredMessage", ...]
+    has_more: bool
+
+
+@dataclass(frozen=True)
 class TurnRun:
     turn_id: str
     provider_session_id: str | None
@@ -2612,6 +2618,22 @@ class MessageStore:
         limit: int = PRIOR_CONTEXT_MAX_ITEMS,
         max_bytes: int = PRIOR_CONTEXT_MAX_BYTES,
     ) -> tuple[StoredMessage, ...]:
+        """Return only the bounded rows for compatibility with direct callers."""
+        return (
+            await self.get_prior_context_page(
+                anchor,
+                limit=limit,
+                max_bytes=max_bytes,
+            )
+        ).items
+
+    async def get_prior_context_page(
+        self,
+        anchor: StoredMessage,
+        *,
+        limit: int = PRIOR_CONTEXT_MAX_ITEMS,
+        max_bytes: int = PRIOR_CONTEXT_MAX_BYTES,
+    ) -> PriorContextPage:
         """Return a bounded, read-only slice before an Inbox page anchor.
 
         The route is derived from the durable row itself.  Only rows already
@@ -2628,8 +2650,6 @@ class MessageStore:
             raise ValueError("max_bytes must be non-negative")
         limit = min(limit, PRIOR_CONTEXT_MAX_ITEMS)
         max_bytes = min(max_bytes, PRIOR_CONTEXT_MAX_BYTES)
-        if not limit or not max_bytes:
-            return ()
 
         position = self._inbox_order(anchor)
         order_sql = (
@@ -2683,7 +2703,7 @@ class MessageStore:
                 + f" ORDER BY {', '.join(expression + ' DESC' for expression in order_sql)}"
                 + " LIMIT ?"
             )
-            params.append(limit)
+            params.append(limit + 1)
             async with db.execute(sql, tuple(params)) as cursor:
                 rows = await cursor.fetchall()
 
@@ -2694,14 +2714,20 @@ class MessageStore:
             # bound before exposing the result.
             selected_rows: list[aiosqlite.Row] = []
             used_bytes = 0
+            has_more = False
             for row in rows:
+                if len(selected_rows) >= limit:
+                    has_more = True
+                    continue
                 body_bytes = len(str(row["content"]).encode("utf-8"))
                 if used_bytes + body_bytes > max_bytes:
+                    has_more = True
                     continue
                 selected_rows.append(row)
                 used_bytes += body_bytes
-            return tuple(
-                self._row_to_msg(row) for row in reversed(selected_rows)
+            return PriorContextPage(
+                tuple(self._row_to_msg(row) for row in reversed(selected_rows)),
+                has_more,
             )
 
     async def get_channel_pending(

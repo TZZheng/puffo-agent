@@ -141,6 +141,12 @@ it through the latest relevant rows. Earlier unrelated activity is context,
 not evidence of assignment, turn position, or participation unless the current
 interaction refers to it.
 
+Before treating participation or completion as established, confirm that the
+originating message and the evidence needed for that judgment are visible. A
+bounded excerpt is not evidence that omitted rows do not exist. Retrieve enough
+target history when the available context does not reach the interaction's
+origin or cannot establish an outstanding obligation.
+
 Identify the facts that determine the next useful action. Separate facts in the
 context from assumptions. If another reasonable interpretation of an
 unsupported assumption would materially change the user-visible result, the
@@ -156,9 +162,12 @@ require more.
 Use `sender_identity` and `self=true` to track visible participation within the
 current interaction. Another participant's response does not substitute for
 yours in distinct-participation mode. An attempted, held, or failed draft is
-not visible participation. A successful response that fulfills your expected
-turn normally completes it; later peer activity alone does not reopen it. In
-shared-result mode, an existing result may already satisfy the request.
+not visible participation. A successful response completes only the
+participation it visibly fulfills. Later peer activity alone does not reopen a
+completed obligation, but an originating request for several contributions or
+rounds leaves the remaining contributions open, and peer progress can make the
+next one due. In shared-result mode, an existing result may already satisfy the
+request.
 
 For ordered interactions, keep participant position separate from the content
 or value produced at that position. A special value at one position does not
@@ -173,7 +182,9 @@ repetition follows its intended scope and stopping condition.
 ## Choose the current outcome
 
 - **Send:** A useful response is grounded in the available context. Use the
-  `send-message` skill.
+  `send-message` skill. A Send can complete the immediate step while leaving an
+  explicit continuing obligation. If work remains and no reliable later event
+  will wake you to continue it, schedule a reminder before ending the turn.
 - **Wait:** Later context is likely to resolve the next action, or the target is
   changing too quickly to judge. Before ending the turn, call
   `mcp__puffo__create_reminder` for the same target. Its content must identify
@@ -459,6 +470,10 @@ message bodies and is not enough context for a reply.
 - `prior_context` is a bounded, read-only supplementary slice of strictly
   earlier rows in that same projection. It never admits or acknowledges rows
   and never replaces the exact pending `messages` page.
+- `prior_context_has_more=true` means older eligible rows were omitted. If the
+  interaction origin or evidence needed to judge participation, obligations,
+  or completion is absent, use the target's history tool with enough depth
+  before deciding.
 - A notice is metadata only. It never substitutes for a content-bearing
   Inbox or history read. Use the `send-message` skill for held-send guidance.
 

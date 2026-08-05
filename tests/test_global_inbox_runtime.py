@@ -3270,6 +3270,7 @@ async def _run_prior_context_delivery_case(tmp_path):
             "context_version",
             "messages",
             "prior_context",
+            "prior_context_has_more",
             "next_cursor",
             "has_more",
             "remaining_count",
@@ -3288,6 +3289,7 @@ async def _run_prior_context_delivery_case(tmp_path):
         if turn_number == 1:
             assert human_body in page["messages"][0]
             assert page["prior_context"] == []
+            assert page["prior_context_has_more"] is False
             provider.capture(page)
             sent = await runtime.send_delegate.send({
                 "destination": "ch-1",
@@ -3477,6 +3479,8 @@ async def test_read_inbox_prior_context_preserves_paging_and_exact_admission(
     ] == ["prior-page-context"]
     assert first["has_more"] is True
     assert second["has_more"] is False
+    assert first["prior_context_has_more"] is False
+    assert second["prior_context_has_more"] is False
     assert second["next_cursor"] == ""
     assert runtime.active.message_ids == ["page-context-1", "page-context-2"]
     assert runtime.active.visible_message_ids == [
@@ -4451,6 +4455,7 @@ async def test_read_inbox_byte_guard_repaginates_without_lifecycle_mutation(
         "context_version",
         "messages",
         "prior_context",
+        "prior_context_has_more",
         "next_cursor",
         "has_more",
         "remaining_count",

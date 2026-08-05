@@ -427,7 +427,10 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
     }]
 
     description = " ".join(tools["read_inbox"].description.lower().split())
-    for phrase in ("target", "cursor", "limit", "messages", "prior_context", "next_cursor", "has_more"):
+    for phrase in (
+        "target", "cursor", "limit", "messages", "prior_context",
+        "prior_context_has_more", "next_cursor", "has_more",
+    ):
         assert phrase.lower() in description, (phrase, description)
     for forbidden in ("same originating assignment", "send-anyway", "held", "benchmark", "assignment-completion"):
         assert forbidden not in description

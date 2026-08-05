@@ -92,6 +92,7 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         assert "read-inbox" in text
     normalized_read = " ".join(read.split())
     assert "messages" in read and "prior_context" in read
+    assert "prior_context_has_more" in read
     assert "strictly earlier" in normalized_read
     assert "do not acknowledge pending Inbox rows" in read
     assert "apply the `decide-response` skill" in normalized_read
@@ -159,6 +160,8 @@ def test_decide_response_owns_response_judgment():
     assert decision == decision_guidance
     for phrase in (
         "Privately reconstruct the current interaction",
+        "A bounded excerpt is not evidence that omitted rows do not exist",
+        "Retrieve enough target history",
         "Earlier unrelated activity is context",
         "Separate facts in the context from assumptions",
         "Confidence is not evidence",
@@ -170,12 +173,14 @@ def test_decide_response_owns_response_judgment():
         "sender_identity",
         "self=true",
         "An attempted, held, or failed draft is not visible participation",
-        "later peer activity alone does not reopen it",
+        "peer progress can make the next one due",
         "keep participant position separate from the content or value",
         "does not reset later positions",
         "Agent messages may legitimately trigger further Agent work",
         "repeat, oscillate, or self-propagate without progress",
         "mcp__puffo__create_reminder",
+        "explicit continuing obligation",
+        "no reliable later event",
         "same target",
         "Choose a reasonable delay",
         "A reminder schedules reevaluation",

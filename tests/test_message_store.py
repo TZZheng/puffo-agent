@@ -1642,9 +1642,15 @@ async def test_prior_context_is_bounded_ordered_and_lifecycle_filtered(tmp_path)
         or item.receipt_disposition is ReceiptDisposition.TERMINAL
         for item in context
     )
+    complete_page = await store.get_prior_context_page(anchor)
+    assert complete_page.items == context
+    assert complete_page.has_more is False
 
     limited = await store.get_prior_context(anchor, limit=1)
     assert [item.envelope_id for item in limited] == ["prior-self-echo"]
+    limited_page = await store.get_prior_context_page(anchor, limit=1)
+    assert limited_page.items == limited
+    assert limited_page.has_more is True
     bounded = await store.get_prior_context(
         anchor, limit=20, max_bytes=len("agent contribution")
     )
@@ -1652,6 +1658,11 @@ async def test_prior_context_is_bounded_ordered_and_lifecycle_filtered(tmp_path)
     assert sum(len(str(item.content).encode("utf-8")) for item in bounded) <= len(
         "agent contribution"
     )
+    bounded_page = await store.get_prior_context_page(
+        anchor, limit=20, max_bytes=len("agent contribution")
+    )
+    assert bounded_page.items == bounded
+    assert bounded_page.has_more is True
 
     in_turn = await store.get_message_by_envelope("prior-in-turn")
     future = await store.get_message_by_envelope("prior-future")
