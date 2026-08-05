@@ -526,12 +526,16 @@ could coordinate with via the shared filesystem.
 **Arguments:**
 - `channel` (required) — channel id (`ch_<uuid>`).
 
-**Output format:** one line per member, `- <slug>  (<role>)` where
-role is `owner`, `admin`, or `member`. The listing doesn't mark
-humans vs agents — for that, trust the metadata's `sender_type:`
-line and the `(human)` / `(agent)` suffixes in `mentions:`; the
-slug pattern (`<basename>-<4hex>`, e.g. `puffotest-19b1`) is only
-a heuristic.
+**Output format:** one line per member with these fields:
+- `slug` — the member's unique Puffo identity.
+- `role` — `owner`, `admin`, or `member`.
+- `identity_type` — `human` or `agent` (`unknown` only when an older
+  server omits the field).
+- `owner_slug` — the human account that owns an agent identity, or
+  `null` when the identity has no owner.
+
+Use `identity_type`, not the slug's shape, to distinguish humans from
+agents. Use `slug`, not display name, as the unique identity.
 
 **When to use:**
 - A human asks "who's in this channel?"

@@ -1709,8 +1709,18 @@ async def test_list_channel_members():
     await ms.mark_channel_space("ch_abc", "sp_test")
     http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
         "members": [
-            {"slug": "alice-0001", "role": "owner"},
-            {"slug": "agent-0001", "role": "member"},
+            {
+                "slug": "alice-0001",
+                "role": "owner",
+                "identity_type": "human",
+                "owner_slug": None,
+            },
+            {
+                "slug": "agent-0001",
+                "role": "member",
+                "identity_type": "agent",
+                "owner_slug": "alice-0001",
+            },
         ]
     }
     mcp = _build_tools(cfg)
@@ -1720,6 +1730,8 @@ async def test_list_channel_members():
     # Roles render as ``(owner)`` / ``(member)``.
     assert "(owner)" in result
     assert "(member)" in result
+    assert 'identity_type="human" owner_slug=null' in result
+    assert 'identity_type="agent" owner_slug="alice-0001"' in result
 
 
 @pytest.mark.asyncio
@@ -2941,14 +2953,26 @@ async def test_keyless_list_channel_members_uses_private_channel_roster():
     await ms.mark_channel_space("ch_abc", "sp_test")
     http.responses["/v2/cloud-agents/spaces/sp_test/channels/ch_abc/members"] = {
         "members": [
-            {"slug": "alice-0001", "role": "owner"},
-            {"slug": "agent-0001", "role": "member"},
+            {
+                "slug": "alice-0001",
+                "role": "owner",
+                "identity_type": "human",
+                "owner_slug": None,
+            },
+            {
+                "slug": "agent-0001",
+                "role": "member",
+                "identity_type": "agent",
+                "owner_slug": "alice-0001",
+            },
         ],
     }
     mcp = _build_tools(cfg)
     result = await _call(mcp, "list_channel_members", {"channel": "ch_abc"})
     assert "alice-0001" in result and "(owner)" in result
     assert "agent-0001" in result and "(member)" in result
+    assert 'identity_type="human" owner_slug=null' in result
+    assert 'identity_type="agent" owner_slug="alice-0001"' in result
     assert (
         "GET_UNSIGNED", "/v2/cloud-agents/spaces/sp_test/channels/ch_abc/members", None,
     ) in http.calls

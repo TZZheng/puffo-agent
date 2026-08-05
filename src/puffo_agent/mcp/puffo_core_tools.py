@@ -1169,8 +1169,11 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
 
     @mcp.tool()
     async def list_channel_members(channel: str) -> str:
-        """List the members of a channel as ``- <slug>  (<role>)``.
-        Role is one of owner / admin / member.
+        """List channel members with role, identity type, and agent owner.
+
+        Each line includes ``slug``, ``role``, ``identity_type``, and
+        ``owner_slug``. ``owner_slug`` is null when the identity has no
+        owning human account.
         """
         channel_ref = channel.strip()
         if channel_ref.startswith("#"):
@@ -1185,15 +1188,20 @@ def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
         # for any channel not in the agent's home space.
         space_id = await _resolve_channel_space(cfg, channel_id)
 
-        # Keyless degrades to the space roster (no keyless channel-members
-        # route exists); native reads the channel-scoped members. See
+        # Both transports read the exact channel-scoped roster. See
         # ``_read_channel_members``.
         data = await _read_channel_members(cfg, space_id, channel_id)
         rows = []
         for m in data.get("members", []):
             slug = m.get("slug", "?")
             role = m.get("role") or "member"
-            rows.append(f"- {slug}  ({role})")
+            identity_type = m.get("identity_type") or "unknown"
+            owner_slug = m.get("owner_slug") or None
+            rows.append(
+                f"- {slug}  ({role}) "
+                f"identity_type={json.dumps(identity_type)} "
+                f"owner_slug={json.dumps(owner_slug)}"
+            )
         return "\n".join(rows) or "(empty channel)"
 
     @mcp.tool()
