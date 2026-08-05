@@ -1019,21 +1019,15 @@ class RuntimeConfig:
     docker_memory_limit: str = ""
     docker_memory_reservation: str = ""
     # cli-local Claude Code permission mode. Only ``bypassPermissions``
-    # is supported today; see LocalCLIAdapter._sanitise_permission_mode.
+    # is supported by the local Driver runtime today.
     permission_mode: str = "bypassPermissions"
     # codex (cli-local) sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
-    # Agent engine (CLI kinds only):
-    #   - ``claude-code``: ``claude`` CLI with our stream-json session
-    #     protocol, --resume, --model, and the puffo MCP tool suite.
-    #   - ``hermes``: ``hermes chat -q`` one-shot per turn against
-    #     Anthropic, using Claude Code's credential store.
-    #   - ``gemini-cli``: declared, not yet implemented.
-    # Hermes + anthropic billing note: third-party OAuth clients route
-    # to Anthropic's ``extra_usage`` pool, NOT a Claude subscription.
-    # Same token, different ledger.
-    harness: str = "claude-code"  # claude-code | hermes
+    # Agent engine (CLI kinds only). cli-local supports the long-lived
+    # ``claude-code`` and ``codex`` Drivers; cli-docker additionally keeps
+    # the declarative ``hermes`` and ``gemini-cli`` harnesses.
+    harness: str = "claude-code"
     # sdk only: cap on agentic-loop iterations per turn. 10 is fine
     # for short Q&A; multi-step work often needs 30-50. CLI kinds use
     # the separate wall-time limit below instead of this iteration cap.
@@ -1081,7 +1075,12 @@ class AgentConfig:
 
     @classmethod
     def load(cls, agent_id: str) -> "AgentConfig":
-        from .runtime_matrix import migrate_legacy_kind, validate_triple
+        from .runtime_matrix import (
+            migrate_legacy_kind,
+            resolve_effective_harness,
+            resolve_effective_provider,
+            validate_triple,
+        )
 
         path = agent_yml_path(agent_id)
         with path.open("r", encoding="utf-8") as f:
@@ -1102,17 +1101,6 @@ class AgentConfig:
             raise RuntimeError(
                 f"agent {agent_id!r}: runtime.inference_level must be a string"
             )
-        if inference_level:
-            from ..mcp.config import supported_inference_levels
-
-            levels = supported_inference_levels(harness)
-            if inference_level not in levels:
-                raise RuntimeError(
-                    f"agent {agent_id!r}: inference_level={inference_level!r} "
-                    f"is not supported by harness={harness!r}; expected one "
-                    f"of {list(levels)}"
-                )
-
         # Fail fast on invalid triples (e.g. gemini-cli + anthropic,
         # or reserved kind=cli-sandbox).
         result = validate_triple(kind, provider, harness)
@@ -1120,6 +1108,20 @@ class AgentConfig:
             raise RuntimeError(
                 f"agent {agent_id!r}: invalid runtime config — {result.error}"
             )
+        effective_provider = resolve_effective_provider(kind, provider)
+        effective_harness = resolve_effective_harness(
+            kind, effective_provider, harness
+        )
+        if inference_level:
+            from ..mcp.config import supported_inference_levels
+
+            levels = supported_inference_levels(effective_harness)
+            if inference_level not in levels:
+                raise RuntimeError(
+                    f"agent {agent_id!r}: inference_level={inference_level!r} "
+                    f"is not supported by harness={effective_harness!r}; "
+                    f"expected one of {list(levels)}"
+                )
 
         # Transport validation (T23). Absent key ⇒ native ⇒ identical
         # to pre-transport configs; bridge requires its credential pair.

@@ -70,9 +70,8 @@ def _rebuild_managed_system_prompt(
     role_short: str = "",
 ) -> str:
     """Dispatch wrapper: write the right system-prompt file(s) for the
-    agent's harness. Codex agents get ``$CODEX_HOME/AGENTS.md``; every
-    other harness goes through the legacy claude-code path (which also
-    writes GEMINI.md for the gemini-cli harness sharing the same body).
+    agent's harness. Codex agents get ``$CODEX_HOME/AGENTS.md``; other
+    harnesses use the shared Claude/Gemini prompt-file builder.
     Returns the assembled prompt body either way. The identity fields
     feed the managed ``memory/briefing/profile.md`` re-sync inside the
     rebuild.
@@ -173,7 +172,15 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             )
         from ..agent.adapters.docker_cli import DockerCLIAdapter
         from ..agent.harness import build_harness
-        harness = build_harness(agent_cfg.runtime.harness)
+        effective_provider = resolve_effective_provider(
+            kind, getattr(agent_cfg.runtime, "provider", "")
+        )
+        effective_harness = resolve_effective_harness(
+            kind,
+            effective_provider,
+            getattr(agent_cfg.runtime, "harness", ""),
+        )
+        harness = build_harness(effective_harness)
         # gemini-cli needs GEMINI_API_KEY per docker exec; claude-code
         # and hermes use the bind-mounted credentials file.
         google_key = ""
@@ -235,7 +242,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 data_service_url=f"http://host.docker.internal:{daemon_cfg.data_service.port}",
                 rpc_url=f"http://host.docker.internal:{daemon_cfg.rpc_service.port}",
                 runtime_kind="cli-docker",
-                harness=agent_cfg.runtime.harness,
+                harness=harness.name(),
                 # MCP runs in-container; the agent dir is bind-mounted
                 # at /home/agent/.puffo-agent-state (docker_cli also
                 # pins this at its env-override sites).
@@ -249,259 +256,15 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
         return adapter
 
     if kind == "cli-local":
-        from ..agent.adapters.local_cli import LocalCLIAdapter
-        # The legacy permission-proxy DM flow has not been ported to
-        # puffo-core; the hook fail-opens when PUFFO_OPERATOR_USERNAME
-        # is unset, so cli-local works without supervised approvals.
-        operator = ""
-        from ..agent.harness import build_harness
-        harness = build_harness(agent_cfg.runtime.harness)
-        if harness.name() == "codex":
-            model = agent_cfg.runtime.model or daemon_cfg.openai.model or ""
-        else:
-            model = agent_cfg.runtime.model or daemon_cfg.anthropic.model or ""
-        adapter = LocalCLIAdapter(
-            agent_id=agent_cfg.id,
-            model=model,
-            workspace_dir=str(agent_cfg.resolve_workspace_dir()),
-            claude_dir=str(agent_cfg.resolve_claude_dir()),
-            session_file=str(cli_session_json_path(agent_cfg.id)),
-            mcp_config_file=str(agent_dir(agent_cfg.id) / "mcp-config.json"),
-            agent_home_dir=str(agent_home_dir(agent_cfg.id)),
-            owner_username=operator,
-            permission_mode=agent_cfg.runtime.permission_mode,
-            sandbox=agent_cfg.runtime.sandbox,
-            inference_level=getattr(agent_cfg.runtime, "inference_level", ""),
-            task_timeout_seconds=getattr(
-                agent_cfg.runtime,
-                "task_timeout_seconds",
-                600.0,
-            ),
-            harness=harness,
-            desired_skills=agent_cfg.desired_skills,
-            desired_mcps=agent_cfg.desired_mcps,
-            puffo_core_server_url=agent_cfg.puffo_core.server_url,
-            puffo_core_slug=agent_cfg.puffo_core.slug,
-            puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
-            # Empty base URL → no env override (claude keeps its OAuth /
-            # ~/.claude credential path). Set → ANTHROPIC_BASE_URL routes
-            # the CLI's model calls through the proxy; the VK rides on
-            # runtime.api_key (injected as ANTHROPIC_API_KEY only when
-            # the base URL is also set — see LocalCLIAdapter._llm_env).
-            llm_base_url=agent_cfg.runtime.llm_base_url,
-            llm_api_key=agent_cfg.runtime.api_key,
+        raise RuntimeError(
+            "cli-local is constructed by Worker through the Driver runtime; "
+            "build_adapter only constructs non-Driver adapters"
         )
-        if agent_cfg.puffo_core.is_configured():
-            from ..mcp.config import puffo_core_mcp_env
-            pc = agent_cfg.puffo_core
-            adapter.puffo_core_mcp_env = puffo_core_mcp_env(
-                slug=pc.slug,
-                device_id=pc.device_id,
-                server_url=pc.server_url,
-                space_id=pc.space_id,
-                keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
-                workspace=str(agent_cfg.resolve_workspace_dir()),
-                agent_id=agent_cfg.id,
-                data_service_url=f"http://127.0.0.1:{daemon_cfg.data_service.port}",
-                rpc_url=f"http://127.0.0.1:{daemon_cfg.rpc_service.port}",
-                runtime_kind="cli-local",
-                harness=agent_cfg.runtime.harness,
-                memory_dir=str(agent_cfg.resolve_memory_dir()),
-                # T23 phase-2: forward the transport so a keyless
-                # ``bridge`` agent's subprocess MCP sets keyless=True
-                # (unsigned /v2/cloud-agents/* path) instead of hitting
-                # the signed keystore path and raising identity-not-found.
-                # Only "bridge" is emitted downstream; native is inert.
-                transport=pc.transport,
-            )
-        return adapter
 
     raise RuntimeError(
         f"agent {agent_cfg.id!r}: unknown runtime kind {kind!r} "
         "(valid: chat-local, sdk-local, cli-docker, cli-local)"
     )
-
-
-async def _promote_supported_local_driver(
-    adapter: Adapter,
-    agent_cfg: AgentConfig,
-    *,
-    system_prompt: str,
-    outbox,
-    logical_session_ref: str,
-) -> Adapter:
-    """Replace a prepared supported local CLI Adapter with its Driver facade.
-
-    ``build_adapter`` intentionally remains the compatibility/configuration
-    entrypoint.  The Worker calls this only after the legacy adapter has
-    installed desired assets and written provider/MCP configuration, and
-    before the global Inbox runtime can plan work.
-    """
-    from ..agent.adapters.local_cli import LocalCLIAdapter
-    from ..agent.harness import UnsupportedDriver, build_driver
-    from ..agent.harness.driver import HarnessEvent, RuntimeSpec, SessionRef, TurnRef
-    from ..agent.harness.runtime_manager import (
-        RuntimeManager,
-        RuntimeManagerAdapter,
-    )
-    from ..agent.runtime_event_outbox import RuntimeEventProjectingSink
-    from ..agent.runtime_events import RuntimeEventProjector, TrustedScope
-
-    harness_name = (agent_cfg.runtime.harness or "claude-code").strip()
-    if (
-        not isinstance(adapter, LocalCLIAdapter)
-        or harness_name not in {"codex", "claude-code"}
-    ):
-        return adapter
-
-    # Preserve the mature legacy setup boundary (credentials, desired assets,
-    # MCP config, per-Agent HOME, binary resolution) without retaining
-    # protocol ownership.
-    adapter._verify()
-    await adapter._install_desired()
-    if harness_name == "codex":
-        prepared = adapter._ensure_codex_session()
-        executable = prepared.argv[0]
-        launch_args = tuple(prepared.argv[1:-1])
-        environment = dict(prepared.env or {})
-        native_session_id = (
-            outbox.state().get("native_session_id")
-            or prepared.get_provider_session_id()
-            or ""
-        )
-        model = adapter.model
-    else:
-        prepared = adapter._ensure_session()
-        argv = prepared.build_command(prepared.extra_args, {})
-        executable = argv[0]
-        launch_args = tuple(argv[1:])
-        environment = dict(prepared.env or {})
-        native_session_id = (
-            outbox.state().get("native_session_id")
-            or prepared.get_provider_session_id()
-            or ""
-        )
-        # The prepared Claude argv already contains any model override.
-        model = ""
-
-    driver = build_driver(harness_name)
-    if isinstance(driver, UnsupportedDriver):
-        return adapter
-
-    projector = RuntimeEventProjector(
-        agent_id=agent_cfg.id,
-        session_ref=logical_session_ref,
-        scope=TrustedScope(),
-    )
-    projecting_sink = RuntimeEventProjectingSink(outbox, projector)
-    manager: RuntimeManager
-
-    def require_initial_capacity() -> None:
-        """Reserve the canonical start/activity pair without consuming IDs."""
-        sizing_projector = RuntimeEventProjector(
-            agent_id=agent_cfg.id,
-            session_ref=projector.session_ref,
-            scope=projector.scope,
-        )
-        sizing_start = HarnessEvent(
-            type="turn.started",
-            driver=harness_name,
-            session_ref=SessionRef(projector.session_ref),
-            turn_ref=TurnRef(f"turn_{'f' * 32}"),
-            # HarnessEvent normally emits this shape when microseconds exist.
-            occurred_at="9999-12-31T23:59:59.999999+00:00",
-        )
-        estimated_start_bytes = sum(
-            len(outbox.canonical_bytes(value))
-            for value in sizing_projector.project_all(sizing_start)
-        )
-        outbox.require_turn_capacity(
-            estimated_start_bytes=estimated_start_bytes
-        )
-
-    async def persist_event(event) -> None:
-        logical_session = str(event.session_ref or manager.session_ref)
-        projector.session_ref = logical_session
-        await projecting_sink(event)
-        event_type = getattr(event.type, "value", event.type)
-        if event_type == "turn.started":
-            outbox.set_active_turn(
-                str(event.turn_ref),
-                session_ref=logical_session,
-                native_session_id=manager.native_session_id,
-            )
-        elif event_type in {"turn.completed", "turn.abandoned"}:
-            outbox.set_active_turn(
-                None,
-                session_ref=logical_session,
-                native_session_id=manager.native_session_id,
-            )
-        elif event_type in {"session.opened", "session.resumed"}:
-            outbox.set_active_turn(
-                outbox.state().get("active_turn_ref") or None,
-                session_ref=logical_session,
-                native_session_id=manager.native_session_id,
-            )
-
-    manager = RuntimeManager(
-        driver,
-        RuntimeSpec(
-            workspace_dir=adapter.workspace_dir,
-            model=model,
-            system_prompt=system_prompt,
-            executable=executable,
-            launch_args=launch_args,
-            environment=environment,
-            permission_mode=adapter.permission_mode,
-            sandbox=adapter.sandbox,
-            task_timeout_seconds=adapter.task_timeout_seconds,
-        ),
-        agent_id=agent_cfg.id,
-        session_ref=SessionRef(logical_session_ref),
-        native_session_id=native_session_id,
-        driver_name=harness_name,
-        event_sink=persist_event,
-        before_start=require_initial_capacity,
-    )
-    facade = RuntimeManagerAdapter(manager)
-    try:
-        await facade.warm(system_prompt)
-        await adapter.aclose()
-    except BaseException:
-        await facade.aclose()
-        raise
-    return facade
-
-
-async def _promote_local_driver_after_warm(
-    adapter: Adapter,
-    agent_cfg: AgentConfig,
-    *,
-    warm_ok: bool,
-    system_prompt: str,
-    outbox,
-    logical_session_ref: str,
-) -> Adapter:
-    """Promote only a healthy prepared adapter; otherwise retain fallback."""
-    if not warm_ok:
-        return adapter
-    try:
-        return await _promote_supported_local_driver(
-            adapter,
-            agent_cfg,
-            system_prompt=system_prompt,
-            outbox=outbox,
-            logical_session_ref=logical_session_ref,
-        )
-    except Exception as exc:
-        logger.warning(
-            "agent %s: driver promotion failed; retaining legacy adapter "
-            "for first-turn retry: %s",
-            agent_cfg.id,
-            exc,
-            exc_info=True,
-        )
-        return adapter
 
 
 def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
@@ -708,7 +471,14 @@ def _build_puffo_core_client(
 
     # The inbound-image downscale cap follows the harness's effective model
     # (Opus 4.7+ resolves 2576px, else 1568px).
-    is_codex = (agent_cfg.runtime.harness or "claude-code") == "codex"
+    runtime_kind = agent_cfg.runtime.kind or "chat-local"
+    effective_provider = resolve_effective_provider(
+        runtime_kind, agent_cfg.runtime.provider
+    )
+    effective_harness = resolve_effective_harness(
+        runtime_kind, effective_provider, agent_cfg.runtime.harness
+    )
+    is_codex = effective_harness == "codex"
     if is_codex:
         model = agent_cfg.runtime.model or (daemon_cfg.openai.model if daemon_cfg else "")
     else:
@@ -1297,7 +1067,16 @@ class Worker:
             return None
         from .host_mcp_handler import HostMcpContext
         from .state import agent_home_dir
-        harness = self.agent_cfg.runtime.harness or "claude-code"
+        runtime = self.agent_cfg.runtime
+        runtime_kind = getattr(runtime, "kind", "") or "cli-local"
+        provider = resolve_effective_provider(
+            runtime_kind, getattr(runtime, "provider", "")
+        )
+        harness = resolve_effective_harness(
+            runtime_kind,
+            provider,
+            getattr(runtime, "harness", ""),
+        )
         return HostMcpContext(
             agent_id=self.agent_cfg.id,
             slug=client.slug,
@@ -1344,27 +1123,32 @@ class Worker:
                 logger.warning(
                     "agent %s: adapter aclose failed: %s", self.agent_cfg.id, exc,
                 )
-        if self._client is not None:
-            # Release WS + SQLite handles. Required on Windows so
-            # ``messages.db*`` is renamable by ``agent archive``.
-            try:
-                await asyncio.wait_for(self._client.stop(), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "agent %s: client.stop timed out after 10s",
-                    self.agent_cfg.id,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "agent %s: client.stop failed: %s", self.agent_cfg.id, exc,
-                )
-            self._client = None
+        await self._close_client()
         self.runtime.status = "stopped"
         self.runtime.save(self.agent_cfg.id)
 
+    async def _close_client(self) -> None:
+        """Release a partially or fully started message client."""
+        if self._client is None:
+            return
+        # Release WS + SQLite handles. Required on Windows so
+        # ``messages.db*`` is renamable by ``agent archive``.
+        try:
+            await asyncio.wait_for(self._client.stop(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "agent %s: client.stop timed out after 10s",
+                self.agent_cfg.id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "agent %s: client.stop failed: %s", self.agent_cfg.id, exc,
+            )
+        self._client = None
+
     def _runtime_info(self) -> dict[str, str]:
         rt = self.agent_cfg.runtime
-        kind = rt.kind or "chat-local"
+        kind = getattr(rt, "kind", "") or "chat-local"
         if kind == RUNTIME_WS_LOCAL:
             return {
                 "kind": kind,
@@ -1372,17 +1156,28 @@ class Worker:
                 "harness": "",
                 "model": "",
             }
-        provider = rt.provider
-        if not provider and kind in (RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER) and rt.harness:
-            supported = HARNESS_PROVIDERS.get(rt.harness, frozenset())
+        provider = getattr(rt, "provider", "")
+        configured_harness = getattr(rt, "harness", "")
+        if (
+            not provider
+            and kind in (RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER)
+            and configured_harness
+        ):
+            supported = HARNESS_PROVIDERS.get(
+                configured_harness, frozenset()
+            )
             if len(supported) == 1:
                 provider = next(iter(supported))
         if not provider and kind == "chat-local":
             provider = self.daemon_cfg.default_provider
         provider = resolve_effective_provider(kind, provider)
-        harness = resolve_effective_harness(kind, provider, rt.harness)
+        harness = resolve_effective_harness(
+            kind, provider, configured_harness
+        )
         provider_cfg = getattr(self.daemon_cfg, provider, None)
-        model = rt.model or getattr(provider_cfg, "model", "")
+        model = getattr(rt, "model", "") or getattr(
+            provider_cfg, "model", ""
+        )
         return {
             "kind": kind,
             "provider": provider,
@@ -1468,8 +1263,11 @@ class Worker:
             await self._run_ws_local()
             return
         agent_id = self.agent_cfg.id
+        effective_harness = self._runtime_info()["harness"]
+        runtime_event_outbox = None
+        runtime_session_ref = ""
+        prepared_local_runtime = None
         try:
-            self._adapter = build_adapter(self.daemon_cfg, self.agent_cfg)
             profile_path = str(self.agent_cfg.resolve_profile_path())
             memory_path = str(self.agent_cfg.resolve_memory_dir())
             workspace_path = str(self.agent_cfg.resolve_workspace_dir())
@@ -1482,7 +1280,7 @@ class Worker:
             # get the same string as system_prompt.
             shared_path = docker_shared_dir()
             claude_md = _rebuild_managed_system_prompt(
-                harness_name=(self.agent_cfg.runtime.harness or "").strip(),
+                harness_name=effective_harness,
                 agent_id=agent_id,
                 shared_path=shared_path,
                 profile_path=profile_path,
@@ -1510,6 +1308,58 @@ class Worker:
                         agent_id, old_managed, exc,
                     )
 
+            if not self.agent_cfg.puffo_core.is_configured():
+                raise RuntimeError(
+                    f"agent {agent_id!r}: puffo_core block in agent.yml "
+                    "is incomplete. Required fields: server_url, slug, "
+                    "device_id, space_id."
+                )
+
+            if self.agent_cfg.runtime.kind == RUNTIME_CLI_LOCAL:
+                from ..agent.harness.local_runtime import (
+                    LocalRuntimePreparer,
+                    build_local_runtime_adapter,
+                )
+                from ..agent.runtime_event_outbox import (
+                    RuntimeEventOutbox,
+                    runtime_event_outbox_path,
+                )
+
+                runtime_event_outbox = RuntimeEventOutbox(
+                    runtime_event_outbox_path(agent_dir(agent_id))
+                )
+                persisted_runtime_state = runtime_event_outbox.state()
+                runtime_session_ref = persisted_runtime_state.get(
+                    "session_ref", ""
+                ) or f"session_{uuid.uuid4().hex}"
+                preparer = LocalRuntimePreparer(
+                    self.daemon_cfg,
+                    self.agent_cfg,
+                )
+                prepared_local_runtime = await preparer.prepare(
+                    system_prompt=claude_md,
+                    persisted_native_session_id=persisted_runtime_state.get(
+                        "native_session_id", ""
+                    ),
+                )
+                runtime_event_outbox.set_active_turn(
+                    persisted_runtime_state.get("active_turn_ref") or None,
+                    session_ref=runtime_session_ref,
+                    native_session_id=(
+                        prepared_local_runtime.native_session_id
+                    ),
+                )
+                self._adapter = build_local_runtime_adapter(
+                    prepared_local_runtime,
+                    outbox=runtime_event_outbox,
+                    logical_session_ref=runtime_session_ref,
+                )
+            else:
+                self._adapter = build_adapter(
+                    self.daemon_cfg,
+                    self.agent_cfg,
+                )
+
             puffo = PuffoAgent(
                 adapter=self._adapter,
                 system_prompt=claude_md,
@@ -1519,12 +1369,6 @@ class Worker:
                 agent_id=agent_id,
             )
 
-            if not self.agent_cfg.puffo_core.is_configured():
-                raise RuntimeError(
-                    f"agent {agent_id!r}: puffo_core block in agent.yml "
-                    "is incomplete. Required fields: server_url, slug, "
-                    "device_id, space_id."
-                )
             client = _build_puffo_core_client(
                 self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg,
             )
@@ -1546,49 +1390,63 @@ class Worker:
             self.runtime.save(agent_id)
             # Init crashed before warm() — release the startup gate.
             self._warm_done.set()
+            if self._adapter is not None:
+                try:
+                    await self._adapter.aclose()
+                except Exception:
+                    logger.exception(
+                        "agent %s: failed to close adapter after init error",
+                        agent_id,
+                    )
+                self._adapter = None
+            await self._close_client()
+            if runtime_event_outbox is not None:
+                runtime_event_outbox.close()
             return
 
         # Per-agent refresh_ping retired; daemon-level CredentialRefresher is
         # the single writer of ~/.claude/.credentials.json.
 
-        # Warm the adapter so persisted-session agents re-spawn their
-        # subprocess now rather than on the first DM. Non-fatal.
+        # Driver-backed local runtimes are ready only after their one and only
+        # provider process has opened. Other adapter types retain the older
+        # first-turn retry behavior.
         warm_ok = False
         try:
             await self._adapter.warm(claude_md)
             warm_ok = True
         except Exception as exc:
+            if prepared_local_runtime is not None:
+                logger.error(
+                    "agent %s: local Driver failed to open: %s",
+                    agent_id,
+                    exc,
+                    exc_info=True,
+                )
+                self.runtime.status = "error"
+                self.runtime.error = str(exc)
+                self.runtime.save(agent_id)
+                self._warm_done.set()
+                try:
+                    await self._adapter.aclose()
+                except Exception:
+                    logger.exception(
+                        "agent %s: failed to close Driver after warm error",
+                        agent_id,
+                    )
+                self._adapter = None
+                await self._close_client()
+                if runtime_event_outbox is not None:
+                    runtime_event_outbox.close()
+                return
             logger.warning(
                 "agent %s: warm() failed (will retry on first turn): %s",
-                agent_id, exc,
+                agent_id,
+                exc,
             )
 
-        # Supported local Drivers must be promoted and registered before
-        # ``wait_warm()`` can release callers.  The readiness event is the
-        # daemon's permission to dispatch work, so exposing the warmed legacy
-        # adapter here would race the durable Manager boundary installed
-        # below.
-        runtime_event_outbox = None
-        runtime_session_ref = ""
-        effective_harness = (
-            self.agent_cfg.runtime.harness or "claude-code"
-        ).strip()
-        if (
-            self.agent_cfg.runtime.kind == RUNTIME_CLI_LOCAL
-            and effective_harness in {"codex", "claude-code"}
-        ):
-            from ..agent.runtime_event_outbox import (
-                RuntimeEventOutbox,
-                runtime_event_outbox_path,
-            )
-
-            runtime_event_outbox = RuntimeEventOutbox(
-                runtime_event_outbox_path(agent_dir(agent_id))
-            )
+        if prepared_local_runtime is not None:
+            assert runtime_event_outbox is not None
             persisted_runtime_state = runtime_event_outbox.state()
-            runtime_session_ref = persisted_runtime_state.get(
-                "session_ref", ""
-            ) or f"session_{uuid.uuid4().hex}"
             runtime_event_outbox.set_active_turn(
                 persisted_runtime_state.get("active_turn_ref") or None,
                 session_ref=runtime_session_ref,
@@ -1596,17 +1454,7 @@ class Worker:
                     self._adapter.get_provider_session_id() or ""
                 ),
             )
-            self._adapter = await _promote_local_driver_after_warm(
-                self._adapter,
-                self.agent_cfg,
-                warm_ok=warm_ok,
-                system_prompt=claude_md,
-                outbox=runtime_event_outbox,
-                logical_session_ref=runtime_session_ref,
-            )
-            # PuffoAgent is constructed before the durable runtime boundary;
-            # keep it aligned whether promotion succeeded or fell back.
-            puffo.adapter = self._adapter
+            prepared_local_runtime.finalize_legacy_session_migration()
 
         if warm_ok:
             await self._run_post_warm_gate(agent_id)
@@ -1670,173 +1518,14 @@ class Worker:
                 runtime_event_outbox, append_transport
             )
 
-        class _RuntimeTurnProjection:
-            """Project the Adapter facade's user-visible progress safely.
-
-            Driver-backed adapters ultimately expose the same normalized text
-            stream. Keeping this bridge here lets the existing durable Inbox
-            boundary remain unchanged while public rows still pass through the
-            Runtime Events allowlist/projector.
-            """
-
-            def __init__(self, turn_ref: str):
-                from ..agent.runtime_events import (
-                    DeltaCoalescer,
-                    RuntimeEventProjector,
-                    TrustedScope,
-                )
-
-                self.turn_ref = turn_ref
-                self.projector = RuntimeEventProjector(
-                    agent_id=agent_id,
-                    session_ref=runtime_session_ref,
-                    scope=TrustedScope(),
-                )
-                self.coalescer = DeltaCoalescer()
-                self.saw_text = False
-
-            def _event(self, type_: str, data: dict | None = None):
-                from ..agent.harness.driver import (
-                    HarnessEvent,
-                    SessionRef,
-                    TurnRef,
-                )
-
-                return HarnessEvent(
-                    type=type_,
-                    driver=effective_harness,
-                    session_ref=SessionRef(runtime_session_ref),
-                    turn_ref=TurnRef(self.turn_ref),
-                    data=data or {},
-                )
-
-            async def _persist(self, event) -> None:
-                if runtime_event_outbox is None:
-                    return
-                from ..agent._logging import log_runtime_event
-
-                event_type = getattr(event.type, "value", event.type)
-                log_runtime_event(
-                    logger,
-                    "runtime.normalized_event",
-                    agent_id=agent_id,
-                    session_ref=runtime_session_ref,
-                    turn_ref=self.turn_ref,
-                    event_type=str(event_type),
-                )
-                for projected in self.projector.project_all(event):
-                    log_runtime_event(
-                        logger,
-                        "runtime.projected",
-                        agent_id=agent_id,
-                        session_ref=runtime_session_ref,
-                        turn_ref=self.turn_ref,
-                        event_id=projected.event_id,
-                        event_type=projected.type,
-                    )
-                    await runtime_event_outbox.enqueue(
-                        projected,
-                        terminal=projected.type == "turn.finished",
-                    )
-
-            async def start(self) -> None:
-                await self._persist(self._event("turn.started"))
-
-            async def progress(self, text: str) -> None:
-                if not isinstance(text, str) or not text:
-                    return
-                self.saw_text = True
-                for chunk in self.coalescer.add(text):
-                    await self._persist(self._event(
-                        "turn.assistant_delta",
-                        {"text": chunk, "block_id": "result"},
-                    ))
-
-            async def finish(self, outcome: str, final_text: str = "") -> None:
-                if final_text and not self.saw_text:
-                    await self.progress(final_text)
-                chunks = self.coalescer.flush()
-                for chunk in chunks:
-                    await self._persist(self._event(
-                        "turn.assistant_delta",
-                        {"text": chunk, "block_id": "result"},
-                    ))
-                if self.saw_text:
-                    await self._persist(self._event(
-                        "turn.assistant_completed", {"block_id": "result"}
-                    ))
-                await self._persist(self._event(
-                    "turn.completed", {"outcome": outcome}
-                ))
-
-        async def _runtime_event_start() -> _RuntimeTurnProjection | None:
-            if runtime_event_outbox is None:
-                return None
-            from ..agent.harness.runtime_manager import RuntimeManagerAdapter
-            if isinstance(self._adapter, RuntimeManagerAdapter):
-                # The Manager's normalized-event sink owns projection and
-                # durable lifecycle for Driver-backed turns.
-                return None
-
-            public_turn_ref = f"turn_{uuid.uuid4().hex}"
-            projection = _RuntimeTurnProjection(public_turn_ref)
-            from ..agent.harness.driver import HarnessEvent, SessionRef, TurnRef
-            from ..agent.runtime_events import RuntimeEventProjector, TrustedScope
-
-            sizing_projector = RuntimeEventProjector(
-                agent_id=agent_id,
-                session_ref=runtime_session_ref,
-                scope=TrustedScope(),
-            )
-            sizing_start = HarnessEvent(
-                type="turn.started",
-                driver=effective_harness,
-                session_ref=SessionRef(runtime_session_ref),
-                turn_ref=TurnRef(public_turn_ref),
-                occurred_at="9999-12-31T23:59:59.999999+00:00",
-            )
-            runtime_event_outbox.require_turn_capacity(
-                estimated_start_bytes=sum(
-                    len(runtime_event_outbox.canonical_bytes(value))
-                    for value in sizing_projector.project_all(sizing_start)
-                )
-            )
-            await projection.start()
-            runtime_event_outbox.set_active_turn(
-                public_turn_ref,
-                session_ref=runtime_session_ref,
-                native_session_id=(
-                    self._adapter.get_provider_session_id() or ""
-                ),
-            )
-            return projection
-
-        async def _runtime_event_finish(
-            projection: _RuntimeTurnProjection | None,
-            outcome: str,
-            final_text: str = "",
-        ) -> None:
-            if runtime_event_outbox is None or projection is None:
-                return
-            await projection.finish(outcome, final_text)
-            runtime_event_outbox.set_active_turn(
-                None,
-                session_ref=runtime_session_ref,
-                native_session_id=(
-                    self._adapter.get_provider_session_id() or ""
-                ),
-            )
-
         async def run_global_turn(planned):
-            async def execute_provider_turn(on_progress=None):
+            async def execute_provider_turn():
                 self._turn_active = True
                 try:
                     async with self._reload_lock:
                         await _process_refresh_flags(
                             agent_id=agent_id,
-                            harness_name=(
-                                self.agent_cfg.runtime.harness or ""
-                            ).strip(),
+                            harness_name=effective_harness,
                             shared_path=shared_path,
                             profile_path=profile_path,
                             memory_path=memory_path,
@@ -1866,29 +1555,17 @@ class Worker:
                     Worker._flip_health_in_progress(
                         self.runtime, agent_id, logger
                     )
-                    return await puffo.handle_global_inbox_turn(
-                        planned, on_progress=on_progress
-                    )
+                    return await puffo.handle_global_inbox_turn(planned)
                 finally:
                     self._turn_active = False
 
-            projection = await _runtime_event_start()
             try:
-                reply = await execute_provider_turn(
-                    projection.progress if projection is not None else None
-                )
+                reply = await execute_provider_turn()
             except AgentAPIError as exc:
-                await _runtime_event_finish(projection, "failed")
                 if exc.is_auth:
                     self._enter_auth_failed(agent_id)
                 raise
-            except Exception:
-                await _runtime_event_finish(projection, "failed")
-                raise
             else:
-                await _runtime_event_finish(
-                    projection, "succeeded", reply or ""
-                )
                 Worker._resolve_health_on_success(
                     self.runtime, agent_id, logger
                 )
@@ -1903,31 +1580,17 @@ class Worker:
             )
 
         async def retry_global_turn(planned):
-            projection = await _runtime_event_start()
             self._turn_active = True
             try:
                 try:
-                    reply = await puffo.handle_global_inbox_retry(
-                        planned,
-                        on_progress=(
-                            projection.progress
-                            if projection is not None else None
-                        ),
-                    )
+                    reply = await puffo.handle_global_inbox_retry(planned)
                 finally:
                     self._turn_active = False
             except AgentAPIError as exc:
-                await _runtime_event_finish(projection, "failed")
                 if exc.is_auth:
                     self._enter_auth_failed(agent_id)
                 raise
-            except Exception:
-                await _runtime_event_finish(projection, "failed")
-                raise
             else:
-                await _runtime_event_finish(
-                    projection, "succeeded", reply or ""
-                )
                 Worker._resolve_health_on_success(self.runtime, agent_id, logger)
             if not reply:
                 return
@@ -2049,7 +1712,7 @@ class Worker:
         async def apply_refresh() -> None:
             await _process_refresh_flags(
                 agent_id=agent_id,
-                harness_name=(self.agent_cfg.runtime.harness or "").strip(),
+                harness_name=effective_harness,
                 shared_path=shared_path,
                 profile_path=profile_path,
                 memory_path=memory_path,

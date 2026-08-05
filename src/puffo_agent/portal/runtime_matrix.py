@@ -148,8 +148,9 @@ def validate_triple(
 ) -> ValidationResult:
     """Check a (runtime, provider, harness) triple.
 
-    Empty ``provider`` / ``harness`` mean "use the default" and are
-    accepted; callers resolve defaults separately.
+    Empty ``provider`` / ``harness`` mean "use the default". Validation
+    resolves those defaults so an unsupported inferred combination cannot
+    pass here and fail later during Worker startup.
     """
     if runtime in RESERVED_RUNTIMES:
         return ValidationResult(False, (
@@ -173,13 +174,30 @@ def validate_triple(
         return ValidationResult(True, "")
 
     if not harness:
-        # Empty means "use default" — resolved by caller.
-        return ValidationResult(True, "")
+        harness = resolve_effective_harness(runtime, provider, harness)
 
     if harness not in VALID_HARNESSES:
         return ValidationResult(False, (
             f"unknown harness {harness!r} "
             f"(valid: {', '.join(sorted(VALID_HARNESSES))})"
+        ))
+
+    if runtime == RUNTIME_CLI_LOCAL and harness not in {
+        HARNESS_CLAUDE_CODE,
+        HARNESS_CODEX,
+    }:
+        return ValidationResult(False, (
+            f"runtime {RUNTIME_CLI_LOCAL!r} supports only "
+            f"{HARNESS_CLAUDE_CODE!r} and {HARNESS_CODEX!r}; "
+            f"harness {harness!r} is not implemented by the Driver runtime"
+        ))
+
+    if runtime == RUNTIME_CLI_DOCKER and harness == HARNESS_CODEX:
+        return ValidationResult(False, (
+            f"runtime {RUNTIME_CLI_DOCKER!r} supports only "
+            f"{HARNESS_CLAUDE_CODE!r}, {HARNESS_HERMES!r}, and "
+            f"{HARNESS_GEMINI_CLI!r}; harness {HARNESS_CODEX!r} "
+            "requires the host-local Driver runtime"
         ))
 
     if provider:
@@ -211,6 +229,8 @@ def resolve_effective_harness(runtime: str, provider: str, harness: str) -> str:
     if harness:
         return harness
     provider = resolve_effective_provider(runtime, provider)
+    if runtime == RUNTIME_CLI_LOCAL and provider == PROVIDER_OPENAI:
+        return HARNESS_CODEX
     return DEFAULT_HARNESS_FOR_PROVIDER.get(provider, HARNESS_CLAUDE_CODE)
 
 

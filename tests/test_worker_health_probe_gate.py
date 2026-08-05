@@ -1,7 +1,4 @@
-"""Worker-side reassertion + adapter dispatch — the seams the round-trip
-probe test doesn't cover: ``LocalCli.health_probe`` delegates to a live
-``CodexSession`` (else True), and ``_reassert_auth_failed_after_failed_probe``
-only re-flips the eager-cleared ``ok`` state (no clobber of sticky-red)."""
+"""Worker-side health-gate reassertion and startup ordering."""
 
 from __future__ import annotations
 
@@ -9,37 +6,6 @@ import asyncio
 import logging
 from types import SimpleNamespace
 
-
-# ── (1) LocalCli.health_probe dispatch ─────────────────────────────────────
-
-
-def test_local_cli_probe_delegates_to_codex_session(monkeypatch):
-    """With a CodexSession built, LocalCli delegates to its probe."""
-    from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
-
-    class _StubCodex:
-        async def health_probe(self):
-            return False
-
-    stub = SimpleNamespace.__new__(SimpleNamespace)
-    # __new__ to skip __init__ — the method only reads _codex_session.
-    adapter = LocalCLIAdapter.__new__(LocalCLIAdapter)
-    adapter._session = None
-    adapter._codex_session = _StubCodex()
-
-    assert asyncio.run(adapter.health_probe()) is False
-
-
-def test_local_cli_probe_returns_true_without_codex_session():
-    """No _codex_session → inherit the True default (non-Codex agents
-    surface a real failure via the existing leak filter)."""
-    from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
-
-    adapter = LocalCLIAdapter.__new__(LocalCLIAdapter)
-    adapter._session = None
-    adapter._codex_session = None
-
-    assert asyncio.run(adapter.health_probe()) is True
 
 
 # ── (2) Worker._reassert_auth_failed_after_failed_probe ────────────────────

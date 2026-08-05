@@ -15,6 +15,7 @@ from puffo_agent.portal.runtime_matrix import (
     DEFAULT_HARNESS_FOR_PROVIDER,
     DEFAULT_PROVIDER_FOR_RUNTIME,
     HARNESS_CLAUDE_CODE,
+    HARNESS_CODEX,
     HARNESS_GEMINI_CLI,
     HARNESS_HERMES,
     HARNESS_PROVIDERS,
@@ -90,14 +91,13 @@ def test_migrate_unknown_kind_passes_through_for_validator_to_reject():
 
     # cli-local / cli-docker: harness matters.
     (RUNTIME_CLI_LOCAL,  PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE),
-    (RUNTIME_CLI_LOCAL,  PROVIDER_ANTHROPIC, HARNESS_HERMES),
-    (RUNTIME_CLI_LOCAL,  PROVIDER_OPENAI,    HARNESS_HERMES),
-    (RUNTIME_CLI_LOCAL,  PROVIDER_GOOGLE,    HARNESS_GEMINI_CLI),
+    (RUNTIME_CLI_LOCAL,  PROVIDER_OPENAI,    HARNESS_CODEX),
     (RUNTIME_CLI_DOCKER, PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE),
     (RUNTIME_CLI_DOCKER, PROVIDER_GOOGLE,    HARNESS_GEMINI_CLI),
 
     # Empty harness on CLI kinds falls back to the runtime default.
     (RUNTIME_CLI_LOCAL,  PROVIDER_ANTHROPIC, ""),
+    (RUNTIME_CLI_LOCAL,  PROVIDER_OPENAI,    ""),
     (RUNTIME_CLI_DOCKER, "",                 ""),
 ])
 def test_validate_triple_accepts_valid_combos(runtime, provider, harness):
@@ -134,6 +134,18 @@ def test_validate_triple_rejects_unknown_harness_on_cli_runtime():
     result = validate_triple(RUNTIME_CLI_LOCAL, PROVIDER_ANTHROPIC, "lanchain")
     assert not result.ok
     assert "unknown harness" in result.error.lower()
+
+
+def test_validate_triple_rejects_harnesses_missing_from_runtime():
+    for runtime, harness, provider in (
+        (RUNTIME_CLI_LOCAL, HARNESS_HERMES, PROVIDER_ANTHROPIC),
+        (RUNTIME_CLI_LOCAL, HARNESS_GEMINI_CLI, PROVIDER_GOOGLE),
+        (RUNTIME_CLI_LOCAL, "", PROVIDER_GOOGLE),
+        (RUNTIME_CLI_DOCKER, HARNESS_CODEX, PROVIDER_OPENAI),
+    ):
+        result = validate_triple(runtime, provider, harness)
+        assert not result.ok
+        assert "Driver runtime" in result.error
 
 
 def test_validate_triple_rejects_claude_code_with_google():
@@ -226,6 +238,9 @@ def test_resolve_effective_harness_fills_cli_default():
     assert resolve_effective_harness(
         RUNTIME_CLI_LOCAL, PROVIDER_ANTHROPIC, "",
     ) == HARNESS_CLAUDE_CODE
+    assert resolve_effective_harness(
+        RUNTIME_CLI_LOCAL, PROVIDER_OPENAI, "",
+    ) == HARNESS_CODEX
     assert resolve_effective_harness(
         RUNTIME_CLI_DOCKER, PROVIDER_GOOGLE, "",
     ) == HARNESS_GEMINI_CLI

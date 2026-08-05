@@ -91,7 +91,32 @@ class RuntimeManager:
             if resume and self.native_session_id
             else None
         )
-        opened = await self.driver.open(self.spec, native_resume)
+        try:
+            opened = await self.driver.open(self.spec, native_resume)
+        except Exception:
+            if native_resume is None:
+                try:
+                    await self.driver.close()
+                except Exception:
+                    logger.exception("failed to close runtime after open failure")
+                raise
+            logger.warning(
+                "%s could not resume native session; starting a fresh session",
+                self.driver_name,
+                exc_info=True,
+            )
+            await self.driver.close()
+            self.native_session_id = ""
+            try:
+                opened = await self.driver.open(self.spec, None)
+            except Exception:
+                try:
+                    await self.driver.close()
+                except Exception:
+                    logger.exception(
+                        "failed to close runtime after fresh open failure"
+                    )
+                raise
         self.native_session_id = opened.native_session_id
         # Preserve the durable Puffo logical reference independently of the
         # native provider session ID.
@@ -176,10 +201,17 @@ class RuntimeManager:
             if future.done():
                 self._terminal.pop(turn, None)
 
-    async def reload_resources(self, *, preserve_session: bool) -> None:
+    async def reload_resources(
+        self,
+        *,
+        preserve_session: bool,
+        spec: RuntimeSpec | None = None,
+    ) -> None:
         async with self._command_lock:
             if self.active_turn_ref is not None:
                 raise RuntimeStateError("cannot reload while a turn is active")
+            if spec is not None:
+                self.spec = spec
             await self._retire_runtime_locked(
                 preserve_session=preserve_session
             )
@@ -572,8 +604,14 @@ class RuntimeManager:
 class RuntimeManagerAdapter(Adapter):
     """Blocking compatibility facade over the event-driven Runtime Manager."""
 
-    def __init__(self, manager: RuntimeManager):
+    def __init__(
+        self,
+        manager: RuntimeManager,
+        *,
+        spec_reloader: Callable[[str], Awaitable[RuntimeSpec]] | None = None,
+    ):
         self.manager = manager
+        self.spec_reloader = spec_reloader
         self.assistant_text_parts: list[str] = []
 
     async def run_turn(self, ctx: TurnContext) -> TurnResult:
@@ -702,16 +740,25 @@ class RuntimeManagerAdapter(Adapter):
     async def reload(
         self, new_system_prompt: str, *, with_session: bool = False
     ) -> None:
-        await self.manager.reload_resources(preserve_session=not with_session)
+        spec = (
+            await self.spec_reloader(new_system_prompt)
+            if self.spec_reloader is not None else None
+        )
+        await self.manager.reload_resources(
+            preserve_session=not with_session,
+            spec=spec,
+        )
 
     async def aclose(self) -> None:
         await self.manager.close()
 
     def get_provider_session_id(self) -> str | None:
-        return (
+        value = (
             self.manager.opened.native_session_id
-            if self.manager.opened is not None else None
+            if self.manager.opened is not None
+            else self.manager.native_session_id
         )
+        return value or None
 
     async def get_context_snapshot(self) -> ContextSnapshot:
         status = await self.manager.driver.context_status()

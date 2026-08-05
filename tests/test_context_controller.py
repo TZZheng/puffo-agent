@@ -9,7 +9,6 @@ import pytest
 from puffo_agent.agent.adapters.base import Adapter, TurnContext, TurnResult
 from puffo_agent.agent.adapters.chat_only import ChatOnlyAdapter
 from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
-from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
 from puffo_agent.agent.adapters.sdk import SDKAdapter
 from puffo_agent.agent.context_controller import (
     AdmissionCandidate,
@@ -276,7 +275,7 @@ def test_chat_stateless_admission_after_valid_completion():
     assert "stateless" in asyncio.run(adapter.get_context_snapshot()).source
 
 
-def test_local_and_docker_wrapper_delegate_context_contract():
+def test_docker_wrapper_delegates_context_contract():
     class Harness:
         def name(self):
             return "claude-code"
@@ -290,24 +289,20 @@ def test_local_and_docker_wrapper_delegate_context_contract():
             self.registered = (callback, planning_cycle_key)
 
     callback = lambda event: asyncio.sleep(0)
-    for wrapper_type in (LocalCLIAdapter, DockerCLIAdapter):
-        wrapper = wrapper_type.__new__(wrapper_type)
-        wrapper.harness = Harness()
-        wrapper._session = Session()
-        wrapper._one_shot_provider_session_id = None
-        if wrapper_type is LocalCLIAdapter:
-            wrapper._codex_session = None
-        assert asyncio.run(wrapper.get_context_snapshot()).used_tokens == 12
-        wrapper.register_admission_callback(callback, "wrapped-cycle")
-        assert wrapper._session.registered == (callback, "wrapped-cycle")
-        assert wrapper.get_provider_session_id() == "provider-session"
+    wrapper = DockerCLIAdapter.__new__(DockerCLIAdapter)
+    wrapper.harness = Harness()
+    wrapper._session = Session()
+    wrapper._one_shot_provider_session_id = None
+    assert asyncio.run(wrapper.get_context_snapshot()).used_tokens == 12
+    wrapper.register_admission_callback(callback, "wrapped-cycle")
+    assert wrapper._session.registered == (callback, "wrapped-cycle")
+    assert wrapper.get_provider_session_id() == "provider-session"
 
 
-def test_local_codex_and_one_shot_hermes_gemini_compatibility(
+def test_one_shot_gemini_context_and_admission(
     tmp_path, monkeypatch,
 ):
     import puffo_agent.agent.adapters.docker_cli as docker_module
-    import puffo_agent.agent.adapters.local_cli as local_module
 
     class Harness:
         def __init__(self, value):
@@ -315,27 +310,6 @@ def test_local_codex_and_one_shot_hermes_gemini_compatibility(
 
         def name(self):
             return self.value
-
-    codex = FakeProvider([snapshot(44)])
-    local = LocalCLIAdapter.__new__(LocalCLIAdapter)
-    local.harness = Harness("codex")
-    local._codex_session = codex
-    local._session = None
-    local._one_shot_provider_session_id = None
-    assert asyncio.run(local.get_context_snapshot()).used_tokens == 44
-    assert local.get_context_capabilities() is codex.capabilities
-    assert local.get_provider_session_id() == "provider-session"
-
-    hermes = LocalCLIAdapter.__new__(LocalCLIAdapter)
-    hermes.harness = Harness("hermes")
-    hermes._codex_session = None
-    hermes._session = None
-    hermes._one_shot_provider_session_id = "hermes-real-session"
-    hermes.session_file = tmp_path / "hermes-session.json"
-    hermes_snapshot = asyncio.run(hermes.get_context_snapshot())
-    assert "hermes_unsupported" in hermes_snapshot.source
-    assert "unsupported" in hermes.get_context_capabilities().diagnostic
-    assert hermes.get_provider_session_id() == "hermes-real-session"
 
     gemini = DockerCLIAdapter.__new__(DockerCLIAdapter)
     gemini.harness = Harness("gemini-cli")
@@ -351,21 +325,6 @@ def test_local_codex_and_one_shot_hermes_gemini_compatibility(
 
     async def admitted(event):
         admission_events.append(event)
-
-    async def fake_hermes_run(*args, **kwargs):
-        return 0, b"session_id: hermes-observed\nreply", b""
-
-    hermes._hermes_bin = "hermes"
-    hermes._hermes_home = tmp_path
-    hermes._hermes_mcp_registered = True
-    hermes._hermes_audit = None
-    hermes.puffo_core_mcp_env = None
-    hermes.agent_id = "hermes-test"
-    hermes.model = ""
-    hermes.workspace_dir = str(tmp_path)
-    monkeypatch.setattr(local_module, "hermes_run_cmd", fake_hermes_run)
-    hermes.register_admission_callback(admitted, "hermes-boundary")
-    asyncio.run(hermes._run_hermes_turn("hello", "system"))
 
     async def fake_gemini_run(*args, **kwargs):
         return (
@@ -384,10 +343,7 @@ def test_local_codex_and_one_shot_hermes_gemini_compatibility(
     assert [
         (event.planning_cycle_key, event.provider_session_id)
         for event in admission_events
-    ] == [
-        ("hermes-boundary", "hermes-observed"),
-        ("gemini-boundary", "gemini-observed"),
-    ]
+    ] == [("gemini-boundary", "gemini-observed")]
 
 
 def test_sdk_stateless_admits_on_first_yielded_provider_message():

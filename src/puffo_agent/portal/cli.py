@@ -1908,12 +1908,10 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["claude-code", "hermes", "gemini-cli", "codex"],
         help=(
             "cli-local / cli-docker: which agent engine runs inside the "
-            "runtime. 'claude-code' (default, anthropic only) spawns the "
-            "claude CLI with our stream-json session protocol. 'hermes' "
-            "(anthropic + openai) spawns `hermes chat` one-shot per turn. "
-            "'gemini-cli' (google, reserved — not yet implemented) targets "
-            "Google's gemini CLI. 'codex' (openai, cli-local alpha — opt-"
-            "in, not the default for openai) spawns `codex app-server` as "
+            "runtime. cli-local supports only 'claude-code' (anthropic) "
+            "and 'codex' (openai); both use long-lived Drivers. "
+            "cli-docker also supports 'hermes' (anthropic + openai) and "
+            "'gemini-cli' (google). 'codex' spawns `codex app-server` as "
             "a long-lived JSON-RPC subprocess; auth via runtime.api_key or "
             "operator-side `codex login`. Hermes OAuth routes to "
             "Anthropic's extra_usage pool, NOT your Claude subscription — "

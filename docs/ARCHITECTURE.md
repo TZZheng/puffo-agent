@@ -135,17 +135,14 @@ What runs *inside* a worker.
   `handle_envelope` callback (`puffo_core_client.py:603`) which decrypts
   (`puffo_core_client.py:630`), and owns the outbound fallback reply path
   `send_fallback_message` (`puffo_core_client.py:3609`).
-- **`agent/adapters/`** — one adapter per runtime kind, all implementing
-  `Adapter.run_turn` (`agent/adapters/base.py:65`): `ChatOnlyAdapter`
-  (`chat_only.py:15`), `SDKAdapter` (`sdk.py:27`), `LocalCLIAdapter`
-  (`local_cli.py:154`), `DockerCLIAdapter` (`docker_cli.py:139`), plus
-  `cli_session.py` (long-lived claude CLI session with `--resume`) and
-  `desired_install.py` (skills/MCP install into the agent home).
-- **`agent/harness/`** — the *engine inside a CLI runtime*: `Harness` ABC
-  (`harness/base.py:36`), `build_harness` registry (`harness/__init__.py:20`), and the
-  four concrete harnesses `ClaudeCodeHarness` (`harness/claude_code.py:14`),
-  `HermesHarness`, `GeminiCLIHarness`, `CodexHarness`. Each declares
-  `supported_providers()` so the matrix rejects bad triples.
+- **`agent/adapters/`** — compatibility facade for non-local-Driver runtimes:
+  `ChatOnlyAdapter`, `SDKAdapter`, and `DockerCLIAdapter`, plus
+  `desired_install.py` for skills/MCP installation.
+- **`agent/harness/`** — the host-local execution layer. `RuntimeManagerAdapter`
+  exposes the ordinary Adapter contract while `CodexAppServerDriver` and
+  `ClaudeCodeCliDriver` own their native protocols. `LocalRuntimePreparer` owns
+  configuration, credentials, host assets, and one-time old-session migration.
+  The older declarative `Harness` registry remains for `cli-docker`.
 - **`agent/providers/`** — direct model SDK clients for the non-CLI runtimes:
   `AnthropicProvider` (`providers/anthropic_provider.py:4`, `complete()` at line 9)
   and `OpenAIProvider`.
@@ -194,13 +191,6 @@ The E2E layer. Two responsibilities kept apart: *transport* (crypto-agnostic) an
 - **`mcp/data_client.py`** — `class DataClient` (`data_client.py:72`): the tool-side
   client that reads history from data_service on `63386` (`get_channel_history`
   `data_client.py:122`, `get_dm_history` `data_client.py:153`).
-
-### `hooks/` — the permission gate
-
-- **`hooks/permission.py`** — the Claude Code **PreToolUse** hook proxy: `_deny`
-  (`permission.py:49`), `_allow` (`permission.py:57`), `_fail_open`
-  (`permission.py:38`). Exit `2` = deny, exit `0` + allow-JSON = allow. Fails **open**
-  on proxy-side failures.
 
 ### `macos/` — platform credential storage
 
@@ -261,7 +251,6 @@ flowchart TB
             tools["puffo_core_tools.send_message (:406)"]
             hosttools["host_tools + data_client"]
         end
-        hook["hooks/permission.py PreToolUse gate"]
     end
 
     subgraph engines["Local agent engines (external CLIs / SDKs)"]
@@ -324,21 +313,20 @@ ignored; `ws-local` brings its own external engine.
 
 | Harness | Providers | Engine invocation |
 |---|---|---|
-| `claude-code` | anthropic | long-lived `claude` CLI, stream-json, `--resume` (`cli_session.py`) |
-| `hermes` | anthropic, openai | one-shot `hermes chat -q <msg>` per turn |
-| `gemini-cli` | google | `gemini` CLI |
-| `codex` | openai | `codex` CLI, opt-in, honors `--sandbox` policy (`state.py:991`) |
+| `claude-code` | anthropic | local Driver or Docker CLI |
+| `hermes` | anthropic, openai | Docker-only one-shot `hermes chat -q <msg>` |
+| `gemini-cli` | google | Docker-only `gemini` CLI |
+| `codex` | openai | local `codex app-server` Driver, honors `--sandbox` policy |
 
-Defaults: `DEFAULT_PROVIDER_FOR_RUNTIME` (`runtime_matrix.py:97`, all → anthropic),
-`DEFAULT_HARNESS_FOR_PROVIDER` (`runtime_matrix.py:105`: anthropic → claude-code,
-openai → hermes, google → gemini-cli). `validate_triple` (`runtime_matrix.py:146`)
-rejects mismatched (runtime, provider, harness) at config load.
+Defaults are provider-aware; for `cli-local`, OpenAI resolves to `codex` rather
+than the Docker-only Hermes path. `validate_triple` rejects mismatched
+(runtime, provider, harness) values at config load, including inferred defaults.
 
 **Adapter dispatch** (`build_adapter`, `worker.py:89`): `chat-local` →
 `ChatOnlyAdapter`, `sdk-local` → `SDKAdapter` (needs an anthropic api_key),
-`cli-local`/`cli-docker` → CLI adapters that authenticate via the host's
-`~/.claude/.credentials.json` (`claude login`) — **no api_key is threaded through the
-CLI runtimes**.
+`cli-local` → `LocalRuntimePreparer` + `RuntimeManagerAdapter` + one native
+Driver; `cli-docker` → `DockerCLIAdapter`. Local Drivers use host OAuth views or
+the configured LLM gateway credentials.
 
 ## Diagram (c) — runtime × harness matrix
 
@@ -640,8 +628,9 @@ An in-process **MCP** server gives each agent its tool surface. `build_server`
 - **Skills** are loaded by `SkillsLoader` (`skills_loader.py:9`) and materialized into
   the agent home by `desired_install.py` (`write_desired_skill`
   `adapters/desired_install.py:127`, `install_claude_mcp` `:214`).
-- **Permission gate:** the claude-code harness routes every tool call through the
-  **PreToolUse** hook `hooks/permission.py` (`_deny` `:49` / `_allow` `:57`).
+- **Execution policy:** `LocalRuntimePreparer` writes the supported policy into
+  `RuntimeSpec`; Claude Code currently uses unattended bypass mode, while Codex
+  exposes native permission requests through the Driver event contract.
 
 ### Ports (three loopback services)
 
@@ -717,7 +706,7 @@ An in-process **MCP** server gives each agent its tool surface. `build_server`
 | Where is an operator command verified/decrypted? | `portal/control/envelope.py:38` / `:66` |
 | Where is (flat) memory loaded into context? | `agent/memory.py:21` (`get_context`) |
 | Where are tools registered for the agent? | `mcp/puffo_core_server.py:224` (`build_server`) |
-| Where is the PreToolUse permission decision made? | `hooks/permission.py:49`/`:57` |
+| Where is local execution policy prepared? | `agent/harness/local_runtime.py` → `RuntimeSpec` |
 | Where is Claude OAuth refreshed? | `portal/credential_refresh.py:1` |
 
 ---

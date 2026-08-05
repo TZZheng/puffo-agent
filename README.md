@@ -393,8 +393,8 @@ The `runtime.kind` in an agent's `agent.yml` decides where its brain runs:
 | --- | --- | --- |
 | `chat-local` | Direct LLM call inside the daemon (anthropic / openai / google). **Default.** | `puffo-agent[chat-local]` + provider key |
 | `sdk-local` | Claude Agent SDK, in-process (anthropic only). | `puffo-agent[sdk]` |
-| `cli-local` | A CLI harness as a host subprocess — Claude Code, `codex`, or `hermes` (alpha). Shell + skills on the host. | `claude` / `codex` / `hermes` login |
-| `cli-docker` | Same as `cli-local`, in a per-agent container. `claude-code` / `hermes` / `gemini-cli`. | Docker |
+| `cli-local` | A long-lived Driver subprocess: Claude Code or `codex`. Shell + skills run on the host. | `claude` or `codex` login |
+| `cli-docker` | A per-agent CLI container using `claude-code`, `hermes`, or `gemini-cli`. | Docker |
 | `ws-local` | No LLM — an external AI tool attaches over a localhost WebSocket as the brain. | `.puffoagent` bundle + passcode |
 
 Switch runtime kind / model / harness:
@@ -407,9 +407,9 @@ Pass `--help` for the full flag list (provider, harness, allowed_tools,
 docker_image, permission_mode, max_turns).
 
 > **codex** (`runtime.harness=codex`, `cli-local` only) spawns OpenAI's `codex
-> app-server` — `codex login` once (ChatGPT-account OAuth, no API key path).
+> app-server`; authenticate with `codex login` or a configured LiteLLM gateway.
 >
-> **hermes** (`runtime.harness=hermes`, alpha) runs one-shot `hermes chat -q`
+> **hermes** (`runtime.harness=hermes`, `cli-docker`) runs one-shot `hermes chat -q`
 > per turn; continuity comes from the per-agent `HERMES_HOME` seeded from your
 > `~/.hermes/`. Install the Hermes Agent CLI
 > (`curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash`,

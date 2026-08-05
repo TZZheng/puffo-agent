@@ -101,6 +101,7 @@ def test_cli_switch_to_harness_without_inference_support_clears_level(
     cfg = _save_codex_agent(tmp_path, monkeypatch, level="high")
     args = build_parser().parse_args([
         "agent", "runtime", cfg.id,
+        "--kind", "cli-docker",
         "--harness", "hermes",
     ])
 

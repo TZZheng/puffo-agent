@@ -2,16 +2,13 @@
 
 Runtime answers WHERE the agent executes; harness answers WHAT.
 Only meaningful for the CLI runtimes; ``chat-local`` / ``sdk-local``
-ignore the field. Four harnesses ship: ``claude-code`` (Anthropic),
-``hermes`` (Anthropic + OpenAI), ``gemini-cli`` (Google),
-``codex`` (OpenAI — opt-in, default for openai is still hermes).
-Each declares ``supported_providers`` so the runtime matrix can
-reject mismatched triples at load time.
+ignore the field. Docker retains three declarative Harness types.
+The host-local runtime uses the long-lived Driver implementations for
+``claude-code`` and ``codex`` only.
 """
 
 from .base import Harness, HarnessTurn
 from .claude_code import ClaudeCodeHarness
-from .codex import CodexHarness
 from .gemini_cli import GeminiCLIHarness
 from .hermes import HermesHarness
 from .driver import (
@@ -39,25 +36,23 @@ def build_harness(name: str) -> Harness:
         return HermesHarness()
     if name == "gemini-cli":
         return GeminiCLIHarness()
-    if name == "codex":
-        return CodexHarness()
     raise ValueError(
         f"unknown harness {name!r}: expected one of "
-        "'claude-code', 'hermes', 'gemini-cli', 'codex'"
+        "'claude-code', 'hermes', 'gemini-cli'"
     )
 
 
 @dataclass(frozen=True)
 class UnsupportedDriver:
     harness: str
-    diagnostic: str = "no Driver implementation for this legacy harness"
+    diagnostic: str = "no local Driver implementation for this harness"
 
 
 def build_driver(name: str, **kwargs: Any) -> HarnessDriver | UnsupportedDriver:
     """Construct only the two ratified Driver implementations.
 
-    This factory is deliberately separate from :func:`build_harness`; legacy
-    adapters continue accepting Hermes, Gemini, Docker, SDK, and chat paths.
+    This factory is deliberately separate from :func:`build_harness`, which
+    remains the declarative registry used by the Docker runtime.
     """
     if name == "codex":
         return CodexAppServerDriver(**kwargs)
@@ -70,7 +65,6 @@ __all__ = [
     "Harness",
     "HarnessTurn",
     "ClaudeCodeHarness",
-    "CodexHarness",
     "GeminiCLIHarness",
     "HermesHarness",
     "build_harness",

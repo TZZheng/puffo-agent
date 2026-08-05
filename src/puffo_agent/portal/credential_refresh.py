@@ -476,7 +476,7 @@ class CodexFileBackend:
     def sync_to_agent(self, agent_home: Path) -> None:
         agent_codex_home = agent_home / ".codex"
         # Only codex agents have a ``.codex`` subdir (created lazily by
-        # ``LocalCLIAdapter._ensure_codex_session``). Skip claude-only
+        # ``LocalRuntimePreparer._prepare_codex_spec``). Skip claude-only
         # agents to avoid cluttering them with a stray auth.json.
         if not agent_codex_home.exists():
             return
