@@ -10,7 +10,7 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **Codex is now supported by `runtime.kind=cli-docker`.** Each agent
   runs `codex app-server` in its own container while reusing the
-  operator's `codex login` credentials. Per-agent Codex state, skills,
+  operator's Codex account credentials. Per-agent Codex state, skills,
   Puffo MCP tools, and container-reachable host MCP registrations are
   mounted or synchronized into the runtime.
 

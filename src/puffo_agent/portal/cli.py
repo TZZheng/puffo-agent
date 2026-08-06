@@ -1969,7 +1969,10 @@ def build_parser() -> argparse.ArgumentParser:
     refresh.add_argument(
         "--host-sync",
         action="store_true",
-        help="also re-sync ~/.claude/skills + host MCP registrations",
+        help=(
+            "also re-sync host skills, MCP registrations, and portable "
+            "credentials"
+        ),
     )
     refresh.add_argument(
         "--session",

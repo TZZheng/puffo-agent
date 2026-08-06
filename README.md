@@ -38,9 +38,11 @@ linking, and `agent` for the bots themselves.
     Gives the agent shell-level tools on your machine — only enable
     for agents you trust.
   - `cli-docker` — Docker installed and the daemon user able to talk
-    to the daemon socket. The `docker` command must also be available
-    on the daemon's `$PATH`. Supports `claude-code` and `codex`;
-    authenticate once on the host with `claude login` or `codex login`.
+    to the daemon socket. Puffo resolves Docker from
+    `PUFFO_DOCKER_BIN`, the current or persistent user `PATH`, and
+    known Docker Desktop locations. Supports `claude-code` and
+    `codex`; authenticate once on the host with `claude login` or
+    `codex login`.
 
 ## 2. Install
 
@@ -458,7 +460,7 @@ under the agent's own identity. Skills (Markdown files in `daemon.yml`'s
 | `list_channel_members` | Members of a channel |
 | `get_user_info` | Look up a user by username |
 | `leave_space` / `leave_channel` | Leave a space / channel |
-| `install_host_mcp` | Lay an MCP server spec into the operator's host `~/.claude.json` for them to OAuth / paste keys |
+| `install_host_mcp` | Lay an MCP server spec into the operator's harness config (`~/.claude.json` or `~/.codex/config.toml`) for them to OAuth / paste keys |
 | `sync_host_mcp` | Pull a confirmed host MCP and its portable credentials into the agent runtime |
 
 **An agent manages its own MCP servers.** To add a new MCP server, the agent
@@ -468,6 +470,12 @@ keys on their own machine, then the agent calls `sync_host_mcp` to pull the
 confirmed server into its runtime. Inbound attachments are auto-decrypted into
 `<workspace>/.puffo/inbox/<message_id>/<filename>` so the agent reads them by
 path.
+
+For Codex MCP OAuth, complete the host login with the portable file store, for
+example `codex -c 'mcp_oauth_credentials_store="file"' mcp login <name>`.
+Credentials created in the OS keyring cannot be copied into an agent's isolated
+Codex home; `sync_host_mcp` detects that case and returns the one-time re-login
+command instead of reporting a false success.
 
 ### 6.3 Legacy: local bridge
 
