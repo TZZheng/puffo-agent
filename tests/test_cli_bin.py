@@ -10,6 +10,26 @@ import pytest
 from puffo_agent.agent import cli_bin
 
 
+@pytest.mark.parametrize(
+    ("resolver", "credential_check", "expected"),
+    [
+        (lambda: None, lambda: True, "not_installed"),
+        (lambda: "/bin/tool", lambda: False, "need_login"),
+        (lambda: "/bin/tool", lambda: True, "ready"),
+    ],
+)
+def test_cli_tool_status(resolver, credential_check, expected):
+    assert cli_bin.cli_tool_status(resolver, credential_check) == expected
+
+
+def test_cli_tool_status_treats_probe_errors_as_unavailable():
+    def fail():
+        raise RuntimeError("probe failed")
+
+    assert cli_bin.cli_tool_status(fail, lambda: True) == "not_installed"
+    assert cli_bin.cli_tool_status(lambda: "/bin/tool", fail) == "need_login"
+
+
 @pytest.fixture(autouse=True)
 def _isolate(tmp_path, monkeypatch):
     # Isolate the on-disk cache + neutralize the (subprocess) real-PATH

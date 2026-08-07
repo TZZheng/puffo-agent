@@ -38,6 +38,13 @@ skills_dir: ""
 reconcile_interval_seconds: 2.0
 runtime_heartbeat_seconds:  5.0
 
+# Dedicated loopback WebSocket for ws-local attachments. Port 63387 exposes
+# only GET /v1/ws-local; it is not an agent-management API.
+ws_local_service:
+  enabled: true
+  bind_host: 127.0.0.1
+  port: 63387
+
 # cli-docker resource caps applied to every agent container at
 # `docker run` time. Defaults are ON: 1.5 GiB hard ceiling / 500 MiB
 # soft floor, verified against the 0.7.1 ENOMEM-on-read incident

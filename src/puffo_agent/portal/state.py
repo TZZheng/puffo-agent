@@ -757,13 +757,6 @@ def background_log_path() -> Path:
     return home_dir() / "background.log"
 
 
-def pairing_path() -> Path:
-    """Single-pairing file holding (slug, device_id) + cached certs
-    for the operator currently authorised to drive this daemon.
-    Removed by ``puffo-agent pairing unpair``."""
-    return home_dir() / "pairing.json"
-
-
 def agent_dir(agent_id: str) -> Path:
     return agents_dir() / agent_id
 
@@ -854,24 +847,12 @@ class RpcServiceConfig:
 
 
 @dataclass
-class BridgeConfig:
-    """Local HTTP API for the puffo web/desktop client. Loopback only;
-    auth uses the same ed25519 request-signing scheme as puffo-server.
+class WsLocalServiceConfig:
+    """Loopback WebSocket used by externally attached ws-local tools."""
 
-    ``allowed_origins`` is the CORS allowlist for PNA preflights.
-
-    Off by default — agents are managed remotely via the portal. Opt in
-    per-run with ``start --with-local-bridge`` (or ``bridge.enabled`` in
-    daemon.yml). The MCP-facing data + rpc services stay on regardless.
-    """
-    enabled: bool = False
+    enabled: bool = True
     bind_host: str = "127.0.0.1"
     port: int = 63387
-    allowed_origins: list[str] = field(default_factory=lambda: [
-        "https://chat.puffo.ai",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ])
 
 
 @dataclass
@@ -901,7 +882,9 @@ class DaemonConfig:
     segment_chars: int = MESSAGE_SEGMENT_CHARS
     # Catch-up older than this is stored but skips the LLM; <= 0 disables.
     catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS
-    bridge: BridgeConfig = field(default_factory=BridgeConfig)
+    ws_local_service: "WsLocalServiceConfig" = field(
+        default_factory=lambda: WsLocalServiceConfig(),
+    )
     data_service: "DataServiceConfig" = field(
         default_factory=lambda: DataServiceConfig(),
     )
@@ -939,14 +922,12 @@ class DaemonConfig:
                 api_key=p.get("api_key", ""),
                 model=p.get("model", ""),
             ))
-        # Older daemon.yml files may omit ``bridge:``.
-        b = raw.get("bridge") or {}
-        defaults = BridgeConfig()
-        cfg.bridge = BridgeConfig(
-            enabled=bool(b.get("enabled", defaults.enabled)),
-            bind_host=str(b.get("bind_host", defaults.bind_host)),
-            port=int(b.get("port", defaults.port)),
-            allowed_origins=list(b.get("allowed_origins") or defaults.allowed_origins),
+        w = raw.get("ws_local_service") or {}
+        defaults = WsLocalServiceConfig()
+        cfg.ws_local_service = WsLocalServiceConfig(
+            enabled=bool(w.get("enabled", defaults.enabled)),
+            bind_host=str(w.get("bind_host", defaults.bind_host)),
+            port=int(w.get("port", defaults.port)),
         )
         d = raw.get("data_service") or {}
         ds_defaults = DataServiceConfig()
@@ -980,7 +961,7 @@ class DaemonConfig:
             "anthropic": asdict(self.anthropic),
             "openai": asdict(self.openai),
             "google": asdict(self.google),
-            "bridge": asdict(self.bridge),
+            "ws_local_service": asdict(self.ws_local_service),
             "data_service": asdict(self.data_service),
             "rpc_service": asdict(self.rpc_service),
         }

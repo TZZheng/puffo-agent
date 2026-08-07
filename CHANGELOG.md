@@ -28,6 +28,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Port 63387 is now dedicated to `ws-local` message transport.** The legacy
+  Local Bridge HTTP APIs, pairing commands, and browser-facing management
+  surface have been removed; externally hosted agents continue to attach over
+  the `/v1/ws-local` WebSocket endpoint.
+
 - **`cli-docker` now supports only Claude Code and Codex.** Gemini CLI
   and Hermes were removed from the Docker runtime matrix and bundled
   image. Hermes remains available through `cli-local`.

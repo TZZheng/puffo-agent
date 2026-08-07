@@ -7,7 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication
 
-from _bridge_support import write_test_agent
+from _portal_support import write_test_agent
 from puffo_agent.portal.state import AgentConfig, RuntimeState
 from puffo_agent.portal.ui.widgets import agent_detail
 
@@ -139,6 +139,47 @@ def test_codex_save_uses_codex_override_key(qapp, agent_home):
         "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
         "CODEX_AUTOCOMPACT_PCT_OVERRIDE": "75",
     }
+
+
+def test_avatar_upload_uses_shared_profile_helper(
+    qapp, agent_home, tmp_path, monkeypatch,
+):
+    avatar = tmp_path / "avatar.png"
+    avatar.write_bytes(b"avatar-bytes")
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+    monkeypatch.setattr(
+        agent_detail.QFileDialog,
+        "getOpenFileName",
+        lambda *_args, **_kwargs: (str(avatar), ""),
+    )
+    calls = []
+
+    async def fake_upload(cfg, data):
+        calls.append((cfg.id, data))
+        return "https://relay.example/blobs/blob_1"
+
+    async def fake_verify(_cfg, _url):
+        return b"avatar-bytes"
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    monkeypatch.setattr(agent_detail, "upload_avatar", fake_upload)
+    monkeypatch.setattr(agent_detail, "_verify_avatar_blob", fake_verify)
+    monkeypatch.setattr(agent_detail.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(agent_detail.disk_cache, "write_avatar_bytes", lambda *_args: None)
+    emitted = []
+    view._avatar_uploaded.connect(lambda url, error: emitted.append((url, error)))
+
+    view._on_change_avatar()
+
+    assert calls == [("threshold-ui", b"avatar-bytes")]
+    assert emitted == [("https://relay.example/blobs/blob_1", "")]
 
 
 def test_threshold_selection_participates_in_dirty_state(qapp, agent_home):

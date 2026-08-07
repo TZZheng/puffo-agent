@@ -21,8 +21,8 @@ from typing import Optional
 from pathlib import Path
 
 from ..macos.keychain import CredentialCache, is_macos
-from .api import start_api_server, stop_api_server
 from .ws_local.hub import WsLocalHub
+from .ws_local.server import start_ws_local_server, stop_ws_local_server
 from .credential_refresh import (
     CodexFileBackend,
     CredentialRefresher,
@@ -72,8 +72,7 @@ class Daemon:
         self.daemon_cfg = daemon_cfg
         self.workers: dict[str, Worker] = {}
         self._paused_reported: set[str] = set()
-        # Shared attach registry: ws-local Workers register here; the
-        # bridge's /v1/ws-local route serves tools against it.
+        # Shared attach registry for the ws-local loopback endpoint.
         self.ws_local_hub = WsLocalHub()
         self._stop = asyncio.Event()
         # Cap on per-worker warm wait so a wedged warm can't pin the
@@ -128,18 +127,17 @@ class Daemon:
         # the operator hand-edited agent.yml / profile.md offline.
         asyncio.ensure_future(_full_sync_all_owned_agents_at_startup())
 
-        # Start auxiliary HTTP services. Both are non-fatal on bind
+        # Start auxiliary HTTP services. Each is non-fatal on bind
         # failure — the daemon's primary job is still running agents.
-        api_runner = await start_api_server(
-            self.daemon_cfg.bridge, ws_local_hub=self.ws_local_hub,
+        ws_local_runner = await start_ws_local_server(
+            self.daemon_cfg.ws_local_service, ws_local_hub=self.ws_local_hub,
         )
         set_profile_setter(self._set_worker_profile_cache)
         set_client_resolver(self._resolve_message_client)
         set_rpc_resolver(self._resolve_host_mcp_context)
-        # Bridge pins 63387 (browser clients hard-code it). Both
-        # fallbacks scan from 63388 onward so neither collides with
-        # bridge; data starts after rpc so its fallback can route
-        # past rpc's resolved port.
+        # ws-local pins 63387. Both fallbacks scan from 63388 onward so
+        # neither collides with it; data starts after rpc so its fallback
+        # can route past rpc's resolved port.
         rpc_runner = await start_rpc_service(
             self.daemon_cfg.rpc_service, fallback_start=63388,
         )
@@ -199,7 +197,7 @@ class Daemon:
                     await t
                 except (asyncio.CancelledError, Exception):
                     pass
-            await stop_api_server(api_runner)
+            await stop_ws_local_server(ws_local_runner)
             set_profile_setter(None)
             set_client_resolver(None)
             set_rpc_resolver(None)
@@ -1034,7 +1032,7 @@ def _install_posix_stop_handlers(loop, handle_signal) -> bool:
     return installed
 
 
-async def run_daemon(with_local_bridge: bool = False) -> int:
+async def run_daemon() -> int:
     # Single-daemon enforcement. ``start`` against an already-running
     # daemon exits 0 (the user wanted a running daemon; one exists) —
     # exit 1 read as an error in upgrade flows. Enforcement is unchanged:
@@ -1055,8 +1053,6 @@ async def run_daemon(with_local_bridge: bool = False) -> int:
     cleanup_staging_dir()
 
     daemon_cfg = DaemonConfig.load()
-    if with_local_bridge:
-        daemon_cfg.bridge.enabled = True
     write_daemon_pid(os.getpid())
 
     daemon = Daemon(daemon_cfg)

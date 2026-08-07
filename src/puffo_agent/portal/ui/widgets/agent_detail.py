@@ -35,14 +35,14 @@ from PySide6.QtWidgets import (
 from ....agent import disk_cache
 from ....agent.model_catalog import ModelOption, prefetch, provider_models
 from ... import export
-from ...api.handlers import (
+from ...profile_sync import (
     MAX_AVATAR_BYTES,
     MAX_PROFILE_SUMMARY_BYTES,
     MAX_ROLE_LEN,
     MAX_ROLE_SHORT_LEN,
-    _profile_summary,
-    _update_profile_summary,
-    _upload_avatar_via_agent_keystore,
+    profile_summary,
+    update_profile_summary,
+    upload_avatar,
 )
 from ...runtime_matrix import (
     HARNESS_PROVIDERS,
@@ -416,7 +416,7 @@ class AgentDetail(QWidget):
         self._display_name.setText(cfg.display_name)
         self._role.setText(cfg.role)
         self._role_short.setText(cfg.role_short)
-        self._soul.setPlainText(_profile_summary(cfg))
+        self._soul.setPlainText(profile_summary(cfg))
         self._set_combo(self._runtime_kind, cfg.runtime.kind)
         self._set_combo(self._harness, cfg.runtime.harness)
         self._populate_model_combo(cfg.runtime.harness, cfg.runtime.model)
@@ -622,7 +622,7 @@ class AgentDetail(QWidget):
 
         def worker() -> None:
             try:
-                url = asyncio.run(_upload_avatar_via_agent_keystore(cfg, data))
+                url = asyncio.run(upload_avatar(cfg, data))
                 if not url:
                     self._avatar_uploaded.emit("", "upload returned empty url")
                     return
@@ -925,7 +925,7 @@ class AgentDetail(QWidget):
             return
         try:
             cfg.save()
-            _update_profile_summary(cfg, soul)
+            update_profile_summary(cfg, soul)
         except Exception as exc:
             QMessageBox.warning(self, "Save", f"failed to persist: {exc}")
             return

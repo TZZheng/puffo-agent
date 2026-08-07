@@ -19,7 +19,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .api.pairing import clear_pairing, load_pairing
 from .daemon import run_daemon
 from .state import (
     AgentConfig,
@@ -258,21 +257,20 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    with_local_bridge = getattr(args, "with_local_bridge", False)
     if getattr(args, "tray_runner", False):
         from .ui.tray import run_tray
-        return run_tray(with_local_bridge=with_local_bridge)
+        return run_tray()
     if getattr(args, "background", False):
         from .background import spawn_background
-        return spawn_background(with_local_bridge=with_local_bridge)
+        return spawn_background()
     if getattr(args, "ui", False):
         from .ui.launcher import launch
-        return launch(with_local_bridge=with_local_bridge)
+        return launch()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-    return asyncio.run(run_daemon(with_local_bridge=with_local_bridge))
+    return asyncio.run(run_daemon())
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
@@ -344,7 +342,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
     return asyncio.run(run_attach(
         Path(args.bundle),
         args.passcode,
-        bridge_url=args.bridge_url,
+        daemon_url=args.daemon_url,
         session_dir=session_dir,
     ))
 
@@ -548,84 +546,6 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     else:
         print("daemon will pick it up on the next reconcile tick (a few seconds).")
     return 0
-
-
-def _bridge_wait_until_command(base: str, command_id: str, timeout: float) -> int:
-    """GET the bridge's wait-until-command and print its result JSON to stdout."""
-    import json
-    import urllib.error
-    import urllib.parse
-    import urllib.request
-
-    url = (
-        f"{base}/v1/machine/wait-until-command?"
-        f"id={urllib.parse.quote(command_id)}&timeout={int(timeout)}"
-    )
-    try:
-        with urllib.request.urlopen(url, timeout=timeout + 10) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        if exc.code == 504:
-            print(f"pending: operator hasn't approved yet ({detail})", file=sys.stderr)
-        else:
-            print(f"error: wait failed (HTTP {exc.code}): {detail}", file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"error: cannot reach the daemon bridge ({exc.reason})", file=sys.stderr)
-        return 1
-    print(json.dumps(result))
-    return 0
-
-
-def cmd_agent_create_ws_local(args: argparse.Namespace) -> int:
-    """Request a ws-local agent via operator approval. Non-blocking: prints the
-    ``request_id`` and returns. Poll completion with
-    ``machine wait-until-command --id <request_id>`` (or pass ``--wait`` to block
-    here). Requires the daemon running with the bridge."""
-    import json
-    import urllib.error
-    import urllib.request
-
-    base = args.bridge_url.rstrip("/")
-    body = json.dumps(
-        {
-            "operator": args.operator,
-            "passcode": args.passcode,
-            "display_name": getattr(args, "display_name", "") or "",
-            "message": getattr(args, "message", "") or "",
-        }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        f"{base}/v1/agents/create-ws-local",
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            started = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        print(f"error: request failed (HTTP {exc.code}): {detail}", file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(
-            f"error: cannot reach the daemon bridge at {args.bridge_url} ({exc.reason}). "
-            "Is the daemon running with --with-local-bridge?",
-            file=sys.stderr,
-        )
-        return 1
-
-    if not getattr(args, "wait", False):
-        print(json.dumps(started))
-        return 0
-    return _bridge_wait_until_command(base, str(started.get("request_id") or ""), args.wait_timeout)
-
-
-def cmd_machine_wait_until_command(args: argparse.Namespace) -> int:
-    """Block until the command with ``--id`` has been processed, print its result."""
-    return _bridge_wait_until_command(args.bridge_url.rstrip("/"), args.id, args.timeout)
 
 
 def cmd_agent_list(args: argparse.Namespace) -> int:
@@ -915,11 +835,9 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     role_short) and best-effort sync them to puffo-server signed by
     the agent's own keystore.
 
-    Mirrors the bridge ``PATCH /v1/agents/{id}/profile`` endpoint
-    one-for-one — same validation, same wire shape, same server
-    update — so anything the operator can do from the local-bridge
-    UI is reachable from the CLI too. No flags ⇒ show current
-    values. With flags ⇒ update agent.yml, then sync to server."""
+    Uses the same server profile shape as remote management. No flags
+    show current values; update flags write agent.yml and then sync to
+    the server."""
     import asyncio
 
     from .profile_sync import sync_agent_profile
@@ -1185,40 +1103,12 @@ def cmd_agent_edit(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_pairing_show(args: argparse.Namespace) -> int:
-    """Print the current bridge pairing, or ``(not paired)``.
-    Reads ``pairing.json`` directly — works whether the daemon is
-    running or not."""
-    pairing = load_pairing()
-    if pairing is None:
-        print("bridge: not paired")
-        return 0
-    print(f"slug:        {pairing.slug}")
-    print(f"device_id:   {pairing.device_id}")
-    print(f"paired_at:   {_format_ts(int(pairing.paired_at / 1000))}")
-    print(f"root_pubkey: {pairing.root_public_key}")
-    return 0
-
-
-def cmd_pairing_unpair(args: argparse.Namespace) -> int:
-    """Remove the bridge pairing so a different identity can pair
-    next. The daemon re-reads ``pairing.json`` on every request — no
-    restart needed."""
-    pairing = load_pairing()
-    if pairing is None:
-        print("bridge: nothing to unpair (not paired)")
-        return 0
-    clear_pairing()
-    print(f"bridge: unpaired (was slug={pairing.slug} device_id={pairing.device_id})")
-    return 0
-
-
 def cmd_link(args: argparse.Namespace) -> int:
     """Link this machine to an operator via the online agent portal."""
     from .control.link import DEFAULT_SERVER_URL, friendly_device_name, run_link
 
     # The daemon holds the control WS that serves the operator's commands
-    # once approved — auto-start it (without the local bridge) if it isn't
+    # once approved — auto-start it if it isn't
     # running, so `link` is a one-step onboard.
     if not is_daemon_alive():
         from .background import spawn_background
@@ -1240,24 +1130,6 @@ def cmd_unlink(args: argparse.Namespace) -> int:
     from .control.link import run_unlink
 
     return asyncio.run(run_unlink(args.operator, expected_server_url=args.server_url))
-
-
-def cmd_api_status(args: argparse.Namespace) -> int:
-    """Print bridge configuration + pairing status."""
-    cfg = DaemonConfig.load()
-    b = cfg.bridge
-    pairing = load_pairing()
-    print(f"enabled:         {b.enabled}")
-    print(f"bind:            http://{b.bind_host}:{b.port}")
-    print(f"allowed_origins: {b.allowed_origins}")
-    if pairing is None:
-        print("paired:          (none)")
-    else:
-        print(f"paired:          slug={pairing.slug} device_id={pairing.device_id}")
-        print(f"paired_at:       {_format_ts(int(pairing.paired_at / 1000))}")
-    if not is_daemon_alive():
-        print("daemon:          not running (bridge is offline until you `puffo-agent start`)")
-    return 0
 
 
 def cmd_agent_export(args: argparse.Namespace) -> int:
@@ -1616,14 +1488,6 @@ def build_parser() -> argparse.ArgumentParser:
             "run `puffo-agent stop`."
         ),
     )
-    start.add_argument(
-        "--with-local-bridge",
-        action="store_true",
-        help=(
-            "Also serve the local bridge HTTP API (off by default; the MCP "
-            "data + rpc ports are always served)."
-        ),
-    )
     # Internal: the detached child that --background spawns to host the
     # tray. Hidden from --help.
     start.add_argument("--tray-runner", action="store_true", help=argparse.SUPPRESS)
@@ -1716,37 +1580,6 @@ def build_parser() -> argparse.ArgumentParser:
     create.add_argument("--no-mention", action="store_true", help="Don't reply on @mention")
     create.add_argument("--no-dm", action="store_true", help="Don't reply on DM")
     create.set_defaults(func=cmd_agent_create)
-
-    create_wsl = agent_sub.add_parser(
-        "create-ws-local",
-        help="Create a ws-local agent via operator approval over the machine channel.",
-    )
-    create_wsl.add_argument(
-        "--operator", required=True, help="Linked operator slug to request approval from"
-    )
-    create_wsl.add_argument(
-        "--passcode", required=True, help="Passcode for the .puffoagent bundle + ws-local attach"
-    )
-    create_wsl.add_argument("--display-name", default="", help="Suggested name for the new agent")
-    create_wsl.add_argument(
-        "--message",
-        default="",
-        help="Free-text note shown to the operator for context (why this agent is needed).",
-    )
-    create_wsl.add_argument(
-        "--wait",
-        action="store_true",
-        help="Block until the operator approves and print the final result (slug/bundle/passcode).",
-    )
-    create_wsl.add_argument(
-        "--wait-timeout", type=float, default=600.0, help="Seconds to wait with --wait (default 600)."
-    )
-    create_wsl.add_argument(
-        "--bridge-url",
-        default="http://127.0.0.1:63387",
-        help="Bridge HTTP base URL (default: %(default)s).",
-    )
-    create_wsl.set_defaults(func=cmd_agent_create_ws_local)
 
     lst = agent_sub.add_parser("list", help="List registered agents")
     lst.set_defaults(func=cmd_agent_list)
@@ -1849,7 +1682,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Show or edit identity-profile fields (display_name, role, "
             "role_short). No flags ⇒ show. With flags ⇒ update "
             "agent.yml AND sync to puffo-server, signed by the agent's "
-            "own keystore. Mirrors the local-bridge PATCH endpoint."
+            "own keystore."
         ),
     )
     profile.add_argument("id")
@@ -1992,21 +1825,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     refresh.set_defaults(func=cmd_agent_refresh)
 
-    # Bridge / local HTTP API admin.
-    pairing = sub.add_parser(
-        "pairing",
-        help="Inspect or reset the local bridge pairing (which user can drive this daemon)",
-    )
-    pairing_sub = pairing.add_subparsers(dest="pairing_cmd", required=True)
-    pairing_sub.add_parser(
-        "show",
-        help="Print the currently paired (slug, device_id), or '(not paired)'",
-    ).set_defaults(func=cmd_pairing_show)
-    pairing_sub.add_parser(
-        "unpair",
-        help="Delete pairing.json so a different identity can pair next",
-    ).set_defaults(func=cmd_pairing_unpair)
-
     machine = sub.add_parser(
         "machine",
         help="Link / unlink this machine to puffo operators via the agent portal",
@@ -2054,31 +1872,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     machine_unlink.set_defaults(func=cmd_unlink)
 
-    machine_wait = machine_sub.add_parser(
-        "wait-until-command",
-        help="Block until a machine command (by id) is processed; print its result.",
-    )
-    machine_wait.add_argument("--id", required=True, help="Command id to wait for (e.g. a create request_id).")
-    machine_wait.add_argument(
-        "--timeout", type=float, default=600.0, help="Seconds to wait (default 600)."
-    )
-    machine_wait.add_argument(
-        "--bridge-url",
-        default="http://127.0.0.1:63387",
-        help="Bridge HTTP base URL (default: %(default)s).",
-    )
-    machine_wait.set_defaults(func=cmd_machine_wait_until_command)
-
-    api = sub.add_parser(
-        "api",
-        help="Inspect the local bridge HTTP API config",
-    )
-    api_sub = api.add_subparsers(dest="api_cmd", required=True)
-    api_sub.add_parser(
-        "status",
-        help="Print bind address, allowed origins, and pairing status",
-    ).set_defaults(func=cmd_api_status)
-
     attach = sub.add_parser(
         "ws-local",
         help=(
@@ -2094,9 +1887,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Passcode that decrypts the bundle (matches the create-agent UI).",
     )
     attach.add_argument(
-        "--bridge-url",
+        "--daemon-url",
+        dest="daemon_url",
         default="http://127.0.0.1:63387",
-        help="Bridge HTTP base URL (default: %(default)s).",
+        help="Daemon ws-local base URL (default: %(default)s).",
     )
     attach.add_argument(
         "--session-dir",

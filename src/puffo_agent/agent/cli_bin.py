@@ -27,11 +27,28 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 # Resolved-path caches: in-memory for this daemon's lifetime, plus a
 # last-resort JSON fallback for installs that later disappear from PATH.
 _resolve_memcache: dict[str, str] = {}
 _real_path_cache: str | None = None
+
+
+def cli_tool_status(
+    resolver: Callable[[], str | None], credential_check: Callable[[], bool],
+) -> str:
+    """Return ``not_installed``, ``need_login``, or ``ready`` for a host CLI."""
+    try:
+        path = resolver()
+    except Exception:
+        path = None
+    if not path:
+        return "not_installed"
+    try:
+        return "ready" if credential_check() else "need_login"
+    except Exception:
+        return "need_login"
 
 
 def resolve_codex_bin() -> str | None:
