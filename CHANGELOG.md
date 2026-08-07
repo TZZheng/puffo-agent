@@ -8,6 +8,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Codex agents now report and control their live context window.** Local and
+  Docker workers persist the model-reported maximum and selected compact point,
+  attach current usage to completed-turn events, and translate per-agent
+  compact percentages into Codex app-server session limits. The default follows
+  Codex's model-derived limit, while 75%, 50%, or 30% overrides are available.
+
 - **Per-agent Claude Code auto-compaction controls and context telemetry.**
   Operators can select Claude's session-reported default or an earlier 75%,
   50%, or 30% threshold for local and Docker CLI agents. The desktop and web

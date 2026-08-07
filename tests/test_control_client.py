@@ -339,6 +339,47 @@ async def test_edit_sets_env_override_threshold(home):
 
 
 @pytest.mark.asyncio
+async def test_edit_maps_legacy_threshold_key_to_codex(home):
+    write_test_agent(home, "scout")
+    cfg = AgentConfig.load("scout")
+    cfg.runtime.harness = "codex"
+    cfg.env_overrides = {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"}
+    cfg.save()
+
+    res = await execute_command(
+        "edit", "scout",
+        {"env_overrides": {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "30"}},
+    )
+
+    assert res["ok"] is True
+    assert AgentConfig.load("scout").env_overrides == {
+        "CODEX_AUTOCOMPACT_PCT_OVERRIDE": "30",
+    }
+
+
+@pytest.mark.asyncio
+async def test_edit_prefers_explicit_codex_threshold_key(home):
+    write_test_agent(home, "scout")
+    cfg = AgentConfig.load("scout")
+    cfg.runtime.harness = "codex"
+    cfg.save()
+
+    res = await execute_command(
+        "edit", "scout",
+        {"env_overrides": {
+            "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
+            "CODEX_AUTOCOMPACT_PCT_OVERRIDE": "30",
+        }},
+    )
+
+    assert res["ok"] is True
+    assert AgentConfig.load("scout").env_overrides == {
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
+        "CODEX_AUTOCOMPACT_PCT_OVERRIDE": "30",
+    }
+
+
+@pytest.mark.asyncio
 async def test_edit_rejects_non_whitelisted_env_key(home):
     write_test_agent(home, "scout")
     res = await execute_command(

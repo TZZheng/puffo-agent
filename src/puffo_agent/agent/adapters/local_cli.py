@@ -162,6 +162,7 @@ class LocalCLIAdapter(Adapter):
         permission_mode: str = "default",
         sandbox: str = "danger-full-access",
         inference_level: str = "",
+        auto_compact_threshold_pct: float | None = None,
         task_timeout_seconds: float = 1800.0,
         harness=None,
         desired_skills: list[str] | None = None,
@@ -187,6 +188,7 @@ class LocalCLIAdapter(Adapter):
         self.permission_mode = _sanitise_permission_mode(permission_mode, agent_id)
         self.sandbox = _sanitise_sandbox(sandbox, agent_id)
         self.inference_level = inference_level
+        self.auto_compact_threshold_pct = auto_compact_threshold_pct
         self.task_timeout_seconds = task_timeout_seconds
         self.desired_skills = list(desired_skills or [])
         self.desired_mcps = list(desired_mcps or [])
@@ -230,6 +232,8 @@ class LocalCLIAdapter(Adapter):
         return await session.run_turn(user_message, ctx.system_prompt)
 
     def context_limits(self) -> tuple[int | None, int | None]:
+        if self._codex_session is not None:
+            return self._codex_session.context_limits()
         if self._session is None:
             return None, None
         return self._session.context_limits()
@@ -466,6 +470,7 @@ class LocalCLIAdapter(Adapter):
             permission_mode=self.permission_mode,
             sandbox=self.sandbox,
             model=self.model,
+            auto_compact_threshold_pct=self.auto_compact_threshold_pct,
             task_timeout_seconds=self.task_timeout_seconds,
             audit=codex_audit,
         )

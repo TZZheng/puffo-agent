@@ -136,6 +136,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
     if kind == "cli-docker":
         from ..agent.adapters.docker_cli import DockerCLIAdapter
         from ..agent.harness import build_harness
+        from .control.context_telemetry import configured_compact_pct
         harness = build_harness(agent_cfg.runtime.harness)
         if harness.name() == "codex":
             model = agent_cfg.runtime.model or daemon_cfg.openai.model or ""
@@ -163,6 +164,9 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             permission_mode=agent_cfg.runtime.permission_mode,
             sandbox=agent_cfg.runtime.sandbox,
             inference_level=agent_cfg.runtime.inference_level,
+            auto_compact_threshold_pct=configured_compact_pct(
+                harness.name(), agent_cfg.env_overrides,
+            ),
             task_timeout_seconds=agent_cfg.runtime.task_timeout_seconds,
             harness=harness,
             memory_limit=memory_limit,
@@ -200,6 +204,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
 
     if kind == "cli-local":
         from ..agent.adapters.local_cli import LocalCLIAdapter
+        from .control.context_telemetry import configured_compact_pct
         # The legacy permission-proxy DM flow has not been ported to
         # puffo-core; the hook fail-opens when PUFFO_OPERATOR_USERNAME
         # is unset, so cli-local works without supervised approvals.
@@ -222,6 +227,9 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             permission_mode=agent_cfg.runtime.permission_mode,
             sandbox=agent_cfg.runtime.sandbox,
             inference_level=agent_cfg.runtime.inference_level,
+            auto_compact_threshold_pct=configured_compact_pct(
+                harness.name(), agent_cfg.env_overrides,
+            ),
             task_timeout_seconds=agent_cfg.runtime.task_timeout_seconds,
             harness=harness,
             desired_skills=agent_cfg.desired_skills,
@@ -980,15 +988,39 @@ class Worker:
                     env_overrides=self.agent_cfg.env_overrides,
                 )
             )
+        elif rt.harness == "codex":
+            from .control.context_telemetry import (
+                compact_threshold_pct,
+                configured_compact_pct,
+            )
+
+            adapter = getattr(self, "_adapter", None)
+            limits = adapter.context_limits() if adapter is not None else (None, None)
+            configured_pct = configured_compact_pct(
+                "codex", getattr(self.agent_cfg, "env_overrides", {}),
+            )
+            info.update({
+                "max_context": limits[0],
+                "auto_compact_threshold_pct": (
+                    configured_pct
+                    if configured_pct is not None
+                    else compact_threshold_pct(limits[0], limits[1])
+                ),
+            })
+        if rt.harness in {"claude-code", "codex"}:
             max_context = int(info["max_context"] or 0)
             threshold_pct = info["auto_compact_threshold_pct"]
+            runtime_state = getattr(self, "runtime", None)
             if (
-                self.runtime.max_context != max_context
-                or self.runtime.auto_compact_threshold_pct != threshold_pct
+                runtime_state is not None
+                and (
+                    runtime_state.max_context != max_context
+                    or runtime_state.auto_compact_threshold_pct != threshold_pct
+                )
             ):
-                self.runtime.max_context = max_context
-                self.runtime.auto_compact_threshold_pct = threshold_pct
-                self.runtime.save(self.agent_cfg.id)
+                runtime_state.max_context = max_context
+                runtime_state.auto_compact_threshold_pct = threshold_pct
+                runtime_state.save(self.agent_cfg.id)
         return info
 
     async def _run_ws_local(self) -> None:

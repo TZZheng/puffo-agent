@@ -93,7 +93,7 @@ def test_threshold_control_applies_to_cli_docker_claude(qapp, agent_home):
 
 @pytest.mark.parametrize(
     ("runtime_kind", "harness"),
-    [("cli-local", "codex"), ("ws-local", "claude-code")],
+    [("ws-local", "claude-code"), ("ws-local", "codex")],
 )
 def test_threshold_control_disables_when_not_applicable(
     qapp, agent_home, runtime_kind, harness
@@ -106,7 +106,39 @@ def test_threshold_control_disables_when_not_applicable(
     qapp.processEvents()
 
     assert not view._autocompact.isEnabled()
-    assert "only to Claude Code" in view._autocompact.toolTip()
+    assert "require Claude Code or Codex" in view._autocompact.toolTip()
+
+
+def test_threshold_control_applies_to_codex(qapp, agent_home):
+    cfg = AgentConfig.load("threshold-ui")
+    cfg.runtime.harness = "codex"
+    cfg.runtime.provider = "openai"
+    cfg.env_overrides = {"CODEX_AUTOCOMPACT_PCT_OVERRIDE": "75"}
+    cfg.save()
+    RuntimeState(max_context=258_400, auto_compact_threshold_pct=75).save(
+        "threshold-ui"
+    )
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+
+    assert view._autocompact.isEnabled()
+    assert view._autocompact.currentData() == "75"
+    assert "258K window" in view._context_usage.text()
+    assert "~193K (75%)" in view._context_usage.text()
+
+
+def test_codex_save_uses_codex_override_key(qapp, agent_home):
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+    view._harness.setCurrentText("codex")
+    view._autocompact.setCurrentIndex(view._autocompact.findData("75"))
+
+    view._on_save()
+
+    assert AgentConfig.load("threshold-ui").env_overrides == {
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50",
+        "CODEX_AUTOCOMPACT_PCT_OVERRIDE": "75",
+    }
 
 
 def test_threshold_selection_participates_in_dirty_state(qapp, agent_home):

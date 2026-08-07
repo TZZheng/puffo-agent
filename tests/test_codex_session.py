@@ -291,7 +291,8 @@ turn_id = msg["id"]
 
 w({"jsonrpc": "2.0", "method": "thread/tokenUsage/updated",
    "params": {"threadId": "c1", "turnId": "u1", "tokenUsage": {
-       "last": {"inputTokens": 76544, "cachedInputTokens": 74624, "outputTokens": 21},
+       "last": {"totalTokens": 76565, "inputTokens": 76544, "cachedInputTokens": 74624, "outputTokens": 21},
+       "modelContextWindow": 258400,
    }}})
 
 w({"jsonrpc": "2.0", "id": turn_id, "result": None})
@@ -318,6 +319,149 @@ while True:
     result = asyncio.run(_run())
     assert result.input_tokens == 76544 - 74624  # cached history excluded
     assert result.output_tokens == 21
+    assert result.metadata["context_tokens"] == 76565
+    assert cs.context_limits() == (258400, 244800)
+    assert cs._thread_config() == {}
+    persisted = json.loads((tmp_path / "codex_session.json").read_text())
+    assert persisted["model_context_window"] == 258400
+
+
+def test_configured_compact_pct_uses_persisted_model_window(tmp_path):
+    session_file = tmp_path / "codex_session.json"
+    session_file.write_text(json.dumps({
+        "conversation_id": "c1",
+        "sandbox": "danger-full-access",
+        "thread_cwd": str(tmp_path),
+        "model_context_window": 258400,
+    }))
+
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=session_file,
+        argv=["unused"],
+        cwd=str(tmp_path),
+        auto_compact_threshold_pct=75,
+    )
+
+    assert cs.context_limits() == (258400, 193800)
+    assert cs._thread_config() == {"model_auto_compact_token_limit": 193800}
+
+
+@pytest.mark.parametrize("window", [None, 0, -1, True, "258400"])
+def test_invalid_context_window_notification_is_ignored(tmp_path, window):
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=["unused"],
+    )
+
+    asyncio.run(cs._handle_notification(
+        "thread/tokenUsage/updated",
+        {"tokenUsage": {"modelContextWindow": window}},
+    ))
+
+    assert cs.context_limits() == (None, None)
+
+
+def test_context_window_updates_without_an_active_turn(tmp_path):
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=["unused"],
+    )
+
+    asyncio.run(cs._handle_notification(
+        "thread/tokenUsage/updated",
+        {"tokenUsage": {"modelContextWindow": 258400}},
+    ))
+
+    assert cs.context_limits() == (258400, 244800)
+
+
+def test_missing_persisted_model_is_backward_compatible(tmp_path):
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "missing.json",
+        argv=["unused"],
+    )
+
+    assert cs._load_persisted_model() is None
+
+
+def test_new_thread_receives_configured_compact_limit(tmp_path):
+    fake = _write_fake(tmp_path, '''\
+absorb_initialize()
+msg = r()
+assert msg["method"] == "thread/start"
+assert msg["params"]["config"] == {"model_auto_compact_token_limit": 193800}
+w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+''')
+    session_file = tmp_path / "codex_session.json"
+    session_file.write_text(json.dumps({
+        "conversation_id": "",
+        "sandbox": "danger-full-access",
+        "model": "",
+        "model_context_window": 258400,
+    }))
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=session_file,
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+        auto_compact_threshold_pct=75,
+    )
+
+    async def _run():
+        await cs.warm("system prompt")
+        await cs.aclose()
+
+    asyncio.run(_run())
+
+
+def test_first_context_window_reloads_session_before_next_turn(tmp_path):
+    fake = _write_fake(tmp_path, '''\
+absorb_initialize()
+msg = r()
+if msg["method"] == "thread/start":
+    assert "config" not in msg["params"]
+    w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+    while sys.stdin.readline():
+        pass
+else:
+    assert msg["method"] == "thread/resume"
+    assert msg["params"]["config"] == {"model_auto_compact_token_limit": 193800}
+    w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+    msg = r()
+    w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    w({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+    while sys.stdin.readline():
+        pass
+''')
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+        auto_compact_threshold_pct=75,
+    )
+
+    async def _run():
+        await cs.warm("system prompt")
+        await cs._handle_notification(
+            "thread/tokenUsage/updated",
+            {"tokenUsage": {"modelContextWindow": 258400}},
+        )
+        result = await cs.run_turn("hi", "system prompt")
+        await cs.aclose()
+        return result
+
+    result = asyncio.run(_run())
+    assert result.metadata["conversation_id"] == "c1"
+    assert cs._compact_config_pending is False
 
 
 def test_token_usage_sums_multi_request_turn(tmp_path):
@@ -332,11 +476,11 @@ turn_id = msg["id"]
 
 w({"jsonrpc": "2.0", "method": "thread/tokenUsage/updated",
    "params": {"tokenUsage": {
-       "last": {"inputTokens": 1005, "cachedInputTokens": 1000, "outputTokens": 100},
+       "last": {"totalTokens": 1105, "inputTokens": 1005, "cachedInputTokens": 1000, "outputTokens": 100},
        "total": {"inputTokens": 5005, "cachedInputTokens": 5000, "outputTokens": 100}}}})
 w({"jsonrpc": "2.0", "method": "thread/tokenUsage/updated",
    "params": {"tokenUsage": {
-       "last": {"inputTokens": 1008, "cachedInputTokens": 1000, "outputTokens": 110},
+       "last": {"totalTokens": 1118, "inputTokens": 1008, "cachedInputTokens": 1000, "outputTokens": 110},
        "total": {"inputTokens": 6013, "cachedInputTokens": 6000, "outputTokens": 210}}}})
 
 w({"jsonrpc": "2.0", "id": turn_id, "result": None})
@@ -360,6 +504,7 @@ while True:
         return result
 
     result = asyncio.run(_run())
+    assert result.metadata["context_tokens"] == 1118
     assert result.output_tokens == 210  # 100 + 110, not just the last request's 110
     assert result.input_tokens == 13    # cumulative non-cached, not just the last
 
@@ -374,6 +519,7 @@ absorb_initialize()
 msg = r()
 assert msg["method"] == "thread/resume", f"expected thread/resume, got {msg['method']}"
 assert msg["params"]["threadId"] == "conv_42"
+assert msg["params"]["config"] == {"model_auto_compact_token_limit": 193800}
 w({"jsonrpc": "2.0", "id": msg["id"],
    "result": {"thread": {"id": "conv_42"}}})
 
@@ -399,6 +545,7 @@ def test_resume_existing_conversation(tmp_path):
         "conversation_id": "conv_42",
         "sandbox": "danger-full-access",
         "thread_cwd": str(tmp_path),
+        "model_context_window": 258400,
     }))
 
     cs = CodexSession(
@@ -406,6 +553,7 @@ def test_resume_existing_conversation(tmp_path):
         session_file=session_file,
         argv=_argv_for(fake),
         cwd=str(tmp_path),
+        auto_compact_threshold_pct=75,
     )
 
     async def _run():
@@ -861,14 +1009,15 @@ while True:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_load_conversation_id_failsoft_on_corrupt_json(tmp_path):
-    """Corrupt session JSON loads as ``""`` — the signal
-    ``_ensure_running`` keys on to recover."""
+def test_persisted_session_loaders_failsoft_on_corrupt_json(tmp_path):
     session_file = tmp_path / "codex_session.json"
     session_file.write_text("not-valid-json{", encoding="utf-8")
     cs = CodexSession.__new__(CodexSession)
     cs.session_file = session_file
     assert cs._load_conversation_id() == ""
+    assert cs._load_persisted_thread_cwd() == ""
+    assert cs._load_persisted_model() is None
+    assert cs._load_model_context_window() is None
 
 
 def test_ensure_running_with_empty_cid_and_alive_proc_respawns(tmp_path):
@@ -969,6 +1118,7 @@ def test_run_turn_raises_when_cid_stays_empty(tmp_path):
     cs._lock = asyncio.Lock()
     cs._next_id = 1
     cs._active_turn = None
+    cs._compact_config_pending = False
     cs.current_instructions = None
 
     async def _stub_ensure_running(_system_prompt):
@@ -1221,6 +1371,25 @@ def test_codex_same_sandbox_keeps_persisted_thread(tmp_path):
         agent_id="a", session_file=sf, argv=["x"], sandbox="workspace-write",
     )
     assert cs._conversation_id == "old_thread"  # unchanged → resume
+
+
+def test_codex_model_change_resets_thread_and_stale_context_window(tmp_path):
+    sf = tmp_path / "codex_session.json"
+    sf.write_text(json.dumps({
+        "conversation_id": "old_thread",
+        "sandbox": "danger-full-access",
+        "model": "gpt-old",
+        "model_context_window": 258_400,
+    }), encoding="utf-8")
+
+    cs = CodexSession(
+        agent_id="a", session_file=sf, argv=["x"], model="gpt-new",
+        auto_compact_threshold_pct=75,
+    )
+
+    assert cs._conversation_id == ""
+    assert cs.context_limits() == (None, None)
+    assert cs._thread_config() == {}
 
 
 def test_codex_legacy_session_file_treated_as_full_access(tmp_path):

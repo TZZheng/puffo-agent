@@ -1,4 +1,4 @@
-"""Claude Code context limits and auto-compact configuration."""
+"""Harness context limits and auto-compact configuration."""
 
 from __future__ import annotations
 
@@ -10,6 +10,19 @@ MIN_CONTEXT_WINDOW_TOKENS = 100_000
 MAX_CONTEXT_WINDOW_TOKENS = 1_000_000
 
 logger = logging.getLogger(__name__)
+
+CLAUDE_COMPACT_PCT_KEY = "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+CODEX_COMPACT_PCT_KEY = "CODEX_AUTOCOMPACT_PCT_OVERRIDE"
+
+
+def compact_pct_key(harness: str) -> str:
+    return CODEX_COMPACT_PCT_KEY if harness == "codex" else CLAUDE_COMPACT_PCT_KEY
+
+
+def configured_compact_pct(
+    harness: str, env_overrides: dict[str, str] | None,
+) -> float | None:
+    return parse_threshold_pct((env_overrides or {}).get(compact_pct_key(harness)))
 
 _MODEL_WINDOWS: tuple[tuple[str, int], ...] = (
     # Legacy explicit extended-window aliases.
@@ -105,9 +118,7 @@ def build_context_runtime(
         and max_context > 0
         else resolve_context_window(model, env)
     )
-    configured_pct = parse_threshold_pct(
-        overrides.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
-    )
+    configured_pct = parse_threshold_pct(overrides.get(CLAUDE_COMPACT_PCT_KEY))
     reported_pct = compact_threshold_pct(window, auto_compact_threshold)
     return {
         "max_context": window,

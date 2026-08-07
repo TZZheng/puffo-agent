@@ -1067,7 +1067,10 @@ class RuntimeConfig:
 MAX_ROLE_SHORT_LEN = 32
 
 # Prevent remote edits from rewriting process identity or credentials.
-ENV_OVERRIDE_WHITELIST = frozenset({"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"})
+ENV_OVERRIDE_WHITELIST = frozenset({
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+    "CODEX_AUTOCOMPACT_PCT_OVERRIDE",
+})
 
 
 def validate_env_overrides(raw: object) -> dict[str, str]:
@@ -1096,8 +1099,7 @@ def validate_env_overrides(raw: object) -> dict[str, str]:
             ) from None
         if not (0 < pct <= 100):
             raise ValueError(
-                f"{key} must be >0 and <=100 (claude-code ignores anything "
-                f"else); got {text!r}"
+                f"{key} must be >0 and <=100; got {text!r}"
             )
         text = str(int(pct)) if pct.is_integer() else str(pct)
         out[key] = text
