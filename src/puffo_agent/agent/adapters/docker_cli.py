@@ -148,6 +148,7 @@ class DockerCLIAdapter(Adapter):
         permission_mode: str = "bypassPermissions",
         sandbox: str = "danger-full-access",
         inference_level: str = "",
+        auto_compact_threshold_pct: float | None = None,
         task_timeout_seconds: float = 1800.0,
         harness=None,
         memory_limit: str = "",
@@ -178,6 +179,7 @@ class DockerCLIAdapter(Adapter):
         self.permission_mode = permission_mode
         self.sandbox = sandbox
         self.inference_level = inference_level
+        self.auto_compact_threshold_pct = auto_compact_threshold_pct
         self.task_timeout_seconds = task_timeout_seconds
         # Optional cgroup caps. ``--memory`` is a hard ceiling that
         # OOM-kills processes in this container only; ``--memory-
@@ -227,6 +229,8 @@ class DockerCLIAdapter(Adapter):
         return await session.run_turn(user_message, ctx.system_prompt)
 
     def context_limits(self) -> tuple[int | None, int | None]:
+        if self._codex_session is not None:
+            return self._codex_session.context_limits()
         if self._session is None:
             return None, None
         return self._session.context_limits()
@@ -345,6 +349,7 @@ class DockerCLIAdapter(Adapter):
             permission_mode=self.permission_mode,
             sandbox=self.sandbox,
             model=self.model,
+            auto_compact_threshold_pct=self.auto_compact_threshold_pct,
             task_timeout_seconds=self.task_timeout_seconds,
             audit=AuditLog(
                 Path(self.workspace_dir) / ".puffo-agent" / "audit.log",

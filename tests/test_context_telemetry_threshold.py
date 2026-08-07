@@ -12,6 +12,7 @@ from _bridge_support import isolated_home, write_test_agent  # noqa: E402
 from puffo_agent.portal.control.context_telemetry import (  # noqa: E402
     build_context_runtime,
     compact_threshold_pct,
+    configured_compact_pct,
     estimate_compact_threshold_tokens,
     parse_threshold_pct,
     resolve_context_window,
@@ -260,13 +261,14 @@ def test_runtime_info_preserves_unknown_model_window():
     assert worker.runtime.max_context == 0
 
 
-def test_codex_runtime_info_omits_claude_context_config():
+def test_codex_runtime_info_persists_app_server_context_window():
     from types import SimpleNamespace
 
     from puffo_agent.portal.worker import Worker
 
     worker = Worker.__new__(Worker)
     worker.agent_cfg = SimpleNamespace(
+        id="ctx-bot",
         runtime=SimpleNamespace(
             kind="cli-docker",
             provider="openai",
@@ -276,6 +278,8 @@ def test_codex_runtime_info_omits_claude_context_config():
         ),
         env_overrides={},
     )
+    worker._adapter = SimpleNamespace(context_limits=lambda: (258_400, 244_800))
+    worker.runtime = RuntimeState()
 
     assert worker._runtime_info() == {
         "kind": "cli-docker",
@@ -283,13 +287,57 @@ def test_codex_runtime_info_omits_claude_context_config():
         "harness": "codex",
         "model": "gpt-5.4",
         "inference_level": "high",
+        "max_context": 258_400,
+        "auto_compact_threshold_pct": 94.737,
     }
+    assert worker.runtime.max_context == 258_400
+
+
+def test_codex_runtime_reports_configured_compact_pct():
+    from types import SimpleNamespace
+
+    from puffo_agent.portal.worker import Worker
+
+    worker = Worker.__new__(Worker)
+    worker.agent_cfg = SimpleNamespace(
+        id="ctx-bot",
+        runtime=SimpleNamespace(
+            kind="cli-local",
+            provider="openai",
+            harness="codex",
+            model="gpt-5.4",
+            inference_level="high",
+        ),
+        env_overrides={"CODEX_AUTOCOMPACT_PCT_OVERRIDE": "75"},
+    )
+    worker._adapter = SimpleNamespace(context_limits=lambda: (258_400, 193_800))
+    worker.runtime = RuntimeState()
+
+    out = worker._runtime_info()
+
+    assert out["max_context"] == 258_400
+    assert out["auto_compact_threshold_pct"] == 75
 
 
 def test_validate_accepts_whitelisted_key():
     assert validate_env_overrides(
         {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"}
     ) == {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"}
+
+
+def test_validate_accepts_codex_threshold_key():
+    assert validate_env_overrides(
+        {"CODEX_AUTOCOMPACT_PCT_OVERRIDE": "75"}
+    ) == {"CODEX_AUTOCOMPACT_PCT_OVERRIDE": "75"}
+
+
+def test_configured_threshold_is_harness_specific():
+    overrides = {
+        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "30",
+        "CODEX_AUTOCOMPACT_PCT_OVERRIDE": "75",
+    }
+    assert configured_compact_pct("claude-code", overrides) == 30
+    assert configured_compact_pct("codex", overrides) == 75
 
 
 def test_validate_rejects_unknown_key():
@@ -397,6 +445,10 @@ def test_overrides_layer_over_os_environ_but_under_adapter_owned_vars():
         "autoCompactThreshold": 167_000,
     }
     assert adapter.context_limits() == (200_000, 167_000)
+    adapter._codex_session = type("CodexLimits", (), {
+        "context_limits": lambda self: (258_400, 193_800),
+    })()
+    assert adapter.context_limits() == (258_400, 193_800)
 
     env = session.env
     assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "50"
@@ -443,6 +495,10 @@ def test_docker_session_receives_overrides(tmp_path, monkeypatch):
         "autoCompactThreshold": 967_000,
     }
     assert adapter.context_limits() == (1_000_000, 967_000)
+    adapter._codex_session = type("CodexLimits", (), {
+        "context_limits": lambda self: (258_400, 193_800),
+    })()
+    assert adapter.context_limits() == (258_400, 193_800)
     assert session.env_overrides == {
         "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"
     }
@@ -592,3 +648,20 @@ async def test_remote_edit_reaches_docker_exec_command():
     session = adapter._ensure_session()
     command = session.build_command([], session.env_overrides)
     assert command[3:5] == ["-e", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=50"]
+
+
+def test_build_local_codex_adapter_receives_compact_pct():
+    from puffo_agent.portal.state import DaemonConfig
+    from puffo_agent.portal.worker import build_adapter
+
+    home = isolated_home()
+    write_test_agent(home, "ctx-bot")
+    cfg = AgentConfig.load("ctx-bot")
+    cfg.runtime.kind = "cli-local"
+    cfg.runtime.provider = "openai"
+    cfg.runtime.harness = "codex"
+    cfg.env_overrides = {"CODEX_AUTOCOMPACT_PCT_OVERRIDE": "75"}
+
+    adapter = build_adapter(DaemonConfig(), cfg)
+
+    assert adapter.auto_compact_threshold_pct == 75

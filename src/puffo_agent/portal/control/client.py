@@ -305,11 +305,28 @@ async def execute_command(
             if not result.ok:
                 return {"ok": False, "error": f"runtime: {result.error}"}
         if "env_overrides" in params:
+            from .context_telemetry import (
+                CLAUDE_COMPACT_PCT_KEY,
+                CODEX_COMPACT_PCT_KEY,
+            )
             from ..state import merge_env_overrides
 
+            updates = params.get("env_overrides")
+            if (
+                cfg.runtime.harness == "codex"
+                and isinstance(updates, dict)
+                and CLAUDE_COMPACT_PCT_KEY in updates
+                and CODEX_COMPACT_PCT_KEY not in updates
+            ):
+                updates = dict(updates)
+                updates[CODEX_COMPACT_PCT_KEY] = updates.pop(
+                    CLAUDE_COMPACT_PCT_KEY
+                )
+                if CLAUDE_COMPACT_PCT_KEY in cfg.env_overrides:
+                    updates[CLAUDE_COMPACT_PCT_KEY] = ""
             try:
                 merged = merge_env_overrides(
-                    cfg.env_overrides, params.get("env_overrides")
+                    cfg.env_overrides, updates
                 )
             except ValueError as exc:
                 return {"ok": False, "error": str(exc)}
