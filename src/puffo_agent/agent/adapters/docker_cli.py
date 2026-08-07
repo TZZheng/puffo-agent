@@ -153,6 +153,7 @@ class DockerCLIAdapter(Adapter):
         memory_limit: str = "",
         memory_reservation: str = "",
         desired_skills: list[str] | None = None,
+        env_overrides: dict[str, str] | None = None,
         desired_mcps: list[str] | None = None,
         puffo_core_server_url: str = "",
         puffo_core_slug: str = "",
@@ -196,6 +197,7 @@ class DockerCLIAdapter(Adapter):
             )
         self.harness = harness
         self.desired_skills = list(desired_skills or [])
+        self.env_overrides = {str(k): str(v) for k, v in (env_overrides or {}).items()}
         self.desired_mcps = list(desired_mcps or [])
         self.puffo_core_server_url = puffo_core_server_url
         self.puffo_core_slug = puffo_core_slug
@@ -223,6 +225,11 @@ class DockerCLIAdapter(Adapter):
             )
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
+
+    def context_limits(self) -> tuple[int | None, int | None]:
+        if self._session is None:
+            return None, None
+        return self._session.context_limits()
 
     async def run_retry_turn(
         self,
@@ -364,6 +371,7 @@ class DockerCLIAdapter(Adapter):
             ),
             extra_args=extra,
             model=self.model,
+            env_overrides=self.env_overrides,
         )
         return self._session
 

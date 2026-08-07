@@ -166,11 +166,14 @@ class LocalCLIAdapter(Adapter):
         harness=None,
         desired_skills: list[str] | None = None,
         desired_mcps: list[str] | None = None,
+        env_overrides: dict[str, str] | None = None,
         puffo_core_server_url: str = "",
         puffo_core_slug: str = "",
         puffo_core_keys_dir: str = "",
     ):
         self.agent_id = agent_id
+        # Adapter-owned variables below take precedence over these overrides.
+        self.env_overrides = {str(k): str(v) for k, v in (env_overrides or {}).items()}
         self.model = model
         self.workspace_dir = workspace_dir
         self.claude_dir = claude_dir
@@ -225,6 +228,11 @@ class LocalCLIAdapter(Adapter):
             return await self._run_hermes_turn(user_message, ctx.system_prompt)
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
+
+    def context_limits(self) -> tuple[int | None, int | None]:
+        if self._session is None:
+            return None, None
+        return self._session.context_limits()
 
     async def run_retry_turn(
         self,
@@ -786,6 +794,7 @@ class LocalCLIAdapter(Adapter):
         # consumed by the per-tool-call hook subprocess.
         env = {
             **os.environ,
+            **self.env_overrides,
             "HOME": str(self.agent_home_dir),
             "USERPROFILE": str(self.agent_home_dir),
             **self._permission_hook_env(),
@@ -803,6 +812,7 @@ class LocalCLIAdapter(Adapter):
             ),
             extra_args=extra,
             model=self.model,
+            env_overrides=self.env_overrides,
         )
         return self._session
 

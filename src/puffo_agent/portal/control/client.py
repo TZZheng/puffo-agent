@@ -304,6 +304,18 @@ async def execute_command(
             result = validate_triple(rt.kind, rt.provider, rt.harness)
             if not result.ok:
                 return {"ok": False, "error": f"runtime: {result.error}"}
+        if "env_overrides" in params:
+            from ..state import merge_env_overrides
+
+            try:
+                merged = merge_env_overrides(
+                    cfg.env_overrides, params.get("env_overrides")
+                )
+            except ValueError as exc:
+                return {"ok": False, "error": str(exc)}
+            if merged != cfg.env_overrides:
+                cfg.env_overrides = merged
+                runtime_changed = True
         cfg.save()
         if isinstance(params.get("profile"), str):
             (agent_yml_path(agent_slug).parent / cfg.profile).write_text(

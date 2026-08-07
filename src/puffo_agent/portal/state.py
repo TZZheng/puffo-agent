@@ -1066,6 +1066,54 @@ class RuntimeConfig:
 
 MAX_ROLE_SHORT_LEN = 32
 
+# Prevent remote edits from rewriting process identity or credentials.
+ENV_OVERRIDE_WHITELIST = frozenset({"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"})
+
+
+def validate_env_overrides(raw: object) -> dict[str, str]:
+    """Validate and normalize a partial ``env_overrides`` update."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("env_overrides must be an object")
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        key = str(key)
+        if key not in ENV_OVERRIDE_WHITELIST:
+            allowed = ", ".join(sorted(ENV_OVERRIDE_WHITELIST))
+            raise ValueError(
+                f"env_overrides key {key!r} is not allowed (allowed: {allowed})"
+            )
+        text = str(value).strip()
+        if not text:
+            out[key] = ""
+            continue
+        try:
+            pct = float(text)
+        except ValueError:
+            raise ValueError(
+                f"{key} must be a number between 1 and 100; got {text!r}"
+            ) from None
+        if not (0 < pct <= 100):
+            raise ValueError(
+                f"{key} must be >0 and <=100 (claude-code ignores anything "
+                f"else); got {text!r}"
+            )
+        text = str(int(pct)) if pct.is_integer() else str(pct)
+        out[key] = text
+    return out
+
+
+def merge_env_overrides(current: object, updates: object) -> dict[str, str]:
+    """Apply a validated partial update; empty values remove keys."""
+    merged = dict(validate_env_overrides(current))
+    for key, value in validate_env_overrides(updates).items():
+        if value:
+            merged[key] = value
+        else:
+            merged.pop(key, None)
+    return merged
+
 
 def derive_role_short(role: str) -> str:
     """Canonical mirror of puffo-server's ``derive_role_short``: the chip
@@ -1115,6 +1163,8 @@ class AgentConfig:
     # de-duped against whatever host already provides.
     desired_skills: list[str] = field(default_factory=list)
     desired_mcps: list[str] = field(default_factory=list)
+    # Whitelisted per-agent subprocess environment.
+    env_overrides: dict[str, str] = field(default_factory=dict)
     created_at: int = 0
 
     @classmethod
@@ -1186,6 +1236,9 @@ class AgentConfig:
             ),
             desired_skills=list(raw.get("desired_skills") or []),
             desired_mcps=list(raw.get("desired_mcps") or []),
+            env_overrides={
+                str(k): str(v) for k, v in (raw.get("env_overrides") or {}).items()
+            },
             created_at=int(raw.get("created_at", 0)),
         )
 
@@ -1208,6 +1261,7 @@ class AgentConfig:
             "triggers": asdict(self.triggers),
             "desired_skills": list(self.desired_skills),
             "desired_mcps": list(self.desired_mcps),
+            "env_overrides": dict(self.env_overrides),
         }
         _atomic_write_yaml(path, data)
 
@@ -1244,6 +1298,8 @@ class RuntimeState:
     msg_count: int = 0
     last_event_at: int = 0
     error: str = ""
+    max_context: int = 0
+    auto_compact_threshold_pct: float | None = None
     # Worker-side health, independent of ``status``:
     #   "ok"                  - clean turn / cleared red
     #   "in_progress"         - turn mid-flight; overrides sticky reds
@@ -1275,6 +1331,12 @@ class RuntimeState:
             msg_count=int(raw.get("msg_count", 0)),
             last_event_at=int(raw.get("last_event_at", 0)),
             error=raw.get("error", ""),
+            max_context=int(raw.get("max_context", 0) or 0),
+            auto_compact_threshold_pct=(
+                float(raw["auto_compact_threshold_pct"])
+                if raw.get("auto_compact_threshold_pct") is not None
+                else None
+            ),
             health=raw.get("health", "unknown"),
         )
 

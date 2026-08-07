@@ -257,6 +257,7 @@ def test_worker_uses_openai_defaults_and_forwards_desired_content(monkeypatch, t
         runtime=runtime,
         desired_skills=["review"],
         desired_mcps=["github"],
+        env_overrides={},
         puffo_core=puffo_core,
         resolve_workspace_dir=lambda: tmp_path / "workspace",
         resolve_claude_dir=lambda: tmp_path / "workspace" / ".claude",
