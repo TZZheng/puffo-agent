@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 
-DEFAULT_CONTEXT_WINDOW_TOKENS = 200_000
 MIN_CONTEXT_WINDOW_TOKENS = 100_000
 MAX_CONTEXT_WINDOW_TOKENS = 1_000_000
 
+logger = logging.getLogger(__name__)
+
 _MODEL_WINDOWS: tuple[tuple[str, int], ...] = (
+    # Legacy explicit extended-window aliases.
     ("[1m]", 1_000_000),
     ("-1m", 1_000_000),
     ("opus-5", 1_000_000),
@@ -20,10 +23,12 @@ _MODEL_WINDOWS: tuple[tuple[str, int], ...] = (
     ("sonnet-4-6", 1_000_000),
     ("fable-5", 1_000_000),
     ("mythos-5", 1_000_000),
+    ("haiku-4-5", 200_000),
 )
 
-
-def resolve_context_window(model: str = "", env: dict[str, str] | None = None) -> int:
+def resolve_context_window(
+    model: str = "", env: dict[str, str] | None = None
+) -> int | None:
     """Resolve Claude Code's effective auto-compact window."""
     src = os.environ if env is None else env
     raw = (src.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") or "").strip()
@@ -41,11 +46,12 @@ def resolve_context_window(model: str = "", env: dict[str, str] | None = None) -
     for needle, window in _MODEL_WINDOWS:
         if needle in low:
             return window
-    return DEFAULT_CONTEXT_WINDOW_TOKENS
+    logger.warning("Claude context window is unknown for model %r", model)
+    return None
 
 
 def parse_threshold_pct(raw: object) -> float | None:
-    """Return the effective override, or None when Claude Code ignores it."""
+    """Parse a syntactically valid Claude auto-compact override."""
     if raw is None:
         return None
     text = str(raw).strip()
@@ -60,15 +66,20 @@ def parse_threshold_pct(raw: object) -> float | None:
     return pct
 
 
-def estimate_compact_threshold_tokens(window: int, pct: float | None) -> int | None:
-    if pct is None:
+def estimate_compact_threshold_tokens(
+    window: int | None, pct: float | None
+) -> int | None:
+    if window is None or pct is None:
         return None
     return max(0, int(window * pct / 100))
 
 
-def compact_threshold_pct(window: int, threshold: int | None) -> float | None:
+def compact_threshold_pct(
+    window: int | None, threshold: int | None
+) -> float | None:
     if (
-        isinstance(threshold, bool)
+        window is None
+        or isinstance(threshold, bool)
         or not isinstance(threshold, int)
         or threshold <= 0
         or threshold > window
@@ -97,11 +108,10 @@ def build_context_runtime(
     configured_pct = parse_threshold_pct(
         overrides.get("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE")
     )
+    reported_pct = compact_threshold_pct(window, auto_compact_threshold)
     return {
         "max_context": window,
         "auto_compact_threshold_pct": (
-            configured_pct
-            if configured_pct is not None
-            else compact_threshold_pct(window, auto_compact_threshold)
+            configured_pct if configured_pct is not None else reported_pct
         ),
     }

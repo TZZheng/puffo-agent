@@ -980,7 +980,7 @@ class Worker:
                     env_overrides=self.agent_cfg.env_overrides,
                 )
             )
-            max_context = int(info["max_context"])
+            max_context = int(info["max_context"] or 0)
             threshold_pct = info["auto_compact_threshold_pct"]
             if (
                 self.runtime.max_context != max_context
