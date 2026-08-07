@@ -422,6 +422,48 @@ while True:
     asyncio.run(_run())
 
 
+def test_first_context_window_reloads_session_before_next_turn(tmp_path):
+    fake = _write_fake(tmp_path, '''\
+absorb_initialize()
+msg = r()
+if msg["method"] == "thread/start":
+    assert "config" not in msg["params"]
+    w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+    while sys.stdin.readline():
+        pass
+else:
+    assert msg["method"] == "thread/resume"
+    assert msg["params"]["config"] == {"model_auto_compact_token_limit": 193800}
+    w({"jsonrpc": "2.0", "id": msg["id"], "result": {"thread": {"id": "c1"}}})
+    msg = r()
+    w({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    w({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+    while sys.stdin.readline():
+        pass
+''')
+    cs = CodexSession(
+        agent_id="alice-test-0001",
+        session_file=tmp_path / "codex_session.json",
+        argv=_argv_for(fake),
+        cwd=str(tmp_path),
+        auto_compact_threshold_pct=75,
+    )
+
+    async def _run():
+        await cs.warm("system prompt")
+        await cs._handle_notification(
+            "thread/tokenUsage/updated",
+            {"tokenUsage": {"modelContextWindow": 258400}},
+        )
+        result = await cs.run_turn("hi", "system prompt")
+        await cs.aclose()
+        return result
+
+    result = asyncio.run(_run())
+    assert result.metadata["conversation_id"] == "c1"
+    assert cs._compact_config_pending is False
+
+
 def test_token_usage_sums_multi_request_turn(tmp_path):
     """A turn with several model requests reports the whole turn's usage (the
     thread total's delta), not just the last request."""
@@ -967,14 +1009,15 @@ while True:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def test_load_conversation_id_failsoft_on_corrupt_json(tmp_path):
-    """Corrupt session JSON loads as ``""`` — the signal
-    ``_ensure_running`` keys on to recover."""
+def test_persisted_session_loaders_failsoft_on_corrupt_json(tmp_path):
     session_file = tmp_path / "codex_session.json"
     session_file.write_text("not-valid-json{", encoding="utf-8")
     cs = CodexSession.__new__(CodexSession)
     cs.session_file = session_file
     assert cs._load_conversation_id() == ""
+    assert cs._load_persisted_thread_cwd() == ""
+    assert cs._load_persisted_model() is None
+    assert cs._load_model_context_window() is None
 
 
 def test_ensure_running_with_empty_cid_and_alive_proc_respawns(tmp_path):
@@ -1075,6 +1118,7 @@ def test_run_turn_raises_when_cid_stays_empty(tmp_path):
     cs._lock = asyncio.Lock()
     cs._next_id = 1
     cs._active_turn = None
+    cs._compact_config_pending = False
     cs.current_instructions = None
 
     async def _stub_ensure_running(_system_prompt):

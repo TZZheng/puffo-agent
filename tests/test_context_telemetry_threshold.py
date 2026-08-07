@@ -650,14 +650,15 @@ async def test_remote_edit_reaches_docker_exec_command():
     assert command[3:5] == ["-e", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=50"]
 
 
-def test_build_local_codex_adapter_receives_compact_pct():
+@pytest.mark.parametrize("kind", ["cli-local", "cli-docker"])
+def test_build_codex_adapter_receives_compact_pct(kind):
     from puffo_agent.portal.state import DaemonConfig
     from puffo_agent.portal.worker import build_adapter
 
     home = isolated_home()
     write_test_agent(home, "ctx-bot")
     cfg = AgentConfig.load("ctx-bot")
-    cfg.runtime.kind = "cli-local"
+    cfg.runtime.kind = kind
     cfg.runtime.provider = "openai"
     cfg.runtime.harness = "codex"
     cfg.env_overrides = {"CODEX_AUTOCOMPACT_PCT_OVERRIDE": "75"}

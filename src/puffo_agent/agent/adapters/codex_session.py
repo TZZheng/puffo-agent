@@ -263,6 +263,7 @@ class CodexSession:
         self._lock = asyncio.Lock()
         self._conversation_id: str = self._load_conversation_id()
         self._model_context_window: int | None = self._load_model_context_window()
+        self._compact_config_pending = False
         # thread/start params aren't re-sent on resume; a sandbox change would
         # silently keep the old policy. Drop the thread, next start re-applies.
         if self._conversation_id:
@@ -335,6 +336,8 @@ class CodexSession:
     async def run_turn(self, user_message: str, system_prompt: str) -> TurnResult:
         """Send one turn; wait for ``turn/completed``."""
         async with self._lock:
+            if self._compact_config_pending:
+                await self._teardown_locked()
             await self._ensure_running(system_prompt)
             # Defence-in-depth: a non-empty cid is ``_ensure_running``'s
             # contract; never send ``threadId=""`` (a silent wedge) if
@@ -814,6 +817,8 @@ class CodexSession:
                         resume=True,
                         session_id=self._conversation_id,
                     )
+                if config:
+                    self._compact_config_pending = False
                 return
             except Exception as exc:
                 logger.warning(
@@ -863,7 +868,8 @@ class CodexSession:
                 resume=False,
                 session_id=self._conversation_id,
             )
-
+        if config:
+            self._compact_config_pending = False
 
     async def _teardown_locked(self) -> None:
         for pending in self._pending.values():
@@ -1180,6 +1186,8 @@ class CodexSession:
             ):
                 self._model_context_window = model_context_window
                 self._save_conversation_id(self._conversation_id)
+                if self.auto_compact_threshold_pct is not None:
+                    self._compact_config_pending = True
             if turn is None:
                 return
             last = tu.get("last") or {}
