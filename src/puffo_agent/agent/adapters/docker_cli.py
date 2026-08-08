@@ -67,14 +67,14 @@ def _puffo_agent_pkg_dir() -> Path:
 # Bump on Dockerfile changes so existing hosts rebuild without manual
 # image-tag pruning. ``_ensure_image`` only builds when the tag is
 # missing locally.
-DEFAULT_IMAGE = "puffo/agent-runtime:v15"
-CONTAINER_LAYOUT_VERSION = "15"
+DEFAULT_IMAGE = "puffo/agent-runtime:v16"
+CONTAINER_LAYOUT_VERSION = "16"
 
 # Pinned Claude Code CLI version baked into the image. Floating would
 # let an upstream release shift the stream-json protocol or
 # ``--permission-mode`` semantics under us; bump deliberately after
 # verification.
-CLAUDE_CODE_NPM_VERSION = "2.1.117"
+CLAUDE_CODE_NPM_VERSION = "2.1.224"
 
 # Pinned Codex CLI version. Keep this aligned with the app-server
 # protocol exercised by ``CodexSession``.
@@ -392,6 +392,8 @@ class DockerCLIAdapter(Adapter):
         # errors. Never pass secrets here; use Docker's name-only ``-e NAME``
         # passthrough, as the Codex bearer-token path does.
         for key, value in (env_overrides or {}).items():
+            if key == "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":
+                continue
             cmd.extend(["-e", f"{key}={value}"])
         cmd.extend([
             self.container_name,
@@ -399,6 +401,15 @@ class DockerCLIAdapter(Adapter):
         ])
         if self.model:
             cmd.extend(["--model", self.model])
+        from ...portal.control.context_telemetry import claude_autocompact_tokens
+
+        threshold = claude_autocompact_tokens(
+            model=self.model,
+            pct=getattr(self, "auto_compact_threshold_pct", None),
+            env={},
+        )
+        if threshold is not None:
+            cmd.extend(["--autocompact", str(threshold)])
         if self.inference_level:
             if self.inference_level in INFERENCE_LEVELS:
                 cmd.extend(["--effort", self.inference_level])

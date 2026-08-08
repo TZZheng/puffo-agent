@@ -805,9 +805,14 @@ class LocalCLIAdapter(Adapter):
         }
         env = {
             **os.environ,
-            **self.env_overrides,
+            **{
+                key: value
+                for key, value in self.env_overrides.items()
+                if key != "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"
+            },
             **adapter_owned_env,
         }
+        env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
         self._session = ClaudeSession(
             agent_id=self.agent_id,
             session_file=self.session_file,
@@ -956,6 +961,14 @@ class LocalCLIAdapter(Adapter):
             cmd.extend(["--permission-mode", self.permission_mode])
         if self.model:
             cmd.extend(["--model", self.model])
+        from ...portal.control.context_telemetry import claude_autocompact_tokens
+
+        threshold = claude_autocompact_tokens(
+            model=self.model,
+            pct=getattr(self, "auto_compact_threshold_pct", None),
+        )
+        if threshold is not None:
+            cmd.extend(["--autocompact", str(threshold)])
         # drops codex-only yaml values
         if self.inference_level:
             if self.inference_level in INFERENCE_LEVELS:
