@@ -31,21 +31,24 @@ def _loopback_host_headers(cfg: WsLocalServiceConfig) -> set[str]:
     return hosts | {f"{host}:{cfg.port}" for host in hosts}
 
 
-def _require_loopback_host(cfg: WsLocalServiceConfig):
+def _require_local_request(cfg: WsLocalServiceConfig):
     allowed_hosts = _loopback_host_headers(cfg)
 
     @web.middleware
-    async def require_loopback_host(request: web.Request, handler):
+    async def require_local_request(request: web.Request, handler):
         host = (request.headers.get(hdrs.HOST) or "").lower()
         if host not in allowed_hosts:
             return web.Response(status=403, text="invalid host")
+        if hdrs.ORIGIN in request.headers:
+            return web.Response(status=403, text="invalid origin")
         return await handler(request)
 
-    return require_loopback_host
+    return require_local_request
 
 
 def build_app(cfg: WsLocalServiceConfig, ws_local_hub=None) -> web.Application:
-    app = web.Application(middlewares=[_require_loopback_host(cfg)])
+    # TODO: Bound concurrent pre-auth handshakes to cap local KDF work.
+    app = web.Application(middlewares=[_require_local_request(cfg)])
     app[WS_LOCAL_HUB_KEY] = ws_local_hub
     app.router.add_get(WS_LOCAL_PATH, handle_ws_local)
     return app
@@ -58,6 +61,7 @@ async def start_ws_local_server(
         logger.info("ws-local: disabled in daemon.yml; not starting")
         return None
     if not _is_loopback_bind_host(cfg.bind_host):
+        # TODO: Expose rejected bind configuration through daemon status.
         logger.warning(
             "ws-local: refusing non-loopback bind host %r; not starting",
             cfg.bind_host,

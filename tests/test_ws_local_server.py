@@ -80,6 +80,27 @@ async def test_non_loopback_host_is_rejected_before_handler(monkeypatch):
     assert not called
 
 
+@pytest.mark.parametrize("origin", ["https://attacker.example", "null", ""])
+@pytest.mark.asyncio
+async def test_origin_is_rejected_before_handler(origin, monkeypatch):
+    called = False
+
+    async def handler(request):
+        nonlocal called
+        called = True
+        return ws_local_server.web.Response()
+
+    monkeypatch.setattr(ws_local_server, "handle_ws_local", handler)
+    app = ws_local_server.build_app(WsLocalServiceConfig())
+    headers = {**VALID_HOST, "Origin": origin}
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/v1/ws-local", headers=headers)
+        body = await response.text()
+    assert response.status == 403
+    assert body == "invalid origin"
+    assert not called
+
+
 @pytest.mark.parametrize(
     "host",
     ["localhost", "localhost:63387", "127.0.0.1:63387", "[::1]:63387"],
