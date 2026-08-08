@@ -251,10 +251,9 @@ long-form persona in `profile.md`:
 - **`display_name`** — the human-readable label shown next to the
   avatar in member lists and message bubbles. Falls back to the
   `agent-id` when unset.
-- **`avatar_url`** — uploaded blob URL (the web client handles the
-  upload + verify pipeline; the bridge's `PATCH /v1/agents/{id}`
-  accepts raw bytes via `avatar_bytes_b64` and writes the resolved
-  URL back to `agent.yml`).
+- **`avatar_url`** — uploaded blob URL. The web client and desktop
+  profile editor handle the upload + verify pipeline and persist the
+  resolved URL to `agent.yml`.
 - **`role`** — free-text "what does this agent do" string (≤140
   chars). Recommended shape `<short>: <description>`, e.g.
   `"coder: main puffo-core coder"`. Stored as a single line in
@@ -320,10 +319,10 @@ A few constraints worth knowing:
   web) to force a worker respawn if you need the change to land
   mid-conversation.
 - The server-side `identities.role` / `role_short` fields are kept in
-  sync best-effort. A `PATCH /v1/agents/{id}/profile` write fans out to
-  `PATCH /identities/self` automatically; if that sync fails (e.g.
-  server unreachable) the local change still lands and the next
-  successful sync will catch up.
+  sync best-effort. CLI, desktop, and control-plane profile edits update
+  local state before syncing through `PATCH /identities/self`; if that
+  sync fails (e.g. server unreachable), the next successful sync catches
+  up.
 
 ### 5.2 Server-side status reporting
 

@@ -9,15 +9,24 @@ from aiohttp.test_utils import TestClient, TestServer
 from puffo_agent.portal import state
 from puffo_agent.portal.state import DaemonConfig, WsLocalServiceConfig
 from puffo_agent.portal.ws_local.server import (
+    _is_loopback_bind_host,
     build_app,
     start_ws_local_server,
     stop_ws_local_server,
 )
+from puffo_agent.portal.ws_local import server as ws_local_server
 from puffo_agent.portal.ws_local.route import WS_LOCAL_HUB_KEY
+
+VALID_HOST = {"Host": "localhost:63387"}
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.2", "::1"])
+def test_loopback_bind_hosts_are_accepted(host):
+    assert _is_loopback_bind_host(host)
 
 
 def test_app_exposes_only_ws_local_route():
-    app = build_app(object())
+    app = build_app(WsLocalServiceConfig(), object())
     routes = {(route.method, route.resource.canonical) for route in app.router.routes()}
     assert routes == {("GET", "/v1/ws-local"), ("HEAD", "/v1/ws-local")}
     assert app[WS_LOCAL_HUB_KEY] is not None
@@ -37,17 +46,69 @@ def test_app_exposes_only_ws_local_route():
 )
 @pytest.mark.asyncio
 async def test_removed_http_apis_return_not_found(method, path):
-    async with TestClient(TestServer(build_app())) as client:
-        response = await getattr(client, method)(path)
+    async with TestClient(TestServer(build_app(WsLocalServiceConfig()))) as client:
+        response = await getattr(client, method)(path, headers=VALID_HOST)
     assert response.status == 404
 
 
 @pytest.mark.asyncio
 async def test_ws_route_rejects_when_hub_is_unavailable():
-    async with TestClient(TestServer(build_app())) as client:
-        websocket = await client.ws_connect("/v1/ws-local")
+    async with TestClient(TestServer(build_app(WsLocalServiceConfig()))) as client:
+        websocket = await client.ws_connect("/v1/ws-local", headers=VALID_HOST)
         message = await websocket.receive_json()
     assert message == {"type": "error", "reason": "ws-local is not enabled on this daemon"}
+
+
+@pytest.mark.asyncio
+async def test_non_loopback_host_is_rejected_before_handler(monkeypatch):
+    called = False
+
+    async def handler(request):
+        nonlocal called
+        called = True
+        return ws_local_server.web.Response()
+
+    monkeypatch.setattr(ws_local_server, "handle_ws_local", handler)
+    app = ws_local_server.build_app(WsLocalServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get(
+            "/v1/ws-local", headers={"Host": "attacker.example:63387"},
+        )
+        body = await response.text()
+    assert response.status == 403
+    assert body == "invalid host"
+    assert not called
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["localhost", "localhost:63387", "127.0.0.1:63387", "[::1]:63387"],
+)
+@pytest.mark.asyncio
+async def test_loopback_hosts_reach_handler(host, monkeypatch):
+    async def handler(request):
+        return ws_local_server.web.Response(status=204)
+
+    monkeypatch.setattr(ws_local_server, "handle_ws_local", handler)
+    app = ws_local_server.build_app(WsLocalServiceConfig())
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/v1/ws-local", headers={"Host": host})
+    assert response.status == 204
+
+
+@pytest.mark.asyncio
+async def test_configured_ipv6_loopback_host_reaches_handler(monkeypatch):
+    async def handler(request):
+        return ws_local_server.web.Response(status=204)
+
+    monkeypatch.setattr(ws_local_server, "handle_ws_local", handler)
+    cfg = WsLocalServiceConfig(bind_host="::1")
+    app = ws_local_server.build_app(cfg)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get(
+            "/v1/ws-local", headers={"Host": "[::1]:63387"},
+        )
+    assert response.status == 204
 
 
 @pytest.mark.asyncio
@@ -56,6 +117,17 @@ async def test_disabled_service_does_not_start(caplog):
         runner = await start_ws_local_server(WsLocalServiceConfig(enabled=False))
     assert runner is None
     assert "disabled in daemon.yml" in caplog.text
+
+
+@pytest.mark.parametrize("bind_host", ["0.0.0.0", "::", "agent.example"])
+@pytest.mark.asyncio
+async def test_non_loopback_bind_host_does_not_start(bind_host, caplog):
+    with caplog.at_level(logging.WARNING):
+        runner = await start_ws_local_server(
+            WsLocalServiceConfig(bind_host=bind_host, port=0),
+        )
+    assert runner is None
+    assert "refusing non-loopback bind host" in caplog.text
 
 
 @pytest.mark.asyncio

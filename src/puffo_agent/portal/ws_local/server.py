@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 
-from aiohttp import web
+from aiohttp import hdrs, web
 
 from ..state import WsLocalServiceConfig
 from .route import WS_LOCAL_HUB_KEY, WS_LOCAL_PATH, handle_ws_local
@@ -12,8 +13,39 @@ from .route import WS_LOCAL_HUB_KEY, WS_LOCAL_PATH, handle_ws_local
 logger = logging.getLogger(__name__)
 
 
-def build_app(ws_local_hub=None) -> web.Application:
-    app = web.Application()
+def _is_loopback_bind_host(host: str) -> bool:
+    if host.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _loopback_host_headers(cfg: WsLocalServiceConfig) -> set[str]:
+    hosts = {"127.0.0.1", "localhost", "[::1]"}
+    bind_host = cfg.bind_host.lower()
+    if ":" in bind_host:
+        bind_host = f"[{bind_host}]"
+    hosts.add(bind_host)
+    return hosts | {f"{host}:{cfg.port}" for host in hosts}
+
+
+def _require_loopback_host(cfg: WsLocalServiceConfig):
+    allowed_hosts = _loopback_host_headers(cfg)
+
+    @web.middleware
+    async def require_loopback_host(request: web.Request, handler):
+        host = (request.headers.get(hdrs.HOST) or "").lower()
+        if host not in allowed_hosts:
+            return web.Response(status=403, text="invalid host")
+        return await handler(request)
+
+    return require_loopback_host
+
+
+def build_app(cfg: WsLocalServiceConfig, ws_local_hub=None) -> web.Application:
+    app = web.Application(middlewares=[_require_loopback_host(cfg)])
     app[WS_LOCAL_HUB_KEY] = ws_local_hub
     app.router.add_get(WS_LOCAL_PATH, handle_ws_local)
     return app
@@ -25,8 +57,14 @@ async def start_ws_local_server(
     if not cfg.enabled:
         logger.info("ws-local: disabled in daemon.yml; not starting")
         return None
+    if not _is_loopback_bind_host(cfg.bind_host):
+        logger.warning(
+            "ws-local: refusing non-loopback bind host %r; not starting",
+            cfg.bind_host,
+        )
+        return None
     runner = web.AppRunner(
-        build_app(ws_local_hub),
+        build_app(cfg, ws_local_hub),
         access_log=logging.getLogger("puffo_agent.portal.ws_local.access"),
         access_log_format="%r -> %s (%Tf s)",
     )
