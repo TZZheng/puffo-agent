@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -911,15 +913,26 @@ def test_probe_uses_default_model_after_latch_persists_across_calls(
     assert "--model" not in spawned_argvs[1]
 
 
-def test_refresh_probe_model_honors_env_var_override(monkeypatch):
-    # Reload the module with the env var set so the module-level
-    # constant picks it up. Verifies the operator escape hatch works.
-    import importlib
-    monkeypatch.setenv("PUFFO_AGENT_REFRESH_MODEL", "claude-sonnet-4-6-fake")
-    reloaded = importlib.reload(credential_refresh)
-    try:
-        assert reloaded.REFRESH_PROBE_MODEL == "claude-sonnet-4-6-fake"
-    finally:
-        # Restore the original module state for downstream tests.
-        monkeypatch.delenv("PUFFO_AGENT_REFRESH_MODEL", raising=False)
-        importlib.reload(credential_refresh)
+def test_refresh_probe_model_honors_env_var_override():
+    repo_src = str(Path(__file__).resolve().parents[1] / "src")
+    env = {
+        **os.environ,
+        "PUFFO_AGENT_REFRESH_MODEL": "claude-sonnet-4-6-fake",
+        "PYTHONPATH": os.pathsep.join(
+            path for path in (repo_src, os.environ.get("PYTHONPATH")) if path
+        ),
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from puffo_agent.portal.credential_refresh import "
+            "REFRESH_PROBE_MODEL; print(REFRESH_PROBE_MODEL)",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert result.stdout.strip() == "claude-sonnet-4-6-fake"

@@ -34,6 +34,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Docker Claude workers now reload rotated OAuth credentials.** After the
+  daemon refreshes the shared Claude credential, it restarts affected
+  `cli-docker` Claude Code workers so long-running processes stop using the
+  revoked access token cached at session startup.
+
 - **Claude context telemetry no longer invents limits for unknown models.**
   A transient context query timeout remains retryable on later turns, while
   configured compact thresholds remain authoritative because Claude's context

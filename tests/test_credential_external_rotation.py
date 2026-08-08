@@ -104,7 +104,10 @@ async def test_first_tick_establishes_baseline_without_firing(tmp_path):
 # ── daemon: restart auth_failed agents on recovery ─────────────────
 
 
-def _daemon_harness(monkeypatch, tmp_path, health: str):
+def _daemon_harness(
+    monkeypatch, tmp_path, health: str, *, kind: str = "cli-local",
+    harness: str = "claude-code",
+):
     from puffo_agent.portal import daemon as daemon_module
     from puffo_agent.portal.state import RuntimeState
 
@@ -125,7 +128,10 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
         id = "t-agent"
 
         class runtime:
-            harness = "claude-code"
+            pass
+
+        runtime.kind = kind
+        runtime.harness = harness
 
         class puffo_core:
             slug = "alice-0001"
@@ -140,9 +146,7 @@ def _daemon_harness(monkeypatch, tmp_path, health: str):
         refresher = _StubRefresher()
         codex_refresher = _StubRefresher()
 
-        def _refresher_for(self, _cfg):
-            return self.refresher
-
+        _refresher_for = daemon_module.Daemon._refresher_for
         _register_with_refresher = daemon_module.Daemon._register_with_refresher
 
     d = _StubDaemon()
@@ -163,6 +167,40 @@ def test_on_refresh_success_no_restart_when_healthy(tmp_path, monkeypatch):
     d, w, flag = _daemon_harness(monkeypatch, tmp_path, "ok")
     d.refresher.callback()
     assert not flag.exists()    # nothing to recover → no restart
+
+
+def test_on_refresh_success_restarts_healthy_docker_claude(tmp_path, monkeypatch):
+    d, _w, flag = _daemon_harness(
+        monkeypatch, tmp_path, "ok", kind="cli-docker",
+    )
+
+    d.refresher.callback()
+
+    assert flag.exists()
+
+
+def test_on_refresh_success_does_not_restart_healthy_docker_codex(
+    tmp_path, monkeypatch,
+):
+    d, _w, flag = _daemon_harness(
+        monkeypatch, tmp_path, "ok", kind="cli-docker", harness="codex",
+    )
+
+    d.codex_refresher.callback()
+
+    assert not flag.exists()
+
+
+def test_docker_claude_refresh_restart_is_idempotent(tmp_path, monkeypatch):
+    d, _w, flag = _daemon_harness(
+        monkeypatch, tmp_path, "ok", kind="cli-docker",
+    )
+
+    d.refresher.callback()
+    d.refresher.callback()
+
+    assert flag.exists()
+    assert flag.read_text() == ""
 
 
 # ── new message while auth_failed wakes the refresher ──────────────

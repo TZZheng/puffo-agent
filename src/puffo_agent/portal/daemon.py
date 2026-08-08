@@ -366,17 +366,24 @@ class Daemon:
             # Re-arm the auth_failed DM dedup so a re-expiry this
             # session re-notifies the operator.
             worker._auth_failed_notification_sent = False
-            if was_auth_failed:
-                # The running adapter session still holds the stale
-                # credential; a restart re-links the fresh cred and
-                # redelivers the stalled batch (cursor wasn't advanced).
+            restart_docker_claude = (
+                (getattr(agent_cfg.runtime, "harness", "") or "claude-code")
+                == "claude-code"
+                and getattr(agent_cfg.runtime, "kind", "") == "cli-docker"
+            )
+            if was_auth_failed or restart_docker_claude:
                 try:
                     flag = restart_flag_path(agent_id)
                     flag.parent.mkdir(parents=True, exist_ok=True)
                     flag.write_text("")
+                    reason = (
+                        "credential recovered"
+                        if was_auth_failed
+                        else "credential rotated for cli-docker"
+                    )
                     logger.info(
-                        "agent %s: credential recovered — requesting restart "
-                        "to pick up the new credential", agent_id,
+                        "agent %s: %s — requesting restart to pick up the "
+                        "new credential", agent_id, reason,
                     )
                 except OSError as exc:
                     logger.warning(
