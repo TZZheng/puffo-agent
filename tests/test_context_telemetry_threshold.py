@@ -7,7 +7,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from _bridge_support import isolated_home, write_test_agent  # noqa: E402
+from _portal_support import isolated_home, write_test_agent  # noqa: E402
 
 from puffo_agent.portal.control.context_telemetry import (  # noqa: E402
     build_context_runtime,

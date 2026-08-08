@@ -7,7 +7,7 @@ import types
 
 import pytest
 
-from _bridge_support import isolated_home, write_test_agent
+from _portal_support import isolated_home, write_test_agent
 from puffo_agent.portal.control import client as cc
 from puffo_agent.portal.control.client import MachineControlClient, execute_command
 from puffo_agent.portal.state import AgentConfig
@@ -125,6 +125,35 @@ async def test_create_without_pending_token_rejected(home):
     )
     assert res["ok"] is False
     assert "pending_token" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_create_delegates_to_control_provisioner(home, monkeypatch):
+    seen = {}
+
+    async def fake_provision(params, operator_key, *, materialize):
+        seen.update(params=params, operator_key=operator_key, materialize=materialize)
+        return {"agent_id": "helper-1"}
+
+    monkeypatch.setattr(
+        "puffo_agent.portal.control.provision.provision_agent_from_bundle",
+        fake_provision,
+    )
+    params = {
+        "pending_token": "pending_1",
+        "identity_bundle": {"slug_binding": {}},
+        "puffo_core": {"server_url": "browser-placeholder"},
+    }
+    result = await execute_command(
+        "create",
+        None,
+        params,
+        server_url="https://relay.example",
+        paired_root_pubkey="operator-key",
+    )
+    assert result == {"ok": True, "agent_slug": "helper-1"}
+    assert seen["operator_key"] == "operator-key"
+    assert seen["params"]["puffo_core"]["server_url"] == "https://relay.example"
 
 
 # ── usage-report snapshot loop ─────────────────────────────────────

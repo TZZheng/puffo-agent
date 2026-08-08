@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
 
 from ...state import RuntimeState, discover_agents
 from ..assets import logo_path
-from ..names import resolve_display_name
 
 
 class _LogoLabel(QLabel):
@@ -189,21 +188,6 @@ class HomeView(QWidget):
         title_row.addWidget(open_btn)
         outer.addLayout(title_row)
 
-        # Bridge / pairing card
-        bridge_card, bridge_layout = _card()
-        bridge_title = QLabel("Local bridge")
-        bridge_title.setStyleSheet(
-            "color: #6b7280; font-size: 10pt; text-transform: uppercase;"
-        )
-        bridge_layout.addWidget(bridge_title)
-        self._bridge_status = QLabel("…")
-        self._bridge_status.setStyleSheet(
-            "font-size: 13pt; font-weight: 500; color: #1f2937;"
-        )
-        self._bridge_status.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        bridge_layout.addWidget(self._bridge_status)
-        outer.addWidget(bridge_card)
-
         # AI tool cards
         from ....agent.cli_bin import (
             claude_has_credentials,
@@ -255,7 +239,6 @@ class HomeView(QWidget):
         for card in self._cli_cards:
             card.refresh()
         self._refresh_counts()
-        self._refresh_bridge()
 
     @staticmethod
     def _footer_text() -> str:
@@ -264,28 +247,6 @@ class HomeView(QWidget):
         except importlib.metadata.PackageNotFoundError:
             version = "unknown"
         return f"puffo-agent v{version}"
-
-    def _refresh_bridge(self) -> None:
-        from ...api.pairing import load_pairing
-        pairing = load_pairing()
-        if pairing is None:
-            self._bridge_status.setText(
-                "<span style='color:#9ca3af;'>● Not paired</span> &nbsp; "
-                "<a href='https://chat.puffo.ai/chat/agents' "
-                "style='color:#3b82f6; text-decoration:none;'>"
-                "Pair at chat.puffo.ai/chat/agents →</a>"
-            )
-            self._bridge_status.setOpenExternalLinks(True)
-            return
-        name = resolve_display_name(pairing.slug) or pairing.slug
-        device = pairing.device_id
-        if len(device) > 28:
-            device = device[:24] + "…"
-        self._bridge_status.setText(
-            f"<span style='color:#22c55e;'>● Paired</span> &nbsp; "
-            f"<b>{name}</b> &nbsp; "
-            f"<span style='color:#6b7280; font-size:9pt;'>device: {device}</span>"
-        )
 
     def _refresh_counts(self) -> None:
         ids = discover_agents()

@@ -183,7 +183,7 @@ async def _create_agent_command(
     if isinstance(pc, dict):
         pc["server_url"] = server_url
 
-    from ..api.handlers import ProvisionError, provision_agent_from_bundle
+    from .provision import ProvisionError, provision_agent_from_bundle
 
     async def _materialize(_ctx: dict) -> None:
         await _materialize_slug_binding(server_url, pending_token, slug_binding)
@@ -224,13 +224,12 @@ async def execute_command(
     *,
     server_url: str | None = None,
     paired_root_pubkey: str | None = None,
-    command_id: str | None = None,
 ) -> dict:
-    """Apply a decrypted command to local agent state, the same way the local
-    bridge handlers do (flip ``agent.yml`` state, drop sentinel flags) so the
-    reconcile loop applies it — a single-writer model. ``create`` additionally
-    finalizes the pending identity with puffo-server (needs the operator
-    pairing context)."""
+    """Apply a decrypted command to local agent state for the reconciler.
+
+    ``create`` additionally finalizes the pending identity with puffo-server
+    and therefore needs the operator pairing context.
+    """
     if op in ("pause", "resume", "edit", "archive", "refresh"):
         if not agent_slug or not agent_yml_path(agent_slug).exists():
             # Re-archive of an already-archived agent is idempotent OK.
@@ -340,14 +339,14 @@ async def execute_command(
             )
             prompt_changed = True
         if isinstance(params.get("role"), str):
-            from ..api.handlers import _update_profile_role
+            from ..profile_sync import update_profile_role
 
-            _update_profile_role(cfg, params["role"])
+            update_profile_role(cfg, params["role"])
         if patch:
             try:
-                from ..api.handlers import _sync_agent_profile
+                from ..profile_sync import sync_agent_profile
 
-                await _sync_agent_profile(cfg, patch)
+                await sync_agent_profile(cfg, patch)
             except Exception as exc:  # noqa: BLE001
                 log.warning("control: edit profile sync failed: %s", exc)
         # Prompt-only edits drop refresh_agent.flag; runtime edits
@@ -369,14 +368,6 @@ async def execute_command(
         return {"ok": True, "posted": posted}
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)
-    if op == "agent_create_approved":
-        # The operator approved a machine-initiated ws-local create. command_id ==
-        # request_id ties this command to the stashed identity; finalize + pack.
-        from .agent_create import finalize_from_command
-
-        request_id = command_id or str(params.get("request_id") or "")
-        result = await finalize_from_command(request_id, params)
-        return {"ok": True, **result}
     # export/import carry bigger flows; not yet wired.
     return {"ok": False, "error": f"unsupported op {op!r}"}
 
@@ -394,18 +385,15 @@ async def _sleep_or_stop(stop: asyncio.Event, timeout: float) -> None:
 
 
 def build_capabilities() -> dict:
-    """This machine's reportable capabilities: CLI-tool auth status + provider/
-    model catalog. Mirrors the local bridge's ``info.cli_tools`` + ``/v1/
-    providers`` so the portal renders a remote machine's providers like a local
-    one. ``fetch=False`` keeps it off the network (serves cache/static)."""
+    """Return CLI authentication and model capabilities for the portal."""
     from ...agent.cli_bin import (
         claude_has_credentials,
+        cli_tool_status,
         codex_has_credentials,
         resolve_claude_bin,
         resolve_codex_bin,
     )
     from ...agent.model_catalog import KNOWN_HARNESSES, provider_models
-    from ..api.handlers import _cli_tool_status
 
     import importlib.metadata
 
@@ -415,8 +403,8 @@ def build_capabilities() -> dict:
         daemon_version = ""
 
     cli_tools = {
-        "claude-code": _cli_tool_status(resolve_claude_bin, claude_has_credentials),
-        "codex": _cli_tool_status(resolve_codex_bin, codex_has_credentials),
+        "claude-code": cli_tool_status(resolve_claude_bin, claude_has_credentials),
+        "codex": cli_tool_status(resolve_codex_bin, codex_has_credentials),
     }
     providers = [
         {
@@ -551,28 +539,17 @@ class MachineControlClient:
                 decrypted["params"],
                 server_url=pairing.server_url,
                 paired_root_pubkey=pairing.operator_root_pubkey,
-                command_id=command_id,
             )
             if isinstance(result, dict) and not result.get("ok", True):
                 log.warning(
                     "control: command %s op=%s failed: %s",
                     command_id, decrypted["op"], result.get("error"),
                 )
-            # Publish the result so `wait-until-command --id <command_id>` returns.
-            if command_id and isinstance(result, dict):
-                from .agent_create import get_registry
-
-                get_registry().record_result(command_id, result)
         except ControlError as exc:
             # Forged / malformed → never execute, but ack so it stops redelivering.
             log.warning("control: rejected command %s: %s", command_id, exc)
         except Exception as exc:  # noqa: BLE001
             log.warning("control: command %s failed: %s", command_id, exc)
-            if command_id:
-                from .agent_create import get_registry
-
-                get_registry().record_result(command_id, {"ok": False, "error": str(exc)})
-
         if command_id:
             try:
                 await self._send(ws, {"type": "ack", "command_id": command_id})
