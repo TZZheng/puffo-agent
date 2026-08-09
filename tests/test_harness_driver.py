@@ -25,7 +25,7 @@ from puffo_agent.agent.harness.codex_driver import (
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
     CompactRequest,
-    HarnessDriver,
+    Driver,
     HarnessEvent,
     PermissionDecision,
     PermissionRef,
@@ -195,9 +195,9 @@ def test_contract_has_full_common_method_surface():
         "open", "start_turn", "steer_turn", "cancel_turn",
         "context_status", "compact", "resolve_permission", "events", "close",
     }
-    assert expected <= set(dir(HarnessDriver))
+    assert expected <= set(dir(Driver))
     assert all(
-        inspect.iscoroutinefunction(getattr(HarnessDriver, name))
+        inspect.iscoroutinefunction(getattr(Driver, name))
         for name in expected - {"events"}
     )
 
@@ -272,7 +272,7 @@ async def test_encrypted_control_cancel_is_agent_scoped_and_idempotent():
 
 @pytest.mark.asyncio
 async def test_runtime_manager_one_active_turn_translates_refs_and_close_is_idempotent():
-    class FakeDriver(HarnessDriver):
+    class FakeDriver(Driver):
         def __init__(self):
             self.queue = asyncio.Queue()
             self.cancelled = []
@@ -344,84 +344,92 @@ async def test_runtime_manager_one_active_turn_translates_refs_and_close_is_idem
     assert driver.close_calls == 1
 
 
-@pytest.mark.asyncio
-async def test_runtime_manager_correlates_private_tool_result_and_rejects_terminal_failure():
-    class FakeDriver(HarnessDriver):
-        def __init__(self):
-            self.queue = asyncio.Queue()
-            self.turn = TurnRef("driver-turn")
+class _ToolResultDriver(Driver):
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self.turn = TurnRef("driver-turn")
 
-        async def open(self, spec, resume=None):
-            return RuntimeOpened(
-                RuntimeRef("runtime"), SessionRef("native-session"),
-                "native-session", False, CODEX_CAPABILITIES, SimpleNamespace(),
-            )
+    async def open(self, spec, resume=None):
+        return RuntimeOpened(
+            RuntimeRef("runtime"), SessionRef("native-session"),
+            "native-session", False, CODEX_CAPABILITIES, SimpleNamespace(),
+        )
 
-        async def start_turn(self, input):
-            return TurnStarted(self.turn, "native-turn")
+    async def start_turn(self, input):
+        return TurnStarted(self.turn, "native-turn")
 
-        async def steer_turn(self, turn, input):
-            return UnsupportedCapability("steer")
+    async def steer_turn(self, turn, input):
+        return UnsupportedCapability("steer")
 
-        async def cancel_turn(self, turn):
-            return UnsupportedCapability("cancel")
+    async def cancel_turn(self, turn):
+        return UnsupportedCapability("cancel")
 
-        async def context_status(self):
-            return UnsupportedCapability("context_status")
+    async def context_status(self):
+        return UnsupportedCapability("context_status")
 
-        async def compact(self, request):
-            return UnsupportedCapability("compact")
+    async def compact(self, request):
+        return UnsupportedCapability("compact")
 
-        async def resolve_permission(self, request, decision):
-            return UnsupportedCapability("permission")
+    async def resolve_permission(self, request, decision):
+        return UnsupportedCapability("permission")
 
-        def events(self):
-            async def iterate():
-                while True:
-                    yield await self.queue.get()
-            return iterate()
+    def events(self):
+        async def iterate():
+            while True:
+                yield await self.queue.get()
+        return iterate()
 
-        async def close(self):
-            return None
+    async def close(self):
+        return None
 
-    driver = FakeDriver()
-    manager = RuntimeManager(driver, RuntimeSpec("/tmp"))
-    adapter = RuntimeManagerAdapter(manager)
-    await manager.open()
-    started = await manager.start_turn(TurnInput("notice"))
-    admitted = []
 
+def _register_tool_admission(adapter, admitted, key, arguments, receipt):
     async def admit(event):
         admitted.append(event)
 
     adapter.register_continuation_callback(
-        admit,
-        "read-page-1",
-        tool_names=("read_inbox",),
-        tool_arguments={"limit": 1},
-        correlation_receipt="receipt-1",
+        admit, key, tool_names=("read_inbox",), tool_arguments=arguments,
+        correlation_receipt=receipt,
     )
+
+
+async def _emit_tool_result(
+    driver, call_id, arguments, result, *, session="native-session", omitted=False,
+):
+    payload = {
+        "_puffo_internal": "tool_result", "tool_call_id": call_id,
+        "tool_name": "read_inbox", "arguments": arguments,
+        "result": result, "is_error": False,
+    }
+    if omitted:
+        payload["result_omitted"] = True
     await driver.queue.put(HarnessEvent.normalized(
         type="turn.tool_completed", driver="fake",
-        session_ref=SessionRef("native-session"), turn_ref=driver.turn,
-        native_session_id="native-session", native_turn_id="native-turn",
+        session_ref=SessionRef(session), turn_ref=driver.turn,
+        native_session_id=session, native_turn_id="native-turn",
         data={
-            "tool_call_ref": "call-1", "label": "read_inbox",
+            "tool_call_ref": call_id, "label": "read_inbox",
             "outcome": "succeeded",
         },
-        native_payload={
-            "_puffo_internal": "tool_result",
-            "tool_call_id": "call-1",
-            "tool_name": "read_inbox",
-            "arguments": {"limit": 1},
-            "result": "[puffo:model-visible-read:receipt-1]",
-            "is_error": False,
-        },
+        native_payload=payload,
     ))
+
+
+async def _wait_for_admitted(admitted):
     for _ in range(20):
         if admitted:
-            break
+            return
         await asyncio.sleep(0)
+
+
+async def _assert_tool_result_correlations(adapter, driver, admitted):
+    _register_tool_admission(
+        adapter, admitted, "read-page-1", {"limit": 1}, "receipt-1",
+    )
+    await _emit_tool_result(
+        driver, "call-1", {"limit": 1}, "[puffo:model-visible-read:receipt-1]",
+    )
+    await _wait_for_admitted(admitted)
     assert len(admitted) == 1
     assert admitted[0].planning_cycle_key == "read-page-1"
     assert admitted[0].provider_session_id == "native-session"
@@ -429,150 +437,88 @@ async def test_runtime_manager_correlates_private_tool_result_and_rejects_termin
     assert admitted[0].tool_call_id == "call-1"
 
     admitted.clear()
-    adapter.register_continuation_callback(
-        admit,
-        "read-page-without-result",
-        tool_names=("read_inbox",),
-        tool_arguments={"cursor": "next"},
-        correlation_receipt="receipt-omitted",
+    _register_tool_admission(
+        adapter, admitted, "read-page-without-result",
+        {"cursor": "next"}, "receipt-omitted",
     )
-    await driver.queue.put(HarnessEvent.normalized(
-        type="turn.tool_completed", driver="fake",
-        session_ref=SessionRef("native-session"), turn_ref=driver.turn,
-        native_session_id="native-session", native_turn_id="native-turn",
-        data={
-            "tool_call_ref": "call-2", "label": "read_inbox",
-            "outcome": "succeeded",
-        },
-        native_payload={
-            "_puffo_internal": "tool_result",
-            "tool_call_id": "call-2",
-            "tool_name": "read_inbox",
-            "arguments": {"cursor": "next"},
-            "result": None,
-            "is_error": False,
-        },
-    ))
-    for _ in range(20):
-        if admitted:
-            break
-        await asyncio.sleep(0)
+    await _emit_tool_result(driver, "call-2", {"cursor": "next"}, None)
+    await _wait_for_admitted(admitted)
     assert admitted == []
 
-    adapter.register_continuation_callback(
-        admit,
-        "read-page-provider-omitted-result",
-        tool_names=("read_inbox",),
-        tool_arguments={"cursor": "provider-omitted"},
-        correlation_receipt="receipt-provider-omitted",
+    _register_tool_admission(
+        adapter, admitted, "read-page-provider-omitted-result",
+        {"cursor": "provider-omitted"}, "receipt-provider-omitted",
     )
-    await driver.queue.put(HarnessEvent.normalized(
-        type="turn.tool_completed", driver="fake",
-        session_ref=SessionRef("native-session"), turn_ref=driver.turn,
-        native_session_id="native-session", native_turn_id="native-turn",
-        data={
-            "tool_call_ref": "call-provider-omitted",
-            "label": "read_inbox", "outcome": "succeeded",
-        },
-        native_payload={
-            "_puffo_internal": "tool_result",
-            "tool_call_id": "call-provider-omitted",
-            "tool_name": "read_inbox",
-            "arguments": {"cursor": "provider-omitted"},
-            "result": None,
-            "result_omitted": True,
-            "is_error": False,
-        },
-    ))
-    for _ in range(20):
-        if admitted:
-            break
-        await asyncio.sleep(0)
+    await _emit_tool_result(
+        driver, "call-provider-omitted", {"cursor": "provider-omitted"},
+        None, omitted=True,
+    )
+    await _wait_for_admitted(admitted)
     assert len(admitted) == 1
     assert admitted[0].planning_cycle_key == "read-page-provider-omitted-result"
     assert admitted[0].tool_call_id == "call-provider-omitted"
 
+
+async def _assert_ambiguous_and_foreign_tool_results(adapter, driver, admitted):
     admitted.clear()
     for cycle in ("ambiguous-a", "ambiguous-b"):
-        adapter.register_continuation_callback(
-            admit,
-            cycle,
-            tool_names=("read_inbox",),
-            tool_arguments={"cursor": "ambiguous"},
-            correlation_receipt=f"receipt-{cycle}",
+        _register_tool_admission(
+            adapter, admitted, cycle, {"cursor": "ambiguous"}, f"receipt-{cycle}",
         )
-    await driver.queue.put(HarnessEvent.normalized(
-        type="turn.tool_completed", driver="fake",
-        session_ref=SessionRef("native-session"), turn_ref=driver.turn,
-        native_session_id="native-session", native_turn_id="native-turn",
-        data={
-            "tool_call_ref": "call-ambiguous", "label": "read_inbox",
-            "outcome": "succeeded",
-        },
-        native_payload={
-            "_puffo_internal": "tool_result",
-            "tool_call_id": "call-ambiguous",
-            "tool_name": "read_inbox",
-            "arguments": {"cursor": "ambiguous"},
-            "result": None,
-            "result_omitted": True,
-            "is_error": False,
-        },
-    ))
-    await asyncio.sleep(0)
-    assert admitted == []
-
-    adapter.register_continuation_callback(
-        admit,
-        "read-page-foreign-session",
-        tool_names=("read_inbox",),
-        tool_arguments={"cursor": "foreign"},
-        correlation_receipt="receipt-2",
+    await _emit_tool_result(
+        driver, "call-ambiguous", {"cursor": "ambiguous"}, None, omitted=True,
     )
-    await driver.queue.put(HarnessEvent.normalized(
-        type="turn.tool_completed", driver="fake",
-        session_ref=SessionRef("foreign-session"), turn_ref=driver.turn,
-        native_session_id="foreign-session", native_turn_id="native-turn",
-        data={
-            "tool_call_ref": "call-foreign", "label": "read_inbox",
-            "outcome": "succeeded",
-        },
-        native_payload={
-            "_puffo_internal": "tool_result",
-            "tool_call_id": "call-foreign",
-            "tool_name": "read_inbox",
-            "arguments": {"cursor": "foreign"},
-            "result": "[puffo:model-visible-read:receipt-2]",
-            "is_error": False,
-        },
-    ))
     await asyncio.sleep(0)
     assert admitted == []
-
-    await driver.queue.put(HarnessEvent.normalized(
-        type="turn.tool_completed", driver="fake",
-        session_ref=SessionRef("native-session"), turn_ref=driver.turn,
-        native_session_id="native-session", native_turn_id="native-turn",
-        data={
-            "tool_call_ref": "call-2", "label": "read_inbox",
-            "outcome": "succeeded",
-        },
-        native_payload={
-            "_puffo_internal": "tool_result",
-            "tool_call_id": "call-2",
-            "tool_name": "read_inbox",
-            "arguments": {"cursor": "foreign"},
-            "result": "[puffo:model-visible-read:receipt-2]",
-            "is_error": False,
-        },
-    ))
-    for _ in range(20):
-        if admitted:
-            break
-        await asyncio.sleep(0)
+    _register_tool_admission(
+        adapter, admitted, "read-page-foreign-session",
+        {"cursor": "foreign"}, "receipt-2",
+    )
+    marker = "[puffo:model-visible-read:receipt-2]"
+    await _emit_tool_result(
+        driver, "call-foreign", {"cursor": "foreign"}, marker,
+        session="foreign-session",
+    )
+    await asyncio.sleep(0)
+    assert admitted == []
+    await _emit_tool_result(driver, "call-2", {"cursor": "foreign"}, marker)
+    await _wait_for_admitted(admitted)
     assert len(admitted) == 1
     assert admitted[0].planning_cycle_key == "read-page-foreign-session"
     assert admitted[0].tool_call_id == "call-2"
+
+
+async def _assert_cancelled_manager_adapter_fails():
+    class FailedManager:
+        async def start_turn(self, input):
+            return TurnStarted(TurnRef("logical-turn"), "native-turn")
+
+        def events(self):
+            async def iterate():
+                yield HarnessEvent(
+                    type="turn.completed", driver="fake",
+                    session_ref=SessionRef("logical-session"),
+                    turn_ref=TurnRef("logical-turn"), data={"outcome": "cancelled"},
+                )
+            return iterate()
+
+    with pytest.raises(RuntimeStateError, match="outcome cancelled"):
+        await RuntimeManagerAdapter(FailedManager()).run_turn(SimpleNamespace(
+            messages=[{"role": "user", "content": "notice"}], on_progress=None,
+        ))
+
+
+@pytest.mark.asyncio
+async def test_runtime_manager_correlates_private_tool_result_and_rejects_terminal_failure():
+    driver = _ToolResultDriver()
+    manager = RuntimeManager(driver, RuntimeSpec("/tmp"))
+    adapter = RuntimeManagerAdapter(manager)
+    await manager.open()
+    started = await manager.start_turn(TurnInput("notice"))
+    admitted = []
+
+    await _assert_tool_result_correlations(adapter, driver, admitted)
+    await _assert_ambiguous_and_foreign_tool_results(adapter, driver, admitted)
 
     await driver.queue.put(HarnessEvent(
         type="turn.completed", driver="fake",
@@ -583,28 +529,7 @@ async def test_runtime_manager_correlates_private_tool_result_and_rejects_termin
     terminal = await manager.wait_terminal(started.turn_ref)
     assert terminal.data["outcome"] == "failed"
     await manager.close()
-
-    class FailedManager:
-        async def start_turn(self, input):
-            return TurnStarted(TurnRef("logical-turn"), "native-turn")
-
-        def events(self):
-            async def iterate():
-                yield HarnessEvent(
-                    type="turn.completed", driver="fake",
-                    session_ref=SessionRef("logical-session"),
-                    turn_ref=TurnRef("logical-turn"),
-                    data={"outcome": "cancelled"},
-                )
-            return iterate()
-
-    with pytest.raises(RuntimeStateError, match="outcome cancelled"):
-        await RuntimeManagerAdapter(FailedManager()).run_turn(
-            SimpleNamespace(
-                messages=[{"role": "user", "content": "notice"}],
-                on_progress=None,
-            )
-        )
+    await _assert_cancelled_manager_adapter_fails()
 
 
 @pytest.mark.asyncio
@@ -689,14 +614,8 @@ async def test_manager_adapter_submits_only_current_semantic_input():
     assert captured["content"].count("current-notice-sentinel") == 1
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("provider", ["codex", "claude-code"])
-@pytest.mark.parametrize("terminal_outcome", ["succeeded", "failed"])
-async def test_metadata_notice_through_real_manager_reads_paginated_exact_union(
-    tmp_path, provider, terminal_outcome,
-):
+def _metadata_driver(provider, provider_inputs):
     holder = {}
-    provider_inputs = []
 
     def on_codex_frame(frame):
         proc = holder["proc"]
@@ -705,86 +624,75 @@ async def test_metadata_notice_through_real_manager_reads_paginated_exact_union(
             proc.feed({"id": frame["id"], "result": {"server": "fake"}})
         elif method == "thread/start":
             proc.feed({
-                "id": frame["id"],
-                "result": {"thread": {"id": "native-session"}},
+                "id": frame["id"], "result": {"thread": {"id": "native-session"}},
             })
         elif method == "turn/start":
             provider_inputs.append(frame["params"]["input"][0]["text"])
             proc.feed({
-                "id": frame["id"],
-                "result": {"turn": {"id": "native-turn"}},
+                "id": frame["id"], "result": {"turn": {"id": "native-turn"}},
             })
 
     if provider == "codex":
         proc = _FakeProcess(on_codex_frame)
         holder["proc"] = proc
-        driver = CodexAppServerDriver(lambda _spec: proc)
-    else:
-        def replay_claude_frame(frame):
-            if frame.get("type") == "user":
-                provider_inputs.append(frame["message"]["content"][0]["text"])
-                proc.feed({**frame, "isReplay": True})
+        return proc, CodexAppServerDriver(lambda _spec: proc)
 
-        proc = _FakeProcess(replay_claude_frame)
-        proc.feed({
-            "type": "system",
-            "subtype": "init",
-            "session_id": "native-session",
-            "slash_commands": [],
-        })
-        driver = ClaudeCodeCliDriver(
-            lambda *_args: proc, replay_timeout=0.5
-        )
+    def replay_claude_frame(frame):
+        if frame.get("type") == "user":
+            provider_inputs.append(frame["message"]["content"][0]["text"])
+            proc.feed({**frame, "isReplay": True})
 
-    manager = RuntimeManager(
-        driver,
-        RuntimeSpec(str(tmp_path)),
-        session_ref=SessionRef("logical-session"),
-    )
-    adapter = RuntimeManagerAdapter(manager)
-    await adapter.warm("system")
+    proc = _FakeProcess(replay_claude_frame)
+    proc.feed({
+        "type": "system", "subtype": "init",
+        "session_id": "native-session", "slash_commands": [],
+    })
+    return proc, ClaudeCodeCliDriver(lambda *_args: proc, replay_timeout=0.5)
+
+
+async def _metadata_store(tmp_path):
     store = MessageStore(tmp_path / "messages.db", now_ms=lambda: 1_000)
     await store.open()
     for seq in (1, 2):
         await store.store_receipt(
             {
-                "envelope_id": f"message-{seq}",
-                "envelope_kind": "channel",
-                "sender_slug": "alice",
-                "channel_id": "channel",
-                "space_id": "space",
-                "content": f"secret-{seq}",
-                "content_type": "text/plain",
-                "sent_at": seq,
+                "envelope_id": f"message-{seq}", "envelope_kind": "channel",
+                "sender_slug": "alice", "channel_id": "channel",
+                "space_id": "space", "content": f"secret-{seq}",
+                "content_type": "text/plain", "sent_at": seq,
                 "is_encrypted": True,
             },
-            server_seq=seq,
-            disposition=ReceiptDisposition.ELIGIBLE,
-            reason="test",
-            received_at=1_000,
+            server_seq=seq, disposition=ReceiptDisposition.ELIGIBLE,
+            reason="test", received_at=1_000,
         )
-        notice = await store.get_notice_state()
-        assert notice.first_pending_deadline_ms == 4_000
+        assert (await store.get_notice_state()).first_pending_deadline_ms == 4_000
     assert (await store.get_notice_state()).pending_count == 2
+    return store
 
+
+async def _metadata_runtime(tmp_path, driver, store):
+    manager = RuntimeManager(
+        driver, RuntimeSpec(str(tmp_path)),
+        session_ref=SessionRef("logical-session"),
+    )
+    adapter = RuntimeManagerAdapter(manager)
+    await adapter.warm("system")
     agent = PuffoAgent(
-        adapter,
-        "system",
-        str(tmp_path / "memory"),
-        workspace_dir=str(tmp_path),
-        agent_id="agent",
+        adapter, "system", str(tmp_path / "memory"),
+        workspace_dir=str(tmp_path), agent_id="agent",
     )
     runtime = GlobalInboxRuntime(
-        store=store,
-        adapter=adapter,
-        run_turn=agent.handle_global_inbox_turn,
-        workspace=tmp_path,
+        store=store, adapter=adapter,
+        run_turn=agent.handle_global_inbox_turn, workspace=tmp_path,
     )
-    expected_notice = await runtime.plan_pending()
-    assert expected_notice is not None
-    expected_provider_input = expected_notice.provider_input
-    task = asyncio.create_task(runtime.process_once())
+    expected = await runtime.plan_pending()
+    assert expected is not None
+    return adapter, agent, runtime, expected.provider_input, asyncio.create_task(
+        runtime.process_once()
+    )
 
+
+async def _wait_metadata_turn(runtime, task, provider_inputs, expected, agent):
     for _ in range(500):
         if runtime.active.turn_id:
             break
@@ -793,60 +701,50 @@ async def test_metadata_notice_through_real_manager_reads_paginated_exact_union(
         await asyncio.sleep(0.001)
     assert runtime.active.provider_session_id == "native-session"
     assert runtime.active.message_ids == []
-    assert provider_inputs == [expected_provider_input]
+    assert provider_inputs == [expected]
     assert all("<global_inbox_notice>" not in entry["content"] for entry in agent.log)
 
-    cursor = ""
-    admitted = []
+
+def _feed_metadata_result(proc, provider, page_number, arguments, marker):
+    tool_id = f"tool-{page_number}"
+    if provider == "codex":
+        item = {
+            "id": tool_id, "type": "mcpToolCall", "tool": "read_inbox",
+            "arguments": arguments, "result": marker,
+        }
+        if page_number == 2:
+            item.update({
+                "type": "dynamicToolCall", "status": "completed",
+                "success": True, "contentItems": None,
+            })
+            item.pop("result")
+        proc.feed({"method": "item/completed", "params": {"item": item}})
+        return
+    proc.feed({
+        "type": "assistant", "message": {"content": [{
+            "type": "tool_use", "id": tool_id, "name": "read_inbox",
+            "input": arguments,
+        }]},
+    })
+    proc.feed({
+        "type": "user", "message": {"content": [{
+            "type": "tool_result", "tool_use_id": tool_id, "content": marker,
+        }]},
+    })
+
+
+async def _read_metadata_pages(runtime, proc, provider):
+    cursor, admitted = "", []
     for page_number in (1, 2):
         arguments = {"cursor": cursor, "limit": 1}
         page = await runtime.read_inbox(
-            cursor=cursor, limit=1, tool_arguments=arguments
+            cursor=cursor, limit=1, tool_arguments=arguments,
         )
         assert len(page["messages"]) == 1
-        receipt_marker = (
-            f"[puffo:model-visible-read:{page['correlation_receipt']}]"
-        )
-        tool_id = f"tool-{page_number}"
-        if provider == "codex":
-            item = {
-                "id": tool_id,
-                "type": "mcpToolCall",
-                "tool": "read_inbox",
-                "arguments": arguments,
-                "result": receipt_marker,
-            }
-            if page_number == 2:
-                item.update({
-                    "type": "dynamicToolCall",
-                    "status": "completed",
-                    "success": True,
-                    "contentItems": None,
-                })
-                item.pop("result")
-            proc.feed({
-                "method": "item/completed",
-                "params": {"item": item},
-            })
-        else:
-            proc.feed({
-                "type": "assistant",
-                "message": {"content": [{
-                    "type": "tool_use",
-                    "id": tool_id,
-                    "name": "read_inbox",
-                    "input": arguments,
-                }]},
-            })
-            proc.feed({
-                "type": "user",
-                "message": {"content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_id,
-                    "content": receipt_marker,
-                }]},
-            })
+        marker = f"[puffo:model-visible-read:{page['correlation_receipt']}]"
+        _feed_metadata_result(proc, provider, page_number, arguments, marker)
         admitted.append(f"message-{page_number}")
+
         def admission_is_persisted():
             if runtime.active.message_ids != admitted:
                 return False
@@ -863,44 +761,55 @@ async def test_metadata_notice_through_real_manager_reads_paginated_exact_union(
         assert persisted["provider_session_id"] == "native-session"
         cursor = page["next_cursor"]
 
+
+def _finish_metadata_turn(proc, provider, outcome):
     if provider == "codex":
-        proc.feed({
-            "method": "turn/completed",
-            "params": {"turn": {
-                "status": (
-                    "completed"
-                    if terminal_outcome == "succeeded"
-                    else "failed"
-                )
-            }},
-        })
+        status = "completed" if outcome == "succeeded" else "failed"
+        proc.feed({"method": "turn/completed", "params": {"turn": {"status": status}}})
     else:
-        proc.feed({
-            "type": "result",
-            "subtype": (
-                "success" if terminal_outcome == "succeeded" else "error"
-            ),
-            "usage": {},
-        })
+        subtype = "success" if outcome == "succeeded" else "error"
+        proc.feed({"type": "result", "subtype": subtype, "usage": {}})
+
+
+async def _assert_metadata_terminal(store, runtime, task, outcome):
     assert await asyncio.wait_for(task, timeout=1)
     states = [
-        (await store.get_message_by_envelope(f"message-{seq}"))
-        .processing_state
+        (await store.get_message_by_envelope(f"message-{seq}")).processing_state
         for seq in (1, 2)
     ]
     expected = (
         [ProcessingState.PROCESSED, ProcessingState.PROCESSED]
-        if terminal_outcome == "succeeded"
+        if outcome == "succeeded"
         else [ProcessingState.PENDING, ProcessingState.PENDING]
     )
     assert states == expected
     assert not runtime.current_turn_path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["codex", "claude-code"])
+@pytest.mark.parametrize("terminal_outcome", ["succeeded", "failed"])
+async def test_metadata_notice_through_real_manager_reads_paginated_exact_union(
+    tmp_path, provider, terminal_outcome,
+):
+    provider_inputs = []
+    proc, driver = _metadata_driver(provider, provider_inputs)
+
+    store = await _metadata_store(tmp_path)
+    adapter, agent, runtime, expected, task = await _metadata_runtime(
+        tmp_path, driver, store,
+    )
+    await _wait_metadata_turn(runtime, task, provider_inputs, expected, agent)
+
+    await _read_metadata_pages(runtime, proc, provider)
+
+    _finish_metadata_turn(proc, provider, terminal_outcome)
+    await _assert_metadata_terminal(store, runtime, task, terminal_outcome)
     await adapter.aclose()
     await store.close()
 
 
-@pytest.mark.asyncio
-async def test_codex_driver_fake_app_server_full_protocol_and_concurrency():
+def _codex_protocol_driver():
     holder = {}
 
     def on_frame(frame):
@@ -921,17 +830,23 @@ async def test_codex_driver_fake_app_server_full_protocol_and_concurrency():
 
     proc = _FakeProcess(on_frame)
     holder["proc"] = proc
-    driver = CodexAppServerDriver(lambda _spec: proc)
+    return proc, CodexAppServerDriver(lambda _spec: proc)
+
+
+async def _open_codex_protocol_driver(proc, driver):
     opened = await driver.open(RuntimeSpec("/workspace", model="gpt"))
     assert opened.native_session_id == "th_1"
     methods = [json.loads(value).get("method") for value in proc.stdin.writes]
     assert methods[:3] == ["initialize", "initialized", "thread/start"]
-
     stream = driver.events()
     await _next_matching(stream, "session.opened")
     started = await driver.start_turn(
         TurnInput("hello", client_correlation_id="client-1")
     )
+    return stream, started
+
+
+def _feed_codex_protocol_events(proc):
     proc.feed({"method": "turn/started", "params": {"turn": {"id": "native-1"}}})
     proc.feed({
         "method": "thread/tokenUsage/updated",
@@ -945,6 +860,8 @@ async def test_codex_driver_fake_app_server_full_protocol_and_concurrency():
     })
     proc.feed({"method": "future/notification", "params": {"secret": "SECRET"}})
 
+
+async def _read_codex_protocol_events(stream):
     await _next_matching(stream, "turn.started")
     await _next_matching(stream, "turn.context_updated")
     permission = await _next_matching(stream, "turn.permission_requested")
@@ -952,7 +869,10 @@ async def test_codex_driver_fake_app_server_full_protocol_and_concurrency():
     assert warning.data == {
         "code": "unknown_notification", "method": "future/notification",
     }
+    return permission
 
+
+async def _exercise_codex_protocol_controls(driver, started, permission, stream):
     await asyncio.gather(
         driver.steer_turn(started.turn_ref, TurnInput("more")),
         driver.cancel_turn(started.turn_ref),
@@ -961,10 +881,11 @@ async def test_codex_driver_fake_app_server_full_protocol_and_concurrency():
             PermissionDecision.APPROVE,
         ),
     )
-    permission_updated = await _next_matching(
-        stream, "turn.permission_updated"
-    )
+    permission_updated = await _next_matching(stream, "turn.permission_updated")
     assert permission_updated.data["state"] == "approved"
+
+
+async def _assert_codex_mcp_tool_event(proc, stream):
     proc.feed({
         "method": "item/completed",
         "params": {"item": {
@@ -973,14 +894,17 @@ async def test_codex_driver_fake_app_server_full_protocol_and_concurrency():
             "result": "[puffo:model-visible-read:receipt-1]",
         }},
     })
-    tool_completed = await _next_matching(stream, "turn.tool_completed")
-    assert tool_completed.data == {
+    completed = await _next_matching(stream, "turn.tool_completed")
+    assert completed.data == {
         "tool_call_ref": "tool-1",
         "label": "read_inbox",
         "outcome": "succeeded",
     }
-    assert "arguments" not in tool_completed.data
-    assert "result" not in tool_completed.data
+    assert "arguments" not in completed.data
+    assert "result" not in completed.data
+
+
+async def _assert_codex_dynamic_tool_event(proc, stream):
     proc.feed({
         "method": "item/completed",
         "params": {"item": {
@@ -993,18 +917,20 @@ async def test_codex_driver_fake_app_server_full_protocol_and_concurrency():
             "contentItems": None,
         }},
     })
-    dynamic_completed = await _next_matching(stream, "turn.tool_completed")
-    assert dynamic_completed.data == {
+    completed = await _next_matching(stream, "turn.tool_completed")
+    assert completed.data == {
         "tool_call_ref": "tool-2",
         "label": "read_inbox",
         "outcome": "succeeded",
     }
+
+
+async def _assert_codex_protocol_completion(proc, driver, stream):
     decoded = [json.loads(value) for value in proc.stdin.writes]
     assert any(value.get("method") == "turn/steer" for value in decoded)
     assert any(value.get("method") == "turn/interrupt" for value in decoded)
     assert any(value.get("id") == 900 and "result" in value for value in decoded)
     assert (await driver.context_status()).used_tokens == 12
-
     proc.feed({
         "method": "turn/completed",
         "params": {"turn": {"status": "interrupted"}},
@@ -1015,6 +941,18 @@ async def test_codex_driver_fake_app_server_full_protocol_and_concurrency():
     await driver.close()
     await driver.close()
     assert proc.terminated == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_driver_fake_app_server_full_protocol_and_concurrency():
+    proc, driver = _codex_protocol_driver()
+    stream, started = await _open_codex_protocol_driver(proc, driver)
+    _feed_codex_protocol_events(proc)
+    permission = await _read_codex_protocol_events(stream)
+    await _exercise_codex_protocol_controls(driver, started, permission, stream)
+    await _assert_codex_mcp_tool_event(proc, stream)
+    await _assert_codex_dynamic_tool_event(proc, stream)
+    await _assert_codex_protocol_completion(proc, driver, stream)
 
 
 @pytest.mark.asyncio

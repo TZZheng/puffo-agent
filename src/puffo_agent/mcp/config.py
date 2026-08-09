@@ -1,7 +1,7 @@
 """MCP config builders for the puffo-core agent runtime.
 
-Every adapter (cli-local, cli-docker, sdk-local) spawns the same
-puffo_core MCP server through slightly different transports. This
+Every managed runtime spawns the same puffo_core MCP server through its
+native CLI transport. This
 module centralises env-var names, the MCP subprocess command line,
 and the JSON config shape claude-code expects.
 
@@ -23,6 +23,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 MCP_SERVER_NAME = "puffo"
+_PACKAGE_IMPORT_ROOT = Path(__file__).resolve().parents[2]
 
 # Claude Code reasoning-effort values.
 INFERENCE_LEVELS = ("low", "medium", "high", "xhigh")
@@ -71,10 +72,7 @@ PUFFO_CORE_TOOL_NAMES = (
     "add_dm_allowlist",
     "update_dm_blocklist",
     "refresh",
-    # M3 memory tools (registered by mcp.memory_tools). Kept in the
-    # core allowlist so the sdk adapter's gate auto-allows them like
-    # every other mcp__puffo__ tool — otherwise they register but are
-    # denied at call time on sdk-local.
+    # M3 memory tools (registered by mcp.memory_tools).
     "create_note",
     "patch_note",
     "append_note",
@@ -86,9 +84,7 @@ PUFFO_CORE_TOOL_NAMES = (
     "search_memory",
     "search_imports",
     # M4 memory status / recall / history tools (read-only; registered
-    # by mcp.memory_tools). Same reason as the M3 block — the sdk gate
-    # auto-allows every mcp__puffo__ tool in this list, so leaving them
-    # out would register them but deny them at call time on sdk-local.
+    # by mcp.memory_tools).
     "get_memory_status",
     "get_memory_file_status",
     "list_memory_files",
@@ -305,6 +301,23 @@ def _python_user_base_env(runtime_kind: str) -> dict[str, str]:
     return {"PYTHONUSERBASE": _REAL_USER_BASE}
 
 
+def _mcp_pythonpath(runtime_kind: str) -> str:
+    """Pin the MCP subprocess to the package tree loaded by the daemon."""
+    if "docker" in runtime_kind:
+        return ""
+
+    entries = [str(_PACKAGE_IMPORT_ROOT)]
+    inherited = os.environ.get("PYTHONPATH")
+    if inherited:
+        daemon_cwd = Path.cwd()
+        for raw_entry in inherited.split(os.pathsep):
+            entry = Path(raw_entry or ".").expanduser()
+            if not entry.is_absolute():
+                entry = daemon_cwd / entry
+            entries.append(str(entry.resolve()))
+    return os.pathsep.join(dict.fromkeys(entries))
+
+
 # ── puffo-core config builders ────────────────────────────────────
 
 
@@ -340,10 +353,11 @@ def puffo_core_mcp_env(
         "PUFFO_RPC_URL": rpc_url,
         **_python_user_base_env(runtime_kind),
     }
-    # Forward the daemon's PYTHONPATH so a worktree checkout drives the MCP
-    # subprocess too (unset in prod). Skipped for docker — host path is moot there.
-    pythonpath = os.environ.get("PYTHONPATH")
-    if pythonpath and "docker" not in runtime_kind:
+    # The MCP starts with the agent workspace as cwd. A relative PYTHONPATH
+    # would therefore resolve against the wrong directory and can silently
+    # load a different editable checkout than the daemon.
+    pythonpath = _mcp_pythonpath(runtime_kind)
+    if pythonpath:
         env["PYTHONPATH"] = pythonpath
     if agent_id:
         env["PUFFO_AGENT_ID"] = agent_id
@@ -381,36 +395,3 @@ def puffo_core_mcp_env(
         from pathlib import Path as _Path
         env["CODEX_HOME"] = str(_Path(workspace).parent / ".codex")
     return env
-
-
-def puffo_core_stdio_sdk_config(
-    *,
-    python: str,
-    slug: str,
-    device_id: str,
-    server_url: str,
-    space_id: str = "",
-    keystore_dir: str,
-    workspace: str,
-    agent_id: str,
-    memory_dir: str = "",
-) -> dict:
-    """Return the ``mcp_servers`` config dict for the SDK adapter."""
-    return {
-        MCP_SERVER_NAME: {
-            "type": "stdio",
-            "command": python,
-            "args": ["-m", "puffo_agent.mcp.puffo_core_server"],
-            "env": puffo_core_mcp_env(
-                slug=slug,
-                device_id=device_id,
-                server_url=server_url,
-                space_id=space_id,
-                keystore_dir=keystore_dir,
-                workspace=workspace,
-                agent_id=agent_id,
-                runtime_kind="sdk-local",
-                memory_dir=memory_dir,
-            ),
-        }
-    }

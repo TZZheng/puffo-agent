@@ -163,7 +163,7 @@ class PreparedLocalRuntime:
     native_session_id: str
     migration_source: str
     legacy_session_path: Path
-    preparer: "LocalRuntimePreparer"
+    preparer: LocalRuntimePreparer
 
     def finalize_legacy_session_migration(self) -> None:
         """Retire the pre-Driver session sentinel after durable adoption."""

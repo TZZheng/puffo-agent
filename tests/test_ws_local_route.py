@@ -13,7 +13,6 @@ import json
 
 import pytest
 
-from puffo_agent.portal.ws_local import auth as auth_mod
 from puffo_agent.portal.ws_local import route as route_mod
 from puffo_agent.portal.ws_local.auth import AuthedAgent
 from puffo_agent.portal.ws_local.bridge import WsLocalBridge
@@ -361,72 +360,58 @@ async def test_unservable_slug_rejected(monkeypatch):
     assert errors and "not a ws-local agent" in errors[0]["reason"]
 
 
-@pytest.mark.asyncio
-async def test_v2_receipt_to_global_bundle_admitted_end_and_owned_runtime_cleanup(
-    monkeypatch, tmp_path,
-):
-    from puffo_agent.agent.message_store import (
-        MessageStore,
-        ProcessingState,
-        ReceiptDisposition,
-    )
+class _V2Coordinator:
+    def __init__(self, **kwargs):
+        self.provider_session_id = None
+        self.held_recovery_source = kwargs["held_recovery_source"]
+
+    async def send(self, *_args, **_kwargs):
+        return {"state": "failed"}
+
+
+class _V2Client:
+    def __init__(self, store, tmp_path):
+        self.slug = "puffotest"
+        self.device_id = "dev"
+        self.keystore = object()
+        self.http = object()
+        self.store = store
+        self.space_id = None
+        self.workspace = str(tmp_path)
+        self.global_runtime = None
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def listen(self, _on_message):
+        from puffo_agent.agent.message_store import ReceiptDisposition
+
+        await self.store.store_receipt(
+            {
+                "envelope_id": "global-one", "envelope_kind": "channel",
+                "sender_slug": "alice", "space_id": "sp", "channel_id": "ch",
+                "content": "hello", "content_type": "text/plain", "sent_at": 1,
+            },
+            server_seq=1, disposition=ReceiptDisposition.ELIGIBLE,
+            reason="test receipt",
+        )
+        self.global_runtime.notify()
+        self.started.set()
+        await self.release.wait()
+
+    def set_profile(self, *_args, **_kwargs):
+        return None
+
+
+async def _start_v2_attached(monkeypatch, tmp_path, store):
     import puffo_agent.agent.send_coordinator as coordinator_mod
 
-    store = MessageStore(tmp_path / "messages.db")
-    await store.open()
-
-    class Coordinator:
-        def __init__(self, **kwargs):
-            self.provider_session_id = None
-            self.held_recovery_source = kwargs["held_recovery_source"]
-
-        async def send(self, *_args, **_kwargs):
-            return {"state": "failed"}
-
-    monkeypatch.setattr(coordinator_mod, "SendCoordinator", Coordinator)
+    monkeypatch.setattr(coordinator_mod, "SendCoordinator", _V2Coordinator)
     monkeypatch.setattr(route_mod, "_build_tool_dispatch", lambda _point: {})
-
-    class V2Client:
-        def __init__(self):
-            self.slug = "puffotest"
-            self.device_id = "dev"
-            self.keystore = object()
-            self.http = object()
-            self.store = store
-            self.space_id = None
-            self.workspace = str(tmp_path)
-            self.global_runtime = None
-            self.started = asyncio.Event()
-            self.release = asyncio.Event()
-
-        async def listen(self, _on_message):
-            await self.store.store_receipt(
-                {
-                    "envelope_id": "global-one",
-                    "envelope_kind": "channel",
-                    "sender_slug": "alice",
-                    "space_id": "sp",
-                    "channel_id": "ch",
-                    "content": "hello",
-                    "content_type": "text/plain",
-                    "sent_at": 1,
-                },
-                server_seq=1,
-                disposition=ReceiptDisposition.ELIGIBLE,
-                reason="test receipt",
-            )
-            self.global_runtime.notify()
-            self.started.set()
-            await self.release.wait()
-
-        def set_profile(self, *_args, **_kwargs):
-            return None
-
     class V2Cfg(FakeCfg):
         def resolve_workspace_dir(self):
             return tmp_path
 
-    client = V2Client()
+    client = _V2Client(store, tmp_path)
     reporter = FakeReporter()
     hub = WsLocalHub()
     hub.register(AttachPoint(
@@ -454,12 +439,21 @@ async def test_v2_receipt_to_global_bundle_admitted_end_and_owned_runtime_cleanu
     })
     served = asyncio.create_task(serve_attached(transport, hub))
     await asyncio.wait_for(client.started.wait(), 1)
+    return client, transport, served
+
+
+async def _wait_for_v2_bundle(transport):
     for _ in range(300):
         bundles = transport.by_type("bundle")
         if bundles:
-            break
+            return bundles[0]
         await asyncio.sleep(0.02)
-    bundle = transport.by_type("bundle")[0]
+    return transport.by_type("bundle")[0]
+
+
+async def _admit_and_end_v2_bundle(transport, store, bundle):
+    from puffo_agent.agent.message_store import ProcessingState
+
     assert bundle["turn_id"]
     transport.feed({"type": "ack", "bundle_id": bundle["bundle_id"]})
     await asyncio.sleep(0)
@@ -483,6 +477,19 @@ async def test_v2_receipt_to_global_bundle_admitted_end_and_owned_runtime_cleanu
             break
         await asyncio.sleep(0.01)
     assert run.state == ProcessingState.PROCESSED.value
+
+
+@pytest.mark.asyncio
+async def test_v2_receipt_to_global_bundle_admitted_end_and_owned_runtime_cleanup(
+    monkeypatch, tmp_path,
+):
+    from puffo_agent.agent.message_store import MessageStore
+
+    store = MessageStore(tmp_path / "messages.db")
+    await store.open()
+    client, transport, served = await _start_v2_attached(monkeypatch, tmp_path, store)
+    bundle = await _wait_for_v2_bundle(transport)
+    await _admit_and_end_v2_bundle(transport, store, bundle)
     transport._inbound.put_nowait(None)
     await served
     assert client.global_runtime is None

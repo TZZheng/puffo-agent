@@ -112,7 +112,7 @@ def _canonical_utc(value_ms: int) -> str:
         raise ReminderContractError("invalid reminder metadata") from exc
 
 
-def _parse_rfc3339_ms(value: object) -> int:
+def _parse_rfc3339_timestamp(value: object) -> datetime:
     if not isinstance(value, str) or not _RFC3339_OFFSET_RE.fullmatch(value):
         raise ReminderContractError("invalid reminder metadata")
     try:
@@ -123,6 +123,11 @@ def _parse_rfc3339_ms(value: object) -> int:
         raise ReminderContractError("invalid reminder metadata") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ReminderContractError("invalid reminder metadata")
+    return parsed
+
+
+def _parse_rfc3339_ms(value: object) -> int:
+    parsed = _parse_rfc3339_timestamp(value)
     if parsed.microsecond % 1000:
         # The Agent's v1 AAD canonically binds millisecond UTC instants.  Do
         # not silently round a Server row into a different authenticated time.
@@ -414,8 +419,12 @@ class ReminderSync:
     def _validate_delivery_claim_response(
         response: Any, record: ReminderSyncRecord,
     ) -> str:
-        if not isinstance(response, Mapping) or set(response) != {
+        required = {
             "occurrence_id", "revision", "lifecycle", "status",
+        }
+        if not isinstance(response, Mapping) or set(response) not in {
+            frozenset(required),
+            frozenset(required | {"lease_expires_at"}),
         }:
             raise ReminderContractError("invalid reminder delivery claim")
         if response.get("occurrence_id") != record.occurrence_id:
@@ -427,6 +436,10 @@ class ReminderSync:
         status = response.get("status")
         if status not in {"acquired", "held", "terminal"}:
             raise ReminderContractError("invalid reminder delivery claim")
+        if "lease_expires_at" in response:
+            if status != "acquired":
+                raise ReminderContractError("invalid reminder delivery claim")
+            _parse_rfc3339_timestamp(response.get("lease_expires_at"))
         if status == "terminal":
             if lifecycle not in {"cancelled", "delivered"} or revision < record.revision:
                 raise ReminderContractError("invalid reminder delivery claim")

@@ -9,11 +9,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
 import time
 from pathlib import Path
 
-import pytest
 
 from puffo_agent.portal import credential_refresh
 from puffo_agent.portal.credential_refresh import (

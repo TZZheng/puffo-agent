@@ -1,19 +1,17 @@
-"""Harness abstraction — which agent engine runs inside a runtime.
+"""Execution engines used by Puffo runtimes.
 
 Runtime answers WHERE the agent executes; harness answers WHAT.
-Only meaningful for the CLI runtimes; ``chat-local`` / ``sdk-local``
-ignore the field. Docker retains three declarative Harness types.
+Docker retains three declarative ``DockerHarness`` metadata types.
 The host-local runtime uses the long-lived Driver implementations for
 ``claude-code`` and ``codex`` only.
 """
 
-from .base import Harness, HarnessTurn
+from .base import DockerHarness
 from .claude_code import ClaudeCodeHarness
 from .gemini_cli import GeminiCLIHarness
 from .hermes import HermesHarness
 from .driver import (
     Driver,
-    HarnessDriver,
     RuntimeRef,
     SessionRef,
     TurnRef,
@@ -26,9 +24,10 @@ from dataclasses import dataclass
 from typing import Any
 
 
-def build_harness(name: str) -> Harness:
-    """Resolve a harness name from agent.yml. Default Claude Code so
-    agents without the field keep existing behaviour.
+def build_docker_harness(name: str) -> DockerHarness:
+    """Resolve Docker engine metadata from ``agent.yml``.
+
+    Claude Code is the compatibility default for configs without a harness.
     """
     if not name or name == "claude-code":
         return ClaudeCodeHarness()
@@ -48,11 +47,11 @@ class UnsupportedDriver:
     diagnostic: str = "no local Driver implementation for this harness"
 
 
-def build_driver(name: str, **kwargs: Any) -> HarnessDriver | UnsupportedDriver:
+def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
     """Construct only the two ratified Driver implementations.
 
-    This factory is deliberately separate from :func:`build_harness`, which
-    remains the declarative registry used by the Docker runtime.
+    This factory is deliberately separate from :func:`build_docker_harness`,
+    which is the declarative registry used by the Docker runtime.
     """
     if name == "codex":
         return CodexAppServerDriver(**kwargs)
@@ -62,13 +61,12 @@ def build_driver(name: str, **kwargs: Any) -> HarnessDriver | UnsupportedDriver:
 
 
 __all__ = [
-    "Harness",
-    "HarnessTurn",
+    "DockerHarness",
     "ClaudeCodeHarness",
     "GeminiCLIHarness",
     "HermesHarness",
-    "build_harness",
-    "Driver", "HarnessDriver",
+    "build_docker_harness",
+    "Driver",
     "RuntimeRef", "SessionRef", "TurnRef", "PermissionRef",
     "UnsupportedCapability", "UnsupportedDriver",
     "CodexAppServerDriver", "CodexDriver",

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from pathlib import Path
 from typing import Optional
 
@@ -115,24 +114,16 @@ def mcp_tool_fingerprint() -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _register_local_tools(
-    mcp: FastMCP,
-    workspace: str,
-    runtime_kind: str = "",
-    harness: str = "",
-) -> None:
-    """Register system/local tools that don't depend on the messaging API."""
+def _require_claude_code(harness: str, tool: str) -> None:
+    if harness and harness != "claude-code":
+        raise RuntimeError(
+            f"{tool} is only supported under the claude-code "
+            f"harness (this agent is using {harness!r})."
+        )
 
-    # Closure harness — the tool's own ``harness`` param shadows it below.
+
+def _register_refresh_tool(mcp: FastMCP, workspace: str, runtime_kind: str, harness: str) -> None:
     agent_current_harness = harness
-
-    def _require_claude_code(tool: str) -> None:
-        if harness and harness != "claude-code":
-            raise RuntimeError(
-                f"{tool} is only supported under the claude-code "
-                f"harness (this agent is using {harness!r})."
-            )
-
     @mcp.tool()
     async def refresh(
         harness: Optional[str] = None,
@@ -207,26 +198,25 @@ def _register_local_tools(
                 touched.append("refresh_session")
         return "refresh requested: " + ", ".join(touched)
 
+def _register_skill_tools(mcp: FastMCP, workspace: str, harness: str) -> None:
     @mcp.tool()
     async def install_skill(name: str, content: str) -> str:
         """Install a new skill at project scope."""
-        _require_claude_code("install_skill")
+        _require_claude_code(harness, "install_skill")
         dst = _install_skill(Path(workspace), name, content)
         return (
             f"installed skill {name!r} at project scope ({dst}). "
             "Call refresh() so your next turn picks it up."
         )
-
     @mcp.tool()
     async def uninstall_skill(name: str) -> str:
         """Remove a skill you previously installed."""
-        _require_claude_code("uninstall_skill")
+        _require_claude_code(harness, "uninstall_skill")
         _uninstall_skill(Path(workspace), name)
         return (
             f"uninstalled skill {name!r}. Call refresh() so your next "
             "turn stops seeing it."
         )
-
     @mcp.tool()
     async def list_skills() -> str:
         """List every skill available to you, tagged by scope."""
@@ -238,6 +228,7 @@ def _register_local_tools(
             for scope, name in entries
         )
 
+def _register_mcp_tools(mcp: FastMCP, workspace: str, runtime_kind: str, harness: str) -> None:
     @mcp.tool()
     async def install_mcp_server(
         name: str,
@@ -246,7 +237,7 @@ def _register_local_tools(
         env: Optional[dict[str, str]] = None,
     ) -> str:
         """Register a new stdio MCP server at project scope."""
-        _require_claude_code("install_mcp_server")
+        _require_claude_code(harness, "install_mcp_server")
         check_host_local = runtime_kind != "cli-local"
         path = _install_mcp_server(
             Path(workspace), name, command, args, env,
@@ -256,17 +247,15 @@ def _register_local_tools(
             f"registered MCP server {name!r} at project scope ({path}). "
             "Call refresh() so the claude subprocess respawns."
         )
-
     @mcp.tool()
     async def uninstall_mcp_server(name: str) -> str:
         """Remove an MCP server you previously registered."""
-        _require_claude_code("uninstall_mcp_server")
+        _require_claude_code(harness, "uninstall_mcp_server")
         _uninstall_mcp_server(Path(workspace), name)
         return (
             f"removed MCP server {name!r}. Call refresh() so the claude "
             "subprocess respawns without it."
         )
-
     @mcp.tool()
     async def list_mcp_servers() -> str:
         """List every MCP server available to you, tagged by scope.
@@ -294,6 +283,19 @@ def _register_local_tools(
             else:
                 lines.append(f"{tag} {name}")
         return "\n".join(lines)
+
+def _register_local_tools(
+    mcp: FastMCP,
+    workspace: str,
+    runtime_kind: str = "",
+    harness: str = "",
+) -> None:
+    """Register system/local tools that do not depend on messaging."""
+    _register_refresh_tool(mcp, workspace, runtime_kind, harness)
+    _register_skill_tools(mcp, workspace, harness)
+    _register_mcp_tools(mcp, workspace, runtime_kind, harness)
+
+
 
 
 class _BridgeNoKeysStore(KeyStore):

@@ -11,7 +11,7 @@ import pytest
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
     DriverCapabilities,
-    HarnessDriver,
+    Driver,
     ProtocolDiagnostics,
     RuntimeOpened,
     RuntimeRef,
@@ -141,7 +141,7 @@ async def test_old_codex_agent_imports_session_with_matching_sandbox(
     assert not old_session.exists()
 
 
-class _ResumeFallbackDriver(HarnessDriver):
+class _ResumeFallbackDriver(Driver):
     def __init__(self):
         self.open_calls: list[str | None] = []
         self.close_calls = 0

@@ -23,7 +23,7 @@ class InProcessDataClient:
     the existing tool implementations don't notice the swap.
     """
 
-    def __init__(self, store: "MessageStore", client: "PuffoCoreMessageClient") -> None:
+    def __init__(self, store: MessageStore, client: PuffoCoreMessageClient) -> None:
         self._store = store
         self._client = client
 
@@ -40,7 +40,7 @@ class InProcessDataClient:
         since_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
-    ) -> list["ChannelRoot"]:
+    ) -> list[ChannelRoot]:
         return await self._store.get_channel_roots(
             channel_id=channel_id,
             limit=limit,
@@ -51,7 +51,7 @@ class InProcessDataClient:
 
     async def get_dm_history(
         self, peer_slug: str, limit: int = 20, before: int | None = None,
-    ) -> list["StoredMessage"]:
+    ) -> list[StoredMessage]:
         return await self._store.get_dm_history(peer_slug, limit, before)
 
     async def get_thread_messages(
@@ -61,7 +61,7 @@ class InProcessDataClient:
         since_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
-    ) -> list["StoredMessage"]:
+    ) -> list[StoredMessage]:
         return await self._store.get_thread_messages(
             root_id=root_id,
             limit=limit,

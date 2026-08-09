@@ -1,5 +1,4 @@
 import asyncio
-import os
 
 from ._auth_markers import looks_like_auth_error
 from ._logging import agent_logger
@@ -29,7 +28,11 @@ def _user_message_preview(messages: list[dict]) -> str:
     """Body of the latest user message (the log entry is a metadata block)."""
     for m in reversed(messages):
         content = m.get("content")
-        if m.get("role") == "user" and isinstance(content, str) and "- message: " in content:
+        if (
+            m.get("role") == "user"
+            and isinstance(content, str)
+            and "- message: " in content
+        ):
             body = content.split("- message: ", 1)[1]
             return " ".join(body.split())[:STATUS_PREVIEW_CHARS]
     return ""
@@ -104,7 +107,10 @@ class PuffoAgent:
         is_from_operator: bool = False,
     ) -> str | None:
         self._append_user(
-            channel_name, sender, sender_email, text,
+            channel_name,
+            sender,
+            sender_email,
+            text,
             channel_id=channel_id,
             root_id=root_id,
             attachments=attachments,
@@ -225,7 +231,9 @@ class PuffoAgent:
             on_progress=on_progress,
         )
         result = await self.adapter.run_retry_turn(
-            kick_text, planned.provider_input, ctx,
+            kick_text,
+            planned.provider_input,
+            ctx,
         )
         send_message_called = bool(result.metadata.get("send_message_targets"))
         text_parts: list[str] = result.metadata.get("assistant_text_parts") or []
@@ -280,25 +288,27 @@ class PuffoAgent:
         # adapter API for a single user_message, so concatenate.
         fallback_chunks: list[str] = []
         for msg in fallback_batch:
-            fallback_chunks.append(self._format_user_block(
-                channel_name=channel_meta.get("channel_name", ""),
-                sender=msg.get("sender_slug", ""),
-                sender_email=msg.get("sender_email", ""),
-                text=msg.get("text", ""),
-                channel_id=channel_meta.get("channel_id", ""),
-                root_id=root_id,
-                attachments=msg.get("attachments") or [],
-                sender_is_agent=msg.get("sender_is_agent", False),
-                mentions=msg.get("mentions") or [],
-                post_id=msg.get("envelope_id", ""),
-                create_at=msg.get("sent_at", 0),
-                space_id=channel_meta.get("space_id", ""),
-                space_name=channel_meta.get("space_name", ""),
-                sender_display_name=msg.get("sender_display_name", ""),
-                sender_owner_slug=msg.get("sender_owner_slug", ""),
-                is_from_operator=msg.get("is_from_operator", False),
-                is_encrypted=msg.get("is_encrypted", True),
-            ))
+            fallback_chunks.append(
+                self._format_user_block(
+                    channel_name=channel_meta.get("channel_name", ""),
+                    sender=msg.get("sender_slug", ""),
+                    sender_email=msg.get("sender_email", ""),
+                    text=msg.get("text", ""),
+                    channel_id=channel_meta.get("channel_id", ""),
+                    root_id=root_id,
+                    attachments=msg.get("attachments") or [],
+                    sender_is_agent=msg.get("sender_is_agent", False),
+                    mentions=msg.get("mentions") or [],
+                    post_id=msg.get("envelope_id", ""),
+                    create_at=msg.get("sent_at", 0),
+                    space_id=channel_meta.get("space_id", ""),
+                    space_name=channel_meta.get("space_name", ""),
+                    sender_display_name=msg.get("sender_display_name", ""),
+                    sender_owner_slug=msg.get("sender_owner_slug", ""),
+                    is_from_operator=msg.get("is_from_operator", False),
+                    is_encrypted=msg.get("is_encrypted", True),
+                )
+            )
         fallback_text = "\n\n".join(fallback_chunks)
 
         ctx = TurnContext(
@@ -310,7 +320,9 @@ class PuffoAgent:
             on_progress=on_progress,
         )
         result = await self.adapter.run_retry_turn(
-            kick_text, fallback_text, ctx,
+            kick_text,
+            fallback_text,
+            ctx,
         )
 
         # Route reply the same way as a normal turn so the consumer
@@ -321,7 +333,8 @@ class PuffoAgent:
         if send_message_called:
             if result.reply:
                 self._append_assistant(
-                    channel_meta.get("channel_name", ""), result.reply,
+                    channel_meta.get("channel_name", ""),
+                    result.reply,
                 )
             return None
         joined = "\n".join(text_parts) if text_parts else (result.reply or "")
@@ -370,7 +383,9 @@ class PuffoAgent:
 
         asyncio.ensure_future(
             get_reporter().emit(
-                self.agent_id, "turn_start", {"message": _user_message_preview(ctx.messages)}
+                self.agent_id,
+                "turn_start",
+                {"message": _user_message_preview(ctx.messages)},
             )
         )
         result = await self.adapter.run_turn(ctx)
@@ -379,18 +394,35 @@ class PuffoAgent:
             get_reporter().emit(
                 self.agent_id,
                 "turn_complete",
-                {"tokens": {"input": result.input_tokens, "output": result.output_tokens}},
+                {
+                    "tokens": {
+                        "input": result.input_tokens,
+                        "output": result.output_tokens,
+                    }
+                },
             )
         )
 
-        # Reply routing:
-        #   a. send_message called → return None (MCP already posted).
-        #   b. else if [SILENT] in assistant.text → silent.
-        #   c. else if "API Error" in output → raise AgentAPIError.
-        #   d. else → fallback: bullet list of assistant.text frames.
+        return self._route_turn_result(
+            result,
+            channel_name,
+            sender,
+            allow_plain_fallback=allow_plain_fallback,
+        )
+
+    def _route_turn_result(
+        self,
+        result,
+        channel_name: str,
+        sender: str,
+        *,
+        allow_plain_fallback: bool,
+    ) -> str | None:
+        """Apply the shared MCP/silent/error/plain-text reply policy."""
+        from ..portal.control.reporter import get_reporter
+
         send_message_called = bool(result.metadata.get("send_message_targets"))
         text_parts: list[str] = result.metadata.get("assistant_text_parts") or []
-
         if send_message_called:
             self.logger.debug(
                 f"[mcp-only] [{channel_name}] @{sender}: send_message "
@@ -400,9 +432,6 @@ class PuffoAgent:
                 self._append_assistant(channel_name, result.reply)
             return None
 
-        # Substring match: marker position in the assistant text
-        # doesn't matter. Real replies go via send_message, so a
-        # prose-only turn mentioning the marker is correctly silent.
         joined = "\n".join(text_parts) if text_parts else (result.reply or "")
         if is_silent(joined):
             self.logger.debug(
@@ -410,11 +439,6 @@ class PuffoAgent:
             )
             return None
 
-        # API Error suppression. Provider error bodies often surface
-        # as ``"API Error: 429 ..."`` in the assistant prose when the
-        # adapter couldn't recover. Posting that would leak provider
-        # internals and spam the thread on transient rate-limits.
-        # Raise so the consumer can re-enqueue after a backoff.
         if "API Error" in joined:
             is_auth = looks_like_auth_error(joined)
             self.logger.warning(
@@ -437,8 +461,6 @@ class PuffoAgent:
             )
             return None
 
-        # Fallback: agent skipped send_message and [SILENT]; assemble
-        # assistant.text frames into a bullet list so something lands.
         fallback = _format_assistant_fallback(text_parts, result.reply)
         self.logger.warning(
             f"[fallback] [{channel_name}] @{sender}: agent skipped both "
@@ -447,7 +469,9 @@ class PuffoAgent:
         )
         asyncio.ensure_future(
             get_reporter().emit(
-                self.agent_id, "tool_use", {"tool": "fallback", "content": fallback[:STATUS_PREVIEW_CHARS]}
+                self.agent_id,
+                "tool_use",
+                {"tool": "fallback", "content": fallback[:STATUS_PREVIEW_CHARS]},
             )
         )
         self._append_assistant(channel_name, fallback)
@@ -521,55 +545,22 @@ class PuffoAgent:
         is_from_operator: bool = False,
         is_encrypted: bool = True,
     ) -> str:
-        # Structured markdown block keeps context metadata distinct
-        # from message content, preventing the LLM from echoing
-        # "[#channel] @user:" style prefixes back into replies. Format
-        # is documented to the model in DEFAULT_SHARED_CLAUDE_MD.
-        lines: list[str] = []
-        if post_id:
-            lines.append(f"- post_id: {post_id}")
-        if space_name:
-            lines.append("- space: " + space_name)
-        if space_id:
-            lines.append(f"- space_id: {space_id}")
-        lines.append("- channel: " + (channel_name or channel_id))
-        if channel_id:
-            lines.append(f"- channel_id: {channel_id}")
-        # thread_root_id is the root post id to pass as send_message's
-        # root_id. For a top-level post the root is the post itself.
-        thread_root = root_id or post_id
-        if thread_root:
-            lines.append(f"- thread_root_id: {thread_root}")
-        # Legacy/system messages read as encrypted.
-        lines.append(f"- is_encrypted: {str(is_encrypted).lower()}")
-        ts_iso = _ms_to_iso(create_at)
-        if ts_iso:
-            lines.append(f"- timestamp: {ts_iso}")
-        # ``sender`` is the human-readable name the LLM should use
-        # when addressing this person in prose; ``sender_slug`` is
-        # the structural identifier (always required for @-mentions
-        # and send_message routing). When the server has no
-        # display_name on file, ``sender`` falls back to the slug so
-        # the field is always populated — no parsing branch in the
-        # agent prompt.
-        display = sender_display_name or sender
-        lines.append(f"- sender: {display}")
-        lines.append(f"- sender_slug: {sender}")
-        # ``owner_slug`` exists only for agents, so it doubles as the
-        # agent signal here. Display-only — priority banding still
-        # runs on the upstream ``sender_is_agent`` flag.
-        projected_sender_type = sender_type if sender_type in {"human", "agent"} else (
-            "agent" if (sender_is_agent or sender_owner_slug) else "unknown"
+        lines = _user_metadata_lines(
+            channel_name=channel_name,
+            channel_id=channel_id,
+            root_id=root_id,
+            post_id=post_id,
+            space_id=space_id,
+            space_name=space_name,
+            create_at=create_at,
+            sender=sender,
+            sender_display_name=sender_display_name,
+            sender_is_agent=sender_is_agent,
+            sender_owner_slug=sender_owner_slug,
+            sender_type=sender_type,
+            is_from_operator=is_from_operator,
+            is_encrypted=is_encrypted,
         )
-        lines.append(f"- sender_type: {projected_sender_type}")
-        # ``sender_owner_slug`` fires only for agent senders (their
-        # operator); ``is_from_operator`` only when the sender IS the
-        # agent's own operator. Emit conditionally so older agents
-        # don't see keys their primer doesn't document.
-        if sender_owner_slug:
-            lines.append(f"- sender_owner_slug: {sender_owner_slug}")
-        if is_from_operator:
-            lines.append("- is_from_operator: true")
         lines.append(
             f"- is_visible_to_human: {'true' if is_visible_to_human else 'false'}"
         )
@@ -607,3 +598,53 @@ class PuffoAgent:
     def _truncate_log(self):
         if len(self.log) > MAX_LOG_ENTRIES:
             self.log = self.log[-MAX_LOG_ENTRIES:]
+
+
+def _user_metadata_lines(
+    *,
+    channel_name: str,
+    channel_id: str,
+    root_id: str,
+    post_id: str,
+    space_id: str,
+    space_name: str,
+    create_at: int,
+    sender: str,
+    sender_display_name: str,
+    sender_is_agent: bool,
+    sender_owner_slug: str,
+    sender_type: str | None,
+    is_from_operator: bool,
+    is_encrypted: bool,
+) -> list[str]:
+    """Render stable user-message metadata before optional projections."""
+    lines: list[str] = []
+    if post_id:
+        lines.append(f"- post_id: {post_id}")
+    if space_name:
+        lines.append("- space: " + space_name)
+    if space_id:
+        lines.append(f"- space_id: {space_id}")
+    lines.append("- channel: " + (channel_name or channel_id))
+    if channel_id:
+        lines.append(f"- channel_id: {channel_id}")
+    thread_root = root_id or post_id
+    if thread_root:
+        lines.append(f"- thread_root_id: {thread_root}")
+    lines.append(f"- is_encrypted: {str(is_encrypted).lower()}")
+    timestamp = _ms_to_iso(create_at)
+    if timestamp:
+        lines.append(f"- timestamp: {timestamp}")
+    lines.append(f"- sender: {sender_display_name or sender}")
+    lines.append(f"- sender_slug: {sender}")
+    projected = (
+        sender_type
+        if sender_type in {"human", "agent"}
+        else ("agent" if (sender_is_agent or sender_owner_slug) else "unknown")
+    )
+    lines.append(f"- sender_type: {projected}")
+    if sender_owner_slug:
+        lines.append(f"- sender_owner_slug: {sender_owner_slug}")
+    if is_from_operator:
+        lines.append("- is_from_operator: true")
+    return lines

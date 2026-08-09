@@ -8,7 +8,6 @@ it via ``host.docker.internal`` → host's 127.0.0.1."""
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
 from aiohttp import web

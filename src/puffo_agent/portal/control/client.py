@@ -21,7 +21,6 @@ from ..state import (
     refresh_host_sync_flag_path,
     refresh_model_flag_path,
     refresh_session_flag_path,
-    restart_flag_path,
 )
 from . import machine_auth
 from .envelope import TS_WINDOW_MS, ControlError, decrypt_command
@@ -45,8 +44,7 @@ def _is_already_archived(agent_slug: str) -> bool:
         return False
     prefix = f"{agent_slug}-"
     return any(
-        child.is_dir() and child.name.startswith(prefix)
-        for child in root.iterdir()
+        child.is_dir() and child.name.startswith(prefix) for child in root.iterdir()
     )
 
 
@@ -96,12 +94,7 @@ def _apply_refresh(agent_slug: str, params: dict) -> dict:
                 f"kind={runtime_kind!r}"
             ),
         }
-    if (
-        host_sync
-        and runtime_kind == "cli-docker"
-        and not session
-        and harness is None
-    ):
+    if host_sync and runtime_kind == "cli-docker" and not session and harness is None:
         return {
             "ok": False,
             "error": (
@@ -121,17 +114,20 @@ def _apply_refresh(agent_slug: str, params: dict) -> dict:
         touched.append("refresh_model")
     else:
         _write_flag_payload(
-            refresh_agent_flag_path(workspace), {"requested_at": now},
+            refresh_agent_flag_path(workspace),
+            {"requested_at": now},
         )
         touched.append("refresh_agent")
         if host_sync:
             _write_flag_payload(
-                refresh_host_sync_flag_path(workspace), {"requested_at": now},
+                refresh_host_sync_flag_path(workspace),
+                {"requested_at": now},
             )
             touched.append("refresh_host_sync")
         if session:
             _write_flag_payload(
-                refresh_session_flag_path(workspace), {"requested_at": now},
+                refresh_session_flag_path(workspace),
+                {"requested_at": now},
             )
             touched.append("refresh_session")
     return {"ok": True, "touched": touched}
@@ -207,107 +203,20 @@ async def execute_command(
     reconcile loop applies it — a single-writer model. ``create`` additionally
     finalizes the pending identity with puffo-server (needs the operator
     pairing context)."""
-    if op in ("pause", "resume", "edit", "archive", "refresh"):
-        if not agent_slug or not agent_yml_path(agent_slug).exists():
-            # Re-archive of an already-archived agent is idempotent OK.
-            if op == "archive" and agent_slug and _is_already_archived(agent_slug):
-                return {
-                    "ok": True,
-                    "note": "already archived",
-                    "agent_slug": agent_slug,
-                }
-            return {"ok": False, "error": f"unknown agent {agent_slug!r}"}
-
+    target_error = _command_target_error(op, agent_slug)
+    if target_error is not None:
+        return target_error
     if op in {"runtime.cancel_turn", "runtime.resolve_permission"}:
-        from ...agent.harness.runtime_commands import execute_runtime_command
-
-        command = dict(params)
-        command.update(
-            command_id=str(command_id or ""),
-            agent_id=str(agent_slug or ""),
-            op=op.removeprefix("runtime."),
-        )
-        return await execute_runtime_command(
-            command,
-            expected_agent_id=str(agent_slug or ""),
-            manager_agent_id=str(agent_slug or ""),
-            require_version=False,
-            permission_turn_from_active=False,
-        )
-
-    if op == "pause":
-        cfg = AgentConfig.load(agent_slug)
-        cfg.state = "paused"
-        cfg.save()
-        return {"ok": True, "state": "paused"}
-    if op == "resume":
-        cfg = AgentConfig.load(agent_slug)
-        cfg.state = "running"
-        cfg.save()
-        return {"ok": True, "state": "running"}
+        return await _execute_runtime_command(op, agent_slug, params, command_id)
+    if op in {"pause", "resume"}:
+        return _set_agent_state(agent_slug, "paused" if op == "pause" else "running")
     if op == "archive":
         _touch_flag(archive_flag_path(agent_slug))
         return {"ok": True}
     if op == "refresh":
         return _apply_refresh(agent_slug, params)
     if op == "edit":
-        cfg = AgentConfig.load(agent_slug)
-        patch: dict = {}
-        prompt_changed = False
-        runtime_changed = False
-        if isinstance(params.get("display_name"), str):
-            cfg.display_name = params["display_name"]
-            patch["display_name"] = params["display_name"]
-            prompt_changed = True
-        if isinstance(params.get("role"), str):
-            cfg.role = params["role"]
-            patch["role"] = params["role"]
-            prompt_changed = True
-        # avatar_url points to a blob the operator already uploaded; sync it to
-        # the server identity (avatars are public, so no gating needed).
-        if isinstance(params.get("avatar_url"), str):
-            cfg.avatar_url = params["avatar_url"]
-            patch["avatar_url"] = params["avatar_url"]
-        # Soul is owner-gated text on the server identity (not kept in
-        # agent.yml); the profile.md body carries it for the worker.
-        if isinstance(params.get("soul"), str):
-            patch["soul"] = params["soul"]
-            prompt_changed = True
-        # Runtime block (kind/provider/harness/model) — same fields the local
-        # bridge's update_runtime accepts; reject invalid triples before saving.
-        rt_in = params.get("runtime")
-        if isinstance(rt_in, dict):
-            rt = cfg.runtime
-            for key in ("kind", "provider", "harness", "model"):
-                if isinstance(rt_in.get(key), str):
-                    setattr(rt, key, rt_in[key])
-                    runtime_changed = True
-            from ..runtime_matrix import validate_triple
-
-            result = validate_triple(rt.kind, rt.provider, rt.harness)
-            if not result.ok:
-                return {"ok": False, "error": f"runtime: {result.error}"}
-        cfg.save()
-        if isinstance(params.get("profile"), str):
-            (agent_yml_path(agent_slug).parent / cfg.profile).write_text(
-                params["profile"], encoding="utf-8"
-            )
-            prompt_changed = True
-        if patch:
-            try:
-                from ..api.handlers import _sync_agent_profile
-
-                await _sync_agent_profile(cfg, patch)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("control: edit profile sync failed: %s", exc)
-        # Prompt-only edits drop refresh_agent.flag; runtime edits
-        # ride the daemon's config-changed respawn.
-        if cfg.state == "running" and prompt_changed and not runtime_changed:
-            _write_flag_payload(
-                refresh_agent_flag_path(cfg.resolve_workspace_dir()),
-                {"requested_at": int(__import__("time").time())},
-            )
-        return {"ok": True}
+        return await _execute_edit(agent_slug, params)
     if op == "create":
         return await _create_agent_command(params, server_url, paired_root_pubkey)
     if op == "agent_create_approved":
@@ -320,6 +229,114 @@ async def execute_command(
         return {"ok": True, **result}
     # export/import carry bigger flows; not yet wired.
     return {"ok": False, "error": f"unsupported op {op!r}"}
+
+
+def _command_target_error(op: str, agent_slug: str | None) -> dict | None:
+    if op not in ("pause", "resume", "edit", "archive", "refresh"):
+        return None
+    if agent_slug and agent_yml_path(agent_slug).exists():
+        return None
+    if op == "archive" and agent_slug and _is_already_archived(agent_slug):
+        return {"ok": True, "note": "already archived", "agent_slug": agent_slug}
+    return {"ok": False, "error": f"unknown agent {agent_slug!r}"}
+
+
+async def _execute_runtime_command(
+    op: str, slug: str | None, params: dict, command_id: str | None
+) -> dict:
+    from ...agent.harness.runtime_commands import execute_runtime_command
+
+    command = dict(params)
+    command.update(
+        command_id=str(command_id or ""),
+        agent_id=str(slug or ""),
+        op=op.removeprefix("runtime."),
+    )
+    return await execute_runtime_command(
+        command,
+        expected_agent_id=str(slug or ""),
+        manager_agent_id=str(slug or ""),
+        require_version=False,
+        permission_turn_from_active=False,
+    )
+
+
+def _set_agent_state(agent_slug: str | None, state: str) -> dict:
+    cfg = AgentConfig.load(agent_slug)
+    cfg.state = state
+    cfg.save()
+    return {"ok": True, "state": state}
+
+
+async def _execute_edit(agent_slug: str | None, params: dict) -> dict:
+    cfg = AgentConfig.load(agent_slug)
+    patch, prompt_changed = _apply_edit_profile_fields(cfg, params)
+    runtime_changed, error = _apply_edit_runtime(cfg, params)
+    if error is not None:
+        return {"ok": False, "error": error}
+    cfg.save()
+    prompt_changed = _write_edit_profile(agent_slug, cfg, params) or prompt_changed
+    await _sync_edit_profile(cfg, patch)
+    if cfg.state == "running" and prompt_changed and not runtime_changed:
+        _write_flag_payload(
+            refresh_agent_flag_path(cfg.resolve_workspace_dir()),
+            {"requested_at": int(__import__("time").time())},
+        )
+    return {"ok": True}
+
+
+def _apply_edit_profile_fields(cfg: AgentConfig, params: dict) -> tuple[dict, bool]:
+    patch: dict = {}
+    prompt_changed = False
+    for field in ("display_name", "role"):
+        if isinstance(params.get(field), str):
+            setattr(cfg, field, params[field])
+            patch[field] = params[field]
+            prompt_changed = True
+    if isinstance(params.get("avatar_url"), str):
+        cfg.avatar_url = params["avatar_url"]
+        patch["avatar_url"] = params["avatar_url"]
+    if isinstance(params.get("soul"), str):
+        patch["soul"] = params["soul"]
+        prompt_changed = True
+    return patch, prompt_changed
+
+
+def _apply_edit_runtime(cfg: AgentConfig, params: dict) -> tuple[bool, str | None]:
+    raw = params.get("runtime")
+    if not isinstance(raw, dict):
+        return False, None
+    changed = False
+    for key in ("kind", "provider", "harness", "model"):
+        if isinstance(raw.get(key), str):
+            setattr(cfg.runtime, key, raw[key])
+            changed = True
+    from ..runtime_matrix import validate_triple
+
+    result = validate_triple(
+        cfg.runtime.kind, cfg.runtime.provider, cfg.runtime.harness
+    )
+    return changed, None if result.ok else f"runtime: {result.error}"
+
+
+def _write_edit_profile(agent_slug: str | None, cfg: AgentConfig, params: dict) -> bool:
+    if not isinstance(params.get("profile"), str):
+        return False
+    (agent_yml_path(agent_slug).parent / cfg.profile).write_text(
+        params["profile"], encoding="utf-8"
+    )
+    return True
+
+
+async def _sync_edit_profile(cfg: AgentConfig, patch: dict) -> None:
+    if not patch:
+        return
+    try:
+        from ..api.handlers import _sync_agent_profile
+
+        await _sync_agent_profile(cfg, patch)
+    except Exception as exc:
+        log.warning("control: edit profile sync failed: %s", exc)
 
 
 def _ws_url(base: str) -> str:
@@ -339,6 +356,8 @@ def build_capabilities() -> dict:
     model catalog. Mirrors the local bridge's ``info.cli_tools`` + ``/v1/
     providers`` so the portal renders a remote machine's providers like a local
     one. ``fetch=False`` keeps it off the network (serves cache/static)."""
+    import importlib.metadata
+
     from ...agent.cli_bin import (
         claude_has_credentials,
         codex_has_credentials,
@@ -347,8 +366,6 @@ def build_capabilities() -> dict:
     )
     from ...agent.model_catalog import KNOWN_HARNESSES, provider_models
     from ..api.handlers import _cli_tool_status
-
-    import importlib.metadata
 
     try:
         daemon_version = importlib.metadata.version("puffo-agent")
@@ -370,7 +387,11 @@ def build_capabilities() -> dict:
         }
         for h in KNOWN_HARNESSES
     ]
-    return {"cli_tools": cli_tools, "providers": providers, "daemon_version": daemon_version}
+    return {
+        "cli_tools": cli_tools,
+        "providers": providers,
+        "daemon_version": daemon_version,
+    }
 
 
 class MachineControlClient:
@@ -408,7 +429,9 @@ class MachineControlClient:
                 await self._send(ws, machine_auth.ws_connect_frame(self.machine))
                 # Initial capability snapshot on connect.
                 last_caps = await asyncio.to_thread(build_capabilities)
-                await self._send(ws, {"type": "capabilities", "capabilities": last_caps})
+                await self._send(
+                    ws, {"type": "capabilities", "capabilities": last_caps}
+                )
                 sender = asyncio.create_task(self._heartbeat_loop(ws, stop, last_caps))
 
                 # Register the reverse-channel sender on this live socket.
@@ -417,7 +440,11 @@ class MachineControlClient:
                 async def _report(operator_slug: str, envelope: dict) -> None:
                     await self._send(
                         ws,
-                        {"type": "message", "operator_slug": operator_slug, "envelope": envelope},
+                        {
+                            "type": "message",
+                            "operator_slug": operator_slug,
+                            "envelope": envelope,
+                        },
                     )
 
                 get_reporter().set_sender(_report)
@@ -427,7 +454,10 @@ class MachineControlClient:
                         if stop.is_set():
                             break
                         if msg.type != aiohttp.WSMsgType.TEXT:
-                            if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            if msg.type in (
+                                aiohttp.WSMsgType.CLOSED,
+                                aiohttp.WSMsgType.ERROR,
+                            ):
                                 break
                             continue
                         try:
@@ -437,7 +467,9 @@ class MachineControlClient:
                         if frame.get("type") == "command":
                             await self._handle(ws, frame)
                         elif frame.get("type") == "error":
-                            log.warning("control: server rejected ws: %s", frame.get("reason"))
+                            log.warning(
+                                "control: server rejected ws: %s", frame.get("reason")
+                            )
                             break
                 finally:
                     get_reporter().set_sender(None)
@@ -448,7 +480,10 @@ class MachineControlClient:
                         pass
 
     async def _heartbeat_loop(
-        self, ws: aiohttp.ClientWebSocketResponse, stop: asyncio.Event, initial_caps: dict
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        stop: asyncio.Event,
+        initial_caps: dict,
     ) -> None:
         """Periodic liveness ping; re-push capabilities only when they change
         (e.g. a CLI tool gets authed). Capability compute runs off-thread so a
@@ -503,7 +538,9 @@ class MachineControlClient:
             if isinstance(result, dict) and not result.get("ok", True):
                 log.warning(
                     "control: command %s op=%s failed: %s",
-                    command_id, decrypted["op"], result.get("error"),
+                    command_id,
+                    decrypted["op"],
+                    result.get("error"),
                 )
             # Publish the result so `wait-until-command --id <command_id>` returns.
             if command_id and isinstance(result, dict):
@@ -518,7 +555,9 @@ class MachineControlClient:
             if command_id:
                 from .agent_create import get_registry
 
-                get_registry().record_result(command_id, {"ok": False, "error": str(exc)})
+                get_registry().record_result(
+                    command_id, {"ok": False, "error": str(exc)}
+                )
 
         if command_id:
             try:
@@ -569,10 +608,14 @@ class ControlManager:
                 if pairings:
                     base = next(iter(pairings.values())).server_url.rstrip("/")
                     body = json.dumps({"agents": len(discover_agents())}).encode()
-                    headers = machine_auth.signed_headers(machine, "POST", "/v2/machines/me", body)
+                    headers = machine_auth.signed_headers(
+                        machine, "POST", "/v2/machines/me", body
+                    )
                     headers["content-type"] = "application/json"
                     async with aiohttp.ClientSession() as session:
-                        await session.post(f"{base}/v2/machines/me", data=body, headers=headers)
+                        await session.post(
+                            f"{base}/v2/machines/me", data=body, headers=headers
+                        )
             except Exception as exc:  # noqa: BLE001 — best-effort liveness
                 log.debug("control: /me report failed: %s", exc)
             await _sleep_or_stop(self._stop, ME_INTERVAL_SECONDS)

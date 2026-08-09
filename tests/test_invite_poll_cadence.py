@@ -369,7 +369,7 @@ def test_build_puffo_core_client_threads_agent_created_at(monkeypatch, tmp_path)
             operator_slug="",
         ),
         runtime=RuntimeConfig(
-            kind="chat-local",
+            kind="cli-local",
             harness="claude-code",
         ),
         created_at=1_700_000_000,
@@ -434,7 +434,7 @@ def test_build_puffo_core_client_has_no_retired_queue_budget(
             operator_slug="",
         ),
         runtime=RuntimeConfig(
-            kind="chat-local",
+            kind="cli-local",
             harness=harness,
         ),
     )

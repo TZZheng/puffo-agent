@@ -32,7 +32,6 @@ import pytest
 
 import puffo_agent.agent.puffo_core_client as pcc_mod
 import puffo_agent.agent.send_coordinator as sc_mod
-import puffo_agent.mcp.puffo_core_tools as pct_mod
 from puffo_agent.agent.message_store import MessageStore, ReceiptDisposition
 from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 from puffo_agent.agent.send_coordinator import SendCoordinator
@@ -713,11 +712,8 @@ async def test_pending_stream_101_drains_same_connection_stores_once_and_acks(tm
 async def test_b_send_message_dm_uses_bridge_no_encrypt(tmp_path, monkeypatch):
     enc_calls: list[int] = []
     monkeypatch.setattr(
-        pct_mod, "encrypt_message_with_content_key",
+        sc_mod, "encrypt_message_with_content_key",
         lambda *a, **k: enc_calls.append(1),
-    )
-    monkeypatch.setattr(
-        pct_mod, "encrypt_message", lambda *a, **k: enc_calls.append(1),
     )
 
     ms = MessageStore(str(tmp_path / "b_dm.db"))
@@ -747,11 +743,8 @@ async def test_b_send_message_dm_uses_bridge_no_encrypt(tmp_path, monkeypatch):
 async def test_b_send_message_channel_uses_bridge_no_encrypt(tmp_path, monkeypatch):
     enc_calls: list[int] = []
     monkeypatch.setattr(
-        pct_mod, "encrypt_message_with_content_key",
+        sc_mod, "encrypt_message_with_content_key",
         lambda *a, **k: enc_calls.append(1),
-    )
-    monkeypatch.setattr(
-        pct_mod, "encrypt_message", lambda *a, **k: enc_calls.append(1),
     )
 
     ms = MessageStore(str(tmp_path / "b_ch.db"))
@@ -1277,7 +1270,7 @@ class _RecordingWs:
     ``handle_envelope`` closure) and no-ops ``run()`` so ``listen()``
     returns instead of blocking."""
 
-    instances: list["_RecordingWs"] = []
+    instances: list[_RecordingWs] = []
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -1377,14 +1370,11 @@ async def test_e_attachments_uploaded_keyless_and_reffed_on_bridge(
     mime_type / size_bytes) — no ``encrypt_*`` and no signed HTTP."""
     enc_calls: list[int] = []
     monkeypatch.setattr(
-        pct_mod, "encrypt_message_with_content_key",
+        sc_mod, "encrypt_message_with_content_key",
         lambda *a, **k: enc_calls.append(1),
     )
     monkeypatch.setattr(
-        pct_mod, "encrypt_message", lambda *a, **k: enc_calls.append(1),
-    )
-    monkeypatch.setattr(
-        pct_mod, "encrypt_attachment", lambda *a, **k: enc_calls.append(1),
+        sc_mod, "encrypt_attachment", lambda *a, **k: enc_calls.append(1),
     )
 
     ms = MessageStore(str(tmp_path / "e_out.db"))

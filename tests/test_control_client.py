@@ -170,20 +170,7 @@ async def test_handle_binds_execution_and_ack_to_signed_command_id(monkeypatch):
     }
 
 
-@pytest.mark.asyncio
-async def test_real_encrypted_cancel_and_permission_reach_live_codex_manager(
-    tmp_path, monkeypatch,
-):
-    from puffo_agent.agent.harness.codex_driver import CodexAppServerDriver
-    from puffo_agent.agent.harness.driver import (
-        PermissionRef,
-        RuntimeSpec,
-        SessionRef,
-        TurnInput,
-    )
-    from puffo_agent.agent.harness.runtime_manager import RuntimeManager
-    from puffo_agent.portal.control.agent_create import get_registry
-
+def _configure_live_control_auth(tmp_path, monkeypatch):
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
     machine = control_store.load_or_create_machine()
     operator = Ed25519KeyPair.generate()
@@ -196,6 +183,17 @@ async def test_real_encrypted_cancel_and_permission_reach_live_codex_manager(
     })
     now = 1_000_000
     monkeypatch.setattr(cc, "now_ms", lambda: now)
+    return machine, operator, now
+
+
+async def _open_live_codex_turn(tmp_path):
+    from puffo_agent.agent.harness.codex_driver import CodexAppServerDriver
+    from puffo_agent.agent.harness.driver import (
+        RuntimeSpec,
+        SessionRef,
+        TurnInput,
+    )
+    from puffo_agent.agent.harness.runtime_manager import RuntimeManager
 
     holder = {}
 
@@ -240,7 +238,13 @@ async def test_real_encrypted_cancel_and_permission_reach_live_codex_manager(
     assert str(
         getattr(permission_event.type, "value", permission_event.type)
     ) == "turn.permission_requested"
-    permission_ref = permission_event.data["permission_ref"]
+    return manager, proc, started, stream, permission_event.data["permission_ref"]
+
+
+async def _dispatch_live_control_commands(
+    *, machine, operator, now, started, stream, permission_ref,
+):
+    from puffo_agent.portal.control.agent_create import get_registry
 
     client = MachineControlClient(machine)
     ws = _FakeWS()
@@ -284,6 +288,13 @@ async def test_real_encrypted_cancel_and_permission_reach_live_codex_manager(
         assert get_registry().peek_result(command_id) == {
             "ok": True, "delivered": True, "completed": False,
         }
+    return updated_task, ws
+
+
+async def _assert_live_control_outcomes(
+    *, manager, proc, started, updated_task, permission_ref,
+):
+    from puffo_agent.portal.control.agent_create import get_registry
 
     updated = await asyncio.wait_for(updated_task, timeout=1)
     assert str(
@@ -305,6 +316,31 @@ async def test_real_encrypted_cancel_and_permission_reach_live_codex_manager(
     terminal = await manager.wait_terminal(started.turn_ref)
     assert terminal.data["outcome"] == "cancelled"
     assert get_registry().peek_result("signed-cancel")["completed"] is False
+
+
+@pytest.mark.asyncio
+async def test_real_encrypted_cancel_and_permission_reach_live_codex_manager(
+    tmp_path, monkeypatch,
+):
+    machine, operator, now = _configure_live_control_auth(tmp_path, monkeypatch)
+    manager, proc, started, stream, permission_ref = await _open_live_codex_turn(
+        tmp_path,
+    )
+    updated_task, _ws = await _dispatch_live_control_commands(
+        machine=machine,
+        operator=operator,
+        now=now,
+        started=started,
+        stream=stream,
+        permission_ref=permission_ref,
+    )
+    await _assert_live_control_outcomes(
+        manager=manager,
+        proc=proc,
+        started=started,
+        updated_task=updated_task,
+        permission_ref=permission_ref,
+    )
     await manager.close()
 
 

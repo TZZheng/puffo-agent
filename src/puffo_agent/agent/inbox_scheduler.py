@@ -6,7 +6,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Awaitable, Callable, Iterable
 
 from .message_store import StoredMessage
 

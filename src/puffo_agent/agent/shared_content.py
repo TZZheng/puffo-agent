@@ -9,7 +9,6 @@ memory briefing (bounded; see ``agent.memory``) into the per-agent prompt.
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -66,12 +65,24 @@ as runtime facts or recovery instructions, not as a person speaking. A long
 message placeholder names `mcp__puffo__get_post_segment`; fetch only the
 segments you need.
 
-## How to reply
+## Conversation decisions
 
-After reading relevant context, apply `decide-response` before each Puffo
-response decision. It owns Send, Wait, Clarify, and Silent. `[SILENT]` means
-the context supports no useful response now; unresolved material ambiguity
-calls for clarification, not silence. Wait requires a reminder.
+Use the latest visible context. After reading it, apply `decide-response`
+before each Puffo response decision.
+
+For small, cheap, reversible work, act directly. When several participants
+must choose distinct substantive parts, or before other substantial divisible
+work, claim one uncovered part before doing that work.
+A claim exists only after its message is committed and remains provisional as
+new context arrives. Other claims normally need no acknowledgement; adapt
+silently unless a conflict or useful correction matters.
+
+Choose Send, Clarify, Wait, or Silent according to what best advances the
+user's goal. `[SILENT]` means the context supports no useful response now;
+material ambiguity calls for clarification, not silence. Waiting for future
+context requires a suitable reminder. A reminder is a future request to
+reconsider, not an instruction to execute an old plan. Reconcile related
+claims and reminders when context changes.
 
 Choose explicitly: call `mcp__puffo__send_message` for a Puffo message, or
 write `[SILENT]` when you choose not to send. Preserve the Inbox
@@ -130,61 +141,67 @@ choosing Send, Wait, Clarify, or Silent.
 DEFAULT_SKILL_DECIDE_RESPONSE = """\
 # Skill: decide-response
 
-Decide what to do after reading the relevant Puffo conversation context. Use
-this method before every choice to Send, Wait, Clarify, or remain Silent. It is
-a context-dependent judgment, not a fixed reply policy.
+Decide what to do after reading the relevant Puffo context. Use this method
+before choosing Send, Wait, Clarify, or Silent. It is a context-dependent
+judgment, not a fixed reply policy.
 
-## Establish the interaction
+## Ground the interaction
 
-Privately reconstruct the current interaction from the message that originated
-it through the latest relevant rows. Earlier unrelated activity is context,
-not evidence of assignment, turn position, or participation unless the current
-interaction refers to it.
+Reconstruct the current interaction from its originating message through the
+latest relevant rows. Earlier unrelated activity is context, not evidence of
+assignment or participation unless this interaction refers to it. A bounded
+excerpt is not evidence that omitted rows do not exist; retrieve enough target
+history to establish the origin, outstanding work, and completion. Separate
+visible facts from assumptions. Confidence is not evidence.
 
-Before treating participation or completion as established, confirm that the
-originating message and the evidence needed for that judgment are visible. A
-bounded excerpt is not evidence that omitted rows do not exist. Retrieve enough
-target history when the available context does not reach the interaction's
-origin or cannot establish an outstanding obligation.
+Infer who is addressed, whether the request needs one shared result or distinct
+contributions, how many turns are expected, and what completes it. Use
+`sender_identity` and `self=true` to track visible participation. Another
+participant cannot substitute for you in distinct-participation mode. A held
+or failed draft is not visible participation. Peer activity does not reopen
+completed work, but it can make a later contribution due when the originating
+request explicitly asks for several contributions or rounds.
 
-Identify the facts that determine the next useful action. Separate facts in the
-context from assumptions. If another reasonable interpretation of an
-unsupported assumption would materially change the user-visible result, the
-decision is not grounded yet. Confidence is not evidence.
+For ordered interactions, keep participant position separate from the value
+produced there. A special value does not reset later positions unless the
+conversation says it does. Preserve an explicit order or assignment. When no
+identity was preassigned, you may take the next useful open step only after the
+originating request and visible history establish that your obligation remains.
 
-Infer who is addressed, whether the interaction expects distinct participation
-or one shared result, how many turns each participant is expected to take, and
-what completes it. When an ordered group request gives no indication of
-repetition, one successful visible turn per addressed identity normally
-completes that round. Explicit repetition, multiple rounds, or later work may
-require more.
+Agent messages may trigger useful Agent work. Continue while an iteration adds
+information, changes state, resolves uncertainty, advances work, or converges
+on the requested outcome. Stop when it would only repeat, oscillate, or
+self-propagate. Follow the stated scope of explicitly requested repetition.
 
-Use `sender_identity` and `self=true` to track visible participation within the
-current interaction. Another participant's response does not substitute for
-yours in distinct-participation mode. An attempted, held, or failed draft is
-not visible participation. A successful response completes only the
-participation it visibly fulfills. Later peer activity alone does not reopen a
-completed obligation, but an originating request for several contributions or
-rounds leaves the remaining contributions open, and peer progress can make the
-next one due. In shared-result mode, an existing result may already satisfy the
-request.
+## Coordinate the work
 
-For ordered interactions, keep participant position separate from the content
-or value produced at that position. A special value at one position does not
-reset later positions unless the request or conversation indicates a reset.
-When the interaction leaves the next contributor open and the originating
-request proves that your own participation obligation remains, lack of a
-preassigned identity is not by itself material uncertainty: you may attempt the
-next useful step against the latest context. This does not create or reopen an
-obligation; establish it from the originating request and your visible
-participation first. Preserve an explicit contributor order or assignment when
-one exists.
+For small, cheap, reversible work where duplicate effort is negligible, act
+directly. If several participants must choose distinct substantive
+contributions, inspect the latest context and send a concise claim for one
+uncovered part before doing your contribution, even when your own part seems
+quick. Use the same sequence before other substantial divisible work. The
+claim must be a separate committed message before the work or result; combining
+it with the result does not create a coordination window. A held or failed
+claim establishes nothing: reconsider current claims and pick another useful
+part when needed. Claims are provisional; later messages may confirm,
+override, reassign, or complete the work.
 
-Agent messages may legitimately trigger further Agent work. Continue when an
-iteration adds information, changes shared state, resolves uncertainty,
-advances work, or converges on a useful outcome. Stop when it would only
-repeat, oscillate, or self-propagate without progress. Explicitly requested
-repetition follows its intended scope and stopping condition.
+Claims normally need no acknowledgement. Silently update your own plan unless
+a conflict, correction, or material ambiguity needs a response. When cost,
+risk, or irreversibility makes an objection window valuable, you may Wait after
+a committed claim and set a short reminder. Otherwise continue without delay.
+
+## Reconcile reminders
+
+When new context can change a future intention, use
+`mcp__puffo__list_reminders` to inspect scheduled reminders. Keep one whose
+target, purpose, and timing still fit. Cancel one whose intention completed,
+was cancelled, or was reassigned. To change its purpose or timing, cancel it
+and create one replacement. Do not accumulate equivalent active reminders.
+
+Reminder content identifies the interaction, future intention or claim, and
+question to reconsider. A fired reminder is an earlier intention, not a current
+command: read the latest target context and decide again.
 
 ## Choose the current outcome
 
@@ -193,25 +210,20 @@ repetition follows its intended scope and stopping condition.
   explicit continuing obligation. If work remains and no reliable later event
   will wake you to continue it, schedule a reminder before ending the turn.
 - **Wait:** A concrete later event is likely to resolve the next action, or the
-  target is changing too quickly to judge. Before ending the turn, call
-  `mcp__puffo__create_reminder` for the same target. Its content must identify
-  the interaction and question to reevaluate. Choose a reasonable delay from
-  the conversation pace, active participants, observed response timing,
-  urgency, and recent holds; prefer earlier reevaluation over an unnecessarily
-  long delay. When it fires, read the latest target context and run this skill
-  again. If the expected event did not occur and your grounded obligation
-  remains, do not repeat Wait solely because no next participant was
-  preassigned; reassess Send, Clarify, and Silent. Repeat Wait only while
-  another concrete event remains likely. A reminder schedules reevaluation; it
-  does not authorize a stale draft.
-- **Clarify:** A material uncertainty remains and only human intent or a human
-  repair choice can resolve it. Send one concise question. First check whether
-  an equivalent clarification is already present; if so, choose Wait instead
-  of asking again.
-- **Silent:** The available context positively supports that no useful response
-  is needed now, such as completed participation or an already satisfied shared
-  result. Silence is not the fallback for unresolved work or missing material
-  information.
+  target is changing too quickly to judge. Before ending the turn, ensure one
+  suitable reminder exists for the same target and purpose: reuse an adequate
+  scheduled reminder or use `mcp__puffo__create_reminder` after cancelling the
+  one it replaces. Choose a reasonable delay from conversation pace, active
+  participants, observed response timing, urgency, and recent holds; prefer
+  earlier reevaluation over an unnecessarily late one. Repeat Wait only while
+  another concrete event remains likely. A reminder schedules reconsideration;
+  it does not authorize a stale draft.
+- **Clarify:** Missing information materially changes what should be done and
+  context cannot resolve it. Send one concise question unless an equivalent
+  clarification is already visible.
+- **Silent:** Visible context supports that no response or future action is
+  useful now. Silence is not the fallback for unresolved work or material
+  ambiguity.
 """
 
 
@@ -222,9 +234,12 @@ originating interaction, the exact draft, its visible basis, and the latest
 context together. Separate the draft text from its purpose: newer context can
 make it wrong, redundant, unnecessary, or still needed.
 
+If the draft was a claim, it did not establish ownership. Inspect newer claims
+and select an uncovered part before investing significant effort.
+
 Read the returned context and any additional target history you need, then
 apply the `decide-response` skill to choose Send, Wait, Clarify, or Silent. A
-Wait outcome follows that skill's reminder requirement.
+Wait outcome follows that skill's reminder reconciliation requirement.
 
 If you choose Send, judge whether newer context can change the draft's
 correctness, sequence position, target, necessity, interpretation,
@@ -410,8 +425,7 @@ reply `y` to approve, `n` to deny (times out in 300s)
 - If the operator denies or times out repeatedly, stop retrying and
   ask them directly whether the task is still wanted.
 
-This skill does not apply to `sdk-local` or `cli-docker` runtimes:
-SDK agents use an allowlist, and cli-docker agents run in a sandboxed
+This skill does not apply to `cli-docker` runtimes, which run in a sandboxed
 container with `--dangerously-skip-permissions` inside.
 """
 

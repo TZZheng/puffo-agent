@@ -10,12 +10,10 @@ import websockets
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.crypto.encoding import base64url_decode, base64url_encode
-from puffo_agent.crypto.http_client import PuffoCoreHttpClient
+from puffo_agent.crypto.encoding import base64url_decode
 from puffo_agent.crypto.keystore import KeyStore, Session, StoredIdentity, encode_secret
 from puffo_agent.crypto.primitives import Ed25519KeyPair, ed25519_verify
 from puffo_agent.crypto.ws_client import (
-    CONNECT_TIMEOUT,
     INITIAL_BACKOFF,
     DeliveryResult,
     PuffoCoreWsClient,

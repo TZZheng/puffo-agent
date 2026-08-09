@@ -6,16 +6,13 @@ import tempfile
 import time
 from unittest.mock import patch
 
-import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
 from aiohttp_socks import ProxyConnector
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.crypto.certs import SUBKEY_TTL_HOURS
-from puffo_agent.crypto.encoding import base64url_decode, base64url_encode
-from puffo_agent.crypto.http_auth import sign_request
+from puffo_agent.crypto.encoding import base64url_decode
 from puffo_agent.crypto.http_client import HttpError, PuffoCoreHttpClient
 from puffo_agent.crypto.http_session import create_remote_http_session
 from puffo_agent.crypto.keystore import KeyStore, Session, StoredIdentity, encode_secret

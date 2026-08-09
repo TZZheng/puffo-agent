@@ -8,7 +8,6 @@ local tools live in ``host_tools.py``.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import urllib.parse
 from dataclasses import dataclass
@@ -17,35 +16,14 @@ from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from ..crypto.attachments import (
-    ATTACHMENT_CONTENT_TYPE,
-    AttachmentMeta,
-    encrypt_attachment,
-)
-from ..crypto.encoding import base64url_decode, base64url_encode
+from ..crypto.encoding import base64url_decode
 from ..crypto.http_client import PuffoCoreHttpClient
-from ..crypto.keystore import KeyStore, decode_secret
+from ..crypto.keystore import KeyStore
 from ..crypto.message import (
-    build_plaintext_message,
-    EncryptInput,
     RecipientDevice,
     build_supplementation_envelope,
-    encrypt_message,
-    encrypt_message_with_content_key,
 )
-from ..crypto.primitives import Ed25519KeyPair
-from ..limits import MESSAGE_SEGMENT_CHARS
 from ..agent.context_controller import MODEL_VISIBLE_READ_RECEIPT_PREFIX
-from ..agent.message_projection import (
-    CONTEXT_VERSION,
-    channel_projection,
-    format_message_group,
-    identity_projection,
-    iso_time,
-    sender_type,
-    space_projection,
-    target_ref,
-)
 from ..agent._logging import log_runtime_event
 from ..agent.send_coordinator import (
     SemanticSendRequest,
@@ -133,7 +111,7 @@ def _enc_tag(m: Any) -> str:
 
 
 async def _stage_model_visible_messages(
-    cfg: "PuffoCoreToolsConfig",
+    cfg: PuffoCoreToolsConfig,
     messages: list[Any],
     *,
     tool_name: str,
@@ -323,7 +301,7 @@ class PuffoCoreToolsConfig:
 
 
 async def _dispatch_semantic_send(
-    cfg: "PuffoCoreToolsConfig", request: SemanticSendRequest,
+    cfg: PuffoCoreToolsConfig, request: SemanticSendRequest,
     *, tool_name: str = "send_message",
 ) -> dict[str, Any]:
     coordinator = getattr(cfg, "send_coordinator", None)
@@ -382,7 +360,7 @@ async def _dispatch_semantic_send(
     )
 
 def _note_contact(
-    cfg: "PuffoCoreToolsConfig", slug: str, *,
+    cfg: PuffoCoreToolsConfig, slug: str, *,
     allowed: bool = False, blocked: Optional[bool] = None,
 ) -> None:
     """Reflect an allowlist/blocklist write into the in-process contact
@@ -477,10 +455,92 @@ async def _supplement_missing_devices(
         )
 
 
-from ..agent._visibility import resolve_visibility as _resolve_visibility
 
 
 _RESOLVE_ROOT_MAX_DEPTH = 8
+
+
+async def _read_outgoing_root_message(
+    data_client: Any,
+    root_id: str,
+    current: str,
+) -> tuple[Any, str]:
+    try:
+        message = await data_client.get_message_by_envelope(current)
+    except DataNotFound:
+        message = None
+    except Exception as exc:
+        logger.warning(
+            "resolve_outgoing_root: wiped %s — lookup transport error: %s",
+            root_id,
+            exc,
+        )
+        return None, (
+            f"\nnote: thread_root_id {root_id} could not be verified "
+            "(local cache lookup failed); sent as top-level."
+        )
+    if message is None:
+        logger.info(
+            "resolve_outgoing_root: wiped %s — %s not in local cache",
+            root_id,
+            current,
+        )
+        return None, (
+            f"\nnote: thread_root_id {root_id} not in local cache; "
+            "sent as top-level. Agents can only reply in threads "
+            "whose root is in their own local message store."
+        )
+    return message, ""
+
+
+def _validate_outgoing_root_scope(
+    message: Any,
+    root_id: str,
+    *,
+    self_slug: str,
+    channel_id: Optional[str],
+    space_id: Optional[str],
+    dm_peer: Optional[str],
+) -> None:
+    if dm_peer is not None:
+        kind = getattr(message, "envelope_kind", None)
+        peer = (
+            getattr(message, "recipient_slug", None)
+            if getattr(message, "sender_slug", None) == self_slug
+            else getattr(message, "sender_slug", None)
+        )
+        if kind != "dm" or peer != dm_peer:
+            logger.info(
+                "resolve_outgoing_root: rejected %s — not part of the "
+                "DM with %s (kind=%r peer=%r)",
+                root_id,
+                dm_peer,
+                kind,
+                peer,
+            )
+            raise RuntimeError(
+                f"thread_root_id {root_id} does not belong to this DM "
+                f"with @{dm_peer}; pass a root from this conversation "
+                "or omit root_id to start a new thread."
+            )
+        return
+    message_space = getattr(message, "space_id", None)
+    if message.channel_id != channel_id or (
+        space_id and message_space and message_space != space_id
+    ):
+        logger.info(
+            "resolve_outgoing_root: rejected %s — belongs to channel "
+            "%r, outbound is %r",
+            root_id,
+            message.channel_id,
+            channel_id,
+        )
+        raise RuntimeError(
+            f"thread_root_id {root_id} belongs to channel "
+            f"{message.channel_id!r}, not this send's channel "
+            f"{channel_id!r}; pass a root from the current channel "
+            "or omit root_id to start a new thread."
+        )
 
 
 async def _resolve_outgoing_root(
@@ -517,65 +577,23 @@ async def _resolve_outgoing_root(
             cycle = True
             break
         seen.add(current)
-        try:
-            msg = await data_client.get_message_by_envelope(current)
-        except DataNotFound:
-            msg = None
-        except Exception as exc:
-            logger.warning(
-                "resolve_outgoing_root: wiped %s — lookup transport error: %s",
-                root_id, exc,
-            )
-            return None, (
-                f"\nnote: thread_root_id {root_id} could not be verified "
-                "(local cache lookup failed); sent as top-level."
-            )
+        msg, missing_note = await _read_outgoing_root_message(
+            data_client,
+            root_id,
+            current,
+        )
         if msg is None:
-            logger.info(
-                "resolve_outgoing_root: wiped %s — %s not in local cache",
-                root_id, current,
-            )
-            return None, (
-                f"\nnote: thread_root_id {root_id} not in local cache; "
-                "sent as top-level. Agents can only reply in threads "
-                "whose root is in their own local message store."
-            )
+            return None, missing_note
         # Cross-scope first: rejecting before the system/self-ref wipe
         # keeps misdirected content out of the wrong conversation.
-        if dm_peer is not None:
-            kind = getattr(msg, "envelope_kind", None)
-            peer = (
-                getattr(msg, "recipient_slug", None)
-                if getattr(msg, "sender_slug", None) == self_slug
-                else getattr(msg, "sender_slug", None)
-            )
-            if kind != "dm" or peer != dm_peer:
-                logger.info(
-                    "resolve_outgoing_root: rejected %s — not part of the "
-                    "DM with %s (kind=%r peer=%r)",
-                    root_id, dm_peer, kind, peer,
-                )
-                raise RuntimeError(
-                    f"thread_root_id {root_id} does not belong to this DM "
-                    f"with @{dm_peer}; pass a root from this conversation "
-                    "or omit root_id to start a new thread."
-                )
-        else:
-            msg_space = getattr(msg, "space_id", None)
-            if msg.channel_id != channel_id or (
-                space_id and msg_space and msg_space != space_id
-            ):
-                logger.info(
-                    "resolve_outgoing_root: rejected %s — belongs to "
-                    "channel %r, outbound is %r",
-                    root_id, msg.channel_id, channel_id,
-                )
-                raise RuntimeError(
-                    f"thread_root_id {root_id} belongs to channel "
-                    f"{msg.channel_id!r}, not this send's channel "
-                    f"{channel_id!r}; pass a root from the current channel "
-                    "or omit root_id to start a new thread."
-                )
+        _validate_outgoing_root_scope(
+            msg,
+            root_id,
+            self_slug=self_slug,
+            channel_id=channel_id,
+            space_id=space_id,
+            dm_peer=dm_peer,
+        )
         parent_root = getattr(msg, "thread_root_id", None)
         if getattr(msg, "sender_slug", None) == "system" or parent_root == current:
             # Daemon-minted system envelopes have no server row — threading
@@ -614,1390 +632,20 @@ async def _resolve_outgoing_root(
 
 
 def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
+    """Register the core MCP surface in its established public order."""
+    from .core_history_tools import register_history_tools
+    from .core_host_tools import register_host_tools
+    from .core_identity_tools import register_identity_tools
+    from .core_inbox_tools import register_inbox_tools
+    from .core_message_tools import register_message_tools
+
+    register_inbox_tools(mcp, cfg)
+    register_identity_tools(mcp, cfg)
+    register_message_tools(mcp, cfg)
+    register_history_tools(mcp, cfg)
+    register_host_tools(mcp, cfg)
 
-    @mcp.tool()
-    async def read_inbox(
-        target: str = "",
-        cursor: str = "",
-        limit: int = 50,
-    ) -> dict[str, Any]:
-        """Read one pending Inbox page.
-
-        target is an optional canonical target; cursor is the opaque next
-        cursor; limit is 1..50. Results contain ``messages``, bounded
-        read-only ``prior_context``, ``prior_context_has_more``,
-        ``next_cursor``, and ``has_more``.
-        See the managed ``read-inbox`` skill for interpretation and paging.
-        """
-        arguments: dict[str, Any] = {}
-        if target:
-            arguments["target"] = target
-        if cursor:
-            arguments["cursor"] = cursor
-        if limit != 50:
-            arguments["limit"] = limit
-        runtime = getattr(cfg, "inbox_runtime", None)
-        if runtime is None:
-            runtime = getattr(getattr(cfg, "message_client", None), "global_runtime", None)
-        if runtime is not None:
-            result = await runtime.read_inbox(
-                target=target,
-                cursor=cursor,
-                limit=limit,
-                tool_arguments=arguments,
-            )
-        elif cfg.rpc_client is not None:
-            result = await cfg.rpc_client.read_inbox(
-                target=target, cursor=cursor, limit=limit
-            )
-        else:
-            raise RuntimeError("global Inbox runtime is unavailable")
-        receipt = result.pop("correlation_receipt", "")
-        if receipt:
-            result["admission_receipt"] = (
-                f"[{MODEL_VISIBLE_READ_RECEIPT_PREFIX}{receipt}]"
-            )
-        return result
-
-    @mcp.tool()
-    async def create_reminder(
-        content: str,
-        target: str,
-        intended_at: str,
-    ) -> dict[str, Any]:
-        """Create one durable local reminder for a canonical Inbox target.
-
-        ``intended_at`` is an explicit-offset RFC3339 timestamp. The result
-        is a provider-neutral reminder object; a due occurrence enters the
-        ordinary durable Inbox and leaves any action decision to the model.
-        """
-        runtime = getattr(cfg, "inbox_runtime", None)
-        if runtime is None:
-            runtime = getattr(
-                getattr(cfg, "message_client", None), "global_runtime", None,
-            )
-        if runtime is not None:
-            return await runtime.create_reminder(
-                content=content, target=target, intended_at=intended_at,
-            )
-        if cfg.rpc_client is not None:
-            return await cfg.rpc_client.create_reminder(
-                content=content, target=target, intended_at=intended_at,
-            )
-        raise RuntimeError("global Inbox runtime is unavailable")
-
-    @mcp.tool()
-    async def list_reminders(
-        state: str = "",
-        limit: int = 50,
-    ) -> dict[str, Any]:
-        """List locally durable one-shot reminders in intended-time order."""
-        runtime = getattr(cfg, "inbox_runtime", None)
-        if runtime is None:
-            runtime = getattr(
-                getattr(cfg, "message_client", None), "global_runtime", None,
-            )
-        if runtime is not None:
-            return await runtime.list_reminders(state=state, limit=limit)
-        if cfg.rpc_client is not None:
-            return await cfg.rpc_client.list_reminders(state=state, limit=limit)
-        raise RuntimeError("global Inbox runtime is unavailable")
-
-    @mcp.tool()
-    async def cancel_reminder(reminder_id: str) -> dict[str, Any]:
-        """Idempotently cancel a local reminder that has not delivered."""
-        runtime = getattr(cfg, "inbox_runtime", None)
-        if runtime is None:
-            runtime = getattr(
-                getattr(cfg, "message_client", None), "global_runtime", None,
-            )
-        if runtime is not None:
-            return await runtime.cancel_reminder(reminder_id=reminder_id)
-        if cfg.rpc_client is not None:
-            return await cfg.rpc_client.cancel_reminder(reminder_id=reminder_id)
-        raise RuntimeError("global Inbox runtime is unavailable")
-
-    @mcp.tool()
-    async def whoami() -> dict[str, Any]:
-        """Return a structured self-identity and runtime summary."""
-        profile: dict[str, Any] = {}
-        try:
-            data = await _read_profiles(cfg, cfg.slug)
-            profiles = data.get("profiles", []) if isinstance(data, dict) else []
-            if profiles and isinstance(profiles[0], dict):
-                profile = profiles[0]
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("whoami: failed to fetch own profile: %s", exc)
-
-        projected_identity = identity_projection(
-            cfg.slug,
-            display_name=profile.get("display_name"),
-            identity_type="agent",
-            owner_slug=profile.get("owner_slug"),
-            role=profile.get("role"),
-            self_identity=True,
-            bio=profile.get("bio") or None,
-            avatar_url=profile.get("avatar_url") or None,
-        )
-        if cfg.keyless:
-            return {
-                "context_version": CONTEXT_VERSION,
-                "identity": projected_identity,
-                "runtime": {
-                    "device_id": cfg.device_id,
-                    "server_url": cfg.http_client.server_url,
-                    "transport": "keyless",
-                    "subkey_management": "server",
-                    "subkey_id": None,
-                    "subkey_expires_at": None,
-                },
-            }
-
-        identity = cfg.keystore.load_identity(cfg.slug)
-        subkey_id: str | None = None
-        subkey_expires_at: str | None = None
-        try:
-            sess = cfg.keystore.load_session(cfg.slug)
-            subkey_id = sess.subkey_id
-            subkey_expires_at = _ts_to_iso(sess.expires_at)
-        except FileNotFoundError:
-            pass
-        return {
-            "context_version": CONTEXT_VERSION,
-            "identity": projected_identity,
-            "runtime": {
-                "device_id": identity.device_id,
-                "server_url": identity.server_url,
-                "transport": "signed",
-                "subkey_management": "local",
-                "subkey_id": subkey_id,
-                "subkey_expires_at": subkey_expires_at,
-            },
-        }
-
-    @mcp.tool()
-    async def send_message(
-        channel: str,
-        text: str,
-        root_id: str = "",
-        visibility_level: str = "default",
-        send_anyway: bool = False,
-    ) -> dict[str, Any]:
-        """Post text to a channel ``ch_<uuid>`` or DM ``@<slug>``.
-
-        ``root_id`` is an optional thread root; ``visibility_level`` is
-        ``human``, ``default`` (default), or ``agent_only``; ``send_anyway``
-        is an explicit held-send flag. Results are ``sent``, ``held``, or an
-        error. See the managed ``send-message`` skill for routing, visibility,
-        thread-root validation, and held-send guidance.
-        """
-        return await _dispatch_semantic_send(
-            cfg,
-            SemanticSendRequest(
-                destination=channel,
-                text=text,
-                root_id=root_id,
-                visibility_level=visibility_level,
-                send_anyway=send_anyway,
-            ),
-        )
-
-        # Retained temporarily as unreachable reference code for the other
-        # read-oriented helpers in this module; the semantic return above is
-        # the only model-authored send path.
-        channel_ref = channel.strip()
-        if not channel_ref:
-            raise RuntimeError("channel is required")
-        if channel_ref.startswith("#"):
-            raise RuntimeError(
-                "'#<name>' channel addressing isn't supported; "
-                "use the channel id (e.g. 'ch_<uuid>') or call "
-                "list_channels_in_all_spaces to look one up."
-            )
-
-        if cfg.keyless:
-            # T23 keyless bridge transport: POST plaintext to the unsigned
-            # ``/v2/cloud-agents/messages`` route (the E2B egress proxy
-            # injects ``x-sandbox-token``); the server holds all crypto and
-            # fans out recipients. DM ('@slug') vs channel ('ch_') routing
-            # only — no device-key fetch, no encrypt, no signed POST, no
-            # bridge WS. Threaded replies carry the same snake_case
-            # ``thread_root_id`` / ``reply_to_id`` field names a human/web
-            # message uses: ``thread_root_id`` is the resolved+validated
-            # true root (same resolvers the native branch runs, driven off
-            # the local store — no network), ``reply_to_id`` is the raw
-            # parent id the agent passed. Resolution is fail-soft — a miss
-            # falls through with a note and the send still completes.
-            if channel_ref.startswith("@"):
-                keyless_recipient = channel_ref[1:]
-                if not keyless_recipient:
-                    raise RuntimeError("DM recipient slug is required after '@'")
-                resolved_root, root_note = await _resolve_root_id(
-                    root_id, cfg.data_client,
-                )
-                resolved_root, validate_note = await _validate_root_same_channel(
-                    resolved_root, None, None, cfg.data_client,
-                )
-                body: dict[str, Any] = {
-                    "plaintext": text,
-                    "recipient_slug": keyless_recipient,
-                }
-            else:
-                keyless_channel_id = channel_ref
-                keyless_space_id = await _resolve_channel_space(
-                    cfg, keyless_channel_id,
-                )
-                resolved_root, root_note = await _resolve_root_id(
-                    root_id, cfg.data_client,
-                )
-                resolved_root, validate_note = await _validate_root_same_channel(
-                    resolved_root, keyless_channel_id, keyless_space_id,
-                    cfg.data_client,
-                )
-                body = {
-                    "plaintext": text,
-                    "space_id": keyless_space_id,
-                    "channel_id": keyless_channel_id,
-                }
-            # Only truthy thread keys ride the body. F4: drop the raw parent
-            # ref when root validation wiped the thread — no dangling
-            # reply_to for a root the send no longer threads under.
-            if resolved_root:
-                body["thread_root_id"] = resolved_root
-                if root_id:
-                    body["reply_to_id"] = root_id
-            ack = await _send_keyless(cfg, body)
-            return (
-                f"posted {(ack or {}).get('envelope_id', '?')} to {channel}"
-                f"{root_note}"
-                f"{validate_note}"
-            )
-
-        if channel_ref.startswith("@"):
-            recipient_slug = channel_ref[1:]
-            if not recipient_slug:
-                raise RuntimeError("DM recipient slug is required after '@'")
-            envelope_kind = "dm"
-            channel_id: Optional[str] = None
-            send_space_id: Optional[str] = None
-            # Fan to the recipient AND our own other devices so any
-            # other logged-in clients see the DM too.
-            recipient_slugs = [cfg.slug, recipient_slug]
-        else:
-            channel_id = channel_ref
-            envelope_kind = "channel"
-            recipient_slug = None
-            # The local cache (filled by membership events landing
-            # over the WS — see puffo_core_client._handle_event /
-            # _maybe_cache_channel_space) is authoritative for
-            # channels the agent can reach. Miss → bail loud.
-            send_space_id = await _resolve_channel_space(cfg, channel_id)
-            members_resp = await cfg.http_client.get(
-                f"/spaces/{send_space_id}/channels/{channel_id}/members"
-            )
-            recipient_slugs = [
-                m.get("slug", "")
-                for m in members_resp.get("members", [])
-                if m.get("slug")
-            ]
-            if not recipient_slugs:
-                raise RuntimeError(
-                    f"channel {channel_id} has no resolvable members "
-                    f"(searched space {send_space_id})"
-                )
-
-        sess = cfg.keystore.load_session(cfg.slug)
-        signing_key = Ed25519KeyPair.from_secret_bytes(
-            decode_secret(sess.subkey_secret_key)
-        )
-
-        resolved_root, root_note = await _resolve_outgoing_root(
-            root_id, cfg.data_client,
-            self_slug=cfg.slug,
-            channel_id=channel_id,
-            space_id=send_space_id,
-            dm_peer=recipient_slug,
-        )
-        encrypt = await _send_encryption_required(cfg, resolved_root)
-        devices: list = []
-        if encrypt:
-            devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
-            if not devices:
-                raise RuntimeError("no recipient devices found")
-        # Visibility floors key off the RESOLVED root — a wiped root makes
-        # this a root-level post, which can't fold in the UI.
-        effective_visible, visibility_note = await _resolve_visibility(
-            visibility_level, channel_ref, text, resolved_root or "", cfg.http_client,
-        )
-        inp = EncryptInput(
-            envelope_kind=envelope_kind,
-            sender_slug=cfg.slug,
-            sender_subkey_id=sess.subkey_id,
-            is_visible_to_human=effective_visible,
-            space_id=send_space_id,
-            channel_id=channel_id,
-            recipient_slug=recipient_slug,
-            thread_root_id=resolved_root,
-            content_type="text/plain",
-            content=text,
-            recipients=devices,
-        )
-        if encrypt:
-            envelope, content_key = encrypt_message_with_content_key(
-                inp, signing_key,
-            )
-            # Server expects the envelope at the top level, not wrapped.
-            resp = await cfg.http_client.post("/messages", envelope) or {}
-            missing = resp.get("missing_devices") or []
-            if missing:
-                asyncio.create_task(_supplement_missing_devices(
-                    cfg.http_client, envelope, content_key,
-                    recipient_slugs, missing,
-                ))
-        else:
-            envelope = build_plaintext_message(inp, signing_key)
-            await cfg.http_client.post("/v2/messages/plaintext", envelope)
-        return (
-            f"posted {envelope.get('envelope_id', '?')} to {channel}"
-            f"{visibility_note}"
-            f"{root_note}"
-        )
-
-    @mcp.tool()
-    async def get_channel_history(
-        channel: str,
-        limit: int = 20,
-        since: str = "",
-        before: int = 0,
-        after: int = 0,
-    ) -> str:
-        """List local channel root posts.
-
-        ``channel`` is ``ch_<uuid>``; ``limit``, ``since``, ``before``, and
-        ``after`` filter the result. It returns semantic target/row projection
-        groups with root reply counts; use ``get_thread_history`` for replies.
-        See the managed ``channel-history`` skill for context use.
-        """
-        limit = max(1, min(int(limit), 200))
-        channel_ref = channel.strip()
-        if channel_ref.startswith("#"):
-            raise RuntimeError(
-                "'#<name>' channel addressing isn't supported; pass the "
-                "channel id directly."
-            )
-        # Local-store read would return empty on a slug — route non-
-        # ``ch_`` refs through the resolver purely for its hint error.
-        if not channel_ref.startswith("ch_"):
-            await _resolve_channel_space(cfg, channel_ref)
-        channel_id = channel_ref
-
-        try:
-            roots = await cfg.data_client.get_channel_roots(
-                channel_id,
-                limit=limit,
-                since_envelope_id=since or None,
-                before_ts=int(before) if before else None,
-                after_ts=int(after) if after else None,
-            )
-        except DataNotFound:
-            return f"(no such channel: {channel_id})"
-        if not roots:
-            return "(no root posts in the requested window)"
-        tool_arguments: dict[str, object] = {"channel": channel}
-        if limit != 20:
-            tool_arguments["limit"] = limit
-        if since:
-            tool_arguments["since"] = since
-        if before:
-            tool_arguments["before"] = before
-        if after:
-            tool_arguments["after"] = after
-        receipt_marker = await _stage_model_visible_messages(
-            cfg,
-            [entry.message for entry in roots],
-            tool_name="get_channel_history",
-            tool_arguments=tool_arguments,
-        )
-        result = format_message_group(
-            [entry.message for entry in roots],
-            current_agent_aliases=(cfg.slug,),
-            reply_counts={entry.message.envelope_id: entry.reply_count for entry in roots},
-        )
-        return f"{result}\n{receipt_marker}" if receipt_marker else result
-
-    @mcp.tool()
-    async def get_dm_history(
-        peer: str,
-        limit: int = 20,
-        before: int = 0,
-    ) -> str:
-        """List local DMs with ``peer``, oldest first.
-
-        ``before`` is an exclusive ms-epoch paging bound. Results use the
-        semantic target/row projection. See the managed ``channel-history``
-        skill for supplementary-context guidance.
-        """
-        limit = max(1, min(int(limit), 200))
-        peer_slug = peer.strip().lstrip("@")
-        if not peer_slug:
-            raise RuntimeError("pass the peer's slug to read DM history.")
-        msgs = await cfg.data_client.get_dm_history(
-            peer_slug, limit=limit, before=int(before) if before else None,
-        )
-        if not msgs:
-            return "(no direct messages with that peer in the requested window)"
-        return format_message_group(msgs, current_agent_aliases=(cfg.slug,))
-
-    @mcp.tool()
-    async def get_thread_history(
-        root_id: str,
-        limit: int = 50,
-        since: str = "",
-        before: int = 0,
-        after: int = 0,
-    ) -> str:
-        """List a local thread's root and replies, oldest first.
-
-        ``root_id`` is the root envelope id; ``limit``, ``since``, ``before``,
-        and ``after`` filter it. Results use the semantic target/row projection.
-        See the managed ``channel-history`` skill for supplementary context.
-        """
-        if not root_id.strip():
-            raise RuntimeError("root_id required")
-        limit = max(1, min(int(limit), 200))
-        try:
-            msgs = await cfg.data_client.get_thread_messages(
-                root_id.strip(),
-                limit=limit,
-                since_envelope_id=since or None,
-                before_ts=int(before) if before else None,
-                after_ts=int(after) if after else None,
-            )
-        except DataNotFound:
-            return f"(no such thread: {root_id.strip()})"
-        if not msgs:
-            return "(no messages in this thread for the requested window)"
-        tool_arguments = {"root_id": root_id}
-        if limit != 50:
-            tool_arguments["limit"] = limit
-        if since:
-            tool_arguments["since"] = since
-        if before:
-            tool_arguments["before"] = before
-        if after:
-            tool_arguments["after"] = after
-        receipt_marker = await _stage_model_visible_messages(
-            cfg,
-            msgs,
-            tool_name="get_thread_history",
-            tool_arguments=tool_arguments,
-        )
-        result = format_message_group(
-            msgs,
-            current_agent_aliases=(cfg.slug,),
-            thread_root_id=root_id.strip(),
-        )
-        return f"{result}\n{receipt_marker}" if receipt_marker else result
-
-    @mcp.tool()
-    async def list_spaces() -> dict[str, Any]:
-        """List authoritative space memberships as structured context.
-
-        ``GET /spaces`` is server-filtered to memberships the
-        agent actually has, so the result reflects authoritative
-        permissions — channels can be enumerated for any space
-        listed here via ``list_channels_in_space``."""
-        data = await _read_spaces(cfg)
-        spaces_entries = (
-            data.get("spaces", []) if isinstance(data, dict) else []
-        ) or []
-        spaces = [
-            space_projection(space)
-            for space in spaces_entries
-            if isinstance(space, dict) and space.get("space_id")
-        ]
-        return {
-            "context_version": CONTEXT_VERSION,
-            "count": len(spaces),
-            "spaces": spaces,
-        }
-
-    @mcp.tool()
-    async def list_channels_in_space(space_id: str) -> dict[str, Any]:
-        """List authoritative channel memberships for one space.
-
-        ``GET /spaces/<space_id>/channels`` is server-filtered to the
-        agent's actual channel memberships; this tool just formats the
-        result. The legacy ``cfg.space_id`` is not consulted — pass
-        the explicit ``space_id`` to scope the query. Use
-        ``list_spaces`` to enumerate valid ``space_id``s first.
-
-        Tight-race note: just after AcceptSpaceInvite the endpoint can
-        briefly return the SPA-route HTML stub (decoded as ``str``)
-        while the materialiser commits. Treat that as "no channels yet"
-        rather than crashing the tool.
-        """
-        sid = (space_id or "").strip()
-        if not sid:
-            raise RuntimeError("space_id is required")
-        data = await _read_space_channels(cfg, sid)
-        channels = (
-            data.get("channels", []) if isinstance(data, dict) else []
-        ) or []
-        projected = [
-            channel_projection(channel, space_id=sid)
-            for channel in channels
-            if isinstance(channel, dict) and channel.get("channel_id")
-        ]
-        return {
-            "context_version": CONTEXT_VERSION,
-            "space_id": sid,
-            "count": len(projected),
-            "channels": projected,
-        }
-
-    @mcp.tool()
-    async def list_channels_in_all_spaces() -> dict[str, Any]:
-        """List channels in every authoritative space membership.
-
-        Convenience over ``list_spaces`` + ``list_channels_in_space``
-        for the case where the LLM wants the full membership picture
-        in one tool call. Walks one ``GET /spaces`` plus one
-        ``GET /spaces/<sp>/channels`` per space."""
-        spaces_data = await _read_spaces(cfg)
-        spaces_entries = (
-            spaces_data.get("spaces", [])
-            if isinstance(spaces_data, dict)
-            else []
-        ) or []
-        projected_spaces: list[dict[str, Any]] = []
-        channel_count = 0
-        for sp in spaces_entries:
-            if not isinstance(sp, dict):
-                continue
-            space_id = sp.get("space_id", "")
-            if not space_id:
-                continue
-            ch_data = await _read_space_channels(cfg, space_id)
-            channels = (
-                ch_data.get("channels", []) if isinstance(ch_data, dict) else []
-            ) or []
-            projected_channels = [
-                channel_projection(channel, space_id=space_id)
-                for channel in channels
-                if isinstance(channel, dict) and channel.get("channel_id")
-            ]
-            channel_count += len(projected_channels)
-            projected_spaces.append({
-                **space_projection(sp),
-                "channels": projected_channels,
-            })
-        return {
-            "context_version": CONTEXT_VERSION,
-            "space_count": len(projected_spaces),
-            "channel_count": channel_count,
-            "spaces": projected_spaces,
-        }
-
-    @mcp.tool()
-    async def list_channel_members(channel: str) -> dict[str, Any]:
-        """List channel members as stable identity objects."""
-        channel_ref = channel.strip()
-        if channel_ref.startswith("#"):
-            raise RuntimeError(
-                "'#<name>' channel addressing isn't supported; pass the "
-                "channel id directly."
-            )
-        channel_id = channel_ref
-        # Resolve from the local channel→space cache (populated by
-        # membership events). Misses raise — the previous version
-        # silently used ``cfg.space_id`` (home space), which broke
-        # for any channel not in the agent's home space.
-        space_id = await _resolve_channel_space(cfg, channel_id)
-
-        # Both transports read the exact channel-scoped roster. See
-        # ``_read_channel_members``.
-        data = await _read_channel_members(cfg, space_id, channel_id)
-        roster = data.get("members", []) if isinstance(data, dict) else []
-        roster = [member for member in roster if isinstance(member, dict)]
-        profiles = await _read_profile_map(
-            cfg,
-            [str(member.get("slug") or "") for member in roster],
-        )
-        members = []
-        for member in roster:
-            slug = str(member.get("slug") or "").lstrip("@")
-            if not slug:
-                continue
-            profile = profiles.get(slug, {})
-            members.append(identity_projection(
-                slug,
-                display_name=profile.get("display_name"),
-                identity_type=member.get("identity_type") or "unknown",
-                owner_slug=member.get("owner_slug"),
-                role=member.get("role") or "member",
-                self_identity=slug == cfg.slug.lstrip("@"),
-            ))
-        return {
-            "context_version": CONTEXT_VERSION,
-            "target": {
-                "target_type": "channel",
-                "target_ref": f"channel:{space_id}:{channel_id}",
-                "space_id": space_id,
-                "channel_id": channel_id,
-            },
-            "count": len(members),
-            "members": members,
-        }
-
-    @mcp.tool()
-    async def get_user_info(username: str) -> dict[str, Any]:
-        """Look up one identity by unique slug and return fresh profile context.
-
-        Always fetches fresh from puffo-server (bypasses the daemon's
-        TTL'd profile cache) and writes the result back to that cache
-        so the next inbound message renders with the new values.
-        Use this when the operator says someone renamed themselves.
-        """
-        slug = (username or "").lstrip("@").strip()
-        if not slug:
-            raise RuntimeError("username is required")
-        # ``/identities/profiles?slugs=`` accepts a comma-separated
-        # list; we read back the first entry. Empty list means the
-        # slug isn't registered.
-        data = await _read_profiles(cfg, slug)
-        profiles = data.get("profiles", []) if isinstance(data, dict) else []
-        if not profiles:
-            return {
-                "context_version": CONTEXT_VERSION,
-                "found": False,
-                "identity": f"@{slug}",
-            }
-        p = profiles[0]
-        # Server returns ``display_name`` (was previously read as
-        # ``username`` here, which silently dropped the field for
-        # every lookup — the line was never printed).
-        display_name = (p.get("display_name") or "").strip()
-        avatar_url = (p.get("avatar_url") or "").strip()
-        bio = (p.get("bio") or "").strip()
-        # Push the just-fetched values into the daemon's profile
-        # cache for this agent's view so the next render of an
-        # inbound message uses the fresh display_name + avatar
-        # instead of waiting for the TTL to expire.
-        try:
-            await cfg.data_client.update_profile_cache(
-                slug, display_name, avatar_url,
-            )
-        except Exception as exc:
-            logger.warning(
-                "get_user_info: failed to refresh daemon cache for %s: %s",
-                slug, exc,
-            )
-        owner_slug = p.get("owner_slug")
-        identity_type = (
-            "agent"
-            if owner_slug or slug == cfg.slug.lstrip("@")
-            else "unknown"
-        )
-        return {
-            "context_version": CONTEXT_VERSION,
-            "found": True,
-            "identity": identity_projection(
-                p.get("slug", slug),
-                display_name=display_name,
-                identity_type=identity_type,
-                owner_slug=owner_slug,
-                role=p.get("role"),
-                self_identity=slug == cfg.slug.lstrip("@"),
-                role_short=p.get("role_short") or None,
-                bio=bio or None,
-                avatar_url=avatar_url or None,
-                profile_updated_at=p.get("profile_updated_at"),
-            ),
-        }
-
-    @mcp.tool()
-    async def get_post(post_ref: str) -> str:
-        """Fetch one local message by envelope id.
-
-        Returns the semantic target/row projection. See the managed
-        ``channel-history`` skill for supplementary-context guidance.
-        """
-        envelope_id = (post_ref or "").strip()
-        if not envelope_id:
-            raise RuntimeError("post_ref (envelope_id) is required")
-
-        msg = await cfg.data_client.get_message_by_envelope(envelope_id)
-        if msg is None:
-            return f"message {envelope_id} not found in local storage"
-        receipt_marker = await _stage_model_visible_messages(
-            cfg,
-            [msg],
-            tool_name="get_post",
-            tool_arguments={"post_ref": post_ref},
-        )
-
-        result = format_message_group([msg], current_agent_aliases=(cfg.slug,))
-        return f"{result}\n{receipt_marker}" if receipt_marker else result
-
-    @mcp.tool()
-    async def get_post_segment(
-        envelope_id: str,
-        segment: int,
-        segment_size: int = MESSAGE_SEGMENT_CHARS,
-    ) -> dict[str, Any]:
-        """Page a long message body back in chunks.
-
-        When the daemon redacts an oversize inbound message it
-        replaces the in-prompt body with a ``[puffo-agent system
-        message]`` placeholder citing this tool's name plus the
-        envelope_id and total segment count. Call this tool with
-        ``segment=N`` (zero-indexed) and the same ``segment_size``
-        the placeholder reported to retrieve chunk ``N`` of the
-        full body. Only fetch the segments you actually need —
-        the placeholder preview usually tells you whether the
-        content is worth paging through.
-
-        Returns a structured source and segment range. Missing, empty, and
-        out-of-range results use an explicit ``state`` field.
-
-        ``segment_size`` defaults to the daemon's default redaction
-        page size; pass the value the placeholder cited if the operator
-        has overridden it on their host.
-        """
-        envelope_id = (envelope_id or "").strip()
-        if not envelope_id:
-            raise RuntimeError("envelope_id is required")
-        if segment < 0:
-            raise RuntimeError("segment must be >= 0")
-        if segment_size <= 0:
-            raise RuntimeError("segment_size must be > 0")
-
-        msg = await cfg.data_client.get_message_by_envelope(envelope_id)
-        if msg is None:
-            return {
-                "context_version": CONTEXT_VERSION,
-                "state": "not_found",
-                "message_id": envelope_id,
-            }
-
-        # ``content`` carries either a bare string (plain message)
-        # or the ``puffo/message+attachments/v1`` dict shape; pull
-        # the text out of the latter so segmenting works on the
-        # human-readable portion in both cases.
-        content = msg.content
-        text = _history_text(content)
-
-        if not text:
-            return {
-                "context_version": CONTEXT_VERSION,
-                "state": "empty",
-                "message_id": envelope_id,
-            }
-
-        total = len(text)
-        # ceil(total / segment_size); at least 1 when total > 0.
-        seg_count = (total + segment_size - 1) // segment_size
-        if segment >= seg_count:
-            return {
-                "context_version": CONTEXT_VERSION,
-                "state": "out_of_range",
-                "message_id": envelope_id,
-                "requested_segment_index": segment,
-                "segment_count": seg_count,
-                "segment_size": segment_size,
-            }
-        start = segment * segment_size
-        end = min(start + segment_size, total)
-        chunk = text[start:end]
-        tool_arguments = {
-            "envelope_id": envelope_id,
-            "segment": segment,
-        }
-        if segment_size != MESSAGE_SEGMENT_CHARS:
-            tool_arguments["segment_size"] = segment_size
-        receipt_marker = await _stage_model_visible_messages(
-            cfg,
-            [msg],
-            tool_name="get_post_segment",
-            tool_arguments=tool_arguments,
-        )
-        result: dict[str, Any] = {
-            "context_version": CONTEXT_VERSION,
-            "state": "ok",
-            "source": {
-                "target_ref": target_ref(
-                    msg, current_agent_aliases=(cfg.slug,),
-                ),
-                "message_id": msg.envelope_id,
-                "sender_identity": f"@{str(msg.sender_slug).lstrip('@')}",
-                "sender_type": sender_type(
-                    msg, current_agent_aliases=(cfg.slug,),
-                ),
-                "sent_at": iso_time(msg),
-            },
-            "segment": {
-                "index": segment,
-                "count": seg_count,
-                "char_start": start,
-                "char_end_exclusive": end,
-                "total_chars": total,
-                "text": chunk,
-            },
-        }
-        if receipt_marker:
-            result["admission_receipt"] = receipt_marker
-        return result
-
-    @mcp.tool()
-    async def send_message_with_attachments(
-        paths: list[str],
-        channel: str,
-        caption: str = "",
-        root_id: str = "",
-        visibility_level: str = "default",
-        send_anyway: bool = False,
-    ) -> dict[str, Any]:
-        """Send workspace files and an optional caption to a channel or DM.
-
-        ``paths`` are workspace-relative; ``channel``, ``root_id``,
-        ``visibility_level``, and ``send_anyway`` match ``send_message``.
-        Results are ``sent``, ``held``, or an error. See the managed
-        ``send-message-with-attachments`` skill and its common
-        ``send-message`` held-send procedure.
-        """
-        return await _dispatch_semantic_send(
-            cfg,
-            SemanticSendRequest(
-                destination=channel,
-                attachment_paths=tuple(paths) if isinstance(paths, list) else (),
-                caption=caption,
-                root_id=root_id,
-                visibility_level=visibility_level,
-                send_anyway=send_anyway,
-            ),
-            tool_name="send_message_with_attachments",
-        )
-
-        import mimetypes
-        from pathlib import Path
-
-        if not cfg.workspace:
-            raise RuntimeError(
-                "send_message_with_attachments: agent has no configured "
-                "workspace dir"
-            )
-        if not paths or not isinstance(paths, list):
-            raise RuntimeError(
-                "send_message_with_attachments: paths is required "
-                "(non-empty list)"
-            )
-        if len(paths) > 10:
-            raise RuntimeError(
-                f"send_message_with_attachments: too many files "
-                f"({len(paths)} > 10 cap)"
-            )
-        workspace_dir = Path(cfg.workspace).resolve()
-
-        # Validate all paths up front so a late failure doesn't
-        # leave orphan blob uploads on the server.
-        targets: list[Path] = []
-        for raw in paths:
-            rel = (raw or "").strip()
-            if not rel:
-                raise RuntimeError(
-                    "send_message_with_attachments: paths contains empty entry"
-                )
-            rel_path = Path(rel)
-            if rel_path.is_absolute():
-                raise RuntimeError(
-                    f"send_message_with_attachments: absolute paths not "
-                    f"allowed ({rel!r})"
-                )
-            try:
-                target = (workspace_dir / rel_path).resolve()
-                target.relative_to(workspace_dir)
-            except (OSError, ValueError):
-                raise RuntimeError(
-                    f"send_message_with_attachments: {rel!r} escapes the "
-                    f"workspace"
-                )
-            if not target.is_file():
-                raise RuntimeError(
-                    f"send_message_with_attachments: {rel!r} is not a file"
-                )
-            targets.append(target)
-
-        if cfg.keyless:
-            # T23 keyless bridge transport: the server holds the at-rest
-            # blob store, so we upload each file's PLAINTEXT bytes unsigned
-            # (``post_bytes_unsigned`` → egress-injected ``x-sandbox-token``,
-            # raw body) and pass the returned ``blob_id``s as top-level
-            # ``AttachmentRef``s into the same plaintext ``/v2/cloud-agents/
-            # messages`` POST ``send_message`` uses. No ``encrypt_attachment``,
-            # no device-key fetch, no signed ``/messages`` POST — a keyless
-            # agent has no signed-crypto seam. DM vs channel routing +
-            # fail-soft thread resolution mirror ``send_message``'s keyless
-            # branch.
-            #
-            # F5: run EVERY precondition — destination resolve/validate,
-            # root resolve/validate, and all per-file size checks — BEFORE
-            # the first upload, so a rejected route or an oversized Nth file
-            # raises with no orphaned blobs left on the server.
-            channel_ref = channel.strip()
-            if channel_ref.startswith("#"):
-                raise RuntimeError(
-                    "'#<name>' channel addressing isn't supported; pass "
-                    "the channel id directly."
-                )
-
-            # (1) Resolve + validate the destination first. A bare ``@`` or
-            # a stale ``ch_`` (``_resolve_channel_space`` raises) fails here,
-            # before any upload.
-            is_dm = channel_ref.startswith("@")
-            keyless_recipient = ""
-            keyless_channel_id = ""
-            keyless_space_id = None
-            if is_dm:
-                keyless_recipient = channel_ref[1:]
-                if not keyless_recipient:
-                    raise RuntimeError(
-                        "DM recipient slug is required after '@'"
-                    )
-            else:
-                keyless_channel_id = channel_ref
-                keyless_space_id = await _resolve_channel_space(
-                    cfg, keyless_channel_id,
-                )
-
-            # (2) Resolve + validate the thread root before uploads.
-            resolved_root, root_note = await _resolve_root_id(
-                root_id, cfg.data_client,
-            )
-            resolved_root, validate_note = await _validate_root_same_channel(
-                resolved_root,
-                None if is_dm else keyless_channel_id,
-                None if is_dm else keyless_space_id,
-                cfg.data_client,
-            )
-
-            # (3) Read every file + run the 8 MiB check for ALL files
-            # before uploading any — a later oversized file must not orphan
-            # earlier blobs.
-            prepared: list[tuple[Any, bytes, str]] = []
-            total_bytes = 0
-            for target in targets:
-                plaintext = target.read_bytes()
-                if len(plaintext) > 8 * 1024 * 1024:
-                    raise RuntimeError(
-                        f"send_message_with_attachments: {target.name!r} is "
-                        f"{len(plaintext)} bytes (server caps at 8 MiB)"
-                    )
-                mime_type, _ = mimetypes.guess_type(target.name)
-                mime_type = mime_type or "application/octet-stream"
-                prepared.append((target, plaintext, mime_type))
-                total_bytes += len(plaintext)
-
-            # (4) Only now upload each blob → build refs.
-            refs: list[dict] = []
-            for target, plaintext, mime_type in prepared:
-                up = await _upload_blob_keyless(cfg, plaintext)
-                blob_id = up.get("blob_id") if isinstance(up, dict) else None
-                if not blob_id:
-                    raise RuntimeError(
-                        f"send_message_with_attachments: keyless upload "
-                        f"returned no blob_id for {target.name!r} ({up!r})"
-                    )
-                refs.append({
-                    "blob_id": blob_id,
-                    "filename": target.name,
-                    "mime_type": mime_type,
-                    "size_bytes": len(plaintext),
-                })
-
-            # (5) One send using the pre-resolved route + the F4 reply_to
-            # gate (drop the raw parent when root validation wiped it).
-            if is_dm:
-                body: dict[str, Any] = {
-                    "plaintext": caption,
-                    "recipient_slug": keyless_recipient,
-                    "attachments": refs,
-                }
-            else:
-                body = {
-                    "plaintext": caption,
-                    "space_id": keyless_space_id,
-                    "channel_id": keyless_channel_id,
-                    "attachments": refs,
-                }
-            if resolved_root:
-                body["thread_root_id"] = resolved_root
-                if root_id:
-                    body["reply_to_id"] = root_id
-            ack = await _send_keyless(cfg, body)
-            names = ", ".join(t.name for t in targets)
-            thread_note = f" in thread {resolved_root}" if resolved_root else ""
-            return (
-                f"uploaded {len(targets)} file(s) [{names}] ({total_bytes} "
-                f"bytes total) to {channel}{thread_note} "
-                f"(envelope_id {(ack or {}).get('envelope_id', '?')})"
-                f"{root_note}"
-                f"{validate_note}"
-            )
-
-        # Encrypt + upload each file. ``blob_id`` is patched in
-        # after /blobs/upload returns — AAD doesn't depend on it.
-        attachment_metas: list[AttachmentMeta] = []
-        total_bytes = 0
-        for target in targets:
-            plaintext = target.read_bytes()
-            if len(plaintext) > 8 * 1024 * 1024:
-                raise RuntimeError(
-                    f"send_message_with_attachments: {target.name!r} is {len(plaintext)} bytes "
-                    "(server caps at 8 MiB)"
-                )
-            mime_type, _ = mimetypes.guess_type(target.name)
-            mime_type = mime_type or "application/octet-stream"
-            ciphertext, meta = encrypt_attachment(
-                plaintext=plaintext,
-                filename=target.name,
-                mime_type=mime_type,
-                blob_id="",
-            )
-            upload = await cfg.http_client.post_bytes(
-                "/blobs/upload", ciphertext,
-            )
-            blob_id = upload.get("blob_id") if isinstance(upload, dict) else None
-            if not blob_id:
-                raise RuntimeError(
-                    f"send_message_with_attachments: server returned no blob_id for "
-                    f"{target.name!r} ({upload!r})"
-                )
-            meta.blob_id = blob_id
-            attachment_metas.append(meta)
-            total_bytes += len(plaintext)
-
-        # Compose one envelope carrying all attachments, reusing
-        # ``send_message``'s routing logic.
-        channel_ref = channel.strip()
-        if channel_ref.startswith("#"):
-            raise RuntimeError(
-                "'#<name>' channel addressing isn't supported; pass the "
-                "channel id directly."
-            )
-        if channel_ref.startswith("@"):
-            recipient_slug = channel_ref[1:]
-            if not recipient_slug:
-                raise RuntimeError("DM recipient slug is required after '@'")
-            envelope_kind = "dm"
-            channel_id: Optional[str] = None
-            send_space_id: Optional[str] = None
-            recipient_slugs = [cfg.slug, recipient_slug]
-        else:
-            channel_id = channel_ref
-            envelope_kind = "channel"
-            recipient_slug = None
-            # Same cache-only resolution as ``send_message`` — no
-            # silent fallback to ``cfg.space_id``, because targeting
-            # the wrong space produced FB-76 mismaps.
-            send_space_id = await _resolve_channel_space(cfg, channel_id)
-            members_resp = await cfg.http_client.get(
-                f"/spaces/{send_space_id}/channels/{channel_id}/members"
-            )
-            recipient_slugs = [
-                m.get("slug", "")
-                for m in members_resp.get("members", [])
-                if m.get("slug")
-            ]
-            if not recipient_slugs:
-                raise RuntimeError(
-                    f"send_message_with_attachments: channel {channel_id} has no resolvable members"
-                )
-
-        sess = cfg.keystore.load_session(cfg.slug)
-        signing_key = Ed25519KeyPair.from_secret_bytes(
-            decode_secret(sess.subkey_secret_key)
-        )
-        body_content = {
-            "text": caption,
-            "attachments": [m.to_dict() for m in attachment_metas],
-        }
-        resolved_root, root_note = await _resolve_outgoing_root(
-            root_id, cfg.data_client,
-            self_slug=cfg.slug,
-            channel_id=channel_id,
-            space_id=send_space_id,
-            dm_peer=recipient_slug,
-        )
-        encrypt = await _send_encryption_required(cfg, resolved_root)
-        devices: list = []
-        if encrypt:
-            devices = await _fetch_device_keys(cfg.http_client, recipient_slugs)
-            if not devices:
-                raise RuntimeError(
-                    "send_message_with_attachments: no recipient devices found"
-                )
-        effective_visible, visibility_note = await _resolve_visibility(
-            visibility_level, channel_ref, caption, resolved_root or "", cfg.http_client,
-        )
-        inp = EncryptInput(
-            envelope_kind=envelope_kind,
-            sender_slug=cfg.slug,
-            sender_subkey_id=sess.subkey_id,
-            is_visible_to_human=effective_visible,
-            space_id=send_space_id,
-            channel_id=channel_id,
-            recipient_slug=recipient_slug,
-            thread_root_id=resolved_root,
-            content_type=ATTACHMENT_CONTENT_TYPE,
-            content=body_content,
-            recipients=devices,
-        )
-        if encrypt:
-            envelope, content_key = encrypt_message_with_content_key(
-                inp, signing_key,
-            )
-            resp = await cfg.http_client.post("/messages", envelope) or {}
-            missing = resp.get("missing_devices") or []
-            if missing:
-                asyncio.create_task(_supplement_missing_devices(
-                    cfg.http_client, envelope, content_key,
-                    recipient_slugs, missing,
-                ))
-        else:
-            envelope = build_plaintext_message(inp, signing_key)
-            await cfg.http_client.post("/v2/messages/plaintext", envelope)
-        names = ", ".join(t.name for t in targets)
-        thread_note = f" in thread {resolved_root}" if resolved_root else ""
-        return (
-            f"uploaded {len(targets)} file(s) [{names}] ({total_bytes} bytes "
-            f"total) to {channel}{thread_note} "
-            f"(envelope_id {envelope.get('envelope_id', '?')})"
-            f"{visibility_note}"
-            f"{root_note}"
-        )
-
-    @mcp.tool()
-    async def install_host_mcp(
-        name: str,
-        spec: Optional[dict] = None,
-        template_id: str = "",
-    ) -> str:
-        """Lay down an MCP server spec into the operator's host
-        ``~/.claude.json`` so they can complete OAuth / paste API keys
-        on their own claude session, then auto-DM them a one-line
-        install confirmation. Pair with ``sync_host_mcp`` once they
-        confirm. If you have setup-context to share (docs URL, env
-        keys to populate, gotchas) send a separate follow-up message
-        — the auto-DM is intentionally minimal.
-
-        ``name``: the key the entry registers under
-            (``mcpServers[<name>]`` on host).
-
-        Pass exactly ONE of the two source forms:
-
-        - ``template_id``: look up the spec from puffo-server's
-          ``/v2/mcp-templates/<id>`` catalog. Use when the MCP is
-          operator-curated and ``desired_mcp`` ships an empty-env
-          placeholder you need credentials for.
-        - ``spec``: pass an inline MCP server config dict transcribed
-          from the MCP package's own README — useful when you find
-          an MCP on the web (e.g. Coinbase CDP MCP) that isn't in
-          puffo-server's catalog. Shape:
-            ``{"type": "stdio", "command": "npx", "args": [...], "env": {...}}``
-            ``{"type": "http"|"sse", "url": "https://...", "env": {...}}``
-          Set ``env`` values to empty strings for placeholders the
-          operator needs to populate.
-
-        Behaviour:
-          - host already has the entry → file untouched, no DM, tells
-            you to skip to ``sync_host_mcp``.
-          - catalog / spec validation / file write fails → tool errors,
-            no side effects.
-          - host write succeeds + DM succeeds → returns the DM's
-            envelope_id; wait for the operator's ping.
-          - host write succeeds + DM fails → returns the prebuilt body
-            so you can retry via ``send_message`` yourself.
-        """
-        if cfg.rpc_client is None:
-            raise RuntimeError(
-                "install_host_mcp unavailable — PUFFO_RPC_URL not set "
-                "on this MCP runtime, so the puffo-agent daemon's "
-                "rpc_service isn't reachable."
-            )
-        return await cfg.rpc_client.install_mcp(
-            name=name, template_id=template_id, spec=spec,
-        )
-
-    @mcp.tool()
-    async def sync_host_mcp(template_id: str) -> str:
-        """Copy the operator's ``~/.claude.json#mcpServers[<id>]``
-        entry into your own ``<agent>/.claude.json``. Pair with
-        ``install_host_mcp`` once the operator finishes OAuth on host,
-        then call ``refresh()`` so claude respawns and picks up the
-        new MCP.
-
-        If the host config doesn't have the entry yet, returns an
-        error asking you to call ``install_host_mcp`` first (and
-        relay the result to the operator).
-        """
-        if cfg.rpc_client is None:
-            raise RuntimeError(
-                "sync_host_mcp unavailable — PUFFO_RPC_URL not set "
-                "on this MCP runtime, so the puffo-agent daemon's "
-                "rpc_service isn't reachable."
-            )
-        return await cfg.rpc_client.sync_mcp(template_id=template_id)
-
-    @mcp.tool()
-    async def leave_space(space_id: str, reason: str = "") -> str:
-        """Request to leave a space. This does NOT leave immediately —
-        it asks your operator to approve. The operator gets a DM and
-        replies `y` (you leave) or `n` (you stay); you'll see their
-        decision in that thread.
-
-        space_id: the space to leave (e.g. 'sp_<uuid>'). Use
-            ``list_spaces`` to find it.
-        reason: optional — a short why, shown to the operator in the
-            approval DM. Be honest and specific.
-
-        Note: a space owner can't leave directly, and the request only
-        goes through while you're a member.
-        """
-        sp = space_id.strip()
-        if not sp:
-            raise RuntimeError("space_id is required")
-        # ws-local runs in-process → drive the client directly; harness
-        # runtimes go through the daemon's rpc_service.
-        if cfg.message_client is not None:
-            return await cfg.message_client.request_leave_approval(
-                kind="leave_space", space_id=sp, channel_id="", reason=reason,
-            )
-        if cfg.rpc_client is None:
-            raise RuntimeError(
-                "leave_space unavailable — PUFFO_RPC_URL not set on this "
-                "MCP runtime, so the puffo-agent daemon isn't reachable."
-            )
-        return await cfg.rpc_client.request_leave(
-            kind="leave_space", space_id=sp, channel_id="", reason=reason,
-        )
-
-    @mcp.tool()
-    async def leave_channel(channel_id: str, reason: str = "") -> str:
-        """Request to leave a channel. This does NOT leave immediately —
-        it asks your operator to approve. The operator gets a DM and
-        replies `y` (you leave) or `n` (you stay); you'll see their
-        decision in that thread.
-
-        channel_id: the channel to leave (e.g. 'ch_<uuid>'). Use
-            ``list_channels_in_all_spaces`` to find it.
-        reason: optional — a short why, shown to the operator in the
-            approval DM.
-
-        Note: public channels can't be left on their own — to leave one
-        you'd leave the whole space (``leave_space``).
-        """
-        ch = channel_id.strip()
-        if not ch:
-            raise RuntimeError("channel_id is required")
-        space_id = await _resolve_channel_space(cfg, ch)
-        if cfg.message_client is not None:
-            return await cfg.message_client.request_leave_approval(
-                kind="leave_channel", space_id=space_id, channel_id=ch,
-                reason=reason,
-            )
-        if cfg.rpc_client is None:
-            raise RuntimeError(
-                "leave_channel unavailable — PUFFO_RPC_URL not set on "
-                "this MCP runtime, so the puffo-agent daemon isn't "
-                "reachable."
-            )
-        return await cfg.rpc_client.request_leave(
-            kind="leave_channel", space_id=space_id, channel_id=ch,
-            reason=reason,
-        )
-
-    @mcp.tool()
-    async def get_dm_allowlists() -> dict[str, Any]:
-        """List your DM allowlist (peers whose DMs skip the approval
-        gate). Per-agent — every identity keeps its own list; this
-        reads yours only."""
-        data = await cfg.http_client.get("/allowlists")
-        slugs = sorted(
-            e.get("peer_slug", "")
-            for e in (data.get("entries") or [])
-            if e.get("peer_slug")
-        )
-        return {
-            "context_version": CONTEXT_VERSION,
-            "count": len(slugs),
-            "identities": [f"@{slug.lstrip('@')}" for slug in slugs],
-        }
-
-    @mcp.tool()
-    async def get_dm_blocklists() -> dict[str, Any]:
-        """List your DM blocklist (senders whose messages are silently
-        dropped). Per-agent — every identity keeps its own list; this
-        reads yours only."""
-        data = await cfg.http_client.get("/blocklists")
-        slugs = sorted(
-            b.get("id", "")
-            for b in (data.get("blocks") or [])
-            if b.get("target") == "user" and b.get("id")
-        )
-        return {
-            "context_version": CONTEXT_VERSION,
-            "count": len(slugs),
-            "identities": [f"@{slug.lstrip('@')}" for slug in slugs],
-        }
-
-    @mcp.tool()
-    async def add_dm_allowlist(slug: str) -> str:
-        """Allow a user to DM you. Future DMs from this sender skip
-        the ``auto_accept_dm`` approval prompt and deliver directly.
-        Idempotent: re-allowlisting an entry is a no-op. Per-agent —
-        only your own allowlist changes; other agents are unaffected.
-
-        slug: peer to allow (e.g. ``alice-1234``).
-        """
-        target = (slug or "").strip()
-        if not target:
-            raise RuntimeError("slug is required")
-        await cfg.http_client.post("/allowlists", {"slugs": [target]})
-        _note_contact(cfg, target, allowed=True)
-        return f"allowlisted {target}"
-
-    @mcp.tool()
-    async def update_dm_blocklist(slug: str, on: bool) -> str:
-        """Block (``on=True``) or unblock (``on=False``) a sender.
-        Server-enforced — blocked senders' messages are silently
-        dropped at the server, so you never see them. Per-agent —
-        only your own blocklist changes; other agents are unaffected.
-
-        slug: peer to (un)block (e.g. ``alice-1234``).
-        on: ``True`` adds to blocklist, ``False`` removes.
-        """
-        target = (slug or "").strip()
-        if not target:
-            raise RuntimeError("slug is required")
-        if on:
-            await cfg.http_client.post(
-                "/blocklists", {"target": "user", "id": target},
-            )
-            _note_contact(cfg, target, blocked=True)
-            return f"blocked {target}"
-        await cfg.http_client.delete(
-            "/blocklists", body={"id": target},
-        )
-        _note_contact(cfg, target, blocked=False)
-        return f"unblocked {target}"
-
-    # Bridge-only sandbox-lifecycle tools (schedule_wake / cancel_wake /
-    # get_scheduled_wake / get_runtime_status / keep_alive). Gated on
-    # ``bridge_client`` — set ONLY at the in-process ws-local site — so a
-    # native/subprocess agent never registers them (and never exposes the
-    # keyless ``x-sandbox-token`` lifecycle surface). Imported lazily so
-    # the native path doesn't pay for a module it will never use.
     if cfg.bridge_client is not None:
         from .lifecycle_tools import register_lifecycle_tools
+
         register_lifecycle_tools(mcp, cfg)

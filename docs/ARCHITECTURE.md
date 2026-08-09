@@ -93,8 +93,8 @@ The supervisor. Owns process lifecycle and every long-running service.
   (`daemon.py:286`) and calls `worker.start()` (`daemon.py:295`); `_stop_worker`
   (`daemon.py:405`) tears one down. For *paused* agents (no worker) the daemon still
   emits a lifecycle heartbeat via `_report_lifecycle` (`daemon.py:568`).
-- **`portal/worker.py`** — `class Worker` (`worker.py:561`) and the free function
-  `build_adapter` (`worker.py:89`) that maps `runtime.kind` → an `Adapter`. The worker
+- **`portal/worker.py`** — `class Worker` and the Docker-only adapter factory.
+  Host-local execution is prepared through `build_local_runtime_adapter`. The worker
   runs the reconnecting WS listen loop (`worker.py:1535`, backoff
   `RECONNECT_BACKOFF_SECONDS = 5.0` at `worker.py:86`) and the heartbeat task
   (`worker.py:1489`).
@@ -135,24 +135,23 @@ What runs *inside* a worker.
   `handle_envelope` callback (`puffo_core_client.py:603`) which decrypts
   (`puffo_core_client.py:630`), and owns the outbound fallback reply path
   `send_fallback_message` (`puffo_core_client.py:3609`).
-- **`agent/adapters/`** — compatibility facade for non-local-Driver runtimes:
-  `ChatOnlyAdapter`, `SDKAdapter`, and `DockerCLIAdapter`, plus
-  `desired_install.py` for skills/MCP installation.
+- **`agent/adapters/`** — the common turn facade used by `PuffoAgent`.
+  `DockerCLIAdapter` is the concrete compatibility runtime; `desired_install.py`
+  installs requested skills/MCP configuration.
 - **`agent/harness/`** — the host-local execution layer. `RuntimeManagerAdapter`
   exposes the ordinary Adapter contract while `CodexAppServerDriver` and
   `ClaudeCodeCliDriver` own their native protocols. `LocalRuntimePreparer` owns
   configuration, credentials, host assets, and one-time old-session migration.
-  The older declarative `Harness` registry remains for `cli-docker`.
-- **`agent/providers/`** — direct model SDK clients for the non-CLI runtimes:
-  `AnthropicProvider` (`providers/anthropic_provider.py:4`, `complete()` at line 9)
-  and `OpenAIProvider`.
+  The declarative `DockerHarness` registry remains for `cli-docker`.
 - **`agent/message_store.py`** — `class MessageStore` (`message_store.py:120`): the
   per-agent `messages.db` behind data_service.
 - **`agent/memory.py`** — `class MemoryManager` (`memory.py:6`): the **BUILT** flat
   memory (§ Memory).
-- **`agent/skills_loader.py`** — `class SkillsLoader` (`skills_loader.py:9`); plus
-  `model_catalog.py`, `events.py`, `disk_cache.py`, `status_reporter.py`,
-  `file_browser.py`, `shared_content.py`, `cli_bin.py`.
+- **Skills integration** — `portal/host_assets.py` synchronizes host-native skill
+  directories; `agent/adapters/desired_install.py` materializes provisioned skill
+  templates. Claude Code and Codex discover those files through their native homes.
+  Supporting modules include `model_catalog.py`, `events.py`, `disk_cache.py`,
+  `status_reporter.py`, `file_browser.py`, `shared_content.py`, and `cli_bin.py`.
 
 ### `crypto/` — transport gate classes + the message crypto primitives
 
@@ -231,7 +230,7 @@ flowchart TB
         direction TB
         subgraph portal["portal/"]
             dmn["Daemon._reconcile_once (daemon.py:217)"]
-            wrk["Worker + build_adapter (worker.py:89)"]
+            wrk["Worker + execution factories"]
             svc["data 63386 / rpc 63385 / bridge 63387 (state.py)"]
             ctl["control/ operator plane"]
         end
@@ -253,10 +252,9 @@ flowchart TB
         end
     end
 
-    subgraph engines["Local agent engines (external CLIs / SDKs)"]
+    subgraph engines["Agent engines (external CLIs)"]
         claudecli["claude CLI (claude-code)"]
         othercli["codex · gemini-cli · hermes CLIs"]
-        provsdk["Anthropic / OpenAI SDK (chat/sdk-local)"]
     end
 
     thin["packages/puffo-agent-cloud (THIN · IN-FLIGHT/FROZEN)<br/>keyless x-sandbox-token bridge"]
@@ -270,7 +268,6 @@ flowchart TB
     core --> adapters
     adapters --> claudecli
     adapters --> othercli
-    adapters --> provsdk
     core --> mem
     core -->|"reply"| tools
     tools -->|"encrypt_message_with_content_key :512"| msg
@@ -294,8 +291,7 @@ answers WHAT engine runs inside it; provider answers WHICH model vendor.**
 
 `portal/runtime_matrix.py` is the single source of truth. On this branch:
 
-- **`VALID_RUNTIMES` = 5** (`runtime_matrix.py:27`): `chat-local`, `sdk-local`,
-  `cli-local`, `cli-docker`, `ws-local`.
+- **`VALID_RUNTIMES` = 3**: `cli-local`, `cli-docker`, `ws-local`.
 - **`RESERVED_RUNTIMES` = {`cli-sandbox`}** (`runtime_matrix.py:35`) — named, **not
   implemented** (the placeholder for E2B-style cloud sandboxing).
 - A **6th runtime, `api-puffo`** (cloud-hosted, bearer `session_token`, **no subkey
@@ -304,10 +300,8 @@ answers WHAT engine runs inside it; provider answers WHICH model vendor.**
   (`worker.py:838`, `worker.py:1235`). *It is not a valid runtime on this branch.*
 
 **Harness is meaningful for only two runtimes.** `_HARNESS_BEARING_RUNTIMES` =
-{`cli-local`, `cli-docker`} (`runtime_matrix.py:79`); `harness_applies`
-(`runtime_matrix.py:85`) returns False for everything else. For `chat-local` /
-`sdk-local` the engine is implicit (a direct provider SDK) and the `harness` field is
-ignored; `ws-local` brings its own external engine.
+{`cli-local`, `cli-docker`}; `harness_applies` returns False for everything else.
+`ws-local` brings its own external engine.
 
 **Harness → provider bindings** (`HARNESS_PROVIDERS`, `runtime_matrix.py:69`):
 
@@ -322,11 +316,11 @@ Defaults are provider-aware; for `cli-local`, OpenAI resolves to `codex` rather
 than the Docker-only Hermes path. `validate_triple` rejects mismatched
 (runtime, provider, harness) values at config load, including inferred defaults.
 
-**Adapter dispatch** (`build_adapter`, `worker.py:89`): `chat-local` →
-`ChatOnlyAdapter`, `sdk-local` → `SDKAdapter` (needs an anthropic api_key),
-`cli-local` → `LocalRuntimePreparer` + `RuntimeManagerAdapter` + one native
-Driver; `cli-docker` → `DockerCLIAdapter`. Local Drivers use host OAuth views or
-the configured LLM gateway credentials.
+**Execution dispatch:** `cli-local` → `LocalRuntimePreparer` +
+`RuntimeManagerAdapter` + one native Driver; `cli-docker` → `DockerCLIAdapter`;
+`ws-local` → an externally attached engine. Local Drivers use host OAuth views or
+configured LLM gateway credentials. Legacy direct Chat/SDK runtime names migrate
+to `cli-local` during config load.
 
 ## Diagram (c) — runtime × harness matrix
 
@@ -337,9 +331,7 @@ IN-FLIGHT/RESERVED.*
 flowchart LR
     legendC["harness applies ONLY to cli-local / cli-docker"]
 
-    subgraph runtimes["VALID_RUNTIMES (runtime_matrix.py:27)"]
-        chat["chat-local<br/>ChatOnlyAdapter"]
-        sdk["sdk-local<br/>SDKAdapter"]
+    subgraph runtimes["VALID_RUNTIMES"]
         clil["cli-local"]
         clid["cli-docker"]
         wsl["ws-local<br/>external engine"]
@@ -363,11 +355,7 @@ flowchart LR
         goog["google"]
     end
 
-    chat -->|"implicit engine"| anth
-    sdk -->|"implicit engine"| anth
     clil --> cc
-    clil --> hm
-    clil --> gm
     clil --> cx
     clid --> cc
     clid --> hm
@@ -472,18 +460,16 @@ seals and posts the reply.
 
 ### 5.2 Think-path (flow 3): adapter / harness → model
 
-`adapter.run_turn` (`core.py:314`) dispatches by runtime:
+`adapter.run_turn` dispatches through one of three execution boundaries:
 
-- `chat-local` / `sdk-local` → a direct provider SDK (`AnthropicProvider`,
-  `providers/anthropic_provider.py:4`).
-- `cli-local` / `cli-docker` → a harness (`harness/base.py:36`) that spawns the vendor
-  CLI (claude / codex / gemini / hermes). Claude auth comes from the host
+- `cli-local` → a long-lived native Driver for Claude Code or Codex app-server.
+- `cli-docker` → a declarative harness that spawns Claude, Gemini, or Hermes.
+  Claude auth comes from the host
   `~/.claude/.credentials.json`, refreshed by the daemon (`credential_refresh.py:1`).
 - `ws-local` → the external tool brings its own engine over `/v1/ws-local`.
 
-> **Currency:** the DESIGNED cloud think-path (`ANTHROPIC_BASE_URL` → LiteLLM virtual
-> key) is **not on this branch** — grep finds no `ANTHROPIC_BASE_URL`. Today the CLI
-> harnesses use local vendor credentials; LiteLLM VK is a DESIGNED cloud touchpoint.
+Cloud `cli-local` can point the Driver at a LiteLLM-compatible gateway using
+`runtime.llm_base_url` and a per-agent `runtime.api_key`.
 
 ## Diagram (b) — message round-trip *(sequenceDiagram)*
 
@@ -508,7 +494,7 @@ sequenceDiagram
     PCC->>ST: persist
     PCC->>AG: thread-batch
     AG->>AD: _run_turn_and_route :287
-    AD->>ENG: run turn (CLI / SDK)
+    AD->>ENG: run turn (CLI Driver / subprocess)
     ENG->>TOOL: reply via send_message
     TOOL->>MSG: encrypt_message_with_content_key :512
     MSG-->>TOOL: sealed envelope
@@ -525,7 +511,8 @@ The daemon reconciles agents; each running agent is one worker.
 - `Daemon._reconcile_once` (`daemon.py:217`) diffs desired vs running. New agent →
   `Worker(...)` (`daemon.py:286`) + `worker.start()` (`daemon.py:295`). Removed/paused
   → `_stop_worker` (`daemon.py:405`).
-- `build_adapter` (`worker.py:89`) constructs the runtime-appropriate adapter.
+- `build_local_runtime_adapter` constructs host-local Drivers; the Docker factory
+  constructs the Docker Adapter.
 - The worker's **WS listen loop** reconnects on failure (`worker.py:1535`, backoff
   `RECONNECT_BACKOFF_SECONDS = 5.0`, `worker.py:86`) and reports errors on the agent
   row (`reporter.report_error`).
@@ -545,7 +532,7 @@ flowchart TB
     cfg["agent.yml / daemon.yml (state.py:684, :709)"]
     rec["Daemon._reconcile_once (daemon.py:217)"]
     decide{"desired vs running?"}
-    build["build_adapter (worker.py:89)"]
+    build["build Driver or Docker Adapter"]
     start["worker.start (daemon.py:295)"]
     listen["WS listen loop (worker.py:1535)"]
     reconnect["reconnect · backoff 5s (worker.py:86)"]
@@ -571,8 +558,8 @@ On-disk `daemon.yml` (provider keys, defaults; `state.py:684`) and per-agent
 (`kind` + `provider` + `harness` + `model` + `sandbox`) is validated by
 `validate_triple` (`runtime_matrix.py:146`) — an invalid runtime, an unsupported
 harness→provider pair, or a harness on a non-CLI runtime is rejected at load.
-`build_adapter` (`worker.py:89`) then turns the validated `runtime.kind` into a
-concrete adapter. Legacy `kind` values are migrated by `migrate_legacy_kind`
+The worker then turns the validated `runtime.kind` into a Driver-backed or
+compatibility Adapter execution boundary. Legacy `kind` values are migrated by `migrate_legacy_kind`
 (`runtime_matrix.py:121`).
 
 ---
@@ -625,9 +612,9 @@ An in-process **MCP** server gives each agent its tool surface. `build_server`
 - **Data reads** go through `DataClient` (`mcp/data_client.py:72`) → **data_service on
   63386** (`get_channel_history` `:122`, `get_dm_history` `:153`); RPC control
   (install/sync MCP) goes to **rpc_service on 63385**.
-- **Skills** are loaded by `SkillsLoader` (`skills_loader.py:9`) and materialized into
-  the agent home by `desired_install.py` (`write_desired_skill`
-  `adapters/desired_install.py:127`, `install_claude_mcp` `:214`).
+- **Skills** are synchronized from host-native homes by `portal/host_assets.py` and
+  materialized from desired templates by `desired_install.py`; each Driver then uses
+  its native skill discovery.
 - **Execution policy:** `LocalRuntimePreparer` writes the supported policy into
   `RuntimeSpec`; Claude Code currently uses unattended bypass mode, while Codex
   exposes native permission requests through the Driver event contract.
@@ -697,7 +684,7 @@ An in-process **MCP** server gives each agent its tool surface. `build_server`
 | Where is the runtime/harness/provider validated? | `portal/runtime_matrix.py:146` (`validate_triple`) |
 | Which runtimes take a harness? | `portal/runtime_matrix.py:79` (`_HARNESS_BEARING_RUNTIMES`) |
 | Where does the daemon spawn a worker? | `portal/daemon.py:286` → `:295` (`worker.start`) |
-| Where is the adapter chosen for a runtime? | `portal/worker.py:89` (`build_adapter`) |
+| Where is execution chosen for a runtime? | `portal/worker.py` (`Worker._run`, Docker adapter factory) |
 | Where does the WS reconnect loop live? | `portal/worker.py:1535` (backoff `:86`) |
 | Where are the loopback service ports set? | `portal/state.py:782` / `:791` / `:807` (63386/63385/63387) |
 | Where is ws-local mounted? | `portal/ws_local/route.py:50` + `portal/api/server.py:40` |
@@ -722,9 +709,9 @@ control-client → agent-workers → **MCP loopback** shape; the three ports
 (data **63386**, rpc **63385**, bridge **63387**, off by default); and the
 HPKE-verify / ±5-min-timestamp / replay-nonce control-frame guards.
 
-**What was stale / incomplete** in v0.4: it showed only **3 worker kinds**
-(claude · codex · ws-local) and no harness dimension — the current system is the
-**5-runtime `VALID_RUNTIMES` matrix** (+ `api-puffo` in-flight, `cli-sandbox`
-reserved) crossed with **4 harnesses**; it omitted the **adapter/harness split**,
+**What was stale / incomplete** in v0.4: it showed engine names as worker kinds
+and no harness dimension. The current system is a **3-runtime `VALID_RUNTIMES`
+matrix** (`cli-local`, `cli-docker`, `ws-local`) crossed with **4 harness names**;
+it omitted the **Driver/Adapter/harness split**,
 **memory**, and the entire **fat-vs-thin cloud direction** (the keyless transport
 swap). Those are all covered above.

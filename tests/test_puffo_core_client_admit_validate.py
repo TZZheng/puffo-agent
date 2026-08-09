@@ -14,7 +14,6 @@ stack isn't needed to exercise the validation logic).
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 import tempfile

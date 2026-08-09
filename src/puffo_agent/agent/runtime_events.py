@@ -54,7 +54,7 @@ class TrustedScope:
     @classmethod
     def from_runtime_context(
         cls, context_refs: tuple[str, ...] | list[str] | None
-    ) -> "TrustedScope":
+    ) -> TrustedScope:
         return cls()
 
     def as_dict(self) -> dict[str, str]:

@@ -11,15 +11,11 @@ import json
 import logging
 import os
 import sys
-import tomllib
-from pathlib import Path
 from typing import Any
 
-import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.agent.adapters import desired_install
 from puffo_agent.agent.adapters.desired_install import (
     DESIRED_INSTALLED_MARKER,
     install_claude_mcp,

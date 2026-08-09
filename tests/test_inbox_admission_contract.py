@@ -19,7 +19,7 @@ from puffo_agent.agent.global_inbox_runtime import (
 )
 from puffo_agent.agent.harness.driver import (
     CompactRequest,
-    HarnessDriver,
+    Driver,
     HarnessEvent,
     PermissionDecision,
     PermissionRef,
@@ -56,7 +56,7 @@ from puffo_agent.portal import rpc_service
 from puffo_agent.portal.host_mcp_handler import HostMcpContext
 
 
-class ContractDriver(HarnessDriver):
+class ContractDriver(Driver):
     """Deterministic provider event source; all admission remains real."""
 
     def __init__(self) -> None:
@@ -270,42 +270,29 @@ class BoundaryHarness:
                 await self.turn_task
 
 
-@pytest_asyncio.fixture
-async def boundary_harness(tmp_path: Path):
+async def _seed_boundary_store(tmp_path):
     store = MessageStore(tmp_path / "messages.db")
     await store.open()
-    await _seed(
-        store,
-        envelope_id="history-peer",
-        channel_id="ch-history",
-        seq=2,
-        text="history peer body",
-    )
-    await _seed(
-        store,
-        envelope_id="inbox-peer",
-        channel_id="ch-inbox",
-        seq=3,
-        text="inbox peer body",
-    )
-    await _seed(
-        store,
-        envelope_id="held-peer",
-        channel_id="ch-held",
-        seq=4,
-        text="held peer body",
-    )
+    for envelope_id, channel_id, seq, text in (
+        ("history-peer", "ch-history", 2, "history peer body"),
+        ("inbox-peer", "ch-inbox", 3, "inbox peer body"),
+        ("held-peer", "ch-held", 4, "held peer body"),
+    ):
+        await _seed(
+            store, envelope_id=envelope_id, channel_id=channel_id,
+            seq=seq, text=text,
+        )
+    return store
 
+
+async def _start_boundary_runtime(tmp_path, store):
     driver = ContractDriver()
     manager = RuntimeManager(driver, RuntimeSpec(str(tmp_path)))
     adapter = RuntimeManagerAdapter(manager)
     runtime = GlobalInboxRuntime(
-        store=store,
-        adapter=adapter,
-        run_turn=lambda _planned: None,
+        store=store, adapter=adapter, run_turn=lambda _planned: None,
         workspace=tmp_path,
     )
-
     turn_task = asyncio.create_task(adapter.run_turn(TurnContext(
         system_prompt="contract",
         messages=[{"role": "user", "content": "active turn"}],
@@ -314,29 +301,27 @@ async def boundary_harness(tmp_path: Path):
     runtime.active.turn_id = str(manager.active_turn_ref)
     runtime.active.provider_session_id = adapter.get_provider_session_id()
     runtime.active.provider_turn_id = manager.native_turn_id
+    return driver, manager, adapter, runtime, turn_task
 
+
+def _boundary_coordinator(store, runtime):
     transport = HeldTransport(held_envelope_id="held-peer", held_seq=4)
     coordinator = SendCoordinator(
-        slug="agent-contract",
-        keystore=None,
-        http_client=transport,
-        data_client=store,
-        baseline_source=BaselineAdapter(store),
+        slug="agent-contract", keystore=None, http_client=transport,
+        data_client=store, baseline_source=BaselineAdapter(store),
         active_turn_source=ActiveBoundaryAdapter(store, runtime.active),
         held_recovery_source=runtime.held_recovery_source,
         provider_session_id=runtime.active.provider_session_id,
     )
     runtime.coordinator = coordinator
+    return transport, coordinator
 
+
+async def _start_boundary_rpc(tmp_path, store, runtime, coordinator):
     ctx = HostMcpContext(
-        agent_id="agent-contract",
-        slug="agent-contract",
-        operator_slug="operator",
-        host_home=tmp_path,
-        agent_home=tmp_path,
-        harness="claude-code",
-        keystore=None,
-        http_client=None,
+        agent_id="agent-contract", slug="agent-contract",
+        operator_slug="operator", host_home=tmp_path, agent_home=tmp_path,
+        harness="claude-code", keystore=None, http_client=None,
         message_client=SimpleNamespace(global_runtime=runtime),
         send_coordinator=coordinator,
     )
@@ -357,19 +342,32 @@ async def boundary_harness(tmp_path: Path):
         return result
 
     rpc.stage_model_visible_read = record_stage
+    return server, rpc, staged_responses
+
+
+def _boundary_mcp(store, runtime, rpc, coordinator):
     cfg = PuffoCoreToolsConfig(
-        slug="agent-contract",
-        device_id="device-contract",
-        keystore=None,
-        http_client=SimpleNamespace(keyless=False),
-        data_client=store,
-        agent_id="agent-contract",
-        rpc_client=rpc,
-        send_coordinator=coordinator,
-        inbox_runtime=runtime,
+        slug="agent-contract", device_id="device-contract", keystore=None,
+        http_client=SimpleNamespace(keyless=False), data_client=store,
+        agent_id="agent-contract", rpc_client=rpc,
+        send_coordinator=coordinator, inbox_runtime=runtime,
     )
     mcp = FastMCP("contract")
     register_core_tools(mcp, cfg)
+    return mcp
+
+
+@pytest_asyncio.fixture
+async def boundary_harness(tmp_path: Path):
+    store = await _seed_boundary_store(tmp_path)
+    driver, manager, adapter, runtime, turn_task = await _start_boundary_runtime(
+        tmp_path, store,
+    )
+    transport, coordinator = _boundary_coordinator(store, runtime)
+    server, rpc, staged_responses = await _start_boundary_rpc(
+        tmp_path, store, runtime, coordinator,
+    )
+    mcp = _boundary_mcp(store, runtime, rpc, coordinator)
 
     harness = BoundaryHarness(
         store=store,

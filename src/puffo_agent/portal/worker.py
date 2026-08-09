@@ -7,7 +7,6 @@ into runtime.json so the CLI can read live stats without IPC.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import random
@@ -15,12 +14,12 @@ import re
 import shutil
 import sys
 import time
-import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from ..agent.adapters import Adapter
-from ..agent.core import AgentAPIError, PuffoAgent
+from ..agent.core import AgentAPIError as AgentAPIError
+from ..agent.core import PuffoAgent as PuffoAgent
 from ..limits import (
     DEFAULT_CATCHUP_STALE_HOURS,
     MAX_INLINE_MESSAGE_CHARS,
@@ -37,22 +36,19 @@ from .runtime_matrix import (
 )
 from .ws_local.hub import AttachPoint
 from ..agent.shared_content import (
-    looks_like_managed_claude_md,
-    rebuild_agent_claude_md,
-    rebuild_agent_codex_md,
+    looks_like_managed_claude_md as looks_like_managed_claude_md,
 )
+from ..agent.shared_content import rebuild_agent_claude_md, rebuild_agent_codex_md
 from .state import (
     AgentConfig,
     DaemonConfig,
-    PuffoCoreConfig,
-    RuntimeConfig,
     RuntimeState,
     agent_claude_user_dir,
     agent_codex_user_dir,
     agent_dir,
     agent_home_dir,
     cli_session_json_path,
-    docker_shared_dir,
+    docker_shared_dir as docker_shared_dir,
     shared_fs_dir,
 )
 
@@ -101,68 +97,21 @@ def _rebuild_managed_system_prompt(
         role_short=role_short,
     )
 
+
 logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
 
 
-def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
-    """Construct the adapter for ``runtime.kind``. Raises on unknown
-    or misconfigured kinds."""
-    kind = agent_cfg.runtime.kind or "chat-local"
+def build_docker_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
+    """Construct a non-Driver adapter for ``runtime.kind``.
 
-    if kind == "chat-local":
-        from ..agent.adapters.chat_only import ChatOnlyAdapter
-        provider = _build_legacy_provider(daemon_cfg, agent_cfg.runtime)
-        # Tool wiring is deferred: the in-process puffo_core dispatch
-        # needs the live message client, which Worker._run() builds
-        # after this adapter — it injects ``adapter.tool_dispatch``
-        # there via _build_chat_local_tool_dispatch(). Mirrors how
-        # sdk-local wires its MCP tools below, minus the subprocess.
-        return ChatOnlyAdapter(provider)
-
-    if kind == "sdk-local":
-        from ..agent.adapters.sdk import SDKAdapter
-        api_key = agent_cfg.runtime.api_key or daemon_cfg.anthropic.api_key
-        model = agent_cfg.runtime.model or daemon_cfg.anthropic.model or "claude-sonnet-4-6"
-        if not api_key:
-            raise RuntimeError(
-                f"agent {agent_cfg.id!r}: runtime kind 'sdk-local' requires an anthropic "
-                "api_key in daemon.yml or agent.yml"
-            )
-        adapter = SDKAdapter(
-            api_key=api_key,
-            model=model,
-            allowed_tools=agent_cfg.runtime.allowed_tools,
-            agent_id=agent_cfg.id,
-            workspace_dir=str(agent_cfg.resolve_workspace_dir()),
-            max_turns=agent_cfg.runtime.max_turns,
-            # Empty = vendor endpoint (unchanged); set = route the SDK's
-            # model calls through the proxy via ANTHROPIC_BASE_URL.
-            base_url=agent_cfg.runtime.llm_base_url,
-        )
-        if agent_cfg.puffo_core.is_configured():
-            from ..mcp.config import puffo_core_stdio_sdk_config, default_python_executable
-            pc = agent_cfg.puffo_core
-            adapter.mcp_servers_override = puffo_core_stdio_sdk_config(
-                python=default_python_executable(),
-                slug=pc.slug,
-                device_id=pc.device_id,
-                server_url=pc.server_url,
-                space_id=pc.space_id,
-                keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
-                workspace=str(agent_cfg.resolve_workspace_dir()),
-                agent_id=agent_cfg.id,
-                memory_dir=str(agent_cfg.resolve_memory_dir()),
-            )
-        return adapter
-
-    # CLI adapters authenticate via the host's
-    # ~/.claude/.credentials.json (set up by `claude login`); no
-    # api_key is threaded through. Model overrides still flow.
+    Host-local Claude and Codex runtimes are built by Worker through the
+    Driver runtime. This factory remains only for the Docker compatibility
+    runtime.
+    """
+    kind = agent_cfg.runtime.kind or "cli-local"
     if kind == "cli-docker":
-        # desired_skills install below; desired_mcps can't (their
-        # launch commands don't resolve in-container) — reject loudly.
         if agent_cfg.desired_mcps:
             raise RuntimeError(
                 f"agent {agent_cfg.id!r}: desired_mcps are not supported "
@@ -170,201 +119,102 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
                 "won't resolve inside the container). Clear them from "
                 "agent.yml or switch runtime.kind to cli-local."
             )
-        from ..agent.adapters.docker_cli import DockerCLIAdapter
-        from ..agent.harness import build_harness
-        effective_provider = resolve_effective_provider(
-            kind, getattr(agent_cfg.runtime, "provider", "")
-        )
-        effective_harness = resolve_effective_harness(
-            kind,
-            effective_provider,
-            getattr(agent_cfg.runtime, "harness", ""),
-        )
-        harness = build_harness(effective_harness)
-        # gemini-cli needs GEMINI_API_KEY per docker exec; claude-code
-        # and hermes use the bind-mounted credentials file.
-        google_key = ""
-        if harness.name() == "gemini-cli":
-            google_key = daemon_cfg.google.api_key
-            if not google_key:
-                raise RuntimeError(
-                    f"agent {agent_cfg.id!r}: harness=gemini-cli requires a "
-                    "google.api_key — pass --api-key on `agent create`, set "
-                    "GEMINI_API_KEY in the environment, or run "
-                    "`puffo-agent config` to save a daemon-wide default."
-                )
-        # Per-agent overrides win; empty falls through to daemon
-        # defaults, then to "no cap".
-        memory_limit = (
-            agent_cfg.runtime.docker_memory_limit
-            or daemon_cfg.docker_memory_limit
-        )
-        memory_reservation = (
-            agent_cfg.runtime.docker_memory_reservation
-            or daemon_cfg.docker_memory_reservation
-        )
-        adapter = DockerCLIAdapter(
-            agent_id=agent_cfg.id,
-            model=agent_cfg.runtime.model or daemon_cfg.anthropic.model or "",
-            image=agent_cfg.runtime.docker_image,
-            workspace_dir=str(agent_cfg.resolve_workspace_dir()),
-            claude_dir=str(agent_cfg.resolve_claude_dir()),
-            session_file=str(cli_session_json_path(agent_cfg.id)),
-            agent_home_dir=str(agent_home_dir(agent_cfg.id)),
-            shared_fs_dir=str(shared_fs_dir()),
-            inference_level=getattr(agent_cfg.runtime, "inference_level", ""),
-            harness=harness,
-            google_api_key=google_key,
-            memory_limit=memory_limit,
-            memory_reservation=memory_reservation,
-            desired_skills=agent_cfg.desired_skills,
-            puffo_core_server_url=agent_cfg.puffo_core.server_url,
-            puffo_core_slug=agent_cfg.puffo_core.slug,
-            puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
-        )
-        # Env for spawning the puffo_core MCP server; path-typed values are
-        # rewritten to container bind-mount paths at config-write time.
-        if agent_cfg.puffo_core.is_configured():
-            from ..mcp.config import puffo_core_mcp_env
-            pc = agent_cfg.puffo_core
-            adapter.puffo_core_mcp_env = puffo_core_mcp_env(
-                slug=pc.slug,
-                device_id=pc.device_id,
-                server_url=pc.server_url,
-                space_id=pc.space_id,
-                # Host paths; rewritten to container paths by
-                # docker_cli's _write_cli_mcp_config.
-                keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
-                workspace=str(agent_cfg.resolve_workspace_dir()),
-                agent_id=agent_cfg.id,
-                # MCP runs inside the container; reach the host's
-                # 127.0.0.1 data + rpc services via Docker's host alias.
-                data_service_url=f"http://host.docker.internal:{daemon_cfg.data_service.port}",
-                rpc_url=f"http://host.docker.internal:{daemon_cfg.rpc_service.port}",
-                runtime_kind="cli-docker",
-                harness=harness.name(),
-                # MCP runs in-container; the agent dir is bind-mounted
-                # at /home/agent/.puffo-agent-state (docker_cli also
-                # pins this at its env-override sites).
-                memory_dir="/home/agent/.puffo-agent-state/memory",
-                # T23 phase-2: forward the transport so a keyless
-                # ``bridge`` agent's subprocess MCP sets keyless=True
-                # (unsigned /v2/cloud-agents/* path). Only "bridge" is
-                # emitted downstream; native is inert.
-                transport=pc.transport,
-            )
+        harness, google_key = _resolve_docker_harness(daemon_cfg, agent_cfg)
+        adapter = _new_docker_adapter(daemon_cfg, agent_cfg, harness, google_key)
+        _configure_docker_mcp(adapter, daemon_cfg, agent_cfg, harness.name())
         return adapter
 
     if kind == "cli-local":
         raise RuntimeError(
             "cli-local is constructed by Worker through the Driver runtime; "
-            "build_adapter only constructs non-Driver adapters"
+            "build_docker_adapter only constructs non-Driver adapters"
         )
 
     raise RuntimeError(
         f"agent {agent_cfg.id!r}: unknown runtime kind {kind!r} "
-        "(valid: chat-local, sdk-local, cli-docker, cli-local)"
+        "(valid: cli-local, cli-docker, ws-local)"
     )
 
 
-def _build_legacy_provider(daemon_cfg: DaemonConfig, runtime: RuntimeConfig):
-    """Anthropic/OpenAI message-completion provider for the
-    chat-local adapter. Per-agent fields override daemon defaults."""
-    provider_name = runtime.provider or daemon_cfg.default_provider
-    # Empty base URL → None → vendor endpoint (today's behavior, byte-for-
-    # byte unchanged). Set → route completions through the proxy (VK).
-    base_url = runtime.llm_base_url or None
+def _resolve_docker_harness(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig):
+    from ..agent.harness import build_docker_harness
 
-    if provider_name == "anthropic":
-        try:
-            from ..agent.providers.anthropic_provider import AnthropicProvider
-        except ImportError as exc:
-            # Only re-attribute to a missing extra when the *anthropic*
-            # package itself is what's absent. An ImportError whose missing
-            # module is something else (a broken transitive dep of an
-            # installed anthropic SDK, a partial wheel, an internal
-            # submodule) is a genuine failure — re-raise it unchanged rather
-            # than misdirect the operator to reinstall an already-present
-            # package.
-            if (exc.name or "") != "anthropic" and not (
-                exc.name or ""
-            ).startswith("anthropic."):
-                raise
-            # The Anthropic SDK is a cloud-slim extra, absent from the base
-            # (cli-local template) install. Surface the fix, not a raw
-            # ModuleNotFoundError buried in the worker traceback.
-            raise RuntimeError(
-                "chat-local provider=anthropic needs the Anthropic SDK, "
-                "which isn't in the base install — rebuild the template "
-                "with \"pip install 'puffo-agent[anthropic]'\""
-            ) from exc
-        api_key = runtime.api_key or daemon_cfg.anthropic.api_key
-        model = runtime.model or daemon_cfg.anthropic.model or "claude-sonnet-4-6"
-        if not api_key:
-            raise RuntimeError(
-                "anthropic api_key is not set in daemon.yml or agent.yml"
-            )
-        return AnthropicProvider(api_key=api_key, model=model, base_url=base_url)
-
-    if provider_name == "openai":
-        try:
-            from ..agent.providers.openai_provider import OpenAIProvider
-        except ImportError as exc:
-            # See the anthropic branch: only re-attribute when the *openai*
-            # package itself is missing; re-raise any other ImportError.
-            if (exc.name or "") != "openai" and not (
-                exc.name or ""
-            ).startswith("openai."):
-                raise
-            raise RuntimeError(
-                "chat-local provider=openai needs the OpenAI SDK, which "
-                "isn't in the base install — rebuild the template with "
-                "\"pip install 'puffo-agent[openai]'\""
-            ) from exc
-        api_key = runtime.api_key or daemon_cfg.openai.api_key
-        model = runtime.model or daemon_cfg.openai.model or "gpt-4o"
-        if not api_key:
-            raise RuntimeError(
-                "openai api_key is not set in daemon.yml or agent.yml"
-            )
-        return OpenAIProvider(api_key=api_key, model=model, base_url=base_url)
-
-    raise RuntimeError(f"unknown provider {provider_name!r}")
-
-
-def _build_chat_local_tool_dispatch(client) -> dict:
-    """In-process puffo_core tool dispatch for the chat-local adapter.
-
-    Mirrors ``ws_local.route._build_tool_dispatch``: the same
-    PuffoCoreToolsConfig wired off the live message client, narrowed
-    to the send tools the chat-local provider advertises as Anthropic
-    tool schemas. Without this executor, the model's ``tool_use``
-    blocks would parse but never post.
-    """
-    from ..mcp.puffo_core_tools import PuffoCoreToolsConfig
-    from .ws_local.in_process_data_client import InProcessDataClient
-    from .ws_local.tool_dispatch import build_dispatch
-
-    cfg = PuffoCoreToolsConfig(
-        slug=client.slug,
-        device_id=client.device_id,
-        keystore=client.keystore,
-        http_client=client.http,
-        data_client=InProcessDataClient(client.store, client),
-        space_id=getattr(client, "space_id", None),
-        workspace=getattr(client, "workspace", None),
-        message_client=client,
-        inbox_runtime=getattr(client, "global_runtime", None),
-        # T23: only the daemon-owned bridge WS may drive keyless sends;
-        # None on native agents keeps the signed-crypto path.
-        bridge_client=getattr(client, "_bridge", None),
+    provider = resolve_effective_provider(
+        "cli-docker", getattr(agent_cfg.runtime, "provider", "")
     )
-    return build_dispatch(
-        cfg,
-        allowed=frozenset({
-            "read_inbox", "send_message", "send_message_with_attachments",
-            "create_reminder", "list_reminders", "cancel_reminder",
-        }),
+    name = resolve_effective_harness(
+        "cli-docker", provider, getattr(agent_cfg.runtime, "harness", "")
+    )
+    harness = build_docker_harness(name)
+    google_key = ""
+    if harness.name() == "gemini-cli":
+        google_key = agent_cfg.runtime.api_key or daemon_cfg.google.api_key
+        if not google_key:
+            raise RuntimeError(
+                f"agent {agent_cfg.id!r}: harness=gemini-cli requires a "
+                "google.api_key — pass --api-key on `agent create`, set "
+                "GEMINI_API_KEY in the environment, or run "
+                "`puffo-agent config` to save a daemon-wide default."
+            )
+    return harness, google_key
+
+
+def _new_docker_adapter(
+    daemon_cfg: DaemonConfig, agent_cfg: AgentConfig, harness, google_key: str
+) -> Adapter:
+    from ..agent.adapters.docker_cli import DockerCLIAdapter
+
+    return DockerCLIAdapter(
+        agent_id=agent_cfg.id,
+        model=agent_cfg.runtime.model or daemon_cfg.anthropic.model or "",
+        image=agent_cfg.runtime.docker_image,
+        workspace_dir=str(agent_cfg.resolve_workspace_dir()),
+        claude_dir=str(agent_cfg.resolve_claude_dir()),
+        session_file=str(cli_session_json_path(agent_cfg.id)),
+        agent_home_dir=str(agent_home_dir(agent_cfg.id)),
+        shared_fs_dir=str(shared_fs_dir()),
+        inference_level=getattr(agent_cfg.runtime, "inference_level", ""),
+        harness=harness,
+        google_api_key=google_key,
+        memory_limit=(
+            agent_cfg.runtime.docker_memory_limit or daemon_cfg.docker_memory_limit
+        ),
+        memory_reservation=(
+            agent_cfg.runtime.docker_memory_reservation
+            or daemon_cfg.docker_memory_reservation
+        ),
+        desired_skills=agent_cfg.desired_skills,
+        puffo_core_server_url=agent_cfg.puffo_core.server_url,
+        puffo_core_slug=agent_cfg.puffo_core.slug,
+        puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
+    )
+
+
+def _configure_docker_mcp(
+    adapter: Adapter,
+    daemon_cfg: DaemonConfig,
+    agent_cfg: AgentConfig,
+    harness_name: str,
+) -> None:
+    if not agent_cfg.puffo_core.is_configured():
+        return
+    from ..mcp.config import puffo_core_mcp_env
+
+    core = agent_cfg.puffo_core
+    adapter.puffo_core_mcp_env = puffo_core_mcp_env(
+        slug=core.slug,
+        device_id=core.device_id,
+        server_url=core.server_url,
+        space_id=core.space_id,
+        keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
+        workspace=str(agent_cfg.resolve_workspace_dir()),
+        agent_id=agent_cfg.id,
+        data_service_url=f"http://host.docker.internal:{daemon_cfg.data_service.port}",
+        rpc_url=f"http://host.docker.internal:{daemon_cfg.rpc_service.port}",
+        runtime_kind="cli-docker",
+        harness=harness_name,
+        memory_dir="/home/agent/.puffo-agent-state/memory",
+        transport=core.transport,
     )
 
 
@@ -381,11 +231,22 @@ def _puffo_cli_keystore_dir() -> Path:
         appdata = os.environ.get("APPDATA")
         if appdata:
             return Path(appdata) / "puffo" / "puffo-cli" / "data" / "keys"
-        return Path.home() / "AppData" / "Roaming" / "puffo" / "puffo-cli" / "data" / "keys"
+        return (
+            Path.home()
+            / "AppData"
+            / "Roaming"
+            / "puffo"
+            / "puffo-cli"
+            / "data"
+            / "keys"
+        )
     if sys.platform == "darwin":
         return (
-            Path.home() / "Library" / "Application Support"
-            / "ai.puffo.puffo-cli" / "keys"
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / "ai.puffo.puffo-cli"
+            / "keys"
         )
     xdg = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
     return Path(xdg) / "puffo" / "puffo-cli" / "keys"
@@ -409,19 +270,23 @@ def _ensure_agent_identity_imported(agent_id: str, slug: str) -> None:
         shutil.copy2(src, dest)
         logger.info(
             "agent %s: imported identity from puffo-cli keystore (%s → %s)",
-            agent_id, src, dest,
+            agent_id,
+            src,
+            dest,
         )
     except OSError as exc:
         logger.warning(
             "agent %s: failed to import identity from %s: %s",
-            agent_id, src, exc,
+            agent_id,
+            src,
+            exc,
         )
 
 
 def _build_puffo_core_client(
     agent_cfg: AgentConfig,
     agent_id: str,
-    daemon_cfg: "DaemonConfig | None" = None,
+    daemon_cfg: DaemonConfig | None = None,
 ):
     """Construct a PuffoCoreMessageClient from the agent's config.
     ``daemon_cfg`` carries the host-wide tunables (currently the
@@ -453,12 +318,17 @@ def _build_puffo_core_client(
     # ``/v2/cloud-agents/*`` routes; ``route.py`` reuses ``client.http``, so
     # the in-process ws-local cfg's ``keyless`` accessor reads True here.
     http = PuffoCoreHttpClient(
-        pc.server_url, ks, pc.slug, keyless=(pc.transport == "bridge"),
+        pc.server_url,
+        ks,
+        pc.slug,
+        keyless=(pc.transport == "bridge"),
     )
     ms = MessageStore(str(agent_dir(agent_id) / "messages.db"))
 
     max_inline = (
-        daemon_cfg.max_inline_message_chars if daemon_cfg is not None else MAX_INLINE_MESSAGE_CHARS
+        daemon_cfg.max_inline_message_chars
+        if daemon_cfg is not None
+        else MAX_INLINE_MESSAGE_CHARS
     )
     segment_chars = (
         daemon_cfg.segment_chars if daemon_cfg is not None else MESSAGE_SEGMENT_CHARS
@@ -471,7 +341,7 @@ def _build_puffo_core_client(
 
     # The inbound-image downscale cap follows the harness's effective model
     # (Opus 4.7+ resolves 2576px, else 1568px).
-    runtime_kind = agent_cfg.runtime.kind or "chat-local"
+    runtime_kind = agent_cfg.runtime.kind or "cli-local"
     effective_provider = resolve_effective_provider(
         runtime_kind, agent_cfg.runtime.provider
     )
@@ -480,9 +350,13 @@ def _build_puffo_core_client(
     )
     is_codex = effective_harness == "codex"
     if is_codex:
-        model = agent_cfg.runtime.model or (daemon_cfg.openai.model if daemon_cfg else "")
+        model = agent_cfg.runtime.model or (
+            daemon_cfg.openai.model if daemon_cfg else ""
+        )
     else:
-        model = agent_cfg.runtime.model or (daemon_cfg.anthropic.model if daemon_cfg else "")
+        model = agent_cfg.runtime.model or (
+            daemon_cfg.anthropic.model if daemon_cfg else ""
+        )
 
     return PuffoCoreMessageClient(
         slug=pc.slug,
@@ -532,7 +406,9 @@ _NON_AUTH_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*Credit balance is too low\b", re.IGNORECASE),
     # CLI-emitted server 429 / 5xx.
     re.compile(r"\bAPI Error: Request rejected \(429\)", re.IGNORECASE),
-    re.compile(r"\bAPI Error: Server is temporarily limiting requests\b", re.IGNORECASE),
+    re.compile(
+        r"\bAPI Error: Server is temporarily limiting requests\b", re.IGNORECASE
+    ),
     re.compile(r"\bAPI Error: Repeated 529 Overloaded errors\b", re.IGNORECASE),
     re.compile(r"\bAPI Error: 500\b[\s\S]*Internal server error\b", re.IGNORECASE),
     # API-canonical <type>_error identifiers, minus high-FP entries
@@ -585,7 +461,7 @@ def _suppress_worker_error_leak(reply: str) -> str | None:
 
 def _handle_suppressed_reply(
     reply: str,
-    runtime: "RuntimeState",
+    runtime: RuntimeState,
     agent_id: str,
     *,
     scope: str,
@@ -620,7 +496,10 @@ def _handle_suppressed_reply(
     )
     logger.warning(
         "agent %s: suppressed worker-error leak in %s reply (backoff %.1fs): %s",
-        agent_id, scope, backoff, reply[:200],
+        agent_id,
+        scope,
+        backoff,
+        reply[:200],
     )
     if is_auth:
         was_ok = runtime.health != "auth_failed"
@@ -631,7 +510,8 @@ def _handle_suppressed_reply(
             except Exception as exc:
                 logger.warning(
                     "agent %s: on_auth_failure callback raised: %s",
-                    agent_id, exc,
+                    agent_id,
+                    exc,
                 )
         if was_ok and on_auth_failed_enter is not None:
             try:
@@ -639,7 +519,8 @@ def _handle_suppressed_reply(
             except Exception as exc:
                 logger.warning(
                     "agent %s: on_auth_failed_enter callback raised: %s",
-                    agent_id, exc,
+                    agent_id,
+                    exc,
                 )
     if scope == "api-error-retry":
         if is_auth:
@@ -663,13 +544,12 @@ def _handle_suppressed_reply(
     return True, backoff
 
 
-
 class Worker:
     """Runs a single AI agent inside the daemon event loop."""
 
     @staticmethod
     def _clear_api_error_abandoned_if_recoverable(
-        runtime: "RuntimeState",
+        runtime: RuntimeState,
         agent_id: str,
         root_id: str,
         log: logging.Logger,
@@ -694,12 +574,13 @@ class Worker:
         log.info(
             "agent %s: api-error-recovery on thread %s; "
             "runtime.health cleared back to ok",
-            agent_id, root_id,
+            agent_id,
+            root_id,
         )
 
     @staticmethod
     def _clear_auth_failed_if_recoverable(
-        runtime: "RuntimeState",
+        runtime: RuntimeState,
         agent_id: str,
         log: logging.Logger,
     ) -> None:
@@ -728,7 +609,9 @@ class Worker:
             self._notify_refresh_needed()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "agent %s: notify_refresh_needed raised: %s", agent_id, exc,
+                "agent %s: notify_refresh_needed raised: %s",
+                agent_id,
+                exc,
             )
 
     async def _run_post_warm_gate(self, agent_id: str) -> None:
@@ -740,19 +623,22 @@ class Worker:
             probe_ok = await self._adapter.health_probe()
         except Exception as exc:
             logger.warning(
-                "agent %s: health_probe raised; treating as "
-                "probe-fail: %s", agent_id, exc,
+                "agent %s: health_probe raised; treating as probe-fail: %s",
+                agent_id,
+                exc,
             )
             probe_ok = False
         if not probe_ok:
             Worker._reassert_auth_failed_after_failed_probe(
-                self.runtime, agent_id, logger,
+                self.runtime,
+                agent_id,
+                logger,
             )
         self._warm_done.set()
 
     @staticmethod
     def _reassert_auth_failed_after_failed_probe(
-        runtime: "RuntimeState",
+        runtime: RuntimeState,
         agent_id: str,
         log: logging.Logger,
     ) -> None:
@@ -794,7 +680,9 @@ class Worker:
                 self._notify_refresh_needed()
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    "agent %s: notify_refresh_needed raised: %s", agent_id, exc,
+                    "agent %s: notify_refresh_needed raised: %s",
+                    agent_id,
+                    exc,
                 )
         if was_ok:
             self._on_auth_failed_enter()
@@ -813,7 +701,8 @@ class Worker:
             self._auth_failed_notification_sent = False
             logger.warning(
                 "agent %s: couldn't schedule auth-failed DM: %s",
-                self.agent_cfg.id, exc,
+                self.agent_cfg.id,
+                exc,
             )
 
     async def _notify_operator_of_auth_failed_oauth(self) -> None:
@@ -843,9 +732,8 @@ class Worker:
             format_codex_oauth_expired,
             format_oauth_expired,
         )
-        display_name = (
-            getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
-        )
+
+        display_name = getattr(self.agent_cfg, "display_name", "") or self.agent_cfg.id
         # Codex agents need the Codex recovery command, not the Claude
         # one; otherwise the operator runs the wrong CLI and assumes
         # the alert is broken. Harness is the cheapest signal we have.
@@ -862,17 +750,20 @@ class Worker:
             self._auth_failed_notification_sent = False
             logger.exception(
                 "agent %s: auth-failed DM to %s raised: %s",
-                self.agent_cfg.id, operator_slug, exc,
+                self.agent_cfg.id,
+                operator_slug,
+                exc,
             )
             return
         logger.info(
             "agent %s: notified operator @%s of OAuth-expired",
-            self.agent_cfg.id, operator_slug,
+            self.agent_cfg.id,
+            operator_slug,
         )
 
     @staticmethod
     def _flip_health_in_progress(
-        runtime: "RuntimeState",
+        runtime: RuntimeState,
         agent_id: str,
         log: logging.Logger,
     ) -> None:
@@ -886,7 +777,7 @@ class Worker:
 
     @staticmethod
     def _resolve_health_on_success(
-        runtime: "RuntimeState",
+        runtime: RuntimeState,
         agent_id: str,
         log: logging.Logger,
     ) -> None:
@@ -900,7 +791,7 @@ class Worker:
 
     @staticmethod
     def _fallback_unhandled_error_if_stuck_in_progress(
-        runtime: "RuntimeState",
+        runtime: RuntimeState,
         agent_id: str,
         turn_error: str | None,
         log: logging.Logger,
@@ -916,7 +807,8 @@ class Worker:
         runtime.save(agent_id)
         log.warning(
             "agent %s: runtime.health → unhandled_error (%s)",
-            agent_id, runtime.error,
+            agent_id,
+            runtime.error,
         )
 
     def __init__(
@@ -1002,12 +894,17 @@ class Worker:
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "agent %s: proactive refresh failed: %s",
-                    self.agent_cfg.id, exc,
+                    self.agent_cfg.id,
+                    exc,
                 )
             return True
 
     async def _refresh_watcher_loop(
-        self, flag_paths, apply, *, interval: float = 0.25,
+        self,
+        flag_paths,
+        apply,
+        *,
+        interval: float = 0.25,
     ) -> None:
         """Proactive between-turns profile reload loop. Polls
         ``flag_paths`` every ``interval`` s (waking immediately when
@@ -1023,7 +920,8 @@ class Worker:
         while not self._stop.is_set():
             try:
                 await asyncio.wait_for(
-                    self._refresh_now.wait(), timeout=interval,
+                    self._refresh_now.wait(),
+                    timeout=interval,
                 )
             except asyncio.TimeoutError:
                 pass
@@ -1048,7 +946,10 @@ class Worker:
             return False
 
     def set_profile_cache(
-        self, slug: str, display_name: str, avatar_url: str,
+        self,
+        slug: str,
+        display_name: str,
+        avatar_url: str,
     ) -> None:
         """Cross-process bridge for the MCP ``get_user_info`` tool —
         the subprocess fetches fresh from puffo-server then POSTs the
@@ -1067,6 +968,7 @@ class Worker:
             return None
         from .host_mcp_handler import HostMcpContext
         from .state import agent_home_dir
+
         runtime = self.agent_cfg.runtime
         runtime_kind = getattr(runtime, "kind", "") or "cli-local"
         provider = resolve_effective_provider(
@@ -1121,7 +1023,9 @@ class Worker:
                 )
             except Exception as exc:
                 logger.warning(
-                    "agent %s: adapter aclose failed: %s", self.agent_cfg.id, exc,
+                    "agent %s: adapter aclose failed: %s",
+                    self.agent_cfg.id,
+                    exc,
                 )
         await self._close_client()
         self.runtime.status = "stopped"
@@ -1142,13 +1046,15 @@ class Worker:
             )
         except Exception as exc:
             logger.warning(
-                "agent %s: client.stop failed: %s", self.agent_cfg.id, exc,
+                "agent %s: client.stop failed: %s",
+                self.agent_cfg.id,
+                exc,
             )
         self._client = None
 
     def _runtime_info(self) -> dict[str, str]:
         rt = self.agent_cfg.runtime
-        kind = getattr(rt, "kind", "") or "chat-local"
+        kind = getattr(rt, "kind", "") or "cli-local"
         if kind == RUNTIME_WS_LOCAL:
             return {
                 "kind": kind,
@@ -1163,21 +1069,13 @@ class Worker:
             and kind in (RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER)
             and configured_harness
         ):
-            supported = HARNESS_PROVIDERS.get(
-                configured_harness, frozenset()
-            )
+            supported = HARNESS_PROVIDERS.get(configured_harness, frozenset())
             if len(supported) == 1:
                 provider = next(iter(supported))
-        if not provider and kind == "chat-local":
-            provider = self.daemon_cfg.default_provider
         provider = resolve_effective_provider(kind, provider)
-        harness = resolve_effective_harness(
-            kind, provider, configured_harness
-        )
+        harness = resolve_effective_harness(kind, provider, configured_harness)
         provider_cfg = getattr(self.daemon_cfg, provider, None)
-        model = getattr(rt, "model", "") or getattr(
-            provider_cfg, "model", ""
-        )
+        model = getattr(rt, "model", "") or getattr(provider_cfg, "model", "")
         return {
             "kind": kind,
             "provider": provider,
@@ -1210,7 +1108,9 @@ class Worker:
                     f"agent {agent_id!r}: puffo_core block in agent.yml is incomplete"
                 )
             client = _build_puffo_core_client(
-                self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg,
+                self.agent_cfg,
+                agent_id,
+                daemon_cfg=self.daemon_cfg,
             )
             self._client = client
             reporter = self._build_status_reporter(client)
@@ -1224,7 +1124,9 @@ class Worker:
                 ping_interval_s=30.0,
             )
         except Exception as e:
-            logger.error("agent %s: ws-local init failed: %s", agent_id, e, exc_info=True)
+            logger.error(
+                "agent %s: ws-local init failed: %s", agent_id, e, exc_info=True
+            )
             self.runtime.status = "error"
             self.runtime.error = str(e)
             self.runtime.save(agent_id)
@@ -1246,7 +1148,9 @@ class Worker:
             try:
                 await sync_full_profile(self.agent_cfg)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("agent %s: ws-local profile sync failed: %s", agent_id, exc)
+                logger.warning(
+                    "agent %s: ws-local profile sync failed: %s", agent_id, exc
+                )
 
         asyncio.ensure_future(_ws_local_profile_sync())
         logger.info("agent %s: ws-local idle, awaiting tool attach", agent_id)
@@ -1262,578 +1166,9 @@ class Worker:
         if (self.agent_cfg.runtime.kind or "") == RUNTIME_WS_LOCAL:
             await self._run_ws_local()
             return
-        agent_id = self.agent_cfg.id
-        effective_harness = self._runtime_info()["harness"]
-        runtime_event_outbox = None
-        runtime_session_ref = ""
-        prepared_local_runtime = None
-        try:
-            profile_path = str(self.agent_cfg.resolve_profile_path())
-            memory_path = str(self.agent_cfg.resolve_memory_dir())
-            workspace_path = str(self.agent_cfg.resolve_workspace_dir())
-            claude_path = str(self.agent_cfg.resolve_claude_dir())
-            Path(workspace_path).mkdir(parents=True, exist_ok=True)
-            _seed_claude_dir(Path(claude_path))
+        from .worker_run import StandardWorkerRun
 
-            # Managed CLAUDE.md (primer + profile + memory) written user-level for
-            # auto-discovery; project-level stays agent-editable. chat/sdk-local
-            # get the same string as system_prompt.
-            shared_path = docker_shared_dir()
-            claude_md = _rebuild_managed_system_prompt(
-                harness_name=effective_harness,
-                agent_id=agent_id,
-                shared_path=shared_path,
-                profile_path=profile_path,
-                memory_path=memory_path,
-                workspace_path=workspace_path,
-                display_name=self.agent_cfg.display_name,
-                role=self.agent_cfg.role,
-                role_short=self.agent_cfg.role_short,
-            )
-
-            # One-time migration: remove an older project-level
-            # managed CLAUDE.md, but only if it still carries our
-            # managed-content marker — never clobber user content.
-            old_managed = Path(claude_path) / "CLAUDE.md"
-            if looks_like_managed_claude_md(old_managed):
-                try:
-                    old_managed.unlink()
-                    logger.info(
-                        "agent %s: migrated stale managed CLAUDE.md out of %s",
-                        agent_id, old_managed,
-                    )
-                except OSError as exc:
-                    logger.warning(
-                        "agent %s: could not remove stale %s: %s",
-                        agent_id, old_managed, exc,
-                    )
-
-            if not self.agent_cfg.puffo_core.is_configured():
-                raise RuntimeError(
-                    f"agent {agent_id!r}: puffo_core block in agent.yml "
-                    "is incomplete. Required fields: server_url, slug, "
-                    "device_id, space_id."
-                )
-
-            if self.agent_cfg.runtime.kind == RUNTIME_CLI_LOCAL:
-                from ..agent.harness.local_runtime import (
-                    LocalRuntimePreparer,
-                    build_local_runtime_adapter,
-                )
-                from ..agent.runtime_event_outbox import (
-                    RuntimeEventOutbox,
-                    runtime_event_outbox_path,
-                )
-
-                runtime_event_outbox = RuntimeEventOutbox(
-                    runtime_event_outbox_path(agent_dir(agent_id))
-                )
-                persisted_runtime_state = runtime_event_outbox.state()
-                runtime_session_ref = persisted_runtime_state.get(
-                    "session_ref", ""
-                ) or f"session_{uuid.uuid4().hex}"
-                preparer = LocalRuntimePreparer(
-                    self.daemon_cfg,
-                    self.agent_cfg,
-                )
-                prepared_local_runtime = await preparer.prepare(
-                    system_prompt=claude_md,
-                    persisted_native_session_id=persisted_runtime_state.get(
-                        "native_session_id", ""
-                    ),
-                )
-                runtime_event_outbox.set_active_turn(
-                    persisted_runtime_state.get("active_turn_ref") or None,
-                    session_ref=runtime_session_ref,
-                    native_session_id=(
-                        prepared_local_runtime.native_session_id
-                    ),
-                )
-                self._adapter = build_local_runtime_adapter(
-                    prepared_local_runtime,
-                    outbox=runtime_event_outbox,
-                    logical_session_ref=runtime_session_ref,
-                )
-            else:
-                self._adapter = build_adapter(
-                    self.daemon_cfg,
-                    self.agent_cfg,
-                )
-
-            puffo = PuffoAgent(
-                adapter=self._adapter,
-                system_prompt=claude_md,
-                memory_dir=memory_path,
-                workspace_dir=workspace_path,
-                claude_dir=claude_path,
-                agent_id=agent_id,
-            )
-
-            client = _build_puffo_core_client(
-                self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg,
-            )
-            self._client = client
-
-            # chat-local: now that the message client exists, inject
-            # the in-process puffo_core send-tool dispatch so the
-            # model's structured send_message calls post for real
-            # (the counterpart of sdk-local's mcp_servers_override).
-            from ..agent.adapters.chat_only import ChatOnlyAdapter
-            if isinstance(self._adapter, ChatOnlyAdapter):
-                self._adapter.tool_dispatch = (
-                    _build_chat_local_tool_dispatch(client)
-                )
-        except Exception as e:
-            logger.error("agent %s: failed to initialise: %s", agent_id, e, exc_info=True)
-            self.runtime.status = "error"
-            self.runtime.error = str(e)
-            self.runtime.save(agent_id)
-            # Init crashed before warm() — release the startup gate.
-            self._warm_done.set()
-            if self._adapter is not None:
-                try:
-                    await self._adapter.aclose()
-                except Exception:
-                    logger.exception(
-                        "agent %s: failed to close adapter after init error",
-                        agent_id,
-                    )
-                self._adapter = None
-            await self._close_client()
-            if runtime_event_outbox is not None:
-                runtime_event_outbox.close()
-            return
-
-        # Per-agent refresh_ping retired; daemon-level CredentialRefresher is
-        # the single writer of ~/.claude/.credentials.json.
-
-        # Driver-backed local runtimes are ready only after their one and only
-        # provider process has opened. Other adapter types retain the older
-        # first-turn retry behavior.
-        warm_ok = False
-        try:
-            await self._adapter.warm(claude_md)
-            warm_ok = True
-        except Exception as exc:
-            if prepared_local_runtime is not None:
-                logger.error(
-                    "agent %s: local Driver failed to open: %s",
-                    agent_id,
-                    exc,
-                    exc_info=True,
-                )
-                self.runtime.status = "error"
-                self.runtime.error = str(exc)
-                self.runtime.save(agent_id)
-                self._warm_done.set()
-                try:
-                    await self._adapter.aclose()
-                except Exception:
-                    logger.exception(
-                        "agent %s: failed to close Driver after warm error",
-                        agent_id,
-                    )
-                self._adapter = None
-                await self._close_client()
-                if runtime_event_outbox is not None:
-                    runtime_event_outbox.close()
-                return
-            logger.warning(
-                "agent %s: warm() failed (will retry on first turn): %s",
-                agent_id,
-                exc,
-            )
-
-        if prepared_local_runtime is not None:
-            assert runtime_event_outbox is not None
-            persisted_runtime_state = runtime_event_outbox.state()
-            runtime_event_outbox.set_active_turn(
-                persisted_runtime_state.get("active_turn_ref") or None,
-                session_ref=runtime_session_ref,
-                native_session_id=(
-                    self._adapter.get_provider_session_id() or ""
-                ),
-            )
-            prepared_local_runtime.finalize_legacy_session_migration()
-
-        if warm_ok:
-            await self._run_post_warm_gate(agent_id)
-        else:
-            # Warm failed; release the startup gate so the daemon's
-            # wait_warm doesn't block forever. Probe would have nothing
-            # to verify anyway since the adapter never came up.
-            self._warm_done.set()
-
-        # Per-agent counterpart to daemon-startup full-sync: covers
-        # paused→running flips + restart.flag respawns. Fire-and-
-        # forget; never blocks listen().
-        async def _post_warm_sync() -> None:
-            from .profile_sync import sync_full_profile
-            try:
-                await sync_full_profile(self.agent_cfg)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "agent %s: post-warm profile sync failed: %s",
-                    agent_id, exc,
-                )
-
-        asyncio.ensure_future(_post_warm_sync())
-
-        pa_dir = Path(workspace_path) / ".puffo-agent"
-        refresh_agent_flag_path = pa_dir / "refresh_agent.flag"
-        refresh_host_sync_flag_path = pa_dir / "refresh_host_sync.flag"
-        refresh_session_flag_path = pa_dir / "refresh_session.flag"
-        # One durable global scheduler and one persistent semantic coordinator
-        # own every provider turn.
-        from ..agent.global_inbox_runtime import (
-            ActiveBoundaryAdapter,
-            BaselineAdapter,
-            GlobalInboxRuntime,
-            TrackingSendDelegate,
-            await_listener_with_runtime,
-        )
-        from ..agent.send_coordinator import SendCoordinator
-        from .ws_local.in_process_data_client import InProcessDataClient
-
-        global_runtime: GlobalInboxRuntime
-        runtime_event_uploader = None
-        if runtime_event_outbox is not None and hasattr(client, "http"):
-            from ..agent.runtime_event_outbox import RuntimeEventUploader
-
-            async def append_transport(path: str, body: bytes):
-                from ..crypto.http_client import HttpError
-
-                try:
-                    decoded = json.loads(body)
-                    if getattr(client.http, "keyless", False):
-                        response = await client.http.post_unsigned(path, decoded)
-                    else:
-                        response = await client.http.post(path, decoded)
-                    return 200, response
-                except HttpError as exc:
-                    # Never return or log the response body.
-                    return exc.status, {}
-
-            runtime_event_uploader = RuntimeEventUploader(
-                runtime_event_outbox, append_transport
-            )
-
-        async def run_global_turn(planned):
-            async def execute_provider_turn():
-                self._turn_active = True
-                try:
-                    async with self._reload_lock:
-                        await _process_refresh_flags(
-                            agent_id=agent_id,
-                            harness_name=effective_harness,
-                            shared_path=shared_path,
-                            profile_path=profile_path,
-                            memory_path=memory_path,
-                            workspace_path=workspace_path,
-                            display_name=self.agent_cfg.display_name,
-                            role=self.agent_cfg.role,
-                            role_short=self.agent_cfg.role_short,
-                            puffo=puffo,
-                            adapter=self._adapter,
-                            refresh_agent_flag=refresh_agent_flag_path,
-                            refresh_host_sync_flag=refresh_host_sync_flag_path,
-                            refresh_session_flag=refresh_session_flag_path,
-                        )
-                    self._maybe_wake_refresher_if_auth_failed(agent_id)
-                    if (
-                        self._ensure_fresh_token is not None
-                        and self.agent_cfg.runtime.kind in (
-                            RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER,
-                        )
-                        and not await self._ensure_fresh_token()
-                    ):
-                        self._enter_auth_failed(agent_id)
-                        raise AgentAPIError(
-                            "credential refresh failed before delivery",
-                            is_auth=True,
-                        )
-                    Worker._flip_health_in_progress(
-                        self.runtime, agent_id, logger
-                    )
-                    return await puffo.handle_global_inbox_turn(planned)
-                finally:
-                    self._turn_active = False
-
-            try:
-                reply = await execute_provider_turn()
-            except AgentAPIError as exc:
-                if exc.is_auth:
-                    self._enter_auth_failed(agent_id)
-                raise
-            else:
-                Worker._resolve_health_on_success(
-                    self.runtime, agent_id, logger
-                )
-            self.runtime.msg_count += 1
-            self.runtime.last_event_at = int(time.time())
-            if not reply:
-                return
-            logger.warning(
-                "agent %s: suppressed global plain output; outbound chat "
-                "requires send_message",
-                agent_id,
-            )
-
-        async def retry_global_turn(planned):
-            self._turn_active = True
-            try:
-                try:
-                    reply = await puffo.handle_global_inbox_retry(planned)
-                finally:
-                    self._turn_active = False
-            except AgentAPIError as exc:
-                if exc.is_auth:
-                    self._enter_auth_failed(agent_id)
-                raise
-            else:
-                Worker._resolve_health_on_success(self.runtime, agent_id, logger)
-            if not reply:
-                return
-            logger.warning(
-                "agent %s: suppressed global retry plain output; outbound "
-                "chat requires send_message",
-                agent_id,
-            )
-
-        run_global_turn.handle_global_inbox_retry = retry_global_turn
-
-        global_runtime = GlobalInboxRuntime(
-            store=client.store,
-            adapter=self._adapter,
-            run_turn=run_global_turn,
-            workspace=workspace_path,
-            held_catchup=client.recover_pending_delivery,
-            send_mode_keys=(agent_id, client.slug),
-            agent_id=agent_id,
-            runtime_event_outbox=runtime_event_outbox,
-        )
-        coordinator = SendCoordinator(
-            slug=client.slug,
-            keystore=client.keystore,
-            http_client=client.http,
-            data_client=InProcessDataClient(client.store, client),
-            workspace=workspace_path,
-            baseline_source=BaselineAdapter(client.store),
-            active_turn_source=ActiveBoundaryAdapter(
-                client.store, global_runtime.active
-            ),
-            held_recovery_source=global_runtime.held_recovery_source,
-        )
-        global_runtime.coordinator = coordinator
-        global_runtime.send_delegate = TrackingSendDelegate(
-            coordinator, global_runtime.attempts, global_runtime
-        )
-        client.global_runtime = global_runtime
-        client.send_coordinator = coordinator
-        client.send_delegate = global_runtime.send_delegate
-        # The reminder sync worker owns only encrypted outbox/snapshot work.
-        # It shares the existing durable store, HTTP client, and scheduler;
-        # it neither creates a provider turn nor changes GlobalInboxRuntime
-        # policy.  Connect callbacks merely signal a later bounded pull.
-        from ..agent.reminder_sync import ReminderSync
-
-        reminder_sync = None
-        reminder_sync_task = None
-        if (
-            callable(getattr(client, "add_connected_callback", None))
-            and callable(getattr(client.keystore, "load_or_create_message_backup_dek", None))
-        ):
-            reminder_sync = ReminderSync(
-                store=client.store,
-                keystore=client.keystore,
-                owner_slug=client.slug,
-                http_client=client.http,
-                scheduler=global_runtime.reminder_scheduler,
-            )
-            # Install the remote custody gate before the scheduler worker is
-            # started. ReminderSync remains fail-closed until snapshot success.
-            global_runtime.reminder_scheduler.set_delivery_authorizer(
-                reminder_sync.authorize_due_delivery,
-            )
-            global_runtime.reminder_scheduler.set_deliveries_committed_callback(
-                reminder_sync.signal_delivery_committed,
-            )
-            client.add_connected_callback(reminder_sync.on_transport_connected)
-            # Reconcile Server current-state before the local scheduler can
-            # deliver overdue work. This closes the restore race where an old
-            # local scheduled row outlives a terminal occurrence on Server.
-            try:
-                await reminder_sync.reconcile_snapshot()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.warning(
-                    "agent %s: startup reminder snapshot failed; delivery remains blocked",
-                    agent_id,
-                )
-                reminder_sync.signal_snapshot()
-        global_runtime_task = asyncio.ensure_future(global_runtime.run())
-        if reminder_sync is not None:
-            reminder_sync_task = asyncio.ensure_future(
-                reminder_sync.run(request_snapshot_on_start=False)
-            )
-
-        async def heartbeat():
-            interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)
-            while not self._stop.is_set():
-                self.runtime.save(agent_id)
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=interval)
-                except asyncio.TimeoutError:
-                    pass
-
-        async def upload_runtime_events():
-            if runtime_event_uploader is None:
-                return
-            while not self._stop.is_set():
-                result = await runtime_event_uploader.upload_once()
-                if result.state == "degraded":
-                    return
-                delay = 0.1 if result.state == "uploaded" else 1.0
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
-                except asyncio.TimeoutError:
-                    pass
-
-        # Proactive between-turns reload: bind the turn-start
-        # ``_process_refresh_flags`` primitive over this run's locals so
-        # the watcher applies the SAME reload the turn-start path does.
-        refresh_flag_paths = (
-            refresh_agent_flag_path,
-            refresh_host_sync_flag_path,
-            refresh_session_flag_path,
-        )
-
-        async def apply_refresh() -> None:
-            await _process_refresh_flags(
-                agent_id=agent_id,
-                harness_name=effective_harness,
-                shared_path=shared_path,
-                profile_path=profile_path,
-                memory_path=memory_path,
-                workspace_path=workspace_path,
-                display_name=self.agent_cfg.display_name,
-                role=self.agent_cfg.role,
-                role_short=self.agent_cfg.role_short,
-                puffo=puffo,
-                adapter=self._adapter,
-                refresh_agent_flag=refresh_agent_flag_path,
-                refresh_host_sync_flag=refresh_host_sync_flag_path,
-                refresh_session_flag=refresh_session_flag_path,
-            )
-
-        # PUF-221: per-agent credential_refresh coroutine retired —
-        # CredentialRefresher in portal/credential_refresh.py owns the
-        # refresh loop daemon-wide. Single writer = no multi-process
-        # rotation race on Anthropic's single-use refresh tokens.
-
-        # Status reporter: heartbeat task + inline begin/end_turn; no-op
-        # without an http client (tests). Lazy provider reads live runtime.health.
-        reporter = (
-            self._build_status_reporter(client)
-            if hasattr(client, "http")
-            else None
-        )
-        if reporter is None:  # pragma: no cover — defensive
-            class _NoopReporter:
-                async def begin_turn(self, _mid):
-                    return None
-                async def end_turn(self, *_a, **_kw):
-                    return None
-                async def end_turn_batch(self, *_a, **_kw):
-                    return None
-                async def report_error(self, _t):
-                    return None
-                async def run_heartbeat_loop(self):
-                    return None
-                def stop(self):
-                    return None
-            reporter = _NoopReporter()  # type: ignore[assignment]
-
-        hb_task = asyncio.ensure_future(heartbeat())
-        status_task = asyncio.ensure_future(reporter.run_heartbeat_loop())
-        watch_task = asyncio.ensure_future(
-            self._refresh_watcher_loop(refresh_flag_paths, apply_refresh)
-        )
-        runtime_upload_task = asyncio.ensure_future(upload_runtime_events())
-        try:
-            while not self._stop.is_set():
-                try:
-                    await await_listener_with_runtime(
-                        client.listen(),
-                        global_runtime_task,
-                        label=f"agent {agent_id} global inbox runtime",
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    if global_runtime_task.done():
-                        logger.error(
-                            "agent %s: stopping after global inbox runtime failure: %s",
-                            agent_id,
-                            exc,
-                            exc_info=(type(exc), exc, exc.__traceback__),
-                        )
-                        self.runtime.error = f"{type(exc).__name__}: {exc}"
-                        self.runtime.save(agent_id)
-                        try:
-                            await reporter.report_error(self.runtime.error)
-                        except Exception:
-                            pass
-                        raise
-                    logger.warning(
-                        "agent %s: listen() crashed: %s: %s — reconnecting in %.1fs",
-                        agent_id, type(exc).__name__, exc, RECONNECT_BACKOFF_SECONDS,
-                    )
-                    self.runtime.error = f"{type(exc).__name__}: {exc}"
-                    self.runtime.save(agent_id)
-                    # Surface the failure on the agent's row so the
-                    # operator sees it without tailing logs.
-                    try:
-                        await reporter.report_error(self.runtime.error or "listen crashed")
-                    except Exception:
-                        pass
-                if self._stop.is_set():
-                    break
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=RECONNECT_BACKOFF_SECONDS)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            if reminder_sync is not None and reminder_sync_task is not None:
-                reminder_sync.stop()
-                reminder_sync_task.cancel()
-                try:
-                    await reminder_sync_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            global_runtime.stop()
-            global_runtime_task.cancel()
-            try:
-                await global_runtime_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            reporter.stop()
-            hb_task.cancel()
-            status_task.cancel()
-            watch_task.cancel()
-            runtime_upload_task.cancel()
-            for task in (
-                hb_task, status_task, watch_task, runtime_upload_task,
-            ):
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):
-                    pass
-            self.runtime.status = "stopped"
-            self.runtime.save(agent_id)
-            if runtime_event_outbox is not None:
-                runtime_event_outbox.close()
+        await StandardWorkerRun(self).run()
 
 
 async def _process_refresh_flags(
@@ -1865,24 +1200,7 @@ async def _process_refresh_flags(
         return
 
     if host_sync_seen:
-        try:
-            from .state import (
-                agent_home_dir,
-                sync_host_mcp_servers,
-                sync_host_skills,
-            )
-            host_home = Path.home()
-            ah = agent_home_dir(agent_id)
-            skill_count = sync_host_skills(host_home, ah)
-            merged_mcp, _unreach = sync_host_mcp_servers(host_home, ah)
-            logger.info(
-                "agent %s: refresh_host_sync (skills=%d mcp=%d)",
-                agent_id, skill_count, merged_mcp,
-            )
-        except Exception as exc:
-            logger.warning(
-                "agent %s: refresh_host_sync failed: %s", agent_id, exc,
-            )
+        _sync_refresh_host_assets(agent_id)
 
     new_prompt: str | None = None
     prompt_changed = False
@@ -1910,11 +1228,14 @@ async def _process_refresh_flags(
             puffo.system_prompt = new_prompt
             logger.info(
                 "agent %s: system prompt rebuilt from disk (changed=%s)",
-                agent_id, prompt_changed,
+                agent_id,
+                prompt_changed,
             )
         except Exception as exc:
             logger.warning(
-                "agent %s: refresh_agent failed: %s", agent_id, exc,
+                "agent %s: refresh_agent failed: %s",
+                agent_id,
+                exc,
             )
 
     try:
@@ -1925,7 +1246,8 @@ async def _process_refresh_flags(
     except Exception as exc:
         logger.warning(
             "agent %s: adapter.reload after refresh failed: %s",
-            agent_id, exc,
+            agent_id,
+            exc,
         )
 
     for flag in (refresh_host_sync_flag, refresh_agent_flag, refresh_session_flag):
@@ -1933,6 +1255,28 @@ async def _process_refresh_flags(
             flag.unlink()
         except OSError:
             pass
+
+
+def _sync_refresh_host_assets(agent_id: str) -> None:
+    try:
+        from .state import agent_home_dir, sync_host_mcp_servers, sync_host_skills
+
+        host_home = Path.home()
+        agent_home = agent_home_dir(agent_id)
+        skill_count = sync_host_skills(host_home, agent_home)
+        merged_mcp, _unreachable = sync_host_mcp_servers(host_home, agent_home)
+        logger.info(
+            "agent %s: refresh_host_sync (skills=%d mcp=%d)",
+            agent_id,
+            skill_count,
+            merged_mcp,
+        )
+    except Exception as exc:
+        logger.warning(
+            "agent %s: refresh_host_sync failed: %s",
+            agent_id,
+            exc,
+        )
 
 
 _CLAUDE_DIR_SUBDIRS = ("agents", "commands", "skills", "hooks")

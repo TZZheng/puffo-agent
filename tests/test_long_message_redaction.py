@@ -20,7 +20,6 @@ These tests pin:
 
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 import types

@@ -50,7 +50,7 @@ class ChannelRootDict:
     (``thread_root_id`` is None); ``reply_count`` is how many
     replies currently point at its ``envelope_id``.
     """
-    message: "StoredMessageDict"
+    message: StoredMessageDict
     reply_count: int
 
 

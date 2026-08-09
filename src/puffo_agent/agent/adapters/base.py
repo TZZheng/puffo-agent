@@ -23,7 +23,6 @@ from ..context_controller import (
     normalize_context_snapshot,
 )
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -42,15 +41,14 @@ def is_silent(text: str) -> bool:
 
 
 def anthropic_base_url_env(base_url: str) -> dict[str, str]:
-    """Map an Anthropic-compatible LLM base URL to the subprocess/SDK
-    env override that routes model calls through it.
+    """Map an Anthropic-compatible LLM base URL to the subprocess env
+    override that routes model calls through it.
 
     Returns ``{"ANTHROPIC_BASE_URL": base_url}`` when ``base_url`` is a
     non-empty string, else ``{}`` — so an absent/empty base URL leaves
     the spawn env untouched (vendor endpoint, today's behavior). Shared
-    by the SDK adapter (``run_turn`` env) and the cli-local adapter
-    (``_llm_env``) so the mapping stays DRY and unit-testable without
-    importing the optional ``claude-agent-sdk``.
+    by the cli-local Driver preparer so the mapping stays unit-testable
+    without importing a vendor Python SDK.
     """
     if base_url:
         return {"ANTHROPIC_BASE_URL": base_url}
@@ -62,8 +60,9 @@ def anthropic_base_url_env(base_url: str) -> dict[str, str]:
 class TurnContext:
     """One turn of input. ``workspace_dir`` / ``claude_dir`` /
     ``memory_dir`` are absolute paths the adapter may bind-mount or
-    pass to its runtime; chat-only adapters ignore them.
+    pass to its runtime.
     """
+
     system_prompt: str
     messages: list[dict]
     workspace_dir: str = ""
@@ -82,6 +81,7 @@ class TurnResult:
     """One turn of output. ``reply == ""`` or ``"[SILENT]"`` means
     "don't post" — the shell maps both to no-op.
     """
+
     reply: str
     input_tokens: int = 0
     output_tokens: int = 0
@@ -111,12 +111,15 @@ class Adapter(ABC):
         return None
 
     async def reload(
-        self, new_system_prompt: str, *, with_session: bool = False,
+        self,
+        new_system_prompt: str,
+        *,
+        with_session: bool = False,
     ) -> None:
         """Drop cached runtime state so the next turn re-reads config
         from disk. ``with_session=True`` also unlinks the session
-        sentinel so the next spawn skips ``--resume``. SDK / chat-only
-        adapters have no cache — default no-op is correct."""
+        sentinel so the next spawn skips ``--resume``. Adapters without
+        cached runtime state keep the default no-op."""
         return None
 
     async def run_retry_turn(
@@ -127,8 +130,8 @@ class Adapter(ABC):
     ) -> TurnResult:
         """Retry the most recent turn after an ``AgentAPIError``.
 
-        Default: stateless adapters (SDK, chat-only) have no
-        resumable session, so the kick is meaningless on its own;
+        Default: adapters without a resumable session cannot use the kick
+        on its own;
         send the full ``fallback_user_message`` as a normal turn.
         cli adapters override this to send the cheap kick on
         ``--resume`` success and fall back to the full payload only
@@ -228,7 +231,8 @@ class Adapter(ABC):
         self.register_admission_callback(callback, planning_cycle_key)
 
     async def _fire_admission_callback(
-        self, event: ProviderAdmissionEvent,
+        self,
+        event: ProviderAdmissionEvent,
     ) -> None:
         # Consume before awaiting: duplicate events and callback failures cannot
         # invoke the same callback twice.

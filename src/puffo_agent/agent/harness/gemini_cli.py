@@ -6,10 +6,10 @@ Wraps Google's ``gemini`` CLI. Runtime support is currently
 
 from __future__ import annotations
 
-from .base import Harness
+from .base import DockerHarness
 
 
-class GeminiCLIHarness(Harness):
+class GeminiCLIHarness(DockerHarness):
     def name(self) -> str:
         return "gemini-cli"
 

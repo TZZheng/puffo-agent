@@ -784,28 +784,7 @@ async def test_keyless_client_ref_is_stable_per_retry_and_new_per_logical_send()
     await store.close()
 
 
-@pytest.mark.asyncio
-async def test_keyless_real_http_serializes_exact_server_dto(
-    tmp_path, monkeypatch,
-):
-    cfg, _fake_http, store = _setup_keyless()
-    await store.mark_channel_space("ch_abc", "sp_test")
-    await store.store({
-        "envelope_id": "msg_root",
-        "envelope_kind": "channel",
-        "sender_slug": "alice-0001",
-        "channel_id": "ch_abc",
-        "space_id": "sp_test",
-        "content": "root",
-        "sent_at": 1,
-    })
-    attachment = tmp_path / "evidence.txt"
-    attachment.write_text("proof", encoding="utf-8")
-    monkeypatch.setattr(
-        sc_mod.uuid, "uuid4", lambda: SimpleNamespace(hex="0" * 32),
-    )
-    captured: list[bytes] = []
-
+def _keyless_dto_handlers(captured):
     async def upload(_request):
         return web.json_response({"blob_id": "blob_1"})
 
@@ -814,7 +793,8 @@ async def test_keyless_real_http_serializes_exact_server_dto(
         body = json.loads(raw)
         allowed = {
             "client_ref", "space_id", "channel_id", "plaintext",
-            "is_visible_to_human", "freshness", "thread_root_id", "reply_to_id", "attachments",
+            "is_visible_to_human", "freshness", "thread_root_id",
+            "reply_to_id", "attachments",
         }
         if set(body) - allowed or set(body.get("freshness", {})) != {
             "context_baseline_seq", "seen_seq", "mode",
@@ -866,6 +846,11 @@ async def test_keyless_real_http_serializes_exact_server_dto(
                 "latest_seq_before_send": 0,
             },
         })
+    return upload, send
+
+
+async def _start_keyless_dto_server(captured):
+    upload, send = _keyless_dto_handlers(captured)
 
     app = web.Application()
     app.router.add_post("/v2/cloud-agents/blobs/upload", upload)
@@ -876,6 +861,62 @@ async def test_keyless_real_http_serializes_exact_server_dto(
     await site.start()
     sockets = site._server.sockets
     base = f"http://127.0.0.1:{sockets[0].getsockname()[1]}"
+    return runner, base
+
+
+def _expected_keyless_dto():
+    return {
+        "client_ref": "send_" + ("0" * 32),
+        "space_id": "sp_test", "channel_id": "ch_abc",
+        "plaintext": "caption", "is_visible_to_human": True,
+        "freshness": {
+            "context_baseline_seq": 0, "seen_seq": 0,
+            "mode": "require_current",
+        },
+        "thread_root_id": "msg_root", "reply_to_id": "msg_root",
+        "attachments": [{
+            "blob_id": "blob_1", "filename": "evidence.txt",
+            "mime_type": "text/plain", "size_bytes": 5,
+        }],
+    }
+
+
+async def _assert_keyless_dto_response(http, captured, result):
+    expected = _expected_keyless_dto()
+    assert captured == [json.dumps(expected).encode()]
+    assert result["seq"] == 1
+    assert result["replay"] is False
+    assert result["missing_devices"] == ["device_missing"]
+    assert result["mode"] == "require_current"
+    assert result["context_baseline_seq"] == 0
+    assert result["seen_seq"] == 0
+    assert result["latest_seq_before_send"] == 0
+    for bad in (
+        {**expected, "visibility_level": "human"},
+        {**expected, "freshness": {**expected["freshness"], "unknown": 1}},
+    ):
+        with pytest.raises(HttpError) as error:
+            await http.post_unsigned(KEYLESS_CHANNEL_SEND_PATH, bad)
+        assert error.value.status == 400
+
+
+@pytest.mark.asyncio
+async def test_keyless_real_http_serializes_exact_server_dto(
+    tmp_path, monkeypatch,
+):
+    cfg, _fake_http, store = _setup_keyless()
+    await store.mark_channel_space("ch_abc", "sp_test")
+    await store.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content": "root", "sent_at": 1,
+    })
+    (tmp_path / "evidence.txt").write_text("proof", encoding="utf-8")
+    monkeypatch.setattr(
+        sc_mod.uuid, "uuid4", lambda: SimpleNamespace(hex="0" * 32),
+    )
+    captured: list[bytes] = []
+    runner, base = await _start_keyless_dto_server(captured)
     http = PuffoCoreHttpClient(base, cfg.keystore, cfg.slug, keyless=True)
     coordinator = SendCoordinator(
         slug=cfg.slug,
@@ -894,43 +935,7 @@ async def test_keyless_real_http_serializes_exact_server_dto(
             root_id="msg_root",
             visibility_level="human",
         ))
-        expected = {
-            "client_ref": "send_" + ("0" * 32),
-            "space_id": "sp_test",
-            "channel_id": "ch_abc",
-            "plaintext": "caption",
-            "is_visible_to_human": True,
-            "freshness": {
-                "context_baseline_seq": 0,
-                "seen_seq": 0,
-                "mode": "require_current",
-            },
-            "thread_root_id": "msg_root",
-            "reply_to_id": "msg_root",
-            "attachments": [{
-                "blob_id": "blob_1",
-                "filename": "evidence.txt",
-                "mime_type": "text/plain",
-                "size_bytes": 5,
-            }],
-        }
-        assert captured == [json.dumps(expected).encode()]
-        assert result["seq"] == 1
-        assert result["replay"] is False
-        assert result["missing_devices"] == ["device_missing"]
-        assert result["mode"] == "require_current"
-        assert result["context_baseline_seq"] == 0
-        assert result["seen_seq"] == 0
-        assert result["latest_seq_before_send"] == 0
-        for bad in (
-            {**expected, "visibility_level": "human"},
-            {**expected, "freshness": {
-                **expected["freshness"], "unknown": 1,
-            }},
-        ):
-            with pytest.raises(HttpError) as error:
-                await http.post_unsigned(KEYLESS_CHANNEL_SEND_PATH, bad)
-            assert error.value.status == 400
+        await _assert_keyless_dto_response(http, captured, result)
     finally:
         await http.close()
         await runner.cleanup()

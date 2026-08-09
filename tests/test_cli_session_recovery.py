@@ -404,75 +404,21 @@ def test_held_continuations_match_tool_results_in_same_claude_turn(tmp_path):
     assert initial_event.provider_turn_id.startswith("claude-turn-")
 
 
-def test_history_continuation_matches_exact_claude_tool_result(tmp_path):
-    session = _make_session(tmp_path, audit=False)
-    admitted = []
+def _history_tool_result(tool_use_id, receipt, *, is_error=False):
+    return {
+        "type": "user",
+        "session_id": "sess-history",
+        "message": {"content": [{
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "is_error": is_error,
+            "content": f"history\n[puffo:model-visible-read:{receipt}]",
+        }]},
+    }
 
-    def encode(event):
-        return (json.dumps(event) + "\n").encode()
 
-    def result(tool_use_id, receipt, *, is_error=False):
-        return {
-            "type": "user",
-            "session_id": "sess-history",
-            "message": {
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "is_error": is_error,
-                    "content": (
-                        "history\n[puffo:model-visible-read:"
-                        f"{receipt}]"
-                    ),
-                }],
-            },
-        }
-
-    async def initial(event):
-        admitted.append(("initial", event))
-
-        async def continuation_a(admission):
-            admitted.append(("a", admission))
-
-        async def continuation_b(admission):
-            admitted.append(("b", admission))
-
-        async def continuation_failed(admission):
-            admitted.append(("failed", admission))
-
-        async def continuation_clamped(admission):
-            admitted.append(("clamped", admission))
-
-        session.register_continuation_callback(
-            continuation_a,
-            "visible-read-a",
-            tool_names=("get_channel_history",),
-            tool_arguments={"channel": "ch-a"},
-            correlation_receipt="receipt-a",
-        )
-        session.register_continuation_callback(
-            continuation_b,
-            "visible-read-b",
-            tool_names=("get_channel_history",),
-            tool_arguments={"channel": "ch-a"},
-            correlation_receipt="receipt-b",
-        )
-        session.register_continuation_callback(
-            continuation_failed,
-            "visible-read-failed",
-            tool_names=("get_channel_history",),
-            tool_arguments={"channel": "ch-a"},
-            correlation_receipt="receipt-failed",
-        )
-        session.register_continuation_callback(
-            continuation_clamped,
-            "visible-read-clamped",
-            tool_names=("get_channel_history",),
-            tool_arguments={"channel": "ch-a", "limit": 999},
-            correlation_receipt="receipt-clamped",
-        )
-
-    tool_uses = {
+def _history_tool_uses():
+    return {
         "type": "assistant",
         "session_id": "sess-history",
         "message": {
@@ -493,27 +439,32 @@ def test_history_continuation_matches_exact_claude_tool_result(tmp_path):
             ],
         },
     }
-    lines = [
+
+
+def _history_provider_lines():
+    encode = lambda event: (json.dumps(event) + "\n").encode()
+    wrong_tool = {
+        "type": "assistant",
+        "session_id": "sess-history",
+        "message": {"content": [{
+            "type": "tool_use",
+            "id": "wrong-tool",
+            "name": "mcp__puffo__get_post",
+            "input": {"post_ref": "ch-a"},
+        }]},
+    }
+    return [
         encode({"type": "system", "subtype": "init", "session_id": "sess-history"}),
-        encode(tool_uses),
-        encode({
-            "type": "assistant",
-            "session_id": "sess-history",
-            "message": {"content": [{
-                "type": "tool_use",
-                "id": "wrong-tool",
-                "name": "mcp__puffo__get_post",
-                "input": {"post_ref": "ch-a"},
-            }]},
-        }),
-        encode(result("wrong-tool", "receipt-b")),
+        encode(_history_tool_uses()),
+        encode(wrong_tool),
+        encode(_history_tool_result("wrong-tool", "receipt-b")),
         # A matching receipt alone must not consume the continuation: this
         # otherwise-valid history call has a different semantic target.
-        encode(result("read-b-wrong-arguments", "receipt-b")),
-        encode(result("read-b", "receipt-b")),
-        encode(result("read-failed", "receipt-failed", is_error=True)),
-        encode(result("read-clamped", "receipt-clamped")),
-        encode(result("read-a", "receipt-a")),
+        encode(_history_tool_result("read-b-wrong-arguments", "receipt-b")),
+        encode(_history_tool_result("read-b", "receipt-b")),
+        encode(_history_tool_result("read-failed", "receipt-failed", is_error=True)),
+        encode(_history_tool_result("read-clamped", "receipt-clamped")),
+        encode(_history_tool_result("read-a", "receipt-a")),
         encode({
             "type": "result",
             "subtype": "success",
@@ -522,28 +473,43 @@ def test_history_continuation_matches_exact_claude_tool_result(tmp_path):
         }),
     ]
 
-    async def drive():
-        session.register_admission_callback(initial, "initial")
-        session._proc = _FakeProc(stdout_lines=lines)
-        return await session._one_turn("hello")
 
-    asyncio.run(drive())
+def _history_admission_callback(admitted, label):
+    async def callback(event):
+        admitted.append((label, event))
+
+    return callback
+
+
+async def _register_history_continuations(session, admitted, event):
+    admitted.append(("initial", event))
+    cases = (
+        ("a", "receipt-a", {"channel": "ch-a"}),
+        ("b", "receipt-b", {"channel": "ch-a"}),
+        ("failed", "receipt-failed", {"channel": "ch-a"}),
+        ("clamped", "receipt-clamped", {"channel": "ch-a", "limit": 999}),
+    )
+    for label, receipt, arguments in cases:
+        session.register_continuation_callback(
+            _history_admission_callback(admitted, label),
+            f"visible-read-{label}",
+            tool_names=("get_channel_history",),
+            tool_arguments=arguments,
+            correlation_receipt=receipt,
+        )
+
+
+def _assert_history_continuations(session, admitted):
     assert [kind for kind, _event in admitted] == [
-        "initial",
-        "b",
-        "clamped",
-        "a",
+        "initial", "b", "clamped", "a",
     ]
-    assert {
-        event.provider_turn_id for _, event in admitted
-    } == {admitted[0][1].provider_turn_id}
+    assert {event.provider_turn_id for _, event in admitted} == {
+        admitted[0][1].provider_turn_id,
+    }
     assert [event.tool_call_id for _, event in admitted[1:]] == [
-        "read-b",
-        "read-clamped",
-        "read-a",
+        "read-b", "read-clamped", "read-a",
     ]
     assert session._continuation_admissions == []
-
     with pytest.raises(RuntimeError, match="no active Claude provider turn"):
         session.register_continuation_callback(
             lambda _event: None,
@@ -552,6 +518,22 @@ def test_history_continuation_matches_exact_claude_tool_result(tmp_path):
             tool_arguments={"channel": "ch-a"},
             correlation_receipt="receipt-late",
         )
+
+
+def test_history_continuation_matches_exact_claude_tool_result(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+    admitted = []
+
+    async def drive():
+        async def initial(event):
+            await _register_history_continuations(session, admitted, event)
+
+        session.register_admission_callback(initial, "initial")
+        session._proc = _FakeProc(stdout_lines=_history_provider_lines())
+        return await session._one_turn("hello")
+
+    asyncio.run(drive())
+    _assert_history_continuations(session, admitted)
 
 
 def test_claude_receipt_continuation_rejects_wrong_arguments_before_exact_result(

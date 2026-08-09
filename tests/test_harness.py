@@ -1,8 +1,8 @@
 """Tests for the harness abstraction layer.
 
 Covers:
-  1. ``build_harness`` resolves the runtime.harness string to a
-     concrete ``Harness`` (default + explicit values).
+  1. ``build_docker_harness`` resolves the runtime.harness string to a
+     concrete ``DockerHarness`` (default + explicit values).
   2. ``supports_claude_specific_tools()`` matches the MCP tool gating
      (claude-code -> True, hermes -> False).
   3. The MCP tool guard raises a clear error under non-claude harnesses
@@ -21,36 +21,36 @@ import pytest
 
 from puffo_agent.agent.harness import (
     ClaudeCodeHarness,
-    Harness,
+    DockerHarness,
     HermesHarness,
-    build_harness,
+    build_docker_harness,
 )
 
 
-# ── build_harness ────────────────────────────────────────────────────────────
+# ── build_docker_harness ────────────────────────────────────────────────────────────
 
 
 def test_build_harness_defaults_to_claude_code():
     """Backward-compat: agents with ``harness=""`` keep claude-code."""
-    h = build_harness("")
+    h = build_docker_harness("")
     assert isinstance(h, ClaudeCodeHarness)
     assert h.name() == "claude-code"
 
 
 def test_build_harness_explicit_claude_code():
-    h = build_harness("claude-code")
+    h = build_docker_harness("claude-code")
     assert isinstance(h, ClaudeCodeHarness)
 
 
 def test_build_harness_hermes():
-    h = build_harness("hermes")
+    h = build_docker_harness("hermes")
     assert isinstance(h, HermesHarness)
     assert h.name() == "hermes"
 
 
 def test_build_harness_unknown_raises():
     with pytest.raises(ValueError, match="unknown harness"):
-        build_harness("not-a-harness")
+        build_docker_harness("not-a-harness")
 
 
 # ── supports_claude_specific_tools ────────────────────────────────────────────
@@ -70,7 +70,7 @@ def test_base_harness_defaults_to_not_supporting():
     """New harness authors must opt IN to claude-specific tools, so a
     forgotten override can't silently enable write paths a harness
     doesn't understand."""
-    class MinimalHarness(Harness):
+    class MinimalHarness(DockerHarness):
         def name(self) -> str:
             return "minimal"
     assert MinimalHarness().supports_claude_specific_tools() is False
@@ -95,7 +95,7 @@ def test_gemini_cli_providers_google_only():
 def test_base_harness_declares_empty_provider_set():
     """Empty set forces concrete harnesses to opt in — the validation
     matrix rejects every provider, the safe fallback."""
-    class MinimalHarness(Harness):
+    class MinimalHarness(DockerHarness):
         def name(self) -> str:
             return "minimal"
     assert MinimalHarness().supported_providers() == frozenset()
@@ -103,7 +103,7 @@ def test_base_harness_declares_empty_provider_set():
 
 def test_build_harness_accepts_gemini_cli():
     from puffo_agent.agent.harness import GeminiCLIHarness
-    h = build_harness("gemini-cli")
+    h = build_docker_harness("gemini-cli")
     assert isinstance(h, GeminiCLIHarness)
     assert h.name() == "gemini-cli"
 
@@ -124,9 +124,6 @@ def _build_mcp_with_harness(harness: str, tmp_path=None):
     import os
     import tempfile
 
-    from puffo_agent.agent.message_store import MessageStore
-    from puffo_agent.crypto.http_client import PuffoCoreHttpClient
-    from puffo_agent.crypto.keystore import KeyStore
     from puffo_agent.mcp.puffo_core_server import build_server
 
     workspace = str(tmp_path) if tmp_path is not None else tempfile.mkdtemp()

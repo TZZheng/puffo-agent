@@ -21,7 +21,7 @@ The package is distributed as `puffo-agent`; the Python module is
 | Area | Main modules | Responsibility |
 | --- | --- | --- |
 | CLI and daemon | `portal/cli.py`, `portal/daemon.py`, `portal/state.py` | Start/stop/status commands, read and write on-disk config, reconcile desired agent state into running workers. |
-| Worker runtime | `portal/worker.py`, `agent/core.py`, `agent/adapters/*`, `agent/harness/*`, `agent/providers/*` | Run one agent loop, build system prompt, dispatch messages to the selected runtime, record runtime state. |
+| Worker runtime | `portal/worker.py`, `agent/core.py`, `agent/adapters/*`, `agent/harness/*` | Run one agent loop, build system prompt, dispatch messages to the selected runtime, record runtime state. |
 | Puffo protocol | `crypto/*`, `agent/message_store.py`, `agent/status_reporter.py` | Signed HTTP, WebSocket relay, HPKE/AEAD message encryption, local encrypted message history, status reporting. |
 | Local bridge | `portal/api/*` | Loopback HTTP API for local web clients to pair, manage agents, inspect files/logs, import/export, and attach WS-local tools. |
 | Remote control | `portal/control/*` | Machine linking, operator pairings, encrypted control WebSocket, remote create/edit/pause/resume/archive/refresh commands. |
@@ -38,10 +38,8 @@ The package is distributed as `puffo-agent`; the Python module is
    then repeatedly reconciles `~/.puffo-agent/agents/`.
 3. Each discovered `agent.yml` becomes a `portal.worker.Worker` unless the agent
    is paused, deleted, archived, or invalid.
-4. The worker builds an adapter from `runtime.kind`:
-   - `chat-local`: direct provider-backed chat adapter.
-   - `sdk-local`: Claude SDK adapter.
-   - `cli-local`: local CLI process with isolated per-agent home.
+4. The worker builds the execution boundary from `runtime.kind`:
+   - `cli-local`: Claude Code or Codex Driver with an isolated per-agent home.
    - `cli-docker`: Dockerized CLI process with mounted agent state.
    - `ws-local`: attached local WebSocket tool session.
 5. The worker owns the Puffo Core listen/send loop, persists `runtime.json`,

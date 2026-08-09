@@ -8,8 +8,6 @@ import os
 import sys
 import tempfile
 import time
-import asyncio
-import json
 
 import pytest
 
@@ -22,8 +20,8 @@ from puffo_agent.mcp.config import (
     PUFFO_CORE_TOOL_NAMES,
     PUFFO_CORE_TOOL_FQNS,
     puffo_core_mcp_env,
-    puffo_core_stdio_sdk_config,
 )
+from puffo_agent.mcp import config as mcp_config
 from puffo_agent.portal.state import AgentConfig, PuffoCoreConfig
 
 
@@ -163,6 +161,30 @@ def test_puffo_core_mcp_env_pins_python_user_base():
     assert env["PYTHONUSERBASE"] == site.getuserbase()
 
 
+def test_puffo_core_mcp_env_pins_daemon_package_tree(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(("relative-src", str(tmp_path / "extra-src"))),
+    )
+
+    env = puffo_core_mcp_env(
+        slug="bot-0001",
+        device_id="dev_1",
+        server_url="http://localhost:3000",
+        keystore_dir="/tmp/keys",
+        workspace="/workspace",
+        runtime_kind="cli-local",
+    )
+
+    entries = env["PYTHONPATH"].split(os.pathsep)
+    assert entries[0] == str(mcp_config._PACKAGE_IMPORT_ROOT)
+    assert entries[1:] == [
+        str((tmp_path / "relative-src").resolve()),
+        str((tmp_path / "extra-src").resolve()),
+    ]
+
+
 def test_puffo_core_mcp_env_skips_python_user_base_for_docker():
     """The container has its own Python install with baked-in deps,
     so the host's user-base path is meaningless inside it. We
@@ -177,26 +199,6 @@ def test_puffo_core_mcp_env_skips_python_user_base_for_docker():
         runtime_kind="cli-docker",
     )
     assert "PYTHONUSERBASE" not in env
-
-
-def test_puffo_core_stdio_sdk_config():
-    cfg = puffo_core_stdio_sdk_config(
-        python="/usr/bin/python3",
-        slug="bot-0001",
-        device_id="dev_1",
-        server_url="http://localhost:3000",
-        space_id="sp_test",
-        keystore_dir="/tmp/keys",
-        workspace="/workspace",
-        agent_id="bot-0001",
-    )
-    assert "puffo" in cfg
-    server = cfg["puffo"]
-    assert server["type"] == "stdio"
-    assert server["command"] == "/usr/bin/python3"
-    assert server["args"] == ["-m", "puffo_agent.mcp.puffo_core_server"]
-    assert server["env"]["PUFFO_CORE_SLUG"] == "bot-0001"
-    assert server["env"]["PUFFO_AGENT_ID"] == "bot-0001"
 
 
 # ── MCP server build test ─────────────────────────────────────────

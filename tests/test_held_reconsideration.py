@@ -15,8 +15,7 @@ from puffo_agent.agent.send_coordinator import (
 from puffo_agent.agent.shared_content import HELD_SEND_RECONSIDERATION_GUIDANCE
 
 
-@pytest.mark.asyncio
-async def test_bridge_releases_held_wait_only_after_exact_durable_pair(tmp_path):
+async def _bridge_held_runtime(tmp_path):
     from puffo_agent.agent.global_inbox_runtime import (
         ActiveBoundaryAdapter,
         GlobalInboxRuntime,
@@ -53,16 +52,16 @@ async def test_bridge_releases_held_wait_only_after_exact_durable_pair(tmp_path)
     runtime.active.message_ids[:] = ["already-admitted"]
     runtime.active.provider_session_id = "session-a"
     client.global_runtime = runtime
-
-    cfg, http, _unused_store = _setup_keyless()
-    freshness = Freshness(baseline=2)
     boundary = ActiveBoundaryAdapter(client.store, runtime.active)
+    return client, runtime, boundary, base
+
+
+async def _bridge_held_coordinator(client, runtime, boundary):
+    cfg, http, unused_store = _setup_keyless()
+    freshness = Freshness(baseline=2)
     coordinator = SendCoordinator(
-        slug=cfg.slug,
-        keystore=cfg.keystore,
-        http_client=http,
-        data_client=client.store,
-        baseline_source=freshness,
+        slug=cfg.slug, keystore=cfg.keystore, http_client=http,
+        data_client=client.store, baseline_source=freshness,
         active_turn_source=boundary,
         held_recovery_source=runtime.held_recovery_source,
         provider_session_id="session-a",
@@ -73,20 +72,13 @@ async def test_bridge_releases_held_wait_only_after_exact_durable_pair(tmp_path)
         calls.append((path, body))
         if len(calls) == 1:
             return {
-                "state": "held",
-                "seen_seq": body["freshness"]["seen_seq"],
-                "context_baseline_seq": (
-                    body["freshness"]["context_baseline_seq"]
-                ),
-                "latest_seq": 5,
-                "latest_envelope_id": "held-exact",
+                "state": "held", "seen_seq": body["freshness"]["seen_seq"],
+                "context_baseline_seq": body["freshness"]["context_baseline_seq"],
+                "latest_seq": 5, "latest_envelope_id": "held-exact",
             }
         return {
-            "state": "sent",
-            "envelope_id": "explicit-retry",
-            "seq": 7,
-            "replay": False,
-            "missing_devices": [],
+            "state": "sent", "envelope_id": "explicit-retry", "seq": 7,
+            "replay": False, "missing_devices": [],
             "freshness": {
                 **body["freshness"],
                 "latest_seq_before_send": body["freshness"]["seen_seq"],
@@ -94,20 +86,21 @@ async def test_bridge_releases_held_wait_only_after_exact_durable_pair(tmp_path)
         }
 
     http.post_unsigned = post_unsigned
+    return coordinator, calls, unused_store
+
+
+async def _drive_exact_bridge_pair(client, coordinator, calls, base):
     held_task = asyncio.create_task(coordinator.send(
         SemanticSendRequest(destination="ch_1", text="held draft")
     ))
     while not calls:
         await asyncio.sleep(0)
-    await client._dispatch_bridge_frame({
-        **base, "seq": 4, "envelope_id": "unrelated",
-    })
-    await client._dispatch_bridge_frame({
-        **base, "envelope_id": "legacy",
-    })
-    await client._dispatch_bridge_frame({
-        **base, "seq": 6, "envelope_id": "wrong-envelope",
-    })
+    for frame in (
+        {**base, "seq": 4, "envelope_id": "unrelated"},
+        {**base, "envelope_id": "legacy"},
+        {**base, "seq": 6, "envelope_id": "wrong-envelope"},
+    ):
+        await client._dispatch_bridge_frame(frame)
     await asyncio.sleep(0)
     assert not held_task.done()
     assert len(calls) == 1
@@ -122,35 +115,39 @@ async def test_bridge_releases_held_wait_only_after_exact_durable_pair(tmp_path)
     exact = await client.store.get_message_by_envelope("held-exact")
     assert exact is not None and exact.server_seq == 5
 
+
+async def _assert_bridge_reconsideration(runtime, coordinator, boundary, calls):
     staged = await coordinator.send(SemanticSendRequest(
         destination="ch_1", text="too early", send_anyway=True,
     ))
     assert staged["error_kind"] == "reconsideration_ineligible"
     assert len(calls) == 1
     read = await runtime.stage_model_visible_read(
-        space_id="sp_1",
-        channel_id="ch_1",
-        through_seq=5,
-        through_envelope_id="held-exact",
-        tool_name="get_channel_history",
+        space_id="sp_1", channel_id="ch_1", through_seq=5,
+        through_envelope_id="held-exact", tool_name="get_channel_history",
         tool_arguments={"channel": "ch_1"},
     )
     assert read["state"] == "admitted"
-    # The selective history read cannot leapfrog the locally-known pending
-    # seq=4 receipt; the safe channel prefix remains the admitted seq=2.
     assert await boundary.get_active_turn_through_seq("sp_1", "ch_1") == 2
     sent = await coordinator.send(SemanticSendRequest(
         destination="ch_1", text="explicit retry", send_anyway=True,
     ))
-    # The pending seq=4 receipt also keeps reconsideration ineligible.
     assert sent["state"] == "failed"
     assert len(calls) == 1
     assert calls[-1][1]["freshness"] == {
-        "context_baseline_seq": 2,
-        "seen_seq": 2,
-        "mode": "require_current",
+        "context_baseline_seq": 2, "seen_seq": 2, "mode": "require_current",
     }
-    await _unused_store.close()
+
+
+@pytest.mark.asyncio
+async def test_bridge_releases_held_wait_only_after_exact_durable_pair(tmp_path):
+    client, runtime, boundary, base = await _bridge_held_runtime(tmp_path)
+    coordinator, calls, unused_store = await _bridge_held_coordinator(
+        client, runtime, boundary,
+    )
+    await _drive_exact_bridge_pair(client, coordinator, calls, base)
+    await _assert_bridge_reconsideration(runtime, coordinator, boundary, calls)
+    await unused_store.close()
     await client.store.close()
 
 from .test_puffo_core_tools import _setup_keyless
@@ -291,206 +288,182 @@ async def test_held_thread_basis_overrides_only_its_presentation_target():
     ) < latest.index('message_id="other-route"')
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("transport", ["native", "keyless"])
-async def test_complete_exact_held_identity_and_one_shot_contract(transport):
-    if transport == "native":
-        coordinator, freshness, http = await coordinator_fixture(
-            baseline=2, active=2
-        )
-        boundary = bind_turn(coordinator, freshness)
-        calls = []
-        paths = []
+async def _native_held_contract():
+    coordinator, freshness, http = await coordinator_fixture(baseline=2, active=2)
+    boundary = bind_turn(coordinator, freshness)
+    calls, paths = [], []
 
-        async def post(path, body):
-            paths.append(path)
-            calls.append(body)
-            if len(calls) == 1:
-                return held_response(body)
+    async def post(path, body):
+        paths.append(path)
+        calls.append(body)
+        if len(calls) == 1:
+            return held_response(body)
+        return {
+            "state": "sent", "envelope_id": body["envelope"]["envelope_id"],
+            "seq": 6, "replay": False, "missing_devices": [],
+            "freshness": {
+                "mode": "send_anyway", "context_baseline_seq": 2,
+                "seen_seq": 5, "latest_seq_before_send": 5,
+            },
+        }
+
+    http.post = post
+    return SimpleNamespace(
+        coordinator=coordinator, freshness=freshness, boundary=boundary,
+        calls=calls, paths=paths, destination="ch_a",
+        expected_path=CHANNEL_SEND_PATH, store=None,
+    )
+
+
+async def _keyless_held_contract():
+    cfg, http, store = _setup_keyless()
+    await store.mark_channel_space("ch_abc", "sp_test")
+    freshness = Freshness(baseline=2)
+    freshness.active = SimpleNamespace(
+        turn_id="turn-a", provider_session_id="session-a"
+    )
+
+    async def active_boundary(_space_id, _channel_id):
+        return active_boundary.value
+
+    active_boundary.value = 2
+    freshness.get_active_turn_through_seq = active_boundary
+    coordinator = SendCoordinator(
+        slug=cfg.slug, keystore=cfg.keystore, http_client=http,
+        data_client=store, baseline_source=freshness,
+        active_turn_source=freshness,
+        held_recovery_source=Recovery(rows=[exact_row()]),
+        provider_session_id="session-a",
+    )
+    calls, paths = [], []
+
+    async def post_unsigned(path, body=None):
+        paths.append(path)
+        calls.append(body)
+        if len(calls) == 1:
             return {
-                "state": "sent",
-                "envelope_id": body["envelope"]["envelope_id"],
-                "seq": 6,
-                "replay": False,
-                "missing_devices": [],
-                "freshness": {
-                    "mode": "send_anyway",
-                    "context_baseline_seq": 2,
-                    "seen_seq": 5,
-                    "latest_seq_before_send": 5,
-                },
+                "state": "held", "seen_seq": body["freshness"]["seen_seq"],
+                "context_baseline_seq": body["freshness"]["context_baseline_seq"],
+                "latest_seq": 5, "latest_envelope_id": "msg_latest",
             }
+        return {
+            "state": "sent", "envelope_id": "keyless-sent", "seq": 6,
+            "replay": False, "missing_devices": [],
+            "freshness": {
+                "mode": "send_anyway", "context_baseline_seq": 2,
+                "seen_seq": 5, "latest_seq_before_send": 5,
+            },
+        }
 
-        http.post = post
-        expected_path = CHANNEL_SEND_PATH
-    else:
-        cfg, http, store = _setup_keyless()
-        await store.mark_channel_space("ch_abc", "sp_test")
-        freshness = Freshness(baseline=2)
-        freshness.active = SimpleNamespace(
-            turn_id="turn-a", provider_session_id="session-a"
-        )
+    http.post_unsigned = post_unsigned
+    return SimpleNamespace(
+        coordinator=coordinator, freshness=freshness, boundary=active_boundary,
+        calls=calls, paths=paths, destination="ch_abc",
+        expected_path=KEYLESS_CHANNEL_SEND_PATH, store=store,
+    )
 
-        async def active_boundary(_space_id, _channel_id):
-            return active_boundary.value
 
-        active_boundary.value = 2
-        freshness.get_active_turn_through_seq = active_boundary
-        boundary = active_boundary
-        coordinator = SendCoordinator(
-            slug=cfg.slug,
-            keystore=cfg.keystore,
-            http_client=http,
-            data_client=store,
-            baseline_source=freshness,
-            active_turn_source=freshness,
-            held_recovery_source=Recovery(rows=[exact_row()]),
-            provider_session_id="session-a",
-        )
-        calls = []
-        paths = []
-
-        async def post_unsigned(path, body=None):
-            paths.append(path)
-            calls.append(body)
-            if len(calls) == 1:
-                return {
-                    "state": "held",
-                    "seen_seq": body["freshness"]["seen_seq"],
-                    "context_baseline_seq": (
-                        body["freshness"]["context_baseline_seq"]
-                    ),
-                    "latest_seq": 5,
-                    "latest_envelope_id": "msg_latest",
-                }
-            return {
-                "state": "sent",
-                "envelope_id": "keyless-sent",
-                "seq": 6,
-                "replay": False,
-                "missing_devices": [],
-                "freshness": {
-                    "mode": "send_anyway",
-                    "context_baseline_seq": 2,
-                    "seen_seq": 5,
-                    "latest_seq_before_send": 5,
-                },
-            }
-
-        http.post_unsigned = post_unsigned
-        expected_path = KEYLESS_CHANNEL_SEND_PATH
-
-    destination = "ch_a" if transport == "native" else "ch_abc"
-    held = await coordinator.send(SemanticSendRequest(
-        destination=destination, text="draft"
+async def _assert_initial_held_contract(case):
+    held = await case.coordinator.send(SemanticSendRequest(
+        destination=case.destination, text="draft",
     ))
     assert held["state"] == "held"
     assert held["latest_seq"] == 5
     assert held["latest_envelope_id"] == "msg_latest"
     assert held["synchronized"] is True
-
-    staged_only = await coordinator.send(SemanticSendRequest(
-        destination=destination, text="too soon", send_anyway=True
+    staged = await case.coordinator.send(SemanticSendRequest(
+        destination=case.destination, text="too soon", send_anyway=True,
     ))
-    assert staged_only["error_kind"] == "reconsideration_ineligible"
-    assert len(calls) == 1
+    assert staged["error_kind"] == "reconsideration_ineligible"
+    assert len(case.calls) == 1
 
-    boundary.value = 5
-    freshness.active = SimpleNamespace(
-        turn_id="wrong-turn", provider_session_id="session-a"
+
+async def _assert_wrong_turn_and_pair(case):
+    case.boundary.value = 5
+    case.freshness.active = SimpleNamespace(
+        turn_id="wrong-turn", provider_session_id="session-a",
     )
-    wrong_turn = await coordinator.send(SemanticSendRequest(
-        destination=destination, text="wrong turn", send_anyway=True
+    wrong_turn = await case.coordinator.send(SemanticSendRequest(
+        destination=case.destination, text="wrong turn", send_anyway=True,
     ))
     assert wrong_turn["error_kind"] == "reconsideration_ineligible"
-    assert len(calls) == 1
-    freshness.active = SimpleNamespace(
-        turn_id="turn-a", provider_session_id="session-a"
+    assert len(case.calls) == 1
+    case.freshness.active = SimpleNamespace(
+        turn_id="turn-a", provider_session_id="session-a",
     )
-
-    assert len(coordinator._held_evidence) == 1
-    held_evidence = next(iter(coordinator._held_evidence.values()))
-    held_snapshot = (
-        held_evidence.latest_seq,
-        held_evidence.latest_envelope_id,
-        held_evidence.synchronized,
-    )
-    held_evidence.latest_envelope_id = "wrong-envelope"
-    held_evidence.synchronized = False
-    wrong_pair = await coordinator.send(SemanticSendRequest(
-        destination=destination,
-        text="wrong held pair",
-        send_anyway=True,
+    assert len(case.coordinator._held_evidence) == 1
+    evidence = next(iter(case.coordinator._held_evidence.values()))
+    snapshot = (evidence.latest_seq, evidence.latest_envelope_id, evidence.synchronized)
+    evidence.latest_envelope_id = "wrong-envelope"
+    evidence.synchronized = False
+    wrong_pair = await case.coordinator.send(SemanticSendRequest(
+        destination=case.destination, text="wrong held pair", send_anyway=True,
     ))
     assert wrong_pair["error_kind"] == "reconsideration_ineligible"
-    assert len(calls) == 1
-    (
-        held_evidence.latest_seq,
-        held_evidence.latest_envelope_id,
-        held_evidence.synchronized,
-    ) = held_snapshot
+    assert len(case.calls) == 1
+    evidence.latest_seq, evidence.latest_envelope_id, evidence.synchronized = snapshot
 
-    identity_mismatches = [
-        (
-            "wrong coordinator session",
-            lambda: setattr(
-                coordinator, "provider_session_id", "session-b"
+
+async def _assert_held_identity_mismatches(case):
+    mismatches = [
+        ("wrong coordinator session", lambda: setattr(
+            case.coordinator, "provider_session_id", "session-b",
+        )),
+        ("wrong active session", lambda: setattr(
+            case.freshness, "active", SimpleNamespace(
+                turn_id="turn-a", provider_session_id="session-b",
             ),
-        ),
-        (
-            "wrong active session",
-            lambda: setattr(
-                freshness,
-                "active",
-                SimpleNamespace(
-                    turn_id="turn-a", provider_session_id="session-b"
-                ),
+        )),
+        ("wrong turn", lambda: setattr(
+            case.freshness, "active", SimpleNamespace(
+                turn_id="wrong-turn", provider_session_id="session-a",
             ),
-        ),
-        (
-            "wrong turn",
-            lambda: setattr(
-                freshness,
-                "active",
-                SimpleNamespace(
-                    turn_id="wrong-turn",
-                    provider_session_id="session-a",
-                ),
-            ),
-        ),
+        )),
     ]
-    for label, mutate in identity_mismatches:
-        original_session = coordinator.provider_session_id
-        original_active = freshness.active
+    for label, mutate in mismatches:
+        original_session = case.coordinator.provider_session_id
+        original_active = case.freshness.active
         mutate()
-        blocked = await coordinator.send(SemanticSendRequest(
-            destination=destination,
-            text=label,
-            send_anyway=True,
+        blocked = await case.coordinator.send(SemanticSendRequest(
+            destination=case.destination, text=label, send_anyway=True,
         ))
         assert blocked["error_kind"] == "reconsideration_ineligible"
-        assert len(calls) == 1
-        coordinator.provider_session_id = original_session
-        freshness.active = original_active
+        assert len(case.calls) == 1
+        case.coordinator.provider_session_id = original_session
+        case.freshness.active = original_active
 
-    sent = await coordinator.send(SemanticSendRequest(
-        destination=destination, text="approved", send_anyway=True
+
+async def _assert_one_shot_held_send(case):
+    sent = await case.coordinator.send(SemanticSendRequest(
+        destination=case.destination, text="approved", send_anyway=True,
     ))
     assert sent["state"] == "sent"
-    assert len(calls) == 2
-    assert calls[-1]["freshness"] == {
-        "context_baseline_seq": 2,
-        "seen_seq": 5,
-        "mode": "send_anyway",
+    assert len(case.calls) == 2
+    assert case.calls[-1]["freshness"] == {
+        "context_baseline_seq": 2, "seen_seq": 5, "mode": "send_anyway",
     }
-    reused = await coordinator.send(SemanticSendRequest(
-        destination=destination, text="reuse", send_anyway=True
+    reused = await case.coordinator.send(SemanticSendRequest(
+        destination=case.destination, text="reuse", send_anyway=True,
     ))
     assert reused["error_kind"] == "reconsideration_ineligible"
-    assert len(calls) == 2
-    assert paths == [expected_path, expected_path]
-    if transport == "keyless":
-        await store.close()
+    assert len(case.calls) == 2
+    assert case.paths == [case.expected_path, case.expected_path]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["native", "keyless"])
+async def test_complete_exact_held_identity_and_one_shot_contract(transport):
+    case = (
+        await _native_held_contract()
+        if transport == "native"
+        else await _keyless_held_contract()
+    )
+    await _assert_initial_held_contract(case)
+    await _assert_wrong_turn_and_pair(case)
+    await _assert_held_identity_mismatches(case)
+    await _assert_one_shot_held_send(case)
+    if case.store is not None:
+        await case.store.close()
 
 
 @pytest.mark.asyncio

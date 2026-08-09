@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Observable local scenarios for the durable Puffo Agent message runtime.
 
 The lab uses the production SQLite MessageStore and GlobalInboxRuntime with a
@@ -328,23 +327,16 @@ def _input_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-async def run_batch_scenario(
+def _build_batch_runtime(
     *,
-    message_count: int = 51,
-    targets: str = "mixed",
-    output_dir: Path | None = None,
-) -> dict[str, Any]:
-    if message_count < 1:
-        raise ValueError("message_count must be positive")
-    run_dir = _new_run_dir(output_dir, "batch")
-    run_id = f"run_{uuid.uuid4().hex}"
-    events = EventLog(run_dir / "events.jsonl", scenario="batch", run_id=run_id)
-    workspace = run_dir / "agent-batch"
-    db_path = workspace / "messages.db"
-    store = MessageStore(db_path)
-    await store.open()
-    adapter = ScriptedAdapter("provider-batch")
-    planned_turns: list[dict[str, Any]] = []
+    store: MessageStore,
+    adapter: ScriptedAdapter,
+    workspace: Path,
+    db_path: Path,
+    events: EventLog,
+    planned_turns: list[dict[str, Any]],
+) -> GlobalInboxRuntime:
+    runtime: GlobalInboxRuntime
 
     async def run_turn(planned: Any) -> None:
         await adapter.admit_initial()
@@ -392,7 +384,15 @@ async def run_batch_scenario(
         formatter=lambda item: str(item.content),
         estimator=lambda _text: 1,
     )
-    events.emit("run.started", agent_id="agent-batch", message_count=message_count)
+    return runtime
+
+
+async def _inject_batch_messages(
+    store: MessageStore,
+    *,
+    message_count: int,
+    targets: str,
+) -> None:
     for index in range(message_count):
         kind = "channel"
         channel_id = "channel-lab"
@@ -417,12 +417,14 @@ async def run_batch_scenario(
             thread_root_id=thread_root_id,
             recipient_slug=recipient_slug,
         )
-    events.emit(
-        "messages.injected",
-        agent_id="agent-batch",
-        snapshot=snapshot_database(db_path),
-    )
 
+
+async def _drain_batch_runtime(
+    store: MessageStore,
+    runtime: GlobalInboxRuntime,
+    events: EventLog,
+    db_path: Path,
+) -> None:
     while await store.get_pending(limit=1):
         if not await runtime.process_once():
             raise RuntimeError(f"runtime stopped before draining: {runtime.health}")
@@ -431,6 +433,43 @@ async def run_batch_scenario(
             agent_id="agent-batch",
             snapshot=snapshot_database(db_path),
         )
+
+
+async def run_batch_scenario(
+    *,
+    message_count: int = 51,
+    targets: str = "mixed",
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
+    if message_count < 1:
+        raise ValueError("message_count must be positive")
+    run_dir = _new_run_dir(output_dir, "batch")
+    run_id = f"run_{uuid.uuid4().hex}"
+    events = EventLog(run_dir / "events.jsonl", scenario="batch", run_id=run_id)
+    workspace = run_dir / "agent-batch"
+    db_path = workspace / "messages.db"
+    store = MessageStore(db_path)
+    await store.open()
+    adapter = ScriptedAdapter("provider-batch")
+    planned_turns: list[dict[str, Any]] = []
+    runtime = _build_batch_runtime(
+        store=store,
+        adapter=adapter,
+        workspace=workspace,
+        db_path=db_path,
+        events=events,
+        planned_turns=planned_turns,
+    )
+    events.emit("run.started", agent_id="agent-batch", message_count=message_count)
+    await _inject_batch_messages(
+        store, message_count=message_count, targets=targets,
+    )
+    events.emit(
+        "messages.injected",
+        agent_id="agent-batch",
+        snapshot=snapshot_database(db_path),
+    )
+    await _drain_batch_runtime(store, runtime, events, db_path)
 
     final_snapshot = snapshot_database(db_path)
     expected_sizes = [
@@ -585,191 +624,182 @@ def _numeric_values(rows: Iterable[Any]) -> list[int]:
     return values
 
 
-async def run_count_scenario(
-    *,
-    agent_count: int = 5,
-    output_dir: Path | None = None,
-) -> dict[str, Any]:
-    if agent_count < 2:
-        raise ValueError("agent_count must be at least 2")
-    run_dir = _new_run_dir(output_dir, "count")
-    run_id = f"run_{uuid.uuid4().hex}"
-    events = EventLog(run_dir / "events.jsonl", scenario="count", run_id=run_id)
-    channel = AtomicChannel(events)
-    agents: list[CountingAgent] = []
+@dataclass
+class CountingTurnRunner:
+    events: EventLog
+    channel: AtomicChannel
+    agent_id: str
+    store: MessageStore
+    adapter: ScriptedAdapter
+    commands: asyncio.Queue[str]
+    results: asyncio.Queue[dict[str, Any]]
+    ready: asyncio.Event
+    holder: dict[str, CountingAgent]
 
-    for index in range(agent_count):
-        agent_id = f"agent-{index + 1}"
-        workspace = run_dir / agent_id
-        db_path = workspace / "messages.db"
-        store = MessageStore(db_path)
-        await store.open()
-        await store_receipt(
-            store,
-            envelope_id="seed-count",
-            seq=1,
-            content="Count from 1",
-            sender="operator",
+    async def __call__(self, planned: Any) -> None:
+        self.events.emit(
+            "provider.input",
+            agent_id=self.agent_id,
+            turn_id=planned.turn_id,
+            message_ids=list(planned.message_ids),
+            targets=[list(target) for target in planned.targets],
+            sha256=_input_digest(planned.provider_input),
         )
-        adapter = ScriptedAdapter(f"provider-{agent_id}")
-        # This lab adapter is genuinely in-process: the scripted provider and
-        # tool handler share one event loop. Keep its immediate boundary
-        # explicit; daemon/provider adapters use provider-completion below.
-        adapter.tool_result_admission_boundary = "tool_return"
-        commands: asyncio.Queue[str] = asyncio.Queue()
-        results: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        ready = asyncio.Event()
-        holder: dict[str, CountingAgent] = {}
-
-        async def run_turn(
-            planned: Any,
-            *,
-            current_agent_id: str = agent_id,
-            current_store: MessageStore = store,
-            current_adapter: ScriptedAdapter = adapter,
-            current_commands: asyncio.Queue[str] = commands,
-            current_results: asyncio.Queue[dict[str, Any]] = results,
-            current_ready: asyncio.Event = ready,
-            current_holder: dict[str, CountingAgent] = holder,
-        ) -> None:
-            events.emit(
-                "provider.input",
-                agent_id=current_agent_id,
-                turn_id=planned.turn_id,
-                message_ids=list(planned.message_ids),
-                targets=[list(target) for target in planned.targets],
-                sha256=_input_digest(planned.provider_input),
+        await self.adapter.admit_initial()
+        await self.holder["agent"].runtime.read_inbox(limit=50)
+        self.ready.set()
+        while True:
+            command = await self.commands.get()
+            if command != "attempt":
+                raise RuntimeError(f"unknown counting command: {command}")
+            rows = await self.store.get_in_turn_messages(
+                planned.turn_id, self.adapter.session_id
             )
-            await current_adapter.admit_initial()
-            await current_holder["agent"].runtime.read_inbox(limit=50)
-            current_ready.set()
-            while True:
-                command = await current_commands.get()
-                if command != "attempt":
-                    raise RuntimeError(f"unknown counting command: {command}")
-                rows = await current_store.get_in_turn_messages(
-                    planned.turn_id, current_adapter.session_id
-                )
-                seen_seq = max(
-                    (
-                        row.server_seq
-                        for row in rows
-                        if row.server_seq is not None
-                        and row.envelope_kind == "channel"
-                    ),
-                    default=0,
-                )
-                numbers = _numeric_values(rows)
-                next_number = max(numbers, default=0) + 1
-                result = await channel.send(
-                    agent_id=current_agent_id,
-                    seen_seq=seen_seq,
-                    text=str(next_number),
-                    envelope_id=f"{current_agent_id}-{uuid.uuid4().hex}",
-                )
-                if result["state"] == "sent":
-                    await current_results.put(result)
-                    return
+            seen_seq = max(
+                (
+                    row.server_seq
+                    for row in rows
+                    if row.server_seq is not None
+                    and row.envelope_kind == "channel"
+                ),
+                default=0,
+            )
+            next_number = max(_numeric_values(rows), default=0) + 1
+            result = await self.channel.send(
+                agent_id=self.agent_id,
+                seen_seq=seen_seq,
+                text=str(next_number),
+                envelope_id=f"{self.agent_id}-{uuid.uuid4().hex}",
+            )
+            if result["state"] == "sent":
+                await self.results.put(result)
+                return
 
-                latest = result["latest_message"]
-                if await current_store.get_message_by_envelope(
-                    latest["envelope_id"]
-                ) is None:
-                    await store_receipt(
-                        current_store,
-                        envelope_id=latest["envelope_id"],
-                        seq=latest["seq"],
-                        content=latest["text"],
-                        sender=latest["sender"],
-                    )
-                recovered = await current_holder[
-                    "agent"
-                ].runtime.held_recovery_source.query_held_messages(
-                    "space-lab",
-                    "channel-lab",
-                    latest["seq"],
-                    latest["envelope_id"],
-                    current_adapter.session_id,
+            latest = result["latest_message"]
+            if await self.store.get_message_by_envelope(
+                latest["envelope_id"]
+            ) is None:
+                await store_receipt(
+                    self.store,
+                    envelope_id=latest["envelope_id"],
+                    seq=latest["seq"],
+                    content=latest["text"],
+                    sender=latest["sender"],
                 )
-                if not recovered:
-                    raise RuntimeError("held continuation produced no context")
-                # Local held synchronization is not a content read. The
-                # in-process lab must perform the explicit content-bearing
-                # read that admits the pending row at its immediate boundary.
-                await current_holder["agent"].runtime.read_inbox(limit=50)
-                if not current_holder["agent"].runtime.held.synchronized:
-                    raise RuntimeError("held continuation did not synchronize")
-                await current_results.put(result)
+            recovered = await self.holder[
+                "agent"
+            ].runtime.held_recovery_source.query_held_messages(
+                "space-lab",
+                "channel-lab",
+                latest["seq"],
+                latest["envelope_id"],
+                self.adapter.session_id,
+            )
+            if not recovered:
+                raise RuntimeError("held continuation produced no context")
+            # Local held synchronization is not a content read. The in-process
+            # lab must perform the content-bearing read that admits the row.
+            await self.holder["agent"].runtime.read_inbox(limit=50)
+            if not self.holder["agent"].runtime.held.synchronized:
+                raise RuntimeError("held continuation did not synchronize")
+            await self.results.put(result)
 
-        runtime = GlobalInboxRuntime(
-            store=store,
-            adapter=adapter,
-            run_turn=run_turn,
-            workspace=workspace,
-            formatter=lambda item: str(item.content),
-            estimator=lambda _text: 1,
-        )
-        agent = CountingAgent(
-            agent_id=agent_id,
-            store=store,
-            adapter=adapter,
-            runtime=runtime,
-            db_path=db_path,
-            commands=commands,
-            results=results,
-            ready=ready,
-        )
-        holder["agent"] = agent
-        agents.append(agent)
 
-    events.emit("run.started", agent_count=agent_count)
+async def _create_counting_agent(
+    *,
+    index: int,
+    run_dir: Path,
+    events: EventLog,
+    channel: AtomicChannel,
+) -> CountingAgent:
+    agent_id = f"agent-{index + 1}"
+    workspace = run_dir / agent_id
+    db_path = workspace / "messages.db"
+    store = MessageStore(db_path)
+    await store.open()
+    await store_receipt(
+        store,
+        envelope_id="seed-count",
+        seq=1,
+        content="Count from 1",
+        sender="operator",
+    )
+    adapter = ScriptedAdapter(f"provider-{agent_id}")
+    # This lab adapter is genuinely in-process: the scripted provider and tool
+    # handler share one event loop. Keep its immediate boundary explicit.
+    adapter.tool_result_admission_boundary = "tool_return"
+    commands: asyncio.Queue[str] = asyncio.Queue()
+    results: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    ready = asyncio.Event()
+    holder: dict[str, CountingAgent] = {}
+    runner = CountingTurnRunner(
+        events, channel, agent_id, store, adapter, commands, results, ready, holder
+    )
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=runner,
+        workspace=workspace,
+        formatter=lambda item: str(item.content),
+        estimator=lambda _text: 1,
+    )
+    agent = CountingAgent(
+        agent_id=agent_id,
+        store=store,
+        adapter=adapter,
+        runtime=runtime,
+        db_path=db_path,
+        commands=commands,
+        results=results,
+        ready=ready,
+    )
+    holder["agent"] = agent
+    return agent
+
+
+async def _abort_counting_agents(
+    agents: Sequence[CountingAgent], label: str, cause: BaseException
+) -> None:
+    diagnostics = {}
     for agent in agents:
-        agent.task = asyncio.create_task(agent.runtime.process_once())
-
-    async def abort_agents(label: str, cause: BaseException) -> None:
-        diagnostics = {}
-        for agent in agents:
-            task = agent.task
-            if task is None:
-                diagnostics[agent.agent_id] = "not_started"
-            elif task.cancelled():
-                diagnostics[agent.agent_id] = "cancelled"
-            elif task.done():
-                diagnostics[agent.agent_id] = repr(task.exception())
-            else:
-                diagnostics[agent.agent_id] = "running"
-                task.cancel()
-        await asyncio.gather(
-            *(agent.task for agent in agents if agent.task is not None),
-            return_exceptions=True,
-        )
-        for agent in agents:
-            await agent.store.close()
-        raise RuntimeError(f"{label} failed: {diagnostics}") from cause
-
-    async def wait_step(awaitable: Any, label: str) -> Any:
-        try:
-            return await asyncio.wait_for(awaitable, timeout=5.0)
-        except Exception as exc:
-            await abort_agents(label, exc)
-
-    await wait_step(
-        asyncio.gather(*(agent.ready.wait() for agent in agents)),
-        "provider admission",
+        task = agent.task
+        if task is None:
+            diagnostics[agent.agent_id] = "not_started"
+        elif task.cancelled():
+            diagnostics[agent.agent_id] = "cancelled"
+        elif task.done():
+            diagnostics[agent.agent_id] = repr(task.exception())
+        else:
+            diagnostics[agent.agent_id] = "running"
+            task.cancel()
+    await asyncio.gather(
+        *(agent.task for agent in agents if agent.task is not None),
+        return_exceptions=True,
     )
     for agent in agents:
-        events.emit(
-            "provider.admitted",
-            agent_id=agent.agent_id,
-            snapshot=snapshot_database(agent.db_path),
-        )
+        await agent.store.close()
+    raise RuntimeError(f"{label} failed: {diagnostics}") from cause
 
+
+async def _wait_counting_step(
+    agents: Sequence[CountingAgent], awaitable: Any, label: str
+) -> Any:
+    try:
+        return await asyncio.wait_for(awaitable, timeout=5.0)
+    except Exception as exc:
+        await _abort_counting_agents(agents, label, exc)
+
+
+async def _run_counting_rounds(
+    agents: Sequence[CountingAgent], events: EventLog
+) -> list[dict[str, Any]]:
     active = list(agents)
     rounds: list[dict[str, Any]] = []
     while active:
         for agent in active:
             await agent.commands.put("attempt")
-        results = await wait_step(
+        results = await _wait_counting_step(
+            agents,
             asyncio.gather(*(agent.results.get() for agent in active)),
             "counting round",
         )
@@ -798,7 +828,9 @@ async def run_count_scenario(
             }
         )
         assert winner.task is not None
-        await wait_step(winner.task, f"{winner.agent_id} completion")
+        await _wait_counting_step(
+            agents, winner.task, f"{winner.agent_id} completion"
+        )
         events.emit(
             "turn.completed",
             agent_id=winner.agent_id,
@@ -811,6 +843,45 @@ async def run_count_scenario(
                 agent_id=agent.agent_id,
                 snapshot=snapshot_database(agent.db_path),
             )
+    return rounds
+
+
+async def run_count_scenario(
+    *,
+    agent_count: int = 5,
+    output_dir: Path | None = None,
+) -> dict[str, Any]:
+    if agent_count < 2:
+        raise ValueError("agent_count must be at least 2")
+    run_dir = _new_run_dir(output_dir, "count")
+    run_id = f"run_{uuid.uuid4().hex}"
+    events = EventLog(run_dir / "events.jsonl", scenario="count", run_id=run_id)
+    channel = AtomicChannel(events)
+    agents: list[CountingAgent] = []
+
+    for index in range(agent_count):
+        agents.append(await _create_counting_agent(
+            index=index,
+            run_dir=run_dir,
+            events=events,
+            channel=channel,
+        ))
+
+    events.emit("run.started", agent_count=agent_count)
+    for agent in agents:
+        agent.task = asyncio.create_task(agent.runtime.process_once())
+    await _wait_counting_step(
+        agents,
+        asyncio.gather(*(agent.ready.wait() for agent in agents)),
+        "provider admission",
+    )
+    for agent in agents:
+        events.emit(
+            "provider.admitted",
+            agent_id=agent.agent_id,
+            snapshot=snapshot_database(agent.db_path),
+        )
+    rounds = await _run_counting_rounds(agents, events)
 
     committed_numbers = [int(message.text) for message in channel.messages[1:]]
     final_snapshots = {

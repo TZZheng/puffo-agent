@@ -8,7 +8,7 @@ import pytest
 from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
-    HarnessDriver,
+    Driver,
     HarnessEvent,
     RuntimeOpened,
     RuntimeRef,
@@ -26,7 +26,7 @@ from puffo_agent.agent.harness.runtime_manager import (
 )
 
 
-class _ControllableDriver(HarnessDriver):
+class _ControllableDriver(Driver):
     def __init__(self) -> None:
         self.queue: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
         self.started = asyncio.Event()

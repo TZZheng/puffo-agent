@@ -143,7 +143,7 @@ class ToolResultAdmission:
         tool_names: tuple[str, ...] = (),
         tool_arguments: Mapping[str, Any] | None = None,
         correlation_receipt: str = "",
-    ) -> "ToolResultAdmission":
+    ) -> ToolResultAdmission:
         encoded_arguments = normalize_tool_arguments(tool_arguments)
         return cls(
             callback=callback,

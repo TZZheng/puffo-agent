@@ -22,9 +22,8 @@ from ..context_controller import (
     normalize_context_snapshot,
 )
 from .driver import (
-    CancelReceipt,
     CompactRequest,
-    HarnessDriver,
+    Driver,
     HarnessEvent,
     HarnessEventType,
     PermissionDecision,
@@ -47,7 +46,7 @@ class RuntimeStateError(RuntimeError):
 
 class RuntimeManager:
     def __init__(
-        self, driver: HarnessDriver, spec: RuntimeSpec, *,
+        self, driver: Driver, spec: RuntimeSpec, *,
         agent_id: str = "", session_ref: SessionRef | None = None,
         native_session_id: str = "",
         driver_name: str = "",
@@ -785,7 +784,7 @@ class RuntimeManagerAdapter(Adapter):
             native_compaction=compact != "none",
             rollover=False,
             native_measurement=context_status != "none",
-            diagnostic="Harness Driver capabilities",
+            diagnostic="Driver capabilities",
         )
 
     async def compact_context(self) -> CompactionResult:

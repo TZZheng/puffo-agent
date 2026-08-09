@@ -373,54 +373,55 @@ async def test_missing_command_object_returns_typed_closed_result():
     }
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("op", "target", "event_type", "data", "public_type", "outcome"),
-    [
-        (
-            "cancel_turn",
-            {"turn_ref": "turn-1"},
-            "turn.completed",
-            {"outcome": "cancelled"},
-            "turn.finished",
-            "cancelled",
-        ),
-        (
-            "cancel_turn",
-            {"turn_ref": "turn-1"},
-            "turn.completed",
-            {
-                "outcome": "failed",
-                "error_code": "provider_unavailable",
-                "retryable": True,
-            },
-            "turn.finished",
-            "failed",
-        ),
-        (
-            "resolve_permission",
-            {"permission_ref": "permission-1", "decision": "approved"},
-            "turn.permission_updated",
-            {"permission_ref": "permission-1", "state": "approved"},
-            "permission.updated",
-            "approved",
-        ),
-    ],
-)
-async def test_real_manager_driver_outcome_uses_canonical_outbox_upload(
-    tmp_path, op, target, event_type, data, public_type, outcome,
-):
-    runtime_commands._RESULTS.clear()
+class _OutcomeDriver(ScriptedDriver):
+    def __init__(self, event_type, data):
+        super().__init__()
+        self.queue = asyncio.Queue()
+        self.event_type = event_type
+        self.data = data
+
+    async def open(self, _spec, _resume=None):
+        return RuntimeOpened(
+            RuntimeRef("runtime-1"), SessionRef("native-session"),
+            "native-session", False, CODEX_CAPABILITIES, SimpleNamespace(),
+        )
+
+    async def events(self):
+        while True:
+            event = await self.queue.get()
+            if event is None:
+                return
+            yield event
+
+    async def close(self):
+        await self.queue.put(None)
+
+    async def _emit_outcome(self):
+        for event_type, data in (("turn.started", {}), (self.event_type, self.data)):
+            await self.queue.put(HarnessEvent.normalized(
+                type=event_type, driver="scripted",
+                session_ref=SessionRef("native-session"),
+                turn_ref=TurnRef("driver-turn-1"), data=data,
+            ))
+
+    async def cancel_turn(self, turn):
+        receipt = await super().cancel_turn(turn)
+        await self._emit_outcome()
+        return receipt
+
+    async def resolve_permission(self, permission, decision):
+        receipt = await super().resolve_permission(permission, decision)
+        await self._emit_outcome()
+        return receipt
+
+
+async def _outcome_runtime(tmp_path, event_type, data, public_type, outcome):
     outbox = RuntimeEventOutbox(tmp_path / f"{public_type}.db")
     event_ids = iter(("evt-started", f"evt-{public_type}-{outcome}"))
-    sink = RuntimeEventProjectingSink(
-        outbox,
-        RuntimeEventProjector(
-            agent_id="local-agent-id",
-            session_ref="session-1",
-            id_factory=lambda: next(event_ids),
-        ),
-    )
+    sink = RuntimeEventProjectingSink(outbox, RuntimeEventProjector(
+        agent_id="local-agent-id", session_ref="session-1",
+        id_factory=lambda: next(event_ids),
+    ))
     projected = asyncio.Event()
 
     async def projecting_sink(event):
@@ -428,58 +429,7 @@ async def test_real_manager_driver_outcome_uses_canonical_outbox_upload(
         if event.type == event_type:
             projected.set()
 
-    class OutcomeDriver(ScriptedDriver):
-        def __init__(self):
-            super().__init__()
-            self.queue = asyncio.Queue()
-
-        async def open(self, _spec, _resume=None):
-            return RuntimeOpened(
-                RuntimeRef("runtime-1"),
-                SessionRef("native-session"),
-                "native-session",
-                False,
-                CODEX_CAPABILITIES,
-                SimpleNamespace(),
-            )
-
-        async def events(self):
-            while True:
-                event = await self.queue.get()
-                if event is None:
-                    return
-                yield event
-
-        async def close(self):
-            await self.queue.put(None)
-
-        async def _emit_outcome(self):
-            await self.queue.put(HarnessEvent.normalized(
-                type="turn.started",
-                driver="scripted",
-                session_ref=SessionRef("native-session"),
-                turn_ref=TurnRef("driver-turn-1"),
-                data={},
-            ))
-            await self.queue.put(HarnessEvent.normalized(
-                type=event_type,
-                driver="scripted",
-                session_ref=SessionRef("native-session"),
-                turn_ref=TurnRef("driver-turn-1"),
-                data=data,
-            ))
-
-        async def cancel_turn(self, turn):
-            receipt = await super().cancel_turn(turn)
-            await self._emit_outcome()
-            return receipt
-
-        async def resolve_permission(self, permission, decision):
-            receipt = await super().resolve_permission(permission, decision)
-            await self._emit_outcome()
-            return receipt
-
-    driver = OutcomeDriver()
+    driver = _OutcomeDriver(event_type, data)
     manager = RuntimeManager(
         driver,  # type: ignore[arg-type]
         RuntimeSpec("/fixture"),
@@ -492,6 +442,70 @@ async def test_real_manager_driver_outcome_uses_canonical_outbox_upload(
     manager._active_driver_turn_ref = TurnRef("driver-turn-1")
     manager._turn_refs[TurnRef("driver-turn-1")] = TurnRef("turn-1")
     manager._permission_refs.add(PermissionRef("permission-1"))
+    return outbox, projected, driver, manager
+
+
+def _assert_projected_outcome(outbox, public_type, outcome):
+    rows = outbox.prefix()
+    outcomes = [row.event for row in rows if row.event["type"] == public_type]
+    assert len(outcomes) == 1
+    if public_type == "turn.finished":
+        assert outcomes[0]["payload"]["outcome"] == outcome
+        if outcome == "failed":
+            assert outcomes[0]["payload"]["error"]["code"] == "provider_unavailable"
+    else:
+        assert outcomes[0]["payload"] == {
+            "permission_ref": "permission-1",
+            "state": "approved",
+            "title": "Permission required",
+        }
+
+
+async def _upload_projected_outcome(outbox, public_type):
+    uploaded = []
+
+    async def transport(_path, body):
+        uploaded.extend(json.loads(body)["events"])
+        return 200, {"accepted": [
+            {"event_id": event["event_id"], "cursor": event["event_id"]}
+            for event in uploaded
+        ]}
+
+    result = await RuntimeEventUploader(outbox, transport).upload_once()
+    assert result.state == "uploaded"
+    assert len([event for event in uploaded if event["type"] == public_type]) == 1
+    assert outbox.prefix() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("op", "target", "event_type", "data", "public_type", "outcome"),
+    [
+        (
+            "cancel_turn", {"turn_ref": "turn-1"}, "turn.completed",
+            {"outcome": "cancelled"}, "turn.finished", "cancelled",
+        ),
+        (
+            "cancel_turn", {"turn_ref": "turn-1"}, "turn.completed",
+            {"outcome": "failed", "error_code": "provider_unavailable", "retryable": True},
+            "turn.finished", "failed",
+        ),
+        (
+            "resolve_permission",
+            {"permission_ref": "permission-1", "decision": "approved"},
+            "turn.permission_updated",
+            {"permission_ref": "permission-1", "state": "approved"},
+            "permission.updated", "approved",
+        ),
+    ],
+)
+async def test_real_manager_driver_outcome_uses_canonical_outbox_upload(
+    tmp_path, op, target, event_type, data, public_type, outcome,
+):
+    runtime_commands._RESULTS.clear()
+    outbox, projected, driver, manager = await _outcome_runtime(
+        tmp_path, event_type, data, public_type, outcome,
+    )
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client.slug = "server-agent-slug"
     client.agent_id = "local-agent-id"
@@ -509,35 +523,7 @@ async def test_real_manager_driver_outcome_uses_canonical_outbox_upload(
     ))
     assert delivered == {"ok": True, "delivered": True, "completed": False}
     await asyncio.wait_for(projected.wait(), timeout=1)
-    rows = outbox.prefix()
-    outcomes = [row.event for row in rows if row.event["type"] == public_type]
-    assert len(outcomes) == 1
-    if public_type == "turn.finished":
-        assert outcomes[0]["payload"]["outcome"] == outcome
-        if outcome == "failed":
-            assert outcomes[0]["payload"]["error"]["code"] == (
-                "provider_unavailable"
-            )
-    else:
-        assert outcomes[0]["payload"] == {
-            "permission_ref": "permission-1",
-            "state": "approved",
-            "title": "Permission required",
-        }
-    uploaded = []
-
-    async def transport(_path, body):
-        uploaded.extend(json.loads(body)["events"])
-        return 200, {
-            "accepted": [
-                {"event_id": event["event_id"], "cursor": event["event_id"]}
-                for event in uploaded
-            ]
-        }
-
-    result = await RuntimeEventUploader(outbox, transport).upload_once()
-    assert result.state == "uploaded"
-    assert len([event for event in uploaded if event["type"] == public_type]) == 1
-    assert outbox.prefix() == []
+    _assert_projected_outcome(outbox, public_type, outcome)
+    await _upload_projected_outcome(outbox, public_type)
     await manager.close()
     outbox.close()

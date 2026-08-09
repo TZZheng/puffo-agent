@@ -97,12 +97,15 @@ class _RecordingTransport:
         if self.failure is not None:
             raise self.failure
         lifecycle = "delivered" if self.claim_status == "terminal" else "scheduled"
-        return {
+        response = {
             "occurrence_id": path.split("/")[-2],
             "revision": body["revision"] + (1 if self.claim_status == "terminal" else 0),
             "lifecycle": lifecycle,
             "status": self.claim_status,
         }
+        if self.claim_status == "acquired":
+            response["lease_expires_at"] = "2030-01-01T00:00:00.123456Z"
+        return response
 
     async def get(self, path: str) -> dict[str, object]:
         self.calls.append(("get", path, None))

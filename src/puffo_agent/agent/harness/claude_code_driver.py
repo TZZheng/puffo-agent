@@ -16,7 +16,7 @@ from .driver import (
     CompactRequest,
     ContextStatusCapability,
     DriverCapabilities,
-    HarnessDriver,
+    Driver,
     HarnessEvent,
     HarnessEventType,
     PermissionDecision,
@@ -47,16 +47,20 @@ def claude_capabilities(compact_advertised: bool = False) -> DriverCapabilities:
         context_status=ContextStatusCapability.NONE,
         compact=(
             CompactCapability.SESSION_COMMAND
-            if compact_advertised else CompactCapability.NONE
+            if compact_advertised
+            else CompactCapability.NONE
         ),
         permission_bridge=False,
     )
 
 
-class ClaudeCodeCliDriver(HarnessDriver):
+class ClaudeCodeCliDriver(Driver):
     def __init__(
-        self, process_factory: Callable[..., Any] | None = None,
-        *, executable_version: str = "", replay_timeout: float = 30,
+        self,
+        process_factory: Callable[..., Any] | None = None,
+        *,
+        executable_version: str = "",
+        replay_timeout: float = 30,
     ):
         self.process_factory = process_factory
         self.executable_version = executable_version
@@ -88,10 +92,15 @@ class ClaudeCodeCliDriver(HarnessDriver):
             self._closed = False
             self._events = asyncio.Queue()
         args = [
-            spec.executable or "claude", *spec.launch_args, "-p",
-            "--input-format", "stream-json",
-            "--output-format", "stream-json",
-            "--replay-user-messages", "--verbose",
+            spec.executable or "claude",
+            *spec.launch_args,
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--replay-user-messages",
+            "--verbose",
         ]
         if spec.model:
             args.extend(["--model", spec.model])
@@ -101,10 +110,12 @@ class ClaudeCodeCliDriver(HarnessDriver):
             env = os.environ.copy()
             env.update(spec.environment)
             self._proc = await asyncio.create_subprocess_exec(
-                *args, stdin=asyncio.subprocess.PIPE,
+                *args,
+                stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=spec.workspace_dir or None, env=env,
+                cwd=spec.workspace_dir or None,
+                env=env,
                 limit=16 * 1024 * 1024,
             )
         else:
@@ -126,12 +137,16 @@ class ClaudeCodeCliDriver(HarnessDriver):
         self._compact_advertised = "/compact" in commands or "compact" in commands
         resumed = resume is not None
         await self._emit(
-            HarnessEventType.SESSION_RESUMED if resumed
+            HarnessEventType.SESSION_RESUMED
+            if resumed
             else HarnessEventType.SESSION_OPENED,
             native_payload=init,
         )
         return RuntimeOpened(
-            self._runtime_ref, self._session_ref, native, resumed,
+            self._runtime_ref,
+            self._session_ref,
+            native,
+            resumed,
             claude_capabilities(self._compact_advertised),
             ProtocolDiagnostics(
                 executable_version=self.executable_version,
@@ -176,8 +191,10 @@ class ClaudeCodeCliDriver(HarnessDriver):
             self._pending_content = ""
             self._pending_uuid = ""
         return TurnStarted(
-            local, native_turn_id=replay_uuid,
-            accepted=True, delivery="replay_acknowledged",
+            local,
+            native_turn_id=replay_uuid,
+            accepted=True,
+            delivery="replay_acknowledged",
             replay_id=observed_uuid,
         )
 
@@ -199,7 +216,8 @@ class ClaudeCodeCliDriver(HarnessDriver):
         if request.instructions:
             text += " " + request.instructions
         frame = {
-            "type": "user", "session_id": self._native_session_id,
+            "type": "user",
+            "session_id": self._native_session_id,
             "parent_tool_use_id": None,
             "message": {"role": "user", "content": text},
         }
@@ -218,6 +236,7 @@ class ClaudeCodeCliDriver(HarnessDriver):
                 if event is None:
                     return
                 yield event
+
         return iterate()
 
     async def close(self) -> None:
@@ -238,9 +257,10 @@ class ClaudeCodeCliDriver(HarnessDriver):
         await self._events.put(None)
 
     async def _write(self, frame: dict[str, Any]) -> None:
-        encoded = json.dumps(
-            frame, ensure_ascii=False, separators=(",", ":")
-        ).encode() + b"\n"
+        encoded = (
+            json.dumps(frame, ensure_ascii=False, separators=(",", ":")).encode()
+            + b"\n"
+        )
         async with self._write_lock:
             self._proc.stdin.write(encoded)
             await self._proc.stdin.drain()
@@ -278,124 +298,142 @@ class ClaudeCodeCliDriver(HarnessDriver):
         type_ = str(frame.get("type") or "")
         subtype = str(frame.get("subtype") or "")
         if type_ == "system" and subtype == "init":
-            if self._init is not None and not self._init.done():
-                self._init.set_result(frame)
+            self._complete_init(frame)
             return
         if self._is_exact_replay(frame):
-            assert self._pending_replay is not None
-            self._pending_replay.set_result(str(frame.get("uuid")))
-            await self._emit(
-                HarnessEventType.TURN_STARTED, turn_ref=self._active,
-                native_payload=frame,
-            )
+            await self._complete_replay(frame)
             return
         if type_ == "assistant":
-            if not self._active.value:
-                await self._emit(
-                    HarnessEventType.SESSION_UPDATED,
-                    data={"record_type": "assistant"},
-                    native_payload=frame,
-                )
-                return
-            content = (frame.get("message") or {}).get("content") or ()
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                if block.get("type") == "text":
-                    self._output_block_counter += 1
-                    block_id = str(
-                        block.get("id")
-                        or frame.get("uuid")
-                        or f"result_{self._output_block_counter}"
-                    )
-                    await self._emit(
-                        HarnessEventType.ASSISTANT_DELTA,
-                        turn_ref=self._active,
-                        data={
-                            "text": str(block.get("text") or ""),
-                            "block_id": block_id,
-                        }, native_payload=frame,
-                    )
-                    await self._emit(
-                        HarnessEventType.ASSISTANT_COMPLETED,
-                        turn_ref=self._active,
-                        data={"block_id": block_id},
-                        native_payload=frame,
-                    )
-                elif block.get("type") == "tool_use":
-                    tool_call_id = str(block.get("id") or "")
-                    arguments = block.get("input") or {}
-                    if not isinstance(arguments, dict):
-                        arguments = {}
-                    self._tool_calls[tool_call_id] = (
-                        str(block.get("name") or ""), arguments
-                    )
-                    await self._emit(
-                        HarnessEventType.TOOL_STARTED,
-                        turn_ref=self._active,
-                        data={
-                            "tool_call_ref": str(block.get("id") or ""),
-                            "label": str(block.get("name") or "Tool"),
-                        }, native_payload=frame,
-                    )
+            await self._handle_assistant(frame)
             return
         if type_ == "user" and self._active.value:
-            content = (frame.get("message") or {}).get("content") or ()
-            for block in content:
-                if not isinstance(block, dict) or block.get("type") != "tool_result":
-                    continue
-                tool_call_id = str(block.get("tool_use_id") or "")
-                tool_name, arguments = self._tool_calls.pop(
-                    tool_call_id, ("", {})
-                )
-                await self._emit(
-                    HarnessEventType.TOOL_COMPLETED,
-                    turn_ref=self._active,
-                    data={
-                        "tool_call_ref": tool_call_id,
-                        "label": tool_name or "Tool",
-                        "outcome": (
-                            "failed" if block.get("is_error") else "succeeded"
-                        ),
-                    },
-                    native_payload={
-                        "_puffo_internal": "tool_result",
-                        "tool_call_id": tool_call_id,
-                        "tool_name": tool_name,
-                        "arguments": arguments,
-                        "result": block.get("content"),
-                        "is_error": bool(block.get("is_error")),
-                    },
-                )
+            await self._handle_tool_results(frame)
             return
         if type_ == "result":
-            if not self._active.value:
-                await self._emit(
-                    HarnessEventType.SESSION_UPDATED,
-                    data={"record_type": "result"},
-                    native_payload=frame,
-                )
-                return
-            active = self._active
-            failed = subtype not in {"success", ""}
-            usage = frame.get("usage") or {}
-            await self._emit(
-                HarnessEventType.TURN_COMPLETED, turn_ref=active,
-                data={
-                    "outcome": "failed" if failed else "succeeded",
-                    "input_tokens": int(usage.get("input_tokens") or 0),
-                    "output_tokens": int(usage.get("output_tokens") or 0),
-                }, native_payload=frame,
-            )
-            # Reader stays alive. Records after result are session-scoped.
-            self._active = TurnRef("")
-            self._active_native_turn_id = ""
+            await self._handle_result(frame, subtype)
             return
         await self._emit(
             HarnessEventType.SESSION_UPDATED,
             data={"record_type": type_ or "unknown"},
             native_payload=frame,
         )
+
+    def _complete_init(self, frame: dict[str, Any]) -> None:
+        if self._init is not None and not self._init.done():
+            self._init.set_result(frame)
+
+    async def _complete_replay(self, frame: dict[str, Any]) -> None:
+        assert self._pending_replay is not None
+        self._pending_replay.set_result(str(frame.get("uuid")))
+        await self._emit(
+            HarnessEventType.TURN_STARTED, turn_ref=self._active, native_payload=frame
+        )
+
+    async def _handle_assistant(self, frame: dict[str, Any]) -> None:
+        if not self._active.value:
+            await self._emit(
+                HarnessEventType.SESSION_UPDATED,
+                data={"record_type": "assistant"},
+                native_payload=frame,
+            )
+            return
+        for block in (frame.get("message") or {}).get("content") or ():
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                await self._emit_assistant_text(frame, block)
+            elif block.get("type") == "tool_use":
+                await self._emit_tool_started(frame, block)
+
+    async def _emit_assistant_text(
+        self, frame: dict[str, Any], block: dict[str, Any]
+    ) -> None:
+        self._output_block_counter += 1
+        block_id = str(
+            block.get("id")
+            or frame.get("uuid")
+            or f"result_{self._output_block_counter}"
+        )
+        await self._emit(
+            HarnessEventType.ASSISTANT_DELTA,
+            turn_ref=self._active,
+            data={"text": str(block.get("text") or ""), "block_id": block_id},
+            native_payload=frame,
+        )
+        await self._emit(
+            HarnessEventType.ASSISTANT_COMPLETED,
+            turn_ref=self._active,
+            data={"block_id": block_id},
+            native_payload=frame,
+        )
+
+    async def _emit_tool_started(
+        self, frame: dict[str, Any], block: dict[str, Any]
+    ) -> None:
+        tool_call_id = str(block.get("id") or "")
+        arguments = block.get("input") or {}
+        self._tool_calls[tool_call_id] = (
+            str(block.get("name") or ""),
+            arguments if isinstance(arguments, dict) else {},
+        )
+        await self._emit(
+            HarnessEventType.TOOL_STARTED,
+            turn_ref=self._active,
+            data={
+                "tool_call_ref": tool_call_id,
+                "label": str(block.get("name") or "Tool"),
+            },
+            native_payload=frame,
+        )
+
+    async def _handle_tool_results(self, frame: dict[str, Any]) -> None:
+        for block in (frame.get("message") or {}).get("content") or ():
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                await self._emit_tool_result(frame, block)
+
+    async def _emit_tool_result(
+        self, frame: dict[str, Any], block: dict[str, Any]
+    ) -> None:
+        tool_call_id = str(block.get("tool_use_id") or "")
+        tool_name, arguments = self._tool_calls.pop(tool_call_id, ("", {}))
+        await self._emit(
+            HarnessEventType.TOOL_COMPLETED,
+            turn_ref=self._active,
+            data={
+                "tool_call_ref": tool_call_id,
+                "label": tool_name or "Tool",
+                "outcome": "failed" if block.get("is_error") else "succeeded",
+            },
+            native_payload={
+                "_puffo_internal": "tool_result",
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "arguments": arguments,
+                "result": block.get("content"),
+                "is_error": bool(block.get("is_error")),
+            },
+        )
+
+    async def _handle_result(self, frame: dict[str, Any], subtype: str) -> None:
+        if not self._active.value:
+            await self._emit(
+                HarnessEventType.SESSION_UPDATED,
+                data={"record_type": "result"},
+                native_payload=frame,
+            )
+            return
+        usage = frame.get("usage") or {}
+        await self._emit(
+            HarnessEventType.TURN_COMPLETED,
+            turn_ref=self._active,
+            data={
+                "outcome": "failed" if subtype not in {"success", ""} else "succeeded",
+                "input_tokens": int(usage.get("input_tokens") or 0),
+                "output_tokens": int(usage.get("output_tokens") or 0),
+            },
+            native_payload=frame,
+        )
+        self._active, self._active_native_turn_id = TurnRef(""), ""
 
     def _is_exact_replay(self, frame: dict[str, Any]) -> bool:
         if self._pending_replay is None or self._pending_replay.done():
@@ -408,21 +446,31 @@ class ClaudeCodeCliDriver(HarnessDriver):
             return False
         if str(frame.get("uuid") or "") != self._pending_uuid:
             return False
-        return _normalize_content(
-            (frame.get("message") or {}).get("content")
-        ) == self._pending_content
+        return (
+            _normalize_content((frame.get("message") or {}).get("content"))
+            == self._pending_content
+        )
 
     async def _emit(
-        self, type_: HarnessEventType, *, turn_ref: TurnRef | None = None,
-        data: dict[str, Any] | None = None, native_payload: Any = None,
+        self,
+        type_: HarnessEventType,
+        *,
+        turn_ref: TurnRef | None = None,
+        data: dict[str, Any] | None = None,
+        native_payload: Any = None,
     ) -> None:
-        await self._events.put(HarnessEvent.normalized(
-            type=type_, driver="claude-code",
-            session_ref=self._session_ref, turn_ref=turn_ref,
-            native_session_id=self._native_session_id,
-            native_turn_id=self._active_native_turn_id,
-            data=data or {}, native_payload=native_payload,
-        ))
+        await self._events.put(
+            HarnessEvent.normalized(
+                type=type_,
+                driver="claude-code",
+                session_ref=self._session_ref,
+                turn_ref=turn_ref,
+                native_session_id=self._native_session_id,
+                native_turn_id=self._active_native_turn_id,
+                data=data or {},
+                native_payload=native_payload,
+            )
+        )
 
 
 def _normalize_content(value: Any) -> str:

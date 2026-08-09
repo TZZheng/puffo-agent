@@ -13,7 +13,6 @@ from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 from puffo_agent.limits import DEFAULT_CATCHUP_STALE_HOURS
 from puffo_agent.portal import profile_sync
 from puffo_agent.portal.daemon import Daemon
-from puffo_agent.portal import state
 from puffo_agent.portal.state import (
     AgentConfig,
     DaemonConfig,

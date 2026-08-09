@@ -97,12 +97,8 @@ def test_info_lifecycle_chain_is_joinable_and_redacts_adversarial_values(caplog)
     assert "[REDACTED]" in serialized
 
 
-@pytest.mark.asyncio
-async def test_production_receive_read_send_finalize_trace_is_joinable_and_safe(
-    tmp_path, monkeypatch, caplog,
-):
-    caplog.set_level(logging.INFO)
-    sentinels = (
+def _production_trace_sentinels():
+    return (
         "plaintext-production-sentinel",
         "attachment-path-production-sentinel",
         "attachment-content-production-sentinel",
@@ -113,7 +109,10 @@ async def test_production_receive_read_send_finalize_trace_is_joinable_and_safe(
         "tool-argument-production-sentinel",
         "tool-result-production-sentinel",
     )
-    payload = payload_for(
+
+
+def _production_trace_payload(sentinels):
+    return payload_for(
         "trace-message",
         content={
             "text": sentinels[0],
@@ -126,56 +125,50 @@ async def test_production_receive_read_send_finalize_trace_is_joinable_and_safe(
             "reasoning": sentinels[6],
         },
     )
-    client, store, _events, _delivery = await listen_delivery(
-        monkeypatch,
-        tmp_path,
-        payload=payload,
-        seq=7,
-    )
 
-    class CorrelatingAdapter(Adapter):
-        def __init__(self):
-            super().__init__()
-            self.continuation = None
-            self.continuation_key = ""
 
-        def register_continuation_callback(
-            self, callback, planning_cycle_key, **_metadata
-        ):
-            self.continuation = callback
-            self.continuation_key = planning_cycle_key
+class _CorrelatingAdapter(Adapter):
+    def __init__(self):
+        super().__init__()
+        self.continuation = None
+        self.continuation_key = ""
 
-        async def admit_continuation(self):
-            callback, self.continuation = self.continuation, None
-            await callback(ProviderAdmissionEvent(
-                planning_cycle_key=self.continuation_key,
-                provider_session_id=self.session,
-                provider_turn_id="trace-provider-turn",
-                tool_call_id="trace-tool-call",
-                admitted_at=datetime.now(timezone.utc),
-            ))
+    def register_continuation_callback(
+        self, callback, planning_cycle_key, **_metadata
+    ):
+        self.continuation = callback
+        self.continuation_key = planning_cycle_key
 
-    class Coordinator:
-        def __init__(self):
-            self.provider_session_id = None
-            self.calls = []
+    async def admit_continuation(self):
+        callback, self.continuation = self.continuation, None
+        await callback(ProviderAdmissionEvent(
+            planning_cycle_key=self.continuation_key,
+            provider_session_id=self.session,
+            provider_turn_id="trace-provider-turn",
+            tool_call_id="trace-tool-call",
+            admitted_at=datetime.now(timezone.utc),
+        ))
 
-        async def send(self, request=None, **kwargs):
-            self.calls.append((request, kwargs))
-            return {
-                "state": "sent",
-                "envelope_id": "trace-send",
-                "seq": 8,
-                "seen_seq": 7,
-                "latest_seq_before_send": 7,
-                "note": sentinels[8],
-                "ciphertext": sentinels[3],
-                "raw_frame": sentinels[5],
-                "reasoning": sentinels[6],
-            }
 
-    adapter = CorrelatingAdapter()
-    coordinator = Coordinator()
+class _TraceCoordinator:
+    def __init__(self, sentinels):
+        self.provider_session_id = None
+        self.calls = []
+        self.sentinels = sentinels
+
+    async def send(self, request=None, **kwargs):
+        self.calls.append((request, kwargs))
+        return {
+            "state": "sent", "envelope_id": "trace-send", "seq": 8,
+            "seen_seq": 7, "latest_seq_before_send": 7,
+            "note": self.sentinels[8], "ciphertext": self.sentinels[3],
+            "raw_frame": self.sentinels[5], "reasoning": self.sentinels[6],
+        }
+
+
+async def _run_production_trace(tmp_path, store, client, sentinels):
+    adapter = _CorrelatingAdapter()
+    coordinator = _TraceCoordinator(sentinels)
 
     async def run(_planned):
         await adapter.admit(provider_turn_id="trace-provider-turn")
@@ -204,47 +197,49 @@ async def test_production_receive_read_send_finalize_trace_is_joinable_and_safe(
     )
     assert await runtime.process_once()
 
-    records = _records(caplog)
+
+def _assert_production_trace(records, sentinels):
     events = [record["event"] for record in records]
     required = [
-        "inbox.received",
-        "inbox.persisted",
-        "notice.armed",
-        "notice.due",
-        "notice.admitted",
-        "inbox.read_staged",
-        "inbox.row_in_turn",
-        "send.attempted",
-        "send.committed",
-        "inbox.row_processed",
+        "inbox.received", "inbox.persisted", "notice.armed", "notice.due",
+        "notice.admitted", "inbox.read_staged", "inbox.row_in_turn",
+        "send.attempted", "send.committed", "inbox.row_processed",
         "turn.finalized",
     ]
     positions = [events.index(event) for event in required]
     assert positions == sorted(positions)
-
     message_records = [
-        record for record in records
-        if record.get("message_id") == "trace-message"
+        record for record in records if record.get("message_id") == "trace-message"
     ]
     assert message_records
     assert all(record.get("server_seq") == 7 for record in message_records)
     turn_records = [record for record in records if record.get("turn_id")]
     assert len({record["turn_id"] for record in turn_records}) == 1
     assert {
-        record.get("provider_session_id")
-        for record in turn_records
+        record.get("provider_session_id") for record in turn_records
         if record.get("provider_session_id")
     } == {"provider-1"}
-    attempts = [
-        record for record in records if record["event"] == "send.attempted"
-    ]
-    commits = [
-        record for record in records if record["event"] == "send.committed"
-    ]
+    attempts = [record for record in records if record["event"] == "send.attempted"]
+    commits = [record for record in records if record["event"] == "send.committed"]
     assert attempts[0]["send_attempt_id"] == commits[0]["send_attempt_id"]
     serialized = json.dumps(records)
     for sentinel in sentinels:
         assert sentinel not in serialized
+
+
+@pytest.mark.asyncio
+async def test_production_receive_read_send_finalize_trace_is_joinable_and_safe(
+    tmp_path, monkeypatch, caplog,
+):
+    caplog.set_level(logging.INFO)
+    sentinels = _production_trace_sentinels()
+    client, store, _events, _delivery = await listen_delivery(
+        monkeypatch, tmp_path, payload=_production_trace_payload(sentinels), seq=7,
+    )
+    await _run_production_trace(tmp_path, store, client, sentinels)
+
+    records = _records(caplog)
+    _assert_production_trace(records, sentinels)
     await store.close()
 
 
@@ -339,18 +334,8 @@ async def test_driver_projector_outbox_upload_trace_joins_event_ids_without_nati
     outbox.close()
 
 
-@pytest.mark.asyncio
-async def test_runtime_start_pair_never_leaks_raw_boundaries_before_ack(
-    tmp_path, caplog,
-):
-    """Exercise the production sink/outbox/uploader before acknowledgement.
-
-    Every value below exists at its raw HarnessEvent boundary.  None is in a
-    public envelope, SQLite canonical row, append body, or product log.
-    """
-    caplog.set_level(logging.INFO)
-    logger = logging.getLogger("runtime-start-privacy")
-    sentinels = {
+def _runtime_privacy_sentinels():
+    return {
         "provider": "provider-identity-sentinel",
         "driver": "driver-sentinel",
         "data": "nonallowlisted-data-sentinel",
@@ -366,11 +351,10 @@ async def test_runtime_start_pair_never_leaks_raw_boundaries_before_ack(
         "remote_error": "remote-error-sentinel",
         "exception": "exception-sentinel",
     }
-    outbox = RuntimeEventOutbox(tmp_path / "events.db", logger=logger)
-    sink = RuntimeEventProjectingSink(
-        outbox, RuntimeEventProjector(agent_id="agent", session_ref="logical"),
-    )
-    raw = HarnessEvent.normalized(
+
+
+def _raw_runtime_privacy_event(sentinels):
+    return HarnessEvent.normalized(
         type="turn.started", driver=sentinels["driver"],
         session_ref=SessionRef(sentinels["native_session"]),
         turn_ref=TurnRef("turn-public"),
@@ -378,8 +362,7 @@ async def test_runtime_start_pair_never_leaks_raw_boundaries_before_ack(
         native_turn_id=sentinels["native_turn"],
         data={
             "provider": sentinels["provider"], "data": sentinels["data"],
-            "reasoning": sentinels["reasoning"],
-            "raw_frame": sentinels["raw_frame"],
+            "reasoning": sentinels["reasoning"], "raw_frame": sentinels["raw_frame"],
             "tool_argument": sentinels["tool_argument"],
             "tool_result": sentinels["tool_result"], "path": sentinels["path"],
             "credential": sentinels["credential"],
@@ -388,6 +371,21 @@ async def test_runtime_start_pair_never_leaks_raw_boundaries_before_ack(
         },
         native_payload={"payload": sentinels["native"]},
     )
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_pair_never_leaks_raw_boundaries_before_ack(
+    tmp_path, caplog,
+):
+    """Exercise the production sink/outbox/uploader before acknowledgement."""
+    caplog.set_level(logging.INFO)
+    logger = logging.getLogger("runtime-start-privacy")
+    sentinels = _runtime_privacy_sentinels()
+    outbox = RuntimeEventOutbox(tmp_path / "events.db", logger=logger)
+    sink = RuntimeEventProjectingSink(
+        outbox, RuntimeEventProjector(agent_id="agent", session_ref="logical"),
+    )
+    raw = _raw_runtime_privacy_event(sentinels)
     # Positive raw-boundary controls make this a leakage test, not merely a
     # search through values that were never injected.
     assert raw.driver == sentinels["driver"]

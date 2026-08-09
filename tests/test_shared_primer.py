@@ -68,12 +68,18 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         "<global_inbox_notice>", '"content_included":false', "read_inbox",
         "context_version=1", "target_ref", "sender_identity", "sender_type",
         "An `@slug` identity is unique", "send_message", "[SILENT]",
-        "decide-response", "Send, Wait, Clarify, and Silent",
+        "decide-response", "Send, Clarify, Wait, or Silent",
+        "For small, cheap, reversible work",
+        "choose distinct substantive parts",
+        "claim one uncovered part",
+        "only after its message is committed",
+        "A reminder is a future request to reconsider",
     ):
         assert phrase in primer
     for absent in (
         "prior_context", "visible_draft_basis", "new_channel_context",
         "context_ready", "same originating assignment", "send_anyway=True",
+        "mcp__puffo__list_reminders", "mcp__puffo__cancel_reminder",
     ):
         assert absent not in DEFAULT_SHARED_CLAUDE_MD
 
@@ -104,7 +110,7 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     )
     assert all_prompt_surfaces.count(decision_guidance) == 1
     assert "Confidence is not evidence" in decision
-    assert "Agent messages may legitimately trigger" in decision
+    assert "Agent messages may trigger useful Agent work" in decision
     assert "Silence is not the fallback" in decision
     assert "Confidence is not evidence" not in read
     assert "originating request and conversation intent" not in DEFAULT_SHARED_CLAUDE_MD
@@ -159,42 +165,36 @@ def test_decide_response_owns_response_judgment():
     decision = " ".join(DEFAULT_SKILLS["decide-response"][1].split())
     assert decision == decision_guidance
     for phrase in (
-        "Privately reconstruct the current interaction",
         "A bounded excerpt is not evidence that omitted rows do not exist",
-        "Retrieve enough target history",
         "Earlier unrelated activity is context",
-        "Separate facts in the context from assumptions",
         "Confidence is not evidence",
-        "distinct participation",
+        "distinct contributions",
         "one shared result",
-        "how many turns each participant is expected to take",
-        "one successful visible turn per addressed identity",
-        "Explicit repetition, multiple rounds, or later work may require more",
         "sender_identity",
         "self=true",
-        "An attempted, held, or failed draft is not visible participation",
-        "peer progress can make the next one due",
-        "keep participant position separate from the content or value",
-        "does not reset later positions",
-        "leaves the next contributor open",
-        "lack of a preassigned identity",
-        "does not create or reopen an obligation",
-        "Agent messages may legitimately trigger further Agent work",
-        "repeat, oscillate, or self-propagate without progress",
+        "A held or failed draft is not visible participation",
+        "keep participant position separate from the value",
+        "Agent messages may trigger useful Agent work",
+        "repeat, oscillate, or self-propagate",
+        "choose distinct substantive contributions",
+        "even when your own part seems quick",
+        "separate committed message before the work or result",
+        "A held or failed claim establishes nothing",
+        "Claims normally need no acknowledgement",
+        "mcp__puffo__list_reminders",
+        "cancel it and create one replacement",
+        "Do not accumulate equivalent active reminders",
+        "A fired reminder is an earlier intention",
         "mcp__puffo__create_reminder",
         "explicit continuing obligation",
         "no reliable later event",
-        "same target",
         "A concrete later event",
-        "do not repeat Wait solely",
-        "Choose a reasonable delay",
-        "A reminder schedules reevaluation",
-        "only human intent or a human repair choice can resolve it",
-        "equivalent clarification is already present",
-        "positively supports that no useful response is needed now",
+        "A reminder schedules reconsideration",
+        "equivalent clarification is already visible",
         "Silence is not the fallback",
     ):
         assert phrase in decision
+    assert len(DEFAULT_SKILL_DECIDE_RESPONSE.encode()) < 5_000
     assert "apply the `decide-response` skill" in read
     assert "Confidence is not evidence" not in read
     assert "mcp__puffo__create_reminder" not in read
@@ -261,7 +261,8 @@ def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
     for phrase in (
         "attempted but not sent", "reconsider the originating interaction",
         "apply the `decide-response` skill", "send_anyway=true", "is rare",
-        "wait outcome follows that skill's reminder requirement",
+        "if the draft was a claim", "it did not establish ownership",
+        "wait outcome follows that skill's reminder reconciliation requirement",
     ):
         assert phrase in held_method
     assert "Confidence is not evidence" not in held_method

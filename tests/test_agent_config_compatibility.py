@@ -59,7 +59,7 @@ def test_legacy_agent_config_load_save_preserves_existing_values(home):
     })
 
     loaded = AgentConfig.load(agent_id)
-    assert loaded.runtime.kind == "chat-local"
+    assert loaded.runtime.kind == "cli-local"
     assert loaded.runtime.task_timeout_seconds == 600.0
     loaded.save()
 
@@ -75,7 +75,7 @@ def test_legacy_agent_config_load_save_preserves_existing_values(home):
     assert saved["puffo_core"]["device_id"] == "device-old"
     assert saved["puffo_core"]["space_id"] == "space-old"
     assert saved["puffo_core"]["operator_slug"] == "owner-5678"
-    assert saved["runtime"]["kind"] == "chat-local"
+    assert saved["runtime"]["kind"] == "cli-local"
     assert saved["runtime"]["provider"] == "anthropic"
     assert saved["runtime"]["model"] == "legacy-model"
     assert saved["runtime"]["api_key"] == "fake-old-key"

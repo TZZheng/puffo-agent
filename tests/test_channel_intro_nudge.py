@@ -15,7 +15,6 @@ wrapper on top — covered by manual smoke tests.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import sys

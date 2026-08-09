@@ -565,7 +565,7 @@ class CloudBridgeClient:
         await ws.send_json(frame)
 
     def _discard_waiter(
-        self, queue: "asyncio.Queue", fut: "asyncio.Future",
+        self, queue: asyncio.Queue, fut: asyncio.Future,
     ) -> None:
         """Remove ``fut`` from a FIFO waiter queue in place (F3).
 

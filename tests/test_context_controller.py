@@ -7,9 +7,7 @@ from datetime import datetime, timezone
 import pytest
 
 from puffo_agent.agent.adapters.base import Adapter, TurnContext, TurnResult
-from puffo_agent.agent.adapters.chat_only import ChatOnlyAdapter
 from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
-from puffo_agent.agent.adapters.sdk import SDKAdapter
 from puffo_agent.agent.context_controller import (
     AdmissionCandidate,
     CompactionResult,
@@ -253,28 +251,6 @@ def test_provider_protocol_is_fakeable_without_adapter():
     assert result.outcome is DecisionOutcome.ADMIT
 
 
-def test_chat_stateless_admission_after_valid_completion():
-    order = []
-
-    class Provider:
-        def complete(self, system, messages):
-            order.append("complete")
-            return "reply", 2, 3
-
-    adapter = ChatOnlyAdapter(Provider())
-
-    async def admitted(event):
-        order.append("admitted")
-        assert event.provider_session_id is None
-
-    adapter.register_admission_callback(admitted, "chat-cycle")
-    result = asyncio.run(adapter.run_turn(TurnContext("system", [])))
-    assert result.reply == "reply"
-    assert order == ["complete", "admitted"]
-    assert adapter.get_provider_session_id() is None
-    assert "stateless" in asyncio.run(adapter.get_context_snapshot()).source
-
-
 def test_docker_wrapper_delegates_context_contract():
     class Harness:
         def name(self):
@@ -344,42 +320,3 @@ def test_one_shot_gemini_context_and_admission(
         (event.planning_cycle_key, event.provider_session_id)
         for event in admission_events
     ] == [("gemini-boundary", "gemini-observed")]
-
-
-def test_sdk_stateless_admits_on_first_yielded_provider_message():
-    class Result:
-        usage = {"input_tokens": 2, "output_tokens": 3}
-
-    class Never:
-        pass
-
-    async def query(**kwargs):
-        yield object()
-        yield Result()
-
-    adapter = SDKAdapter.__new__(SDKAdapter)
-    adapter._query = query
-    adapter._Options = lambda **kwargs: kwargs
-    adapter._AssistantMessage = Never
-    adapter._TextBlock = Never
-    adapter._ToolUseBlock = Never
-    adapter._ResultMessage = Result
-    adapter.api_key = ""
-    adapter.model = ""
-    adapter.patterns = []
-    adapter.permission_mode = None
-    adapter.workspace_dir = ""
-    adapter.max_turns = 1
-    adapter.mcp_servers_override = None
-    order = []
-
-    async def admitted(event):
-        order.append("admitted")
-        assert event.provider_session_id is None
-
-    adapter.register_admission_callback(admitted, "sdk-cycle")
-    result = asyncio.run(adapter.run_turn(TurnContext("system", [])))
-    assert order == ["admitted"]
-    assert (result.input_tokens, result.output_tokens) == (2, 3)
-    assert adapter.get_provider_session_id() is None
-    assert "stateless" in asyncio.run(adapter.get_context_snapshot()).source

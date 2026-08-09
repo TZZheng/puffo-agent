@@ -6,19 +6,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from pathlib import Path
 
-import pytest
 
 from puffo_agent.portal import credential_refresh
 from puffo_agent.portal.credential_refresh import (
-    RATE_LIMIT_FAST_RETRY_MAX_SECONDS,
-    RATE_LIMIT_FAST_RETRY_MIN_SECONDS,
     REFRESH_BROKEN_THRESHOLD,
     REFRESH_PROBE_MODEL,
-    REFRESH_SAFETY_MARGIN_SECONDS,
     CredentialRefresher,
     FileBackend,
     RefreshOutcome,

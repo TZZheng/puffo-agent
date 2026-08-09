@@ -251,7 +251,7 @@ class HarnessEvent:
         return self._native.payload if self._native is not None else None
 
 
-class HarnessDriver(ABC):
+class Driver(ABC):
     """The exact common command/event surface implemented by Drivers."""
 
     @abstractmethod
@@ -294,7 +294,3 @@ class HarnessDriver(ABC):
 
     @abstractmethod
     async def close(self) -> None: ...
-
-
-# Short alias used by integrations and tests.
-Driver = HarnessDriver
