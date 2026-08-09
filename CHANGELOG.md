@@ -48,6 +48,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Codex Docker agents can write to their mounted workspace reliably.** The
+  container is now the effective filesystem sandbox, avoiding unsupported
+  nested sandboxing, and resumed local and Docker sessions reapply their
+  working directory and permission policy instead of falling back to
+  read-only access.
+
 - **Claude context telemetry no longer invents limits for unknown models.**
   A transient context query timeout remains retryable on later turns, while
   configured compact thresholds remain authoritative because Claude's context

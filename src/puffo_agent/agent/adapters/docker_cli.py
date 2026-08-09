@@ -68,6 +68,7 @@ def _puffo_agent_pkg_dir() -> Path:
 # image-tag pruning. ``_ensure_image`` only builds when the tag is
 # missing locally.
 DEFAULT_IMAGE = "puffo/agent-runtime:v16"
+CONTAINER_CODEX_SANDBOX = "danger-full-access"
 CONTAINER_LAYOUT_VERSION = "16"
 
 # Pinned Claude Code CLI version baked into the image. Floating would
@@ -146,7 +147,6 @@ class DockerCLIAdapter(Adapter):
         shared_fs_dir: str,
         owner_username: str = "",
         permission_mode: str = "bypassPermissions",
-        sandbox: str = "danger-full-access",
         inference_level: str = "",
         auto_compact_threshold_pct: float | None = None,
         task_timeout_seconds: float = 1800.0,
@@ -177,7 +177,9 @@ class DockerCLIAdapter(Adapter):
         self.shared_fs_dir = Path(shared_fs_dir)
         self.owner_username = owner_username
         self.permission_mode = permission_mode
-        self.sandbox = sandbox
+        # Docker is the filesystem boundary. A second bubblewrap sandbox
+        # cannot create user namespaces under Docker's default seccomp policy.
+        self.sandbox = CONTAINER_CODEX_SANDBOX
         self.inference_level = inference_level
         self.auto_compact_threshold_pct = auto_compact_threshold_pct
         self.task_timeout_seconds = task_timeout_seconds

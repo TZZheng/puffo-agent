@@ -155,7 +155,6 @@ def test_codex_session_runs_app_server_inside_container(tmp_path):
         tmp_path,
         harness=CodexHarness(),
         permission_mode="bypassPermissions",
-        sandbox="workspace-write",
         task_timeout_seconds=321,
     )
     session = adapter._ensure_codex_session()
@@ -166,9 +165,26 @@ def test_codex_session_runs_app_server_inside_container(tmp_path):
     ]
     assert session.cwd is None
     assert session.thread_cwd == "/workspace"
-    assert session.sandbox == "workspace-write"
+    assert session.sandbox == "danger-full-access"
     assert session.task_timeout_seconds == 321
     assert session.model == "gpt-5.4"
+
+
+def test_codex_session_replaces_persisted_nested_sandbox(tmp_path):
+    adapter = _adapter(tmp_path, harness=CodexHarness())
+    adapter.codex_home.mkdir(parents=True)
+    (adapter.codex_home / "codex_session.json").write_text(
+        json.dumps({
+            "conversation_id": "nested-sandbox-thread",
+            "sandbox": "workspace-write",
+        }),
+        encoding="utf-8",
+    )
+
+    session = adapter._ensure_codex_session()
+
+    assert session.sandbox == "danger-full-access"
+    assert session._conversation_id == ""
 
 
 def test_resolved_docker_path_is_used_for_harness_commands(tmp_path):
@@ -279,5 +295,5 @@ def test_worker_uses_openai_defaults_and_forwards_desired_content(monkeypatch, t
     assert captured["model"] == "gpt-default"
     assert captured["desired_skills"] == ["review"]
     assert captured["desired_mcps"] == ["github"]
-    assert captured["sandbox"] == "workspace-write"
+    assert "sandbox" not in captured
     assert captured["task_timeout_seconds"] == 456
