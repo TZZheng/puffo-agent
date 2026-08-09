@@ -987,7 +987,12 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
         print(f"  allowed_tools:    {cfg.runtime.allowed_tools or '[]'}")
         print(f"  docker_image:     {cfg.runtime.docker_image or '(bundled default)'}")
         print(f"  permission_mode:  {cfg.runtime.permission_mode}  (cli-local only)")
-        print(f"  sandbox:          {cfg.runtime.sandbox}  (codex only)")
+        sandbox = (
+            "Docker container"
+            if cfg.runtime.kind == "cli-docker" and cfg.runtime.harness == "codex"
+            else cfg.runtime.sandbox
+        )
+        print(f"  sandbox:          {sandbox}  (codex only)")
         print(f"  max_turns:        {cfg.runtime.max_turns}  (sdk-local only)")
         return 0
 
@@ -1646,7 +1651,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--sandbox",
         choices=["read-only", "workspace-write", "danger-full-access"],
         help=(
-            "codex: file-system policy. Note "
+            "cli-local codex: file-system policy. cli-docker always uses "
+            "its container as the sandbox. Note "
             "``workspace-write`` is silently downgraded to read-only "
             "on Windows; use ``danger-full-access`` there."
         ),

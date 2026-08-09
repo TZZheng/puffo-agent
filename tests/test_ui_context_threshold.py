@@ -8,6 +8,7 @@ import pytest
 from PySide6.QtWidgets import QApplication
 
 from _portal_support import write_test_agent
+from puffo_agent.portal import cli
 from puffo_agent.portal.state import AgentConfig, RuntimeState
 from puffo_agent.portal.ui.widgets import agent_detail
 
@@ -89,6 +90,42 @@ def test_threshold_control_applies_to_cli_docker_claude(qapp, agent_home):
     qapp.processEvents()
 
     assert view._autocompact.isEnabled()
+
+
+def test_cli_docker_codex_reports_container_as_sandbox(qapp, agent_home):
+    cfg = AgentConfig.load("threshold-ui")
+    cfg.runtime.kind = "cli-docker"
+    cfg.runtime.provider = "openai"
+    cfg.runtime.harness = "codex"
+    cfg.runtime.sandbox = "workspace-write"
+    cfg.save()
+
+    view = agent_detail.AgentDetail()
+    view.bind("threshold-ui")
+
+    assert view._access.text() == "sandbox: Docker container · approve: never"
+
+
+@pytest.mark.parametrize(
+    ("runtime_kind", "expected"),
+    [
+        ("cli-docker", "Docker container"),
+        ("cli-local", "workspace-write"),
+    ],
+)
+def test_runtime_cli_reports_effective_codex_sandbox(
+    agent_home, capsys, runtime_kind, expected,
+):
+    cfg = AgentConfig.load("threshold-ui")
+    cfg.runtime.kind = runtime_kind
+    cfg.runtime.provider = "openai"
+    cfg.runtime.harness = "codex"
+    cfg.runtime.sandbox = "workspace-write"
+    cfg.save()
+
+    assert cli.main(["agent", "runtime", "threshold-ui"]) == 0
+
+    assert f"sandbox:          {expected}" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

@@ -844,6 +844,8 @@ class AgentDetail(QWidget):
                 "never" if cfg.runtime.permission_mode == "bypassPermissions"
                 else "untrusted"
             )
+            if cfg.runtime.kind == "cli-docker":
+                return f"sandbox: Docker container · approve: {policy}"
             return f"sandbox: {cfg.runtime.sandbox} · approve: {policy}"
         return f"permission: {cfg.runtime.permission_mode}"
 

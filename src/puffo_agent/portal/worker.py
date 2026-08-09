@@ -162,7 +162,6 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             agent_home_dir=str(agent_home_dir(agent_cfg.id)),
             shared_fs_dir=str(shared_fs_dir()),
             permission_mode=agent_cfg.runtime.permission_mode,
-            sandbox=agent_cfg.runtime.sandbox,
             inference_level=agent_cfg.runtime.inference_level,
             auto_compact_threshold_pct=configured_compact_pct(
                 harness.name(), agent_cfg.env_overrides,

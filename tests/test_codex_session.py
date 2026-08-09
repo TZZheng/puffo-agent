@@ -519,6 +519,9 @@ absorb_initialize()
 msg = r()
 assert msg["method"] == "thread/resume", f"expected thread/resume, got {msg['method']}"
 assert msg["params"]["threadId"] == "conv_42"
+assert msg["params"]["cwd"] == EXPECTED_CWD
+assert msg["params"]["approvalPolicy"] == "never"
+assert msg["params"]["sandbox"] == "danger-full-access"
 assert msg["params"]["config"] == {"model_auto_compact_token_limit": 193800}
 w({"jsonrpc": "2.0", "id": msg["id"],
    "result": {"thread": {"id": "conv_42"}}})
@@ -539,7 +542,10 @@ while True:
 
 
 def test_resume_existing_conversation(tmp_path):
-    fake = _write_fake(tmp_path, RESUME_SCRIPT)
+    fake = _write_fake(
+        tmp_path,
+        f'EXPECTED_CWD = {str(tmp_path)!r}\n' + RESUME_SCRIPT,
+    )
     session_file = tmp_path / "codex_session.json"
     session_file.write_text(json.dumps({
         "conversation_id": "conv_42",

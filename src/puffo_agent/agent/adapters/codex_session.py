@@ -264,8 +264,9 @@ class CodexSession:
         self._conversation_id: str = self._load_conversation_id()
         self._model_context_window: int | None = self._load_model_context_window()
         self._compact_config_pending = False
-        # thread/start params aren't re-sent on resume; a sandbox change would
-        # silently keep the old policy. Drop the thread, next start re-applies.
+        # A sandbox change must start a fresh thread. Although resume re-applies
+        # our current policy, retaining a thread created under a different
+        # policy would make the persisted session state misleading.
         if self._conversation_id:
             persisted_sandbox = self._load_persisted_sandbox()
             persisted_model = self._load_persisted_model()
@@ -793,11 +794,21 @@ class CodexSession:
                 self.agent_id, exc,
             )
 
-        # 2. Start or resume the conversation/thread.
+        # 2. Start or resume the conversation/thread. App Server processes can
+        # be short-lived, so resume must re-apply these settings; otherwise a
+        # newly spawned server falls back to read-only / on-request defaults.
+        thread_settings: dict[str, Any] = {
+            "cwd": self._effective_thread_cwd or os.getcwd(),
+            "approvalPolicy": (
+                "never" if self.permission_mode == "bypassPermissions" else "untrusted"
+            ),
+            "sandbox": self.sandbox,
+        }
         if self._conversation_id:
             try:
                 resume_params: dict[str, Any] = {
                     "threadId": self._conversation_id,
+                    **thread_settings,
                 }
                 config = self._thread_config()
                 if config:
@@ -832,13 +843,7 @@ class CodexSession:
         # ``approvalPolicy: "never"`` = auto-approve everything (confusing name;
         # verified live). Sandbox default stays open: cli-local runs as the
         # operator's UID, the real boundary is cli-docker's container.
-        new_conv_params: dict[str, Any] = {
-            "cwd": self._effective_thread_cwd or os.getcwd(),
-            "approvalPolicy": (
-                "never" if self.permission_mode == "bypassPermissions" else "untrusted"
-            ),
-            "sandbox": self.sandbox,
-        }
+        new_conv_params = thread_settings
         if self.model:
             new_conv_params["model"] = self.model
         config = self._thread_config()
