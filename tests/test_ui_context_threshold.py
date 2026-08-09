@@ -194,6 +194,9 @@ def test_threshold_selection_participates_in_dirty_state(qapp, agent_home):
 
 
 def test_threshold_selection_updates_the_preview_immediately(qapp, agent_home):
+    cfg = AgentConfig.load("threshold-ui")
+    cfg.runtime.model = "claude-haiku-4-5"
+    cfg.save()
     RuntimeState(
         max_context=200_000,
         auto_compact_threshold_pct=50,
@@ -205,7 +208,7 @@ def test_threshold_selection_updates_the_preview_immediately(qapp, agent_home):
     qapp.processEvents()
 
     assert "200K window" in view._context_usage.text()
-    assert "~60K (30%)" in view._context_usage.text()
+    assert "~100K (50%)" in view._context_usage.text()
 
 
 def test_switching_from_override_to_default_does_not_reuse_stale_pct(

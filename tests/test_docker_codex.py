@@ -30,7 +30,10 @@ def _adapter(tmp_path: Path, *, harness=None, **overrides) -> DockerCLIAdapter:
 
 
 def test_bundled_image_contains_only_supported_harnesses():
-    assert "@anthropic-ai/claude-code@" in DOCKERFILE
+    assert (
+        f"@anthropic-ai/claude-code@{docker_cli.CLAUDE_CODE_NPM_VERSION}"
+        in DOCKERFILE
+    )
     assert "@openai/codex@" in DOCKERFILE
     assert '"mcp>=1.0,<2"' in DOCKERFILE
     assert '"aiohttp-socks>=0.10"' in DOCKERFILE

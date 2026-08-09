@@ -11,6 +11,7 @@ from _portal_support import isolated_home, write_test_agent  # noqa: E402
 
 from puffo_agent.portal.control.context_telemetry import (  # noqa: E402
     build_context_runtime,
+    claude_autocompact_tokens,
     compact_threshold_pct,
     configured_compact_pct,
     estimate_compact_threshold_tokens,
@@ -44,6 +45,34 @@ def test_invalid_claude_threshold_is_ignored(threshold):
 @pytest.mark.parametrize("pct,expected", [(50, 100_000), (30, 60_000), (75, 150_000)])
 def test_pct_override_scales_the_window(pct, expected):
     assert estimate_compact_threshold_tokens(200_000, pct) == expected
+
+
+@pytest.mark.parametrize(
+    ("window", "pct", "expected"),
+    [
+        (200_000, 30, 100_000),
+        (200_000, 50, 100_000),
+        (200_000, 75, 150_000),
+        (1_000_000, 30, 300_000),
+    ],
+)
+def test_claude_autocompact_tokens_enforces_cli_minimum(window, pct, expected):
+    assert claude_autocompact_tokens(
+        max_context=window, pct=pct, env={}
+    ) == expected
+
+
+def test_claude_autocompact_tokens_requires_a_known_window():
+    assert claude_autocompact_tokens(
+        model="claude-future-model", pct=50, env={}
+    ) is None
+
+
+def test_claude_autocompact_tokens_omits_default_without_resolving_model(caplog):
+    assert claude_autocompact_tokens(
+        model="claude-future-model", pct=None, env={}
+    ) is None
+    assert "context window is unknown" not in caplog.text
 
 
 def test_pct_100_estimate_does_not_claim_compaction_is_disabled():
@@ -135,22 +164,38 @@ def test_runtime_reports_active_override():
 
 def test_runtime_configured_override_wins_over_raw_session_default():
     out = build_context_runtime(
+        model="claude-haiku-4-5",
         max_context=200_000,
         auto_compact_threshold=167_000,
         env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "5"},
         env={},
     )
-    assert out["auto_compact_threshold_pct"] == 5.0
+    assert out["auto_compact_threshold_pct"] == 50.0
 
 
 def test_runtime_matching_session_threshold_preserves_override():
     out = build_context_runtime(
+        model="claude-haiku-4-5",
         max_context=200_000,
         auto_compact_threshold=60_000,
         env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "30"},
         env={},
     )
-    assert out["auto_compact_threshold_pct"] == 30.0
+    assert out["auto_compact_threshold_pct"] == 50.0
+
+
+def test_runtime_treats_cli_raw_max_as_compact_window_when_configured():
+    out = build_context_runtime(
+        model="claude-fable-5",
+        max_context=300_000,
+        auto_compact_threshold=267_000,
+        env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "30"},
+        env={},
+    )
+    assert out == {
+        "max_context": 1_000_000,
+        "auto_compact_threshold_pct": 30.0,
+    }
 
 
 def test_runtime_prefers_session_reported_max_context():
@@ -208,6 +253,30 @@ def test_docker_runtime_info_persists_context_config_with_model(monkeypatch):
         "max_context": 1_000_000,
         "auto_compact_threshold_pct": 30.0,
     }
+
+
+def test_runtime_info_persists_claude_cli_minimum_as_effective_pct(monkeypatch):
+    from types import SimpleNamespace
+
+    from puffo_agent.portal.worker import Worker
+
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+    worker = Worker.__new__(Worker)
+    worker.agent_cfg = SimpleNamespace(
+        id="ctx-bot",
+        runtime=SimpleNamespace(
+            kind="cli-local",
+            provider="anthropic",
+            harness="claude-code",
+            model="claude-haiku-4-5",
+            inference_level="",
+        ),
+        env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "30"},
+    )
+    worker.runtime = RuntimeState()
+
+    assert worker._runtime_info()["auto_compact_threshold_pct"] == 50.0
+    assert worker.runtime.auto_compact_threshold_pct == 50.0
 
 
 def test_runtime_info_prefers_adapter_context_window(monkeypatch):
@@ -419,9 +488,10 @@ def test_yaml_int_value_loads_as_string():
     assert isinstance(loaded["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"], str)
 
 
-def test_overrides_layer_over_os_environ_but_under_adapter_owned_vars():
+def test_overrides_layer_over_os_environ_but_under_adapter_owned_vars(monkeypatch):
     from puffo_agent.agent.adapters.local_cli import LocalCLIAdapter
 
+    monkeypatch.setenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", "75")
     home = isolated_home()
     write_test_agent(home, "ctx-bot")
     adapter = LocalCLIAdapter(
@@ -437,6 +507,7 @@ def test_overrides_layer_over_os_environ_but_under_adapter_owned_vars():
             "HOME": "/tmp/untrusted-home",
             "USERPROFILE": "/tmp/untrusted-profile",
         },
+        auto_compact_threshold_pct=50,
     )
     assert adapter.context_limits() == (None, None)
     session = adapter._ensure_session()
@@ -451,9 +522,12 @@ def test_overrides_layer_over_os_environ_but_under_adapter_owned_vars():
     assert adapter.context_limits() == (258_400, 193_800)
 
     env = session.env
-    assert env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] == "50"
+    assert "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in env
     assert env["HOME"] == str(adapter.agent_home_dir)
     assert env["USERPROFILE"] == str(adapter.agent_home_dir)
+    assert session.build_command([], session.env_overrides)[-2:] == [
+        "--autocompact", "500000",
+    ]
 
 
 def test_default_band_clears_the_override():
@@ -477,7 +551,7 @@ def test_docker_session_receives_overrides(tmp_path, monkeypatch):
 
     adapter = DockerCLIAdapter(
         agent_id="ctx-bot",
-        model="sonnet",
+        model="claude-sonnet-5",
         image="test",
         workspace_dir=str(tmp_path / "workspace"),
         claude_dir=str(tmp_path / "claude"),
@@ -485,6 +559,7 @@ def test_docker_session_receives_overrides(tmp_path, monkeypatch):
         agent_home_dir=str(tmp_path / "home"),
         shared_fs_dir=str(tmp_path / "shared"),
         env_overrides={"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "50"},
+        auto_compact_threshold_pct=50,
     )
     adapter._prepare_mcp_args = lambda: []
 
@@ -508,15 +583,18 @@ def test_docker_session_receives_overrides(tmp_path, monkeypatch):
         env_overrides=adapter.env_overrides,
         env={},
     )
-    assert runtime["max_context"] is None
-    assert session.build_command([], session.env_overrides)[:6] == [
+    assert runtime["max_context"] == 1_000_000
+    command = session.build_command([], session.env_overrides)
+    assert command[:6] == [
         "docker",
         "exec",
         "-i",
-        "-e",
-        "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=50",
         "puffo-ctx-bot",
+        "claude",
+        "--dangerously-skip-permissions",
     ]
+    assert command[-2:] == ["--autocompact", "500000"]
+    assert all("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in arg for arg in command)
 
 
 @pytest.mark.parametrize(
@@ -647,7 +725,8 @@ async def test_remote_edit_reaches_docker_exec_command():
     adapter._prepare_mcp_args = lambda: []
     session = adapter._ensure_session()
     command = session.build_command([], session.env_overrides)
-    assert command[3:5] == ["-e", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=50"]
+    assert command[-2:] == ["--autocompact", "500000"]
+    assert all("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE" not in arg for arg in command)
 
 
 @pytest.mark.parametrize("kind", ["cli-local", "cli-docker"])

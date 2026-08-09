@@ -28,6 +28,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Claude Code auto-compaction now uses the supported token-window CLI flag.**
+  The existing 30%, 50%, and 75% controls are translated to
+  `--autocompact <tokens>` for local and Docker agents instead of relying on
+  `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`. Claude's 100K minimum is enforced, and
+  runtime telemetry reports the effective percentage after that adjustment.
+  The bundled Docker runtime now pins a Claude Code release that supports the
+  flag.
+
 - **Port 63387 is now dedicated to `ws-local` message transport.** The legacy
   Local Bridge HTTP APIs, pairing commands, and browser-facing management
   surface have been removed; externally hosted agents continue to attach over

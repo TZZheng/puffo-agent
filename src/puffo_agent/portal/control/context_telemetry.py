@@ -8,6 +8,7 @@ import os
 
 MIN_CONTEXT_WINDOW_TOKENS = 100_000
 MAX_CONTEXT_WINDOW_TOKENS = 1_000_000
+MIN_CLAUDE_AUTOCOMPACT_TOKENS = 100_000
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +88,29 @@ def estimate_compact_threshold_tokens(
     return max(0, int(window * pct / 100))
 
 
+def claude_autocompact_tokens(
+    *,
+    model: str = "",
+    pct: float | None,
+    max_context: int | None = None,
+    env: dict[str, str] | None = None,
+) -> int | None:
+    """Translate the percentage control into Claude Code's token argument."""
+    if pct is None:
+        return None
+    window = (
+        max_context
+        if isinstance(max_context, int)
+        and not isinstance(max_context, bool)
+        and max_context > 0
+        else resolve_context_window(model, env)
+    )
+    threshold = estimate_compact_threshold_tokens(window, pct)
+    if threshold is None:
+        return None
+    return max(MIN_CLAUDE_AUTOCOMPACT_TOKENS, threshold)
+
+
 def compact_threshold_pct(
     window: int | None, threshold: int | None
 ) -> float | None:
@@ -111,6 +135,24 @@ def build_context_runtime(
 ) -> dict:
     """Build context configuration persisted with runtime metadata."""
     overrides = env_overrides or {}
+    configured_pct = parse_threshold_pct(overrides.get(CLAUDE_COMPACT_PCT_KEY))
+    if configured_pct is not None:
+        window = resolve_context_window(model, env)
+        configured_threshold = (
+            claude_autocompact_tokens(
+                pct=configured_pct,
+                max_context=window,
+                env=env,
+            )
+            if window is not None
+            else None
+        )
+        return {
+            "max_context": window,
+            "auto_compact_threshold_pct": compact_threshold_pct(
+                window, configured_threshold
+            ),
+        }
     window = (
         max_context
         if isinstance(max_context, int)
@@ -118,11 +160,8 @@ def build_context_runtime(
         and max_context > 0
         else resolve_context_window(model, env)
     )
-    configured_pct = parse_threshold_pct(overrides.get(CLAUDE_COMPACT_PCT_KEY))
     reported_pct = compact_threshold_pct(window, auto_compact_threshold)
     return {
         "max_context": window,
-        "auto_compact_threshold_pct": (
-            configured_pct if configured_pct is not None else reported_pct
-        ),
+        "auto_compact_threshold_pct": reported_pct,
     }
