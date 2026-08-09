@@ -48,6 +48,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Claude Code uses subscription authentication unless API-key mode is
+  explicitly enabled.** Ambient `ANTHROPIC_API_KEY` values are ignored for
+  local and Docker CLI agents. A daemon-owned `anthropic.api_key` is passed to
+  Claude Code only when `anthropic.cli_use_api_key: true` is set in
+  `daemon.yml`.
+
 - **Codex Docker agents can write to their mounted workspace reliably.** The
   container is now the effective filesystem sandbox, avoiding unsupported
   nested sandboxing, and resumed local and Docker sessions reapply their

@@ -48,6 +48,7 @@ from .state import (
     agent_codex_user_dir,
     agent_dir,
     agent_home_dir,
+    claude_cli_api_key,
     cli_session_json_path,
     docker_shared_dir,
     shared_fs_dir,
@@ -89,6 +90,12 @@ def _rebuild_managed_system_prompt(
 logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
+
+
+def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
+    if harness_name != "claude-code":
+        return ""
+    return claude_cli_api_key(daemon_cfg)
 
 
 def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
@@ -176,6 +183,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             puffo_core_server_url=agent_cfg.puffo_core.server_url,
             puffo_core_slug=agent_cfg.puffo_core.slug,
             puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
+            claude_api_key=_claude_cli_api_key(daemon_cfg, harness.name()),
         )
         # Env for spawning the puffo_core MCP server; path-typed values are
         # rewritten to container bind-mount paths at config-write time.
@@ -237,6 +245,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             puffo_core_server_url=agent_cfg.puffo_core.server_url,
             puffo_core_slug=agent_cfg.puffo_core.slug,
             puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
+            claude_api_key=_claude_cli_api_key(daemon_cfg, harness.name()),
         )
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env

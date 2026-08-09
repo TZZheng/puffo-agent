@@ -108,6 +108,35 @@ _CLAUDE_HOME_SEED_PATHS = (
 )
 
 
+def strip_claude_api_key_from_settings(path: Path) -> bool:
+    """Remove a persisted ``env.ANTHROPIC_API_KEY`` override.
+
+    Claude Code gives that setting precedence over subscription credentials.
+    Puffo's only API-key opt-in lives in ``daemon.yml``, so agent-scoped
+    settings must not select a separate billing credential.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    env = data.get("env")
+    if not isinstance(env, dict) or "ANTHROPIC_API_KEY" not in env:
+        return False
+    env = dict(env)
+    del env["ANTHROPIC_API_KEY"]
+    if env:
+        data["env"] = env
+    else:
+        data.pop("env", None)
+    try:
+        _atomic_write_json(path, data)
+    except OSError:
+        return False
+    return True
+
+
 def seed_claude_home(host_home: Path, agent_home: Path) -> bool:
     """Seed a per-agent virtual ``$HOME`` from the operator's real
     ``$HOME``. Idempotent — never overwrites an existing file.
@@ -829,6 +858,12 @@ class ProviderConfig:
 
 
 @dataclass
+class AnthropicProviderConfig(ProviderConfig):
+    # Claude Code uses subscription auth unless this explicit opt-in is true.
+    cli_use_api_key: bool = False
+
+
+@dataclass
 class DataServiceConfig:
     """Loopback HTTP service MCP subprocesses use to read each
     agent's ``messages.db``. See ``portal/data_service.py``."""
@@ -863,7 +898,9 @@ class DaemonConfig:
     daemon holds only provider keys + reconcile knobs.
     """
     default_provider: str = "anthropic"
-    anthropic: ProviderConfig = field(default_factory=ProviderConfig)
+    anthropic: AnthropicProviderConfig = field(
+        default_factory=AnthropicProviderConfig,
+    )
     openai: ProviderConfig = field(default_factory=ProviderConfig)
     # Google provider defaults for chat-local/sdk-local runtimes.
     google: ProviderConfig = field(default_factory=ProviderConfig)
@@ -916,7 +953,13 @@ class DaemonConfig:
                 raw.get("catchup_stale_hours", DEFAULT_CATCHUP_STALE_HOURS)
             ),
         )
-        for name in ("anthropic", "openai", "google"):
+        p = raw.get("anthropic") or {}
+        cfg.anthropic = AnthropicProviderConfig(
+            api_key=p.get("api_key", ""),
+            model=p.get("model", ""),
+            cli_use_api_key=p.get("cli_use_api_key") is True,
+        )
+        for name in ("openai", "google"):
             p = raw.get(name) or {}
             setattr(cfg, name, ProviderConfig(
                 api_key=p.get("api_key", ""),
@@ -944,7 +987,6 @@ class DaemonConfig:
             port=int(r.get("port", rs_defaults.port)),
         )
         return cfg
-
     def save(self) -> None:
         path = daemon_yml_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -966,6 +1008,14 @@ class DaemonConfig:
             "rpc_service": asdict(self.rpc_service),
         }
         _atomic_write_yaml(path, data)
+
+
+def claude_cli_api_key(daemon_cfg: DaemonConfig | None) -> str:
+    """Return the daemon-owned Claude CLI key when explicitly enabled."""
+    anthropic = getattr(daemon_cfg, "anthropic", None)
+    if not getattr(anthropic, "cli_use_api_key", False):
+        return ""
+    return getattr(anthropic, "api_key", "")
 
 
 @dataclass
@@ -1486,8 +1536,15 @@ def clear_refresh_token_request() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Atomic YAML write
+# Atomic config writes
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 
 def _atomic_write_yaml(path: Path, data: Any) -> None:

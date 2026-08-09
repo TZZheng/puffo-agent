@@ -208,7 +208,6 @@ def cmd_config(args: argparse.Namespace) -> int:
     else:
         print("creating daemon.yml (optional — defaults only)")
 
-    env_anthropic = os.environ.get("ANTHROPIC_API_KEY", "")
     env_openai = os.environ.get("OPENAI_API_KEY", "")
     env_google = (
         os.environ.get("GEMINI_API_KEY")
@@ -226,10 +225,11 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     cfg.default_provider = prompt("Default AI provider (anthropic|openai|google)", cfg.default_provider or "anthropic")
 
-    anth_key = cfg.anthropic.api_key or env_anthropic
+    anth_key = cfg.anthropic.api_key
     anth_key = prompt("Default Anthropic API key (blank to skip)", anth_key)
     if anth_key:
-        cfg.anthropic = ProviderConfig(api_key=anth_key, model=cfg.anthropic.model or "claude-sonnet-4-6")
+        cfg.anthropic.api_key = anth_key
+        cfg.anthropic.model = cfg.anthropic.model or "claude-sonnet-4-6"
 
     oai_key = cfg.openai.api_key or env_openai
     oai_key = prompt("Default OpenAI API key (blank to skip)", oai_key)

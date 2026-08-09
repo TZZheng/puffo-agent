@@ -585,10 +585,12 @@ def test_docker_session_receives_overrides(tmp_path, monkeypatch):
     )
     assert runtime["max_context"] == 1_000_000
     command = session.build_command([], session.env_overrides)
-    assert command[:6] == [
+    assert command[:8] == [
         "docker",
         "exec",
         "-i",
+        "-e",
+        "ANTHROPIC_API_KEY=",
         "puffo-ctx-bot",
         "claude",
         "--dangerously-skip-permissions",

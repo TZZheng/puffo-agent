@@ -17,6 +17,7 @@ default_provider: "anthropic"  # "anthropic" | "openai" | "google"
 
 anthropic:
   api_key: ""                    # https://console.anthropic.com/
+  cli_use_api_key: false          # true = Claude Code uses this key instead of subscription auth
   model:   "claude-sonnet-4-6"   # empty = provider default
 
 openai:
