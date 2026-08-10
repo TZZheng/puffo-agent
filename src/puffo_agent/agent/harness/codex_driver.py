@@ -214,19 +214,20 @@ class CodexAppServerDriver(Driver):
             },
         )
         await self._write({"method": "initialized", "params": {}})
+        thread_config = {
+            "cwd": spec.workspace_dir,
+            "approvalPolicy": (
+                "never"
+                if spec.permission_mode == "bypassPermissions"
+                else "untrusted"
+            ),
+            "sandbox": spec.sandbox,
+            **({"model": spec.model} if spec.model else {}),
+        }
         if resume is None:
             result = await self._request(
                 "thread/start",
-                {
-                    "cwd": spec.workspace_dir,
-                    "approvalPolicy": (
-                        "never"
-                        if spec.permission_mode == "bypassPermissions"
-                        else "untrusted"
-                    ),
-                    "sandbox": spec.sandbox,
-                    **({"model": spec.model} if spec.model else {}),
-                },
+                thread_config,
             )
             resumed = False
         else:
@@ -234,6 +235,7 @@ class CodexAppServerDriver(Driver):
                 "thread/resume",
                 {
                     "threadId": str(resume),
+                    **thread_config,
                 },
             )
             resumed = True

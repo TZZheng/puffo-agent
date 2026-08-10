@@ -1060,7 +1060,13 @@ async def test_codex_driver_resumes_with_native_session_id_after_handshake():
         if frame.get("method") == "initialize":
             proc.feed({"id": frame["id"], "result": {}})
         elif frame.get("method") == "thread/resume":
-            assert frame["params"] == {"threadId": "native-thread"}
+            assert frame["params"] == {
+                "threadId": "native-thread",
+                "cwd": "/workspace",
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "model": "gpt",
+            }
             proc.feed({
                 "id": frame["id"],
                 "result": {"thread": {"id": "native-thread"}},
@@ -1070,7 +1076,7 @@ async def test_codex_driver_resumes_with_native_session_id_after_handshake():
     holder["proc"] = proc
     driver = CodexAppServerDriver(lambda _spec: proc)
     opened = await driver.open(
-        RuntimeSpec("/workspace"), SessionRef("native-thread")
+        RuntimeSpec("/workspace", model="gpt"), SessionRef("native-thread")
     )
     assert opened.resumed and opened.native_session_id == "native-thread"
     assert [
