@@ -31,7 +31,8 @@ from ..crypto.message import (
     encrypt_message_with_content_key,
 )
 from ..crypto.primitives import Ed25519KeyPair
-from .message_projection import CONTEXT_VERSION, format_message_group
+from .held_context import build_held_context_output
+from .message_projection import CONTEXT_VERSION
 from .send_response_validation import (
     validate_channel_response,
     validate_keyless_response,
@@ -1554,45 +1555,13 @@ class SendCoordinator:
                     "context_version": CONTEXT_VERSION,
                     "context_ready": False,
                 }
-            rows = list(held.recovered_messages)
-            target_type = "thread" if held.thread_root_id else "channel"
-            target_ref = f"channel:{space_id}:{channel_id}"
-            if held.thread_root_id:
-                target_ref += f":thread:{held.thread_root_id}"
-            data: dict[str, Any] = {
-                "reconsideration": {
-                    "context_version": CONTEXT_VERSION,
-                    "context_ready": bool(held.synchronized and rows),
-                    "draft": held.draft,
-                    "based_on_through_seq": held.based_on_through_seq,
-                    "latest_seq": held.latest_seq,
-                    "latest_envelope_id": held.latest_envelope_id,
-                    "target": {
-                        "target_type": target_type,
-                        "target_ref": target_ref,
-                        "space_id": space_id,
-                        "channel_id": channel_id,
-                        "thread_root_id": held.thread_root_id,
-                    },
-                    "guidance": HELD_SEND_RECONSIDERATION_GUIDANCE,
-                },
-            }
-            if held.diagnostic:
-                data["reconsideration"]["diagnostic"] = held.diagnostic
-        if rows:
-            aliases = (self.slug,)
-            data["reconsideration"]["visible_draft_basis"] = format_message_group(
-                held.visible_draft_basis,
-                current_agent_aliases=aliases,
-                thread_root_id=held.thread_root_id,
-                chronological=True,
+            return build_held_context_output(
+                held=held,
+                current_agent_slug=self.slug,
+                space_id=space_id,
+                channel_id=channel_id,
+                guidance=HELD_SEND_RECONSIDERATION_GUIDANCE,
             )
-            data["reconsideration"]["new_channel_context"] = format_message_group(
-                rows,
-                current_agent_aliases=aliases,
-                chronological=True,
-            )
-        return data
 
     def discard_held_evidence(self) -> None:
         """Drop every held record when the owning turn tears down.

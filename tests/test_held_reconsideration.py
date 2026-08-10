@@ -320,6 +320,56 @@ async def test_held_thread_basis_overrides_only_its_presentation_target():
     ) < latest.index('message_id="other-route"')
 
 
+@pytest.mark.asyncio
+async def test_held_context_makes_returned_participation_facts_explicit():
+    coordinator, _freshness, _http = await coordinator_fixture()
+    key = ("session-a", "turn-a", "sp_1", "ch_a")
+    origin = {
+        "envelope_id": "origin",
+        "server_seq": 1,
+        "sent_at": 1_700_000_000_000,
+        "sender_slug": "human-1",
+        "sender_type": "human",
+        "space_id": "sp_1",
+        "channel_id": "ch_a",
+        "envelope_kind": "channel",
+        "content": "count",
+    }
+    peer = {
+        **origin,
+        "envelope_id": "peer-count",
+        "server_seq": 2,
+        "sender_slug": "peer-agent",
+        "sender_type": "agent",
+        "content": "1",
+    }
+    own = {
+        **origin,
+        "envelope_id": "own-count",
+        "server_seq": 3,
+        "sender_slug": coordinator.slug,
+        "sender_type": "agent",
+        "content": "2",
+    }
+    coordinator._held_evidence[key] = _HeldEvidence(
+        latest_seq=3,
+        latest_envelope_id="own-count",
+        synchronized=True,
+        visible_draft_basis=[origin, peer],
+        recovered_messages=[own, peer],
+    )
+
+    output = await coordinator._held_context_output(key, "sp_1", "ch_a")
+
+    assert output["reconsideration"]["participation_snapshot"] == {
+        "current_agent_identity": f"@{coordinator.slug}",
+        "current_agent_has_visible_message": True,
+        "current_agent_visible_message_ids": ["own-count"],
+        "other_visible_agent_count": 1,
+        "other_visible_agent_identities": ["@peer-agent"],
+    }
+
+
 async def _native_held_contract():
     coordinator, freshness, http = await coordinator_fixture(baseline=2, active=2)
     boundary = bind_turn(coordinator, freshness)
