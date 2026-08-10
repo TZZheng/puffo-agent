@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-08-10
+
 ### Added
 
 - **Codex agents now report and control their live context window.** Local and
