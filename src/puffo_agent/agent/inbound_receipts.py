@@ -55,6 +55,7 @@ class _ReceiptCommitter:
                 self.payload.envelope_id,
                 self.server_seq,
                 reason=reason,
+                approved_payload=row,
             )
             if promoted.status is not ReceiptWriteStatus.CONFLICT:
                 result = promoted

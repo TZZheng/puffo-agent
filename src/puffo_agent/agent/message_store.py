@@ -520,6 +520,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         server_seq: int | None,
         *,
         reason: str,
+        approved_payload: Any | None = None,
     ) -> ReceiptResult:
         """Release one approval-gated receipt into the pending queue.
 
@@ -527,11 +528,21 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         ``None`` for the sequence-less keyless lane. Both lanes run the same
         state machine; only the terminal shape differs, because a row without
         a server sequence is only visible to ``get_pending`` as a local
-        runtime event with an allocated ordinal.
+        runtime event with an allocated ordinal. ``approved_payload`` replaces
+        the gated body with the fully enriched model projection atomically.
         """
+        replacement = None
+        if approved_payload is not None:
+            values = self._payload_values(approved_payload, None)
+            if values[0] != envelope_id:
+                raise ValueError("approved payload belongs to another envelope")
+            replacement = (values[6], values[7])
         async with self._inbox_lock:
             return await self._promote_gated_receipt_unlocked(
-                envelope_id, server_seq, reason=reason
+                envelope_id,
+                server_seq,
+                reason=reason,
+                replacement=replacement,
             )
 
     async def _promote_gated_receipt_unlocked(
@@ -540,19 +551,25 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         server_seq: int | None,
         *,
         reason: str,
+        replacement: tuple[Any, Any] | None,
     ) -> ReceiptResult:
         db = await self._ensure_db()
         await db.execute("BEGIN IMMEDIATE")
         try:
             async with db.execute(
                 "SELECT server_seq, receipt_disposition, processing_state, "
-                "received_at FROM messages WHERE envelope_id = ?",
+                "received_at, content_type, content "
+                "FROM messages WHERE envelope_id = ?",
                 (envelope_id,),
             ) as cursor:
                 row = await cursor.fetchone()
             if server_seq is None:
                 return await self._promote_local_gated_row(
-                    db, row, envelope_id=envelope_id, reason=reason
+                    db,
+                    row,
+                    envelope_id=envelope_id,
+                    reason=reason,
+                    replacement=replacement,
                 )
             if row is None or row["server_seq"] != server_seq:
                 await db.rollback()
@@ -584,15 +601,22 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
                     "receipt is not approval-gated",
                     False,
                 )
+            content_type, content = replacement or (
+                row["content_type"],
+                row["content"],
+            )
             await db.execute(
                 """UPDATE messages
-                   SET receipt_disposition = ?, receipt_reason = ?, processing_state = ?
+                   SET receipt_disposition = ?, receipt_reason = ?, processing_state = ?,
+                       content_type = ?, content = ?
                    WHERE envelope_id = ? AND server_seq = ?
                      AND receipt_disposition = ? AND processing_state IS NULL""",
                 (
                     ReceiptDisposition.ELIGIBLE.value,
                     reason,
                     ProcessingState.PENDING.value,
+                    content_type,
+                    content,
                     envelope_id,
                     server_seq,
                     ReceiptDisposition.FOREIGN_DM_GATED.value,
@@ -617,6 +641,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         *,
         envelope_id: str,
         reason: str,
+        replacement: tuple[Any, Any] | None,
     ) -> ReceiptResult:
         """Release a gated row that was written without a server sequence.
 
@@ -657,10 +682,15 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
                 False,
             )
         ordinal, frontier = await self._allocate_local_position(db)
+        content_type, content = replacement or (
+            row["content_type"],
+            row["content"],
+        )
         await db.execute(
             """UPDATE messages
                SET receipt_disposition = ?, receipt_reason = ?,
-                   processing_state = ?, local_ordinal = ?, after_server_seq = ?
+                   processing_state = ?, local_ordinal = ?, after_server_seq = ?,
+                   content_type = ?, content = ?
                WHERE envelope_id = ? AND server_seq IS NULL
                  AND receipt_disposition = ? AND processing_state IS NULL""",
             (
@@ -669,6 +699,8 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
                 ProcessingState.PENDING.value,
                 ordinal,
                 frontier,
+                content_type,
+                content,
                 envelope_id,
                 ReceiptDisposition.FOREIGN_DM_GATED.value,
             ),

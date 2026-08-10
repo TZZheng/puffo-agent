@@ -672,6 +672,8 @@ async def test_gated_receipt_listen_holds_then_exact_wrapper_promotion_acks_once
     )
     assert events == ["committed", TransportOutcome.DEFER.value]
     assert await store.get_pending() == ()
+    gated = await store.get_message_by_envelope("gated")
+    assert gated is not None and gated.content == "hello"
 
     client._is_foreign_dm_sender = lambda _slug: asyncio.sleep(0, result=True)
     client._maybe_gate_foreign_dm = lambda **_kwargs: asyncio.sleep(0, result=False)
@@ -688,7 +690,11 @@ async def test_gated_receipt_listen_holds_then_exact_wrapper_promotion_acks_once
 
     client.http = ApprovalHttp()
     await client._drain_pending_from_sender("foreign")
-    assert [row.envelope_id for row in await store.get_pending()] == ["gated"]
+    pending = await store.get_pending()
+    assert [row.envelope_id for row in pending] == ["gated"]
+    assert pending[0].content["text"] == "hello"
+    assert pending[0].content["sender_display_name"] == "Foreign"
+    assert pending[0].content["attachment_paths"] == []
     assert posts == [("/messages/ack", {"envelope_ids": ["gated"]})]
     await client._drain_pending_from_sender("foreign")
     assert [row.envelope_id for row in await store.get_pending()] == ["gated"]
