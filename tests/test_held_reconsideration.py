@@ -8,6 +8,7 @@ import pytest
 from puffo_agent.agent.send_coordinator import (
     CHANNEL_SEND_PATH,
     KEYLESS_CHANNEL_SEND_PATH,
+    _MAX_HELD_RECORDS,
     SemanticSendRequest,
     SendCoordinator,
     _HeldEvidence,
@@ -117,10 +118,15 @@ async def _drive_exact_bridge_pair(client, coordinator, calls, base):
 
 
 async def _assert_bridge_reconsideration(runtime, coordinator, boundary, calls):
+    # Unchanged draft, so the probe reaches the admission gate rather than
+    # stopping at the draft-identity gate.
     staged = await coordinator.send(SemanticSendRequest(
-        destination="ch_1", text="too early", send_anyway=True,
+        destination="ch_1", text="held draft", send_anyway=True,
     ))
     assert staged["error_kind"] == "reconsideration_ineligible"
+    assert staged["_reconsideration_audit"]["decision_reason"] == (
+        "admission_before_held"
+    )
     assert len(calls) == 1
     read = await runtime.stage_model_visible_read(
         space_id="sp_1", channel_id="ch_1", through_seq=5,
@@ -130,9 +136,12 @@ async def _assert_bridge_reconsideration(runtime, coordinator, boundary, calls):
     assert read["state"] == "admitted"
     assert await boundary.get_active_turn_through_seq("sp_1", "ch_1") == 2
     sent = await coordinator.send(SemanticSendRequest(
-        destination="ch_1", text="explicit retry", send_anyway=True,
+        destination="ch_1", text="held draft", send_anyway=True,
     ))
     assert sent["state"] == "failed"
+    assert sent["_reconsideration_audit"]["decision_reason"] == (
+        "admission_before_held"
+    )
     assert len(calls) == 1
     assert calls[-1][1]["freshness"] == {
         "context_baseline_seq": 2, "seen_seq": 2, "mode": "require_current",
@@ -197,6 +206,29 @@ def bind_turn(coordinator, freshness, *, boundary=2):
     active_boundary.value = boundary
     freshness.get_active_turn_through_seq = active_boundary
     return active_boundary
+
+
+def basis_row(envelope_id, *, seq, thread_root_id=""):
+    return SimpleNamespace(
+        space_id="sp_1", channel_id="ch_a", thread_root_id=thread_root_id,
+        envelope_id=envelope_id, server_seq=seq, sender_slug="alice",
+        envelope_kind="channel", sent_at=1_700_000_000_000,
+        is_encrypted=False, content="context",
+    )
+
+
+def attach_visible_basis(recovery, rows):
+    """Give the recovery source the runtime shape ``_visible_draft_basis`` reads."""
+    by_id = {row.envelope_id: row for row in rows}
+
+    async def get_message_by_envelope(envelope_id):
+        return by_id.get(envelope_id)
+
+    recovery.runtime = SimpleNamespace(
+        active=SimpleNamespace(visible_message_ids=tuple(by_id)),
+        store=SimpleNamespace(get_message_by_envelope=get_message_by_envelope),
+    )
+    return recovery
 
 
 def held_response(body, *, latest_seq=5, latest_envelope_id="msg_latest"):
@@ -371,10 +403,15 @@ async def _assert_initial_held_contract(case):
     assert held["latest_seq"] == 5
     assert held["latest_envelope_id"] == "msg_latest"
     assert held["synchronized"] is True
+    # Unchanged draft, so the probe reaches the admission gate rather than
+    # stopping at the draft-identity gate.
     staged = await case.coordinator.send(SemanticSendRequest(
-        destination=case.destination, text="too soon", send_anyway=True,
+        destination=case.destination, text="draft", send_anyway=True,
     ))
     assert staged["error_kind"] == "reconsideration_ineligible"
+    assert staged["_reconsideration_audit"]["decision_reason"] == (
+        "admission_before_held"
+    )
     assert len(case.calls) == 1
 
 
@@ -397,9 +434,12 @@ async def _assert_wrong_turn_and_pair(case):
     evidence.latest_envelope_id = "wrong-envelope"
     evidence.synchronized = False
     wrong_pair = await case.coordinator.send(SemanticSendRequest(
-        destination=case.destination, text="wrong held pair", send_anyway=True,
+        destination=case.destination, text="draft", send_anyway=True,
     ))
     assert wrong_pair["error_kind"] == "reconsideration_ineligible"
+    assert wrong_pair["_reconsideration_audit"]["decision_reason"] == (
+        "held_not_synchronized"
+    )
     assert len(case.calls) == 1
     evidence.latest_seq, evidence.latest_envelope_id, evidence.synchronized = snapshot
 
@@ -434,8 +474,18 @@ async def _assert_held_identity_mismatches(case):
 
 
 async def _assert_one_shot_held_send(case):
+    revised = await case.coordinator.send(SemanticSendRequest(
+        destination=case.destination, text="revised draft", send_anyway=True,
+    ))
+    assert revised["state"] == "failed"
+    assert revised["error_kind"] == "reconsideration_ineligible"
+    assert revised["_reconsideration_audit"]["decision_reason"] == (
+        "held_draft_mismatch"
+    )
+    assert len(case.calls) == 1
+    # Only the unchanged draft the model reconsidered may override.
     sent = await case.coordinator.send(SemanticSendRequest(
-        destination=case.destination, text="approved", send_anyway=True,
+        destination=case.destination, text="draft", send_anyway=True,
     ))
     assert sent["state"] == "sent"
     assert len(case.calls) == 2
@@ -610,16 +660,28 @@ async def test_same_session_turn_admitted_boundary_makes_override_eligible():
     )
     assert first["state"] == "held"
     assert first["synchronized"] is True
+    # Unchanged draft, so the probe reaches the admission gate rather than
+    # stopping at the draft-identity gate.
     blocked = await coordinator.send(SemanticSendRequest(
-        destination="ch_a", text="too soon", send_anyway=True
+        destination="ch_a", text="draft", send_anyway=True
     ))
     assert blocked["error_kind"] == "reconsideration_ineligible"
+    assert blocked["_reconsideration_audit"]["decision_reason"] == (
+        "admission_before_held"
+    )
     assert len(calls) == 1
     boundary.value = 5
+    revised = await coordinator.send(SemanticSendRequest(
+        destination="ch_a", text="reconsidered", send_anyway=True
+    ))
+    assert revised["state"] == "failed"
+    assert revised["error_kind"] == "reconsideration_ineligible"
+    assert revised["_reconsideration_audit"]["decision_reason"] == (
+        "held_draft_mismatch"
+    )
+    assert len(calls) == 1
     result = await coordinator.send(
-        SemanticSendRequest(
-            destination="ch_a", text="reconsidered", send_anyway=True
-        )
+        SemanticSendRequest(destination="ch_a", text="draft", send_anyway=True)
     )
     assert result["state"] == "sent"
     assert len(calls) == 2
@@ -714,10 +776,13 @@ async def test_staged_but_unadmitted_held_context_cannot_authorize_override():
     # Catch-up may have made the row durable/readable, but the admitted
     # active boundary intentionally remains below the held watermark.
     result = await coordinator.send(SemanticSendRequest(
-        destination="ch_a", text="override", send_anyway=True
+        destination="ch_a", text="draft", send_anyway=True
     ))
     assert result["state"] == "failed"
     assert result["error_kind"] == "reconsideration_ineligible"
+    assert result["_reconsideration_audit"]["decision_reason"] == (
+        "admission_before_held"
+    )
     assert len(calls) == 1
 
 
@@ -756,10 +821,15 @@ async def test_incomplete_or_mismatched_recovery_fails_closed(recovery):
     assert held["state"] == "held"
     assert held["synchronized"] is False
     boundary.value = 5
+    # Unchanged draft, so the probe reaches the synchronization gate rather
+    # than stopping at the draft-identity gate.
     result = await coordinator.send(SemanticSendRequest(
-        destination="ch_a", text="override", send_anyway=True
+        destination="ch_a", text="draft", send_anyway=True
     ))
     assert result["error_kind"] == "reconsideration_ineligible"
+    assert result["_reconsideration_audit"]["decision_reason"] == (
+        "held_not_synchronized"
+    )
     assert len(calls) == 1
 
 
@@ -787,10 +857,15 @@ async def test_recovery_timeout_or_exception_fails_closed(failure):
         destination="ch_a", text="draft"
     ))
     boundary.value = 5
+    # Unchanged draft, so the probe reaches the synchronization gate rather
+    # than stopping at the draft-identity gate.
     result = await coordinator.send(SemanticSendRequest(
-        destination="ch_a", text="override", send_anyway=True
+        destination="ch_a", text="draft", send_anyway=True
     ))
     assert result["error_kind"] == "reconsideration_ineligible"
+    assert result["_reconsideration_audit"]["decision_reason"] == (
+        "held_not_synchronized"
+    )
     assert len(calls) == 1
 
 
@@ -828,15 +903,20 @@ async def test_later_exact_recovery_can_unlock_only_current_held_record():
     ))
     assert first["synchronized"] is False
     boundary.value = 5
+    # Unchanged draft, so the probe reaches the synchronization gate rather
+    # than stopping at the draft-identity gate.
     blocked = await coordinator.send(SemanticSendRequest(
-        destination="ch_a", text="still blocked", send_anyway=True
+        destination="ch_a", text="draft", send_anyway=True
     ))
     assert blocked["error_kind"] == "reconsideration_ineligible"
+    assert blocked["_reconsideration_audit"]["decision_reason"] == (
+        "held_not_synchronized"
+    )
     assert len(calls) == 1
     recovery.available = True
     recovery.rows = [exact_row()]
     sent = await coordinator.send(SemanticSendRequest(
-        destination="ch_a", text="now eligible", send_anyway=True
+        destination="ch_a", text="draft", send_anyway=True
     ))
     assert sent["state"] == "sent"
     assert len(calls) == 2
@@ -961,8 +1041,156 @@ async def test_stale_recovery_completion_cannot_synchronize_superseded_pair():
     assert first["synchronized"] is False
     assert second["synchronized"] is False
     boundary.value = 6
+    # "two" is the surviving held draft, so the probe reaches the
+    # synchronization gate rather than stopping at the draft-identity gate.
     blocked = await coordinator.send(SemanticSendRequest(
-        destination="ch_a", text="override", send_anyway=True
+        destination="ch_a", text="two", send_anyway=True
     ))
     assert blocked["error_kind"] == "reconsideration_ineligible"
+    assert blocked["_reconsideration_audit"]["decision_reason"] == (
+        "held_not_synchronized"
+    )
     assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_second_draft_held_at_one_head_never_reuses_the_first_draft():
+    """Held evidence is keyed per turn/channel, so two drafts held against the
+    same Server head shared one record: the second draft was answered with the
+    first draft's text, thread target, and visible basis, and the superseded
+    first draft kept override authorization it no longer owned."""
+    coordinator, freshness, http = await coordinator_fixture(baseline=2, active=2)
+    boundary = bind_turn(coordinator, freshness)
+    attach_visible_basis(coordinator.held_recovery_source, [
+        basis_row("root-a", seq=3),
+        basis_row("root-b", seq=4),
+    ])
+    calls = []
+
+    async def post(_path, body):
+        calls.append(body)
+        return held_response(body)
+
+    http.post = post
+    first = await coordinator.send(SemanticSendRequest(
+        destination="ch_a", text="draft one", root_id="root-a",
+    ))
+    second = await coordinator.send(SemanticSendRequest(
+        destination="ch_a", text="draft two", root_id="root-b",
+    ))
+    assert first["reconsideration"]["draft"] == "draft one"
+    assert first["reconsideration"]["target"]["thread_root_id"] == "root-a"
+    assert second["reconsideration"]["draft"] == "draft two"
+    assert second["reconsideration"]["target"]["thread_root_id"] == "root-b"
+    key = ("session-a", "turn-a", "sp_1", "ch_a")
+    evidence = coordinator._held_evidence[key]
+    assert evidence.draft == "draft two"
+    assert [row["envelope_id"] for row in evidence.visible_draft_basis] == ["root-b"]
+    boundary.value = 5
+    superseded = await coordinator.send(SemanticSendRequest(
+        destination="ch_a", text="draft one", root_id="root-a", send_anyway=True,
+    ))
+    assert superseded["state"] == "failed"
+    assert superseded["error_kind"] == "reconsideration_ineligible"
+    assert superseded["_reconsideration_audit"]["decision_reason"] == (
+        "held_draft_mismatch"
+    )
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_stale_recovery_cannot_synchronize_a_superseding_draft_at_one_head():
+    """A recovery in flight for one draft compared only the Server pair, so it
+    could mark a different draft's superseding record synchronized and attach
+    the abandoned draft's rows to it."""
+    coordinator, freshness, http = await coordinator_fixture(baseline=2, active=2)
+    boundary = bind_turn(coordinator, freshness)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class OneShotRecovery:
+        def __init__(self):
+            self.waits = []
+            self.queries = []
+
+        async def wait_for_held_delivery(self, space_id, channel_id, seq, envelope_id):
+            self.waits.append((seq, envelope_id))
+            if len(self.waits) == 1:
+                started.set()
+                await release.wait()
+                return True
+            return False
+
+        async def query_held_messages(
+            self, space_id, channel_id, seq, envelope_id, provider_session_id,
+        ):
+            self.queries.append((seq, envelope_id))
+            return [exact_row(
+                seq=seq, envelope_id=envelope_id, session_id=provider_session_id,
+            )]
+
+    recovery = OneShotRecovery()
+    coordinator.held_recovery_source = recovery
+    calls = []
+
+    async def post(_path, body):
+        calls.append(body)
+        return held_response(body)
+
+    http.post = post
+    first_task = asyncio.create_task(coordinator.send(
+        SemanticSendRequest(destination="ch_a", text="one")
+    ))
+    await started.wait()
+    second = await coordinator.send(
+        SemanticSendRequest(destination="ch_a", text="two")
+    )
+    release.set()
+    first = await first_task
+    assert recovery.queries == []
+    assert first["synchronized"] is False
+    assert second["synchronized"] is False
+    evidence = coordinator._held_evidence[("session-a", "turn-a", "sp_1", "ch_a")]
+    assert evidence.draft == "two"
+    assert evidence.synchronized is False
+    boundary.value = 5
+    blocked = await coordinator.send(SemanticSendRequest(
+        destination="ch_a", text="two", send_anyway=True,
+    ))
+    assert blocked["error_kind"] == "reconsideration_ineligible"
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_abandoned_turn_held_context_is_dropped_and_records_stay_bounded():
+    """Abandoned held evidence kept recovered plaintext for the process
+    lifetime because nothing dropped records once their turn moved on."""
+    coordinator, freshness, http = await coordinator_fixture(baseline=2, active=2)
+    bind_turn(coordinator, freshness)
+    coordinator.held_recovery_source = Recovery(
+        rows=[{**exact_row(), "content": "recovered"}],
+    )
+
+    async def post(_path, body):
+        return held_response(body)
+
+    http.post = post
+    await coordinator.send(SemanticSendRequest(destination="ch_a", text="draft"))
+    abandoned = ("session-a", "turn-a", "sp_1", "ch_a")
+    assert coordinator._held_evidence[abandoned].recovered_messages
+    freshness.active = SimpleNamespace(
+        turn_id="turn-b", provider_session_id="session-a",
+    )
+    await coordinator.send(SemanticSendRequest(destination="ch_b", text="next turn"))
+    assert abandoned not in coordinator._held_evidence
+    assert list(coordinator._held_evidence) == [
+        ("session-a", "turn-b", "sp_1", "ch_b"),
+    ]
+    for index in range(_MAX_HELD_RECORDS + 4):
+        await coordinator._record_held(
+            ("session-a", "turn-b", "sp_1", f"ch_{index}"),
+            5,
+            "msg_latest",
+            attempt_fingerprint=f"fingerprint-{index}",
+        )
+    assert len(coordinator._held_evidence) == _MAX_HELD_RECORDS

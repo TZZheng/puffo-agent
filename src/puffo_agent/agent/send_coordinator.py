@@ -8,6 +8,7 @@ while Package 4 owns the sources that implement those protocols.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
@@ -42,6 +43,9 @@ logger = logging.getLogger(__name__)
 CHANNEL_SEND_PATH = "/v2/agent-runtime/messages:send"
 KEYLESS_CHANNEL_SEND_PATH = "/v2/cloud-agents/agent-runtime/messages:send"
 _KNOWN_ERROR_STATUSES = {400, 401, 403, 404, 405, 409, 413, 429, 500, 503}
+# Held evidence holds decrypted context, so retention is bounded even when a
+# turn is abandoned without any further coordinated send in that channel.
+_MAX_HELD_RECORDS = 8
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,20 @@ class SemanticSendRequest:
             body["text"] = self.text
         return body
 
+    def attempt_fingerprint(self) -> str:
+        """Identify the logical draft behind one send attempt.
+
+        ``send_anyway`` is excluded so an unchanged draft's reconsideration
+        retry keeps the fingerprint of the attempt that was held, while any
+        revised draft — different text, caption, attachments, thread root, or
+        visibility — gets a different one.
+        """
+        arguments = self.to_tool_arguments()
+        arguments.pop("send_anyway", None)
+        return hashlib.sha256(
+            json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
     def to_tool_arguments(self) -> dict[str, Any]:
         """Mirror the public model call without materializing omitted defaults."""
         arguments: dict[str, Any] = {"channel": self.destination}
@@ -159,6 +177,7 @@ class _HeldEvidence:
     latest_seq: int
     latest_envelope_id: str
     synchronized: bool = False
+    attempt_fingerprint: str = ""
     draft: str = ""
     based_on_through_seq: int | None = None
     thread_root_id: str = ""
@@ -194,6 +213,7 @@ class _ChannelSendBoundary:
     baseline: int
     seen_seq: int
     held_key: tuple[str, str, str, str]
+    attempt_fingerprint: str
     reconsideration: _ReconsiderationDecision | None
 
 
@@ -206,6 +226,7 @@ class _HeldRecoveryAttempt:
     channel_id: str
     latest_seq: int
     latest_envelope_id: str
+    attempt_fingerprint: str = ""
 
 
 @runtime_checkable
@@ -357,11 +378,13 @@ class SendCoordinator:
         async with lock:
             result = await self._send_channel(request, space_id, destination)
         if result.get("state") == "held":
+            fingerprint = request.attempt_fingerprint()
             synchronized = await self._recover_held(
                 space_id,
                 destination,
                 result.get("latest_seq"),
                 result.get("latest_envelope_id"),
+                fingerprint,
             )
             result["synchronized"] = synchronized
             session_id, turn_id = self._turn_identity()
@@ -370,6 +393,7 @@ class SendCoordinator:
                     (session_id, turn_id, space_id, destination),
                     space_id,
                     destination,
+                    fingerprint,
                 )
             )
         return result
@@ -702,6 +726,7 @@ class SendCoordinator:
                     boundary.held_key,
                     result.latest_seq,
                     result.latest_envelope_id,
+                    attempt_fingerprint=boundary.attempt_fingerprint,
                     draft=request.caption if request.attachment_paths else request.text,
                     based_on_through_seq=boundary.seen_seq,
                     thread_root_id=root_id,
@@ -715,6 +740,7 @@ class SendCoordinator:
                 channel_id,
                 result.latest_seq,
                 result.latest_envelope_id,
+                boundary.attempt_fingerprint,
             )
         elif result.state == "sent":
             await self._consume_held(boundary.held_key)
@@ -732,6 +758,7 @@ class SendCoordinator:
                     boundary.held_key,
                     space_id,
                     channel_id,
+                    boundary.attempt_fingerprint,
                 )
             )
         if boundary.reconsideration is not None:
@@ -829,9 +856,12 @@ class SendCoordinator:
                 "active-turn boundary is invalid",
                 kind="freshness_unavailable",
             )
+        fingerprint = request.attempt_fingerprint()
         reconsideration: _ReconsiderationDecision | None = None
         if request.send_anyway:
-            reconsideration = await self._reconsideration_decision(space_id, channel_id)
+            reconsideration = await self._reconsideration_decision(
+                space_id, channel_id, fingerprint
+            )
             if not reconsideration.eligible:
                 result = failed_result(
                     "send_anyway requires exact held catch-up and an admitted "
@@ -847,6 +877,7 @@ class SendCoordinator:
             baseline=baseline,
             seen_seq=seen_seq,
             held_key=(session_id, turn_id, space_id, channel_id),
+            attempt_fingerprint=fingerprint,
             reconsideration=reconsideration,
         )
 
@@ -954,6 +985,7 @@ class SendCoordinator:
                     boundary.held_key,
                     space_id,
                     channel_id,
+                    boundary.attempt_fingerprint,
                 )
             )
         if boundary.reconsideration is not None:
@@ -1010,6 +1042,7 @@ class SendCoordinator:
                 boundary.held_key,
                 result.latest_seq,
                 result.latest_envelope_id,
+                attempt_fingerprint=boundary.attempt_fingerprint,
                 draft=request.caption if request.attachment_paths else request.text,
                 based_on_through_seq=boundary.seen_seq,
                 thread_root_id=str(resolved.get("root_id") or request.root_id or ""),
@@ -1375,6 +1408,7 @@ class SendCoordinator:
         latest_seq: int,
         latest_envelope_id: str,
         *,
+        attempt_fingerprint: str,
         draft: str = "",
         based_on_through_seq: int | None = None,
         thread_root_id: str = "",
@@ -1382,6 +1416,9 @@ class SendCoordinator:
     ) -> None:
         async with self._held_lock:
             old = self._held_evidence.get(key)
+            # The key is per turn/channel, so two different drafts can be held
+            # against one Server head. The newest attempt owns the record; the
+            # superseded draft's plaintext rows are dropped with it.
             if (
                 old is None
                 or latest_seq > old.latest_seq
@@ -1389,25 +1426,48 @@ class SendCoordinator:
                     latest_seq == old.latest_seq
                     and latest_envelope_id != old.latest_envelope_id
                 )
+                or attempt_fingerprint != old.attempt_fingerprint
             ):
+                self._held_evidence.pop(key, None)
                 self._held_evidence[key] = _HeldEvidence(
                     latest_seq=latest_seq,
                     latest_envelope_id=latest_envelope_id,
+                    attempt_fingerprint=attempt_fingerprint,
                     draft=draft,
                     based_on_through_seq=based_on_through_seq,
                     thread_root_id=thread_root_id,
                     visible_draft_basis=[dict(row) for row in visible_draft_basis],
                 )
+            self._prune_stale_held_locked()
+
+    def _prune_stale_held_locked(self) -> None:
+        """Bound decrypted held context; call under ``_held_lock``."""
+        session_id, turn_id = self._turn_identity()
+        if session_id and turn_id:
+            # Other channels held by the *current* turn stay valid; an
+            # abandoned or finished turn's rows are dropped. An incomplete
+            # identity proves nothing, so only the cap applies then.
+            for stale in [
+                key
+                for key in self._held_evidence
+                if (key[0], key[1]) != (session_id, turn_id)
+            ]:
+                self._held_evidence.pop(stale, None)
+        while len(self._held_evidence) > _MAX_HELD_RECORDS:
+            self._held_evidence.pop(next(iter(self._held_evidence)), None)
 
     async def _held_context_output(
         self,
         key: tuple[str, str, str, str],
         space_id: str,
         channel_id: str,
+        attempt_fingerprint: str = "",
     ) -> dict[str, Any]:
         async with self._held_lock:
             held = self._held_evidence.get(key)
-            if held is None:
+            # A record superseded by another draft at the same head must never
+            # answer this attempt with the other draft's context.
+            if held is None or held.attempt_fingerprint != attempt_fingerprint:
                 return {
                     "context_version": CONTEXT_VERSION,
                     "context_ready": False,
@@ -1455,6 +1515,7 @@ class SendCoordinator:
     async def _consume_held(self, key: tuple[str, str, str, str]) -> None:
         async with self._held_lock:
             self._held_evidence.pop(key, None)
+            self._prune_stale_held_locked()
 
     async def _visible_draft_basis(
         self,
@@ -1498,7 +1559,7 @@ class SendCoordinator:
         return rows
 
     async def _reconsideration_decision(
-        self, space_id: str, channel_id: str
+        self, space_id: str, channel_id: str, attempt_fingerprint: str
     ) -> _ReconsiderationDecision:
         session_id, turn_id = self._turn_identity()
         if not session_id or not turn_id:
@@ -1511,18 +1572,35 @@ class SendCoordinator:
             held_pair = (
                 (held.latest_seq, held.latest_envelope_id) if held is not None else None
             )
+            held_fingerprint = held.attempt_fingerprint if held is not None else ""
             synchronized = bool(held and held.synchronized)
         if held_pair is None:
             return _ReconsiderationDecision(
                 False, "missing_held_evidence", session_id, turn_id
             )
+        if held_fingerprint != attempt_fingerprint:
+            # Only the unchanged draft the model actually reconsidered may
+            # override; a revised draft goes through normal freshness.
+            return _ReconsiderationDecision(
+                False, "held_draft_mismatch", session_id, turn_id
+            )
         if not synchronized:
-            await self._recover_held(space_id, channel_id, held_pair[0], held_pair[1])
+            await self._recover_held(
+                space_id,
+                channel_id,
+                held_pair[0],
+                held_pair[1],
+                attempt_fingerprint,
+            )
         async with self._held_lock:
             current = self._held_evidence.get(key)
             if current is None:
                 return _ReconsiderationDecision(
                     False, "missing_held_evidence", session_id, turn_id
+                )
+            if current.attempt_fingerprint != attempt_fingerprint:
+                return _ReconsiderationDecision(
+                    False, "held_draft_mismatch", session_id, turn_id
                 )
             latest_seq = current.latest_seq
             latest_envelope_id = current.latest_envelope_id
@@ -1592,12 +1670,14 @@ class SendCoordinator:
         channel_id: str,
         latest_seq: int | None,
         latest_envelope_id: str | None,
+        attempt_fingerprint: str = "",
     ) -> bool:
         attempt = await self._begin_held_recovery(
             space_id,
             channel_id,
             latest_seq,
             latest_envelope_id,
+            attempt_fingerprint,
         )
         if attempt is None or not await self._wait_for_held_delivery(attempt):
             return False
@@ -1623,6 +1703,7 @@ class SendCoordinator:
         channel_id: str,
         latest_seq: int | None,
         latest_envelope_id: str | None,
+        attempt_fingerprint: str = "",
     ) -> _HeldRecoveryAttempt | None:
         if (
             latest_seq is None
@@ -1641,6 +1722,7 @@ class SendCoordinator:
             channel_id=channel_id,
             latest_seq=latest_seq,
             latest_envelope_id=latest_envelope_id,
+            attempt_fingerprint=attempt_fingerprint,
         )
         if not await self._held_evidence_matches(attempt):
             return None
@@ -1653,6 +1735,7 @@ class SendCoordinator:
                 current is not None
                 and current.latest_seq == attempt.latest_seq
                 and current.latest_envelope_id == attempt.latest_envelope_id
+                and current.attempt_fingerprint == attempt.attempt_fingerprint
             )
 
     async def _wait_for_held_delivery(
@@ -1714,13 +1797,15 @@ class SendCoordinator:
         rows: Sequence[Mapping[str, Any]],
     ) -> bool:
         # Exact-pair compare-and-set: a stale recovery completion cannot bless
-        # a superseding held head or resurrect consumed evidence.
+        # a superseding held head, a superseding draft at the same head, or
+        # resurrect consumed evidence.
         async with self._held_lock:
             current = self._held_evidence.get(attempt.key)
             if (
                 current is None
                 or current.latest_seq != attempt.latest_seq
                 or current.latest_envelope_id != attempt.latest_envelope_id
+                or current.attempt_fingerprint != attempt.attempt_fingerprint
             ):
                 return False
             current.synchronized = True
