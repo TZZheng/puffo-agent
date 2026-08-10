@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -116,21 +117,41 @@ def _format_note(color: str, label: str, message: str, mentions: list[str]) -> s
     # Marker line is "/note " — the trailing space is load-bearing.
     lines = ["/note ", f"color: {color}", f"label: {label}"]
     if message:
-        lines.append(f"message: {message}")
+        # Continuation lines carry a two-space indent, matching
+        # ``formatNoteCommand``. It is what stops a body line that happens
+        # to read as ``label: …`` from terminating the message when the
+        # browser parses it back.
+        first, *rest = message.split("\n")
+        lines.append(f"message: {first}")
+        lines.extend(f"  {line}" for line in rest)
     if mentions:
         lines.append("mentions: " + " ".join(f"@{m.lstrip('@')}" for m in mentions))
     return "\n".join(lines)
 
 
 _NOTE_FIELDS = ("color", "label", "message", "mentions")
+_NOTE_FIELD_RE = re.compile(r"^([a-zA-Z]+)\s*:")
 
 
 def _starts_note_field(line: str) -> bool:
     """PUF-417: does this line open a recognized note field? Only those end
     a multi-line ``message:`` body, so prose lines like ``TODO: ...`` or a
-    URL with a port stay part of the message."""
-    key, sep, _ = line.strip().partition(":")
-    return bool(sep) and key.strip().lower() in _NOTE_FIELDS
+    URL with a port stay part of the message.
+
+    Matched against the raw line, deliberately not a stripped one: the web
+    composer escapes a continuation line that would otherwise look like a
+    field by indenting it two spaces (``formatNoteCommand``), and stripping
+    first would defeat that escape and truncate the body.
+    """
+    m = _NOTE_FIELD_RE.match(line)
+    return bool(m) and m.group(1).lower() in _NOTE_FIELDS
+
+
+def _decode_message_line(line: str) -> str:
+    """Undo the two-space continuation indent the web side adds. Mirrors
+    ``decodeMessageLine`` in parse-note-command.ts — without this every
+    wrapped line comes back two spaces further in than it was written."""
+    return line[2:] if line.startswith("  ") else line
 
 
 def _parse_note(content: Any) -> Optional[dict[str, Any]]:
@@ -168,7 +189,7 @@ def _parse_note(content: Any) -> Optional[dict[str, Any]]:
                 chunk = [val]
                 while i + 1 < len(body) and not _starts_note_field(body[i + 1]):
                     i += 1
-                    chunk.append(body[i])
+                    chunk.append(_decode_message_line(body[i]))
                 fields["message"] = "\n".join(chunk).strip()
         elif key in ("color", "label"):
             fields.setdefault(key, val)
