@@ -1356,6 +1356,53 @@ async def test_message_read_tools_stage_highest_model_visible_server_sequence():
 
 
 @pytest.mark.asyncio
+async def test_history_reads_stage_through_the_in_process_inbox_runtime():
+    """MAJOR 8: in-process (ws-local) tools have a runtime and no rpc_client.
+
+    Returning early on ``rpc_client is None`` meant a ws-local agent's channel
+    watermark never advanced, so already-read content was re-presented on the
+    next planning cycle.
+    """
+    cfg, _, ms = _setup()
+    await ms.store_receipt(
+        {
+            "envelope_id": "env_runtime",
+            "envelope_kind": "channel",
+            "sender_slug": "alice-0001",
+            "channel_id": "ch_runtime",
+            "space_id": "sp_runtime",
+            "content_type": "text/plain",
+            "content": "runtime body",
+            "sent_at": _now_ms(),
+        },
+        server_seq=77,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+
+    class RecordingRuntime:
+        def __init__(self):
+            self.calls = []
+
+        async def stage_model_visible_read(self, **kwargs):
+            self.calls.append(kwargs)
+            return {"state": "staged", "correlation_receipt": "runtime-receipt"}
+
+    runtime = RecordingRuntime()
+    assert cfg.rpc_client is None
+    cfg.inbox_runtime = runtime
+    mcp = _build_tools(cfg)
+
+    result = await _call(mcp, "get_channel_history", {"channel": "ch_runtime"})
+    assert "[puffo:model-visible-read:runtime-receipt]" in result
+    assert len(runtime.calls) == 1
+    assert runtime.calls[0]["through_seq"] == 77
+    assert runtime.calls[0]["through_envelope_id"] == "env_runtime"
+    assert runtime.calls[0]["visible_message_ids"] == ["env_runtime"]
+    await ms.close()
+
+
+@pytest.mark.asyncio
 async def test_dm_and_unsequenced_reads_do_not_stage_channel_freshness(caplog):
     caplog.set_level(
         logging.DEBUG,

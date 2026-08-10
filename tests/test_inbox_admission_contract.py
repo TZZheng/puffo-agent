@@ -352,14 +352,23 @@ async def _start_boundary_rpc(tmp_path, store, runtime, coordinator):
     await server.start_server()
     rpc = PuffoRpcClient(str(server.make_url("/")), "agent-contract")
     staged_responses: list[dict] = []
-    real_stage = rpc.stage_model_visible_read
 
-    async def record_stage(**kwargs):
-        result = await real_stage(**kwargs)
-        staged_responses.append(result)
-        return result
+    # This harness deliberately wires both backends. Record whichever one the
+    # tools actually resolve — in-process tools prefer the live runtime, the
+    # subprocess/RPC site has only the client — so the contract assertions
+    # stay about *staging*, not about which transport served it.
+    def _record(owner, name="stage_model_visible_read"):
+        real = getattr(owner, name)
 
-    rpc.stage_model_visible_read = record_stage
+        async def record_stage(**kwargs):
+            result = await real(**kwargs)
+            staged_responses.append(result)
+            return result
+
+        setattr(owner, name, record_stage)
+
+    _record(rpc)
+    _record(runtime)
     return server, rpc, staged_responses
 
 

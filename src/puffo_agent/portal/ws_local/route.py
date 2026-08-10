@@ -252,9 +252,13 @@ def _make_ws_session(
     point, client = hub.get(authed.slug), hub.get(authed.slug).client
     runtime = getattr(client, "global_runtime", None)
     holder: dict[str, WsLocalSession] = {}
-    if runtime is None and {"multi-target-v2", "explicit-admission-v2"}.issubset(
-        capabilities
-    ):
+    if runtime is None:
+        # Capability-independent: the owned runtime is what supplies the
+        # SendCoordinator/send delegate every send path needs, and it is the
+        # only thing that schedules turns at all. Gating it on the v2
+        # capabilities left a v1 peer both mute and unable to reply. The
+        # capability check belongs at the wire-shape seam
+        # (``WsLocalBridge.dispatch_planned``), not at construction.
         runtime = _make_owned_runtime(point, bridge, holder)
         client.global_runtime = runtime
         client._ws_local_owned_runtime = runtime
@@ -320,45 +324,107 @@ def _make_owned_runtime(point: AttachPoint, bridge, holder: dict[str, WsLocalSes
     return runtime
 
 
+class _ConnectedRelay:
+    """One stable transport-connected callback per client.
+
+    ``add_connected_callback`` is append-only, and the client outlives the
+    session, so registering a fresh ``ReminderSync`` bound method on every
+    attach would accumulate callbacks across attach/detach cycles. The relay
+    is registered once and retargeted per attach instead.
+    """
+
+    def __init__(self) -> None:
+        self._target = None
+
+    def bind(self, target) -> None:
+        self._target = target
+
+    async def __call__(self) -> None:
+        target = self._target
+        if target is not None:
+            await target()
+
+
+async def _prepare_owned_reminder_sync(point: AttachPoint, client, runtime):
+    """Give the owned runtime the worker's reminder-sync wiring.
+
+    Without it the exposed reminder tools would schedule against a scheduler
+    with no delivery authorizer and no server sync — a silently different
+    contract from the same tools on the worker runtime.
+    """
+    from ...agent.reminder_sync import prepare_reminder_sync
+
+    relay = getattr(client, "_ws_local_reminder_relay", None)
+    if relay is None:
+        relay = _ConnectedRelay()
+        client._ws_local_reminder_relay = relay
+        client.add_connected_callback(relay)
+    return await prepare_reminder_sync(
+        client, runtime, agent_id=point.agent_id, register_connected=relay.bind,
+    )
+
+
 async def _start_ws_consumer(hub: WsLocalHub, authed, on_message) -> None:
     from ...agent.global_inbox_runtime import await_listener_with_runtime
 
     point, client = hub.get(authed.slug), hub.get(authed.slug).client
     owned = getattr(client, "_ws_local_owned_runtime", None)
     heartbeat = asyncio.ensure_future(point.reporter.run_heartbeat_loop())
-    runtime_task = asyncio.ensure_future(owned.run()) if owned is not None else None
+    reminder_sync = None
+    reminder_task = None
+    runtime_task = None
     try:
-        if runtime_task is None:
-            await client.listen(on_message)
-        else:
+        if owned is not None:
+            reminder_sync = await _prepare_owned_reminder_sync(point, client, owned)
+            reminder_task = asyncio.ensure_future(
+                reminder_sync.run(request_snapshot_on_start=False)
+            )
+            runtime_task = asyncio.ensure_future(owned.run())
             await await_listener_with_runtime(
                 client.listen(on_message),
                 runtime_task,
                 label=f"ws-local {authed.slug} global inbox runtime",
             )
+        else:
+            await client.listen(on_message)
     finally:
-        await _stop_ws_consumer(point, client, owned, heartbeat, runtime_task)
+        await _stop_ws_consumer(
+            point, client, owned, heartbeat, runtime_task,
+            reminder_sync, reminder_task,
+        )
 
 
 async def _stop_ws_consumer(
-    point: AttachPoint, client, owned, heartbeat, runtime_task
+    point: AttachPoint, client, owned, heartbeat, runtime_task,
+    reminder_sync=None, reminder_task=None,
 ) -> None:
     point.reporter.stop()
     heartbeat.cancel()
     if owned is not None:
         owned.stop()
+    if runtime_task is not None:
         runtime_task.cancel()
+    if reminder_sync is not None:
+        reminder_sync.stop()
+        # The relay stays registered on the long-lived client; unbinding it
+        # keeps a detached session's sync from being woken by a later connect.
+        relay = getattr(client, "_ws_local_reminder_relay", None)
+        if relay is not None:
+            relay.bind(None)
+    if reminder_task is not None:
+        reminder_task.cancel()
     try:
         await heartbeat
     except asyncio.CancelledError:
         pass
-    if runtime_task is None:
-        return
-    try:
-        await runtime_task
-    except (asyncio.CancelledError, Exception):
-        pass
-    if getattr(client, "_ws_local_owned_runtime", None) is owned:
+    for task in (runtime_task, reminder_task):
+        if task is None:
+            continue
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+    if getattr(client, "_ws_local_owned_runtime", None) is owned and owned is not None:
         client.global_runtime = None
         client.send_coordinator = None
         client.send_delegate = None

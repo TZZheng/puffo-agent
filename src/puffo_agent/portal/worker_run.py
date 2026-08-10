@@ -486,34 +486,11 @@ class StandardWorkerRun:
         return global_runtime
 
     async def _prepare_reminder_sync(self, context: WorkerRunContext, runtime):
-        from ..agent.reminder_sync import ReminderSync
+        from ..agent.reminder_sync import prepare_reminder_sync
 
-        client = context.client
-        reminder_sync = ReminderSync(
-            store=client.store,
-            keystore=client.keystore,
-            owner_slug=client.slug,
-            http_client=client.http,
-            scheduler=runtime.reminder_scheduler,
+        return await prepare_reminder_sync(
+            context.client, runtime, agent_id=context.paths.agent_id,
         )
-        runtime.reminder_scheduler.set_delivery_authorizer(
-            reminder_sync.authorize_due_delivery
-        )
-        runtime.reminder_scheduler.set_lifecycle_committed_callback(
-            reminder_sync.signal_lifecycle_committed
-        )
-        client.add_connected_callback(reminder_sync.on_transport_connected)
-        try:
-            await reminder_sync.reconcile_snapshot()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning(
-                "agent %s: startup reminder snapshot failed; delivery remains blocked",
-                context.paths.agent_id,
-            )
-            reminder_sync.signal_snapshot()
-        return reminder_sync
 
     async def _heartbeat(self, agent_id: str) -> None:
         worker = self.worker

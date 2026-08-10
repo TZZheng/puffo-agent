@@ -118,8 +118,16 @@ async def _stage_model_visible_messages(
     tool_arguments: dict[str, object],
 ) -> str:
     """Stage the highest channel watermark returned to the provider."""
-    rpc = getattr(cfg, "rpc_client", None)
-    if rpc is None:
+    # Same backend order ``read_inbox`` uses: in-process tools (ws-local) hold
+    # a live runtime and never an rpc_client, and ``GlobalInboxRuntime`` and
+    # ``PuffoRpcClient`` expose ``stage_model_visible_read`` with the identical
+    # keyword signature, so the call site below is shared.
+    staging = getattr(cfg, "inbox_runtime", None)
+    if staging is None:
+        staging = getattr(getattr(cfg, "message_client", None), "global_runtime", None)
+    if staging is None:
+        staging = getattr(cfg, "rpc_client", None)
+    if staging is None:
         log_runtime_event(
             logger,
             "history.read_staged",
@@ -166,7 +174,7 @@ async def _stage_model_visible_messages(
         return ""
     # Only stage the exact local rows that are represented in this response.
     visible = [message.envelope_id for message in candidates]
-    staged = await rpc.stage_model_visible_read(
+    staged = await staging.stage_model_visible_read(
         space_id=watermark.space_id,
         channel_id=watermark.channel_id,
         through_seq=watermark.server_seq,

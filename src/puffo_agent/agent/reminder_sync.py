@@ -825,3 +825,48 @@ class ReminderSync:
                 pass
             finally:
                 self._wakeup.clear()
+
+
+async def prepare_reminder_sync(
+    client: Any,
+    runtime: Any,
+    *,
+    agent_id: str = "",
+    register_connected: Callable[[Callable[[], Any]], None] | None = None,
+) -> ReminderSync:
+    """Wire one durable reminder sync onto ``runtime``'s scheduler.
+
+    Both runtime owners (the worker and the ws-local owned runtime) must
+    expose the *same* server-sync contract behind the reminder tools, so
+    the authorizer/lifecycle/connected wiring lives here rather than being
+    re-derived per call site. ``register_connected`` overrides how the
+    transport-connected callback is registered — the ws-local site keeps a
+    single per-client relay because ``add_connected_callback`` has no
+    removal API and attach/detach cycles would otherwise accumulate.
+    """
+    reminder_sync = ReminderSync(
+        store=client.store,
+        keystore=client.keystore,
+        owner_slug=client.slug,
+        http_client=client.http,
+        scheduler=runtime.reminder_scheduler,
+    )
+    runtime.reminder_scheduler.set_delivery_authorizer(
+        reminder_sync.authorize_due_delivery
+    )
+    runtime.reminder_scheduler.set_lifecycle_committed_callback(
+        reminder_sync.signal_lifecycle_committed
+    )
+    register = register_connected or client.add_connected_callback
+    register(reminder_sync.on_transport_connected)
+    try:
+        await reminder_sync.reconcile_snapshot()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "agent %s: startup reminder snapshot failed; delivery remains blocked",
+            agent_id,
+        )
+        reminder_sync.signal_snapshot()
+    return reminder_sync

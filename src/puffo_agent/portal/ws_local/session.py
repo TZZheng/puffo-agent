@@ -42,6 +42,11 @@ from .protocol import (
 
 logger = logging.getLogger(__name__)
 
+# The capabilities a peer must advertise to receive the v2 global bundle.
+# Single definition: the bridge picks the v1 or v2 wire shape from the same
+# set this class enforces, so the two can never drift apart.
+V2_CAPABILITIES = frozenset({"multi-target-v2", "explicit-admission-v2"})
+
 
 class Transport(Protocol):
     async def send(self, raw: str) -> None: ...
@@ -125,8 +130,7 @@ class WsLocalSession:
         await self._pump()
 
     async def deliver_planned(self, planned: Any) -> None:
-        required = {"multi-target-v2", "explicit-admission-v2"}
-        if not required.issubset(self.capabilities):
+        if not V2_CAPABILITIES.issubset(self.capabilities):
             raise RuntimeError(
                 "ws-local peer lacks multi-target-v2/explicit-admission-v2"
             )
