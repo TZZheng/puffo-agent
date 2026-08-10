@@ -47,6 +47,8 @@ _KNOWN_ERROR_STATUSES = {400, 401, 403, 404, 405, 409, 413, 429, 500, 503}
 # Held evidence holds decrypted context, so retention is bounded even when a
 # turn is abandoned without any further coordinated send in that channel.
 _MAX_HELD_RECORDS = 8
+# Roster enrichment must not consume a material share of the provider turn.
+_HELD_MEMBERSHIP_TIMEOUT_SECONDS = 3.0
 
 
 @dataclass(frozen=True)
@@ -1037,17 +1039,6 @@ class SendCoordinator:
                 result,
             )
         output = result.to_dict()
-        if result.state == "held":
-            # Native sends recover in ``_send_request``; return the immutable
-            # draft/basis now and enrich it after recovery below.
-            output.update(
-                await self._held_context_output(
-                    boundary.held_key,
-                    space_id,
-                    channel_id,
-                    boundary.attempt_fingerprint,
-                )
-            )
         if boundary.reconsideration is not None:
             output["_reconsideration_audit"] = boundary.reconsideration.audit_fields()
         return output
@@ -1561,8 +1552,9 @@ class SendCoordinator:
         try:
             from ..mcp.puffo_core_tools import _read_channel_members
 
-            data = await _read_channel_members(
-                _CoordinatorConfig(self), space_id, channel_id
+            data = await asyncio.wait_for(
+                _read_channel_members(_CoordinatorConfig(self), space_id, channel_id),
+                timeout=_HELD_MEMBERSHIP_TIMEOUT_SECONDS,
             )
             members = data.get("members") if isinstance(data, Mapping) else None
             if isinstance(members, list):

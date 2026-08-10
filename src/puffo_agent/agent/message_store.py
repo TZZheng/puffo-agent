@@ -163,6 +163,17 @@ CREATE TABLE IF NOT EXISTS local_ordinal_allocator (
     next_ordinal INTEGER NOT NULL
 );
 INSERT OR IGNORE INTO local_ordinal_allocator(singleton, next_ordinal) VALUES (1, 1);
+CREATE TABLE IF NOT EXISTS server_sequence_high_water (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    high_water INTEGER NOT NULL CHECK (high_water >= 0)
+);
+INSERT OR IGNORE INTO server_sequence_high_water(singleton, high_water) VALUES (1, 0);
+UPDATE server_sequence_high_water
+SET high_water = MAX(
+    high_water,
+    COALESCE((SELECT MAX(server_seq) FROM messages), 0)
+)
+WHERE singleton = 1;
 CREATE TABLE IF NOT EXISTS inbox_notice_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     generation INTEGER NOT NULL,
@@ -779,7 +790,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
     async def _allocate_local_position(
         self, db: aiosqlite.Connection
     ) -> tuple[int, int | None]:
-        """Claim the next local ordinal and the current pending frontier.
+        """Claim the next local ordinal and durable Server frontier.
 
         Every row that has no ``server_seq`` but must still take a definite
         place in Inbox and prior-context ordering allocates through here, so
@@ -787,13 +798,14 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         share one monotonic sequence. The caller owns ``BEGIN IMMEDIATE``.
         """
         async with db.execute(
-            """SELECT MAX(server_seq) FROM messages
-               WHERE receipt_disposition = ? AND processing_state = ?
-                 AND server_seq IS NOT NULL""",
-            (ReceiptDisposition.ELIGIBLE.value, ProcessingState.PENDING.value),
+            """SELECT high_water FROM server_sequence_high_water
+               WHERE singleton = 1"""
         ) as cursor:
             frontier_row = await cursor.fetchone()
-        frontier = int(frontier_row[0]) if frontier_row[0] is not None else None
+        if frontier_row is None:
+            raise LifecycleConflict("server sequence high-water is unavailable")
+        frontier_value = int(frontier_row[0])
+        frontier = frontier_value if frontier_value > 0 else None
         async with db.execute(
             "SELECT next_ordinal FROM local_ordinal_allocator WHERE singleton = 1"
         ) as cursor:
@@ -804,6 +816,20 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             (ordinal + 1,),
         )
         return ordinal, frontier
+
+    @staticmethod
+    async def _advance_server_sequence_high_water(
+        db: aiosqlite.Connection, server_seq: int
+    ) -> None:
+        """Advance the durable receipt frontier inside the caller's transaction."""
+        cursor = await db.execute(
+            """UPDATE server_sequence_high_water
+               SET high_water = MAX(high_water, ?)
+               WHERE singleton = 1""",
+            (server_seq,),
+        )
+        if cursor.rowcount != 1:
+            raise LifecycleConflict("server sequence high-water is unavailable")
 
     async def has_known_channel_rows_above_baseline(
         self,

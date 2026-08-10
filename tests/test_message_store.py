@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -983,6 +984,67 @@ async def test_local_pending_fifo_frontier_ordinal_and_channel_page_survive_reop
     page = await store.get_channel_pending("sp_1", "ch_1", limit=3)
     assert [m.envelope_id for m in page.items] == ["s1", "l1", "l2"]
     assert page.through_seq == 1 and page.more_available
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_local_event_order_uses_durable_frontier_after_pending_drain(tmp_path):
+    db_path = tmp_path / "durable-frontier.db"
+    store = MessageStore(db_path)
+    await store.store_receipt(
+        _channel_payload("s1"),
+        server_seq=1,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="ok",
+    )
+    await store.store_local_event(_channel_payload("l1"), reason="runtime")
+    await store.admit_messages(
+        ["s1", "l1"],
+        turn_id="turn-1",
+        provider_session_id="provider",
+    )
+    await store.mark_processed(
+        ["s1", "l1"],
+        turn_id="turn-1",
+        provider_session_id="provider",
+    )
+    await store.close()
+
+    # Simulate upgrading a database created before the high-water table existed.
+    with sqlite3.connect(db_path) as db:
+        db.execute("DROP TABLE server_sequence_high_water")
+
+    await store.open()
+    l2 = await store.store_local_event(_channel_payload("l2"), reason="runtime")
+    assert l2.after_server_seq == 1
+    await store.store_receipt(
+        _channel_payload("s2"),
+        server_seq=2,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="ok",
+    )
+    await store.admit_messages(
+        ["l2", "s2"],
+        turn_id="turn-2",
+        provider_session_id="provider",
+    )
+    await store.mark_processed(
+        ["l2", "s2"],
+        turn_id="turn-2",
+        provider_session_id="provider",
+    )
+    await store.close()
+    await store.open()
+    await store.store_receipt(
+        _channel_payload("s3"),
+        server_seq=3,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="ok",
+    )
+    anchor = await store.get_message_by_envelope("s3")
+    assert anchor is not None
+    prior = await store.get_prior_context(anchor)
+    assert [item.envelope_id for item in prior] == ["s1", "l1", "l2", "s2"]
     await store.close()
 
 

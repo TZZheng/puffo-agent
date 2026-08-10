@@ -98,6 +98,7 @@ async def _backfill_missing_sequence(
         )
         if cursor.rowcount != 1:
             raise LifecycleConflict("local receipt promotion lost its association")
+        await store._advance_server_sequence_high_water(db, server_seq)
         await db.commit()
         return ReceiptResult(
             ReceiptWriteStatus.COMMITTED, ReceiptDisposition.ELIGIBLE, reason, True
@@ -114,12 +115,14 @@ async def _backfill_missing_sequence(
                  AND receipt_disposition IS NULL AND processing_state IS NULL""",
             (server_seq, disposition.value, reason, envelope_id),
         )
+        await store._advance_server_sequence_high_water(db, server_seq)
         await db.commit()
         return ReceiptResult(ReceiptWriteStatus.COMMITTED, disposition, reason, False)
     await db.execute(
         "UPDATE messages SET server_seq = ? WHERE envelope_id = ? AND server_seq IS NULL",
         (server_seq, envelope_id),
     )
+    await store._advance_server_sequence_high_water(db, server_seq)
     await db.commit()
     return ReceiptResult(
         ReceiptWriteStatus.COMMITTED,
@@ -195,6 +198,7 @@ async def _insert_new_receipt(
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         values + (server_seq, disposition.value, reason, processing),
     )
+    await store._advance_server_sequence_high_water(db, server_seq)
     if processing == ProcessingState.PENDING.value:
         await store._refresh_notice_state(db, activated_at=int(values[9]))
     await db.commit()
