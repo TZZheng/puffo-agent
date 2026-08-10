@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 from PIL import Image
 
+from puffo_agent.agent import inbound_attachments
 from puffo_agent.agent import puffo_core_client as pcc
 from puffo_agent.agent.bridge_transport import (
     payload_from_bridge_frame,
@@ -233,6 +234,82 @@ def test_non_image_attachment_keeps_bare_name(tmp_path, monkeypatch):
     assert (inbox / "notes.txt").exists()
     assert not (inbox / "notes.origin.txt").exists()
     assert paths == [str(inbox / "notes.txt")]
+
+
+def test_inbound_attachment_count_and_byte_limits(tmp_path, monkeypatch):
+    monkeypatch.setattr(inbound_attachments, "MAX_INBOUND_ATTACHMENT_BYTES", 8)
+    monkeypatch.setattr(
+        inbound_attachments,
+        "MAX_INBOUND_ATTACHMENT_TOTAL_BYTES",
+        10,
+    )
+    payloads = {
+        "actual-too-large": b"x" * 9,
+        "first": b"a" * 6,
+        "aggregate-too-large": b"b" * 6,
+        "past-count-cap": b"late",
+    }
+    fetched: list[str] = []
+
+    async def fake_fetch(_http, blob_id):
+        fetched.append(blob_id)
+        return payloads[blob_id]
+
+    monkeypatch.setattr(pcc, "_fetch_blob_with_retry", fake_fetch)
+    monkeypatch.setattr(
+        "puffo_agent.crypto.attachments.decrypt_attachment",
+        lambda ciphertext, _meta: ciphertext,
+    )
+    declared = _meta("declared-too-large", "declared.bin")
+    declared["size"] = 9
+    first = _meta("first", "first.bin")
+    first["size"] = 6
+    aggregate = _meta("aggregate-too-large", "aggregate.bin")
+    aggregate["size"] = 6
+    refs = [
+        declared,
+        _meta("actual-too-large", "actual.bin"),
+        first,
+        aggregate,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        _meta("past-count-cap", "late.bin"),
+    ]
+
+    paths = asyncio.run(
+        PuffoCoreMessageClient._save_inbound_attachments(
+            _stub_self(tmp_path),
+            envelope_id="env_limits",
+            metas_raw=refs,
+        )
+    )
+
+    expected = tmp_path / ".puffo" / "inbox" / "env_limits" / "first.bin"
+    assert paths == [str(expected)]
+    assert expected.read_bytes() == b"a" * 6
+    assert fetched == ["actual-too-large", "first"]
+
+
+def test_inbound_image_pixel_cap_is_checked_before_decode(tmp_path, monkeypatch):
+    monkeypatch.setattr(inbound_attachments, "MAX_INBOUND_IMAGE_PIXELS", 50)
+    _patch_decrypt(monkeypatch, {"blob-1": _png_bytes(10, 10)})
+
+    paths = asyncio.run(
+        PuffoCoreMessageClient._save_inbound_attachments(
+            _stub_self(tmp_path),
+            envelope_id="env_pixel_cap",
+            metas_raw=[_meta("blob-1", "large-raster.png")],
+        )
+    )
+
+    assert paths == []
+    assert not (
+        tmp_path / ".puffo" / "inbox" / "env_pixel_cap" / "large-raster.png"
+    ).exists()
 
 
 def test_mixed_envelope_only_oversized_splits(tmp_path, monkeypatch):

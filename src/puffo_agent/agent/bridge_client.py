@@ -25,6 +25,8 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 import aiohttp
 
+from ..limits import MAX_INBOUND_ATTACHMENT_BYTES
+
 logger = logging.getLogger(__name__)
 
 
@@ -316,7 +318,27 @@ class CloudBridgeClient:
                             "(%s, status=%s)", blob_id, resp.status,
                         )
                         return None
-                    return await resp.read()
+                    if (
+                        resp.content_length is not None
+                        and resp.content_length > MAX_INBOUND_ATTACHMENT_BYTES
+                    ):
+                        logger.warning(
+                            "cloud bridge: blob download exceeds %d bytes (%s)",
+                            MAX_INBOUND_ATTACHMENT_BYTES,
+                            blob_id,
+                        )
+                        return None
+                    body = bytearray()
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        body.extend(chunk)
+                        if len(body) > MAX_INBOUND_ATTACHMENT_BYTES:
+                            logger.warning(
+                                "cloud bridge: blob download exceeds %d bytes (%s)",
+                                MAX_INBOUND_ATTACHMENT_BYTES,
+                                blob_id,
+                            )
+                            return None
+                    return bytes(body)
         except Exception as exc:  # noqa: BLE001 — fail-soft download
             logger.warning(
                 "cloud bridge: blob download error (%s): %s", blob_id, exc,

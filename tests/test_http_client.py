@@ -259,6 +259,7 @@ class TestHttpClientErrors(AioHTTPTestCase):
         app.router.add_route("GET", "/server-error", self._handle_500)
         app.router.add_route("GET", "/html-ok", self._handle_html_ok)
         app.router.add_route("GET", "/empty-ok", self._handle_empty_ok)
+        app.router.add_route("GET", "/large-stream", self._handle_large_stream)
         return app
 
     async def _handle_404(self, request):
@@ -280,6 +281,14 @@ class TestHttpClientErrors(AioHTTPTestCase):
     async def _handle_empty_ok(self, request):
         # A legitimately empty 2xx (204 No Content) — must NOT raise.
         return web.Response(status=204)
+
+    async def _handle_large_stream(self, request):
+        response = web.StreamResponse(status=200)
+        await response.prepare(request)
+        await response.write(b"a" * 700)
+        await response.write(b"b" * 700)
+        await response.write_eof()
+        return response
 
     @unittest_run_loop
     async def test_404_raises_http_error(self):
@@ -330,6 +339,19 @@ class TestHttpClientErrors(AioHTTPTestCase):
         try:
             result = await client.get("/empty-ok")
             assert not result, f"expected falsy empty result, got {result!r}"
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_get_bytes_enforces_chunked_response_limit(self):
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001")
+        try:
+            await client.get_bytes("/large-stream", max_bytes=1024)
+            assert False, "should have rejected the oversized stream"
+        except HttpError as exc:
+            assert exc.status == 413
+            assert "1024 bytes" in exc.body
         finally:
             await client.close()
 

@@ -148,13 +148,24 @@ class PuffoCoreHttpClient:
         _, data = await self._request("GET", path)
         return data
 
-    async def get_bytes(self, path: str) -> bytes:
+    async def get_bytes(self, path: str, *, max_bytes: int | None = None) -> bytes:
         """Signed GET returning raw bytes (e.g. /blobs/{id})."""
+        if max_bytes is not None and (
+            isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
+            or max_bytes <= 0
+        ):
+            raise ValueError("max_bytes must be a positive integer")
         await self._ensure_subkey()
-        bytes_out = await self._do_request_bytes("GET", path)
+        bytes_out = await self._do_request_bytes("GET", path, max_bytes=max_bytes)
         return bytes_out
 
-    async def _do_request_bytes(self, method: str, path: str) -> bytes:
+    async def _do_request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        max_bytes: int | None = None,
+    ) -> bytes:
         signing_key, signer_id = self._load_signing_key()
         from .http_auth import sign_request
         auth = sign_request(signing_key, self.slug, signer_id, method, path, b"")
@@ -167,7 +178,16 @@ class PuffoCoreHttpClient:
                 raise HttpError(401, await resp.text())
             if resp.status >= 400:
                 raise HttpError(resp.status, await resp.text())
-            return await resp.read()
+            if max_bytes is None:
+                return await resp.read()
+            if resp.content_length is not None and resp.content_length > max_bytes:
+                raise HttpError(413, f"response body exceeds {max_bytes} bytes")
+            body = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                body.extend(chunk)
+                if len(body) > max_bytes:
+                    raise HttpError(413, f"response body exceeds {max_bytes} bytes")
+            return bytes(body)
 
     async def post(self, path: str, body: dict | None = None) -> Any:
         raw = json.dumps(body).encode() if body else b""

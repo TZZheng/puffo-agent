@@ -11,12 +11,21 @@ from typing import Any
 from ..crypto import attachments as attachment_crypto
 from ..crypto.attachments import AttachmentMeta
 from ..crypto.http_client import HttpError, PuffoCoreHttpClient
+from ..limits import (
+    MAX_INBOUND_ATTACHMENTS,
+    MAX_INBOUND_ATTACHMENT_BYTES,
+    MAX_INBOUND_ATTACHMENT_TOTAL_BYTES,
+    MAX_INBOUND_IMAGE_PIXELS,
+)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_IMAGE_EDGE_PX = 1568
 _HIGH_RES_IMAGE_EDGE_PX = 2576
 _HIGH_RES_MODEL_MARKERS = ("opus-4-7", "opus-4-8")
+MAX_INBOUND_ATTACHMENT_CIPHERTEXT_BYTES = (
+    MAX_INBOUND_ATTACHMENT_BYTES + 64 * 1024
+)
 
 BlobFetcher = Callable[[PuffoCoreHttpClient, str], Awaitable[bytes | None]]
 ImageScaler = Callable[[Path, Path | None, int], bool]
@@ -34,7 +43,10 @@ async def fetch_blob_with_retry(
         if delay > 0:
             await asyncio.sleep(delay)
         try:
-            return await http.get_bytes(f"/blobs/{blob_id}")
+            return await http.get_bytes(
+                f"/blobs/{blob_id}",
+                max_bytes=MAX_INBOUND_ATTACHMENT_CIPHERTEXT_BYTES,
+            )
         except HttpError as exc:
             last = exc
             if exc.status != 404:
@@ -109,11 +121,18 @@ def downscale_oversized_image(
         return False
     try:
         with Image.open(path) as image:
-            image.load()
             width, height = image.size
+            if width * height > MAX_INBOUND_IMAGE_PIXELS:
+                logger.warning(
+                    "inbound image %s exceeds the %d-pixel safety cap",
+                    path,
+                    MAX_INBOUND_IMAGE_PIXELS,
+                )
+                return False
             longest = max(width, height)
             if longest <= max_edge_px:
                 return False
+            image.load()
             _preserve_original(path, original_path)
             scale = max_edge_px / longest
             resized_size = (
@@ -167,6 +186,22 @@ def is_safe_path_component(value: Any) -> bool:
     return Path(value).name == value
 
 
+def _image_exceeds_pixel_cap(path: Path) -> bool:
+    """Inspect image headers without decoding a potentially huge raster."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return False
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+            return width * height > MAX_INBOUND_IMAGE_PIXELS
+    except Image.DecompressionBombError:
+        return True
+    except Exception:
+        return False
+
+
 async def save_inbound_attachments(
     *,
     workspace: str,
@@ -191,8 +226,15 @@ async def save_inbound_attachments(
     inbox = Path(workspace) / ".puffo" / "inbox" / envelope_id
     inbox.mkdir(parents=True, exist_ok=True)
     paths: list[str] = []
-    for raw in metas_raw:
-        path = await _save_one_attachment(
+    total_bytes = 0
+    if len(metas_raw) > MAX_INBOUND_ATTACHMENTS:
+        log.warning(
+            "attachment count exceeds cap; processing first %d of %d",
+            MAX_INBOUND_ATTACHMENTS,
+            len(metas_raw),
+        )
+    for raw in metas_raw[:MAX_INBOUND_ATTACHMENTS]:
+        saved = await _save_one_attachment(
             raw=raw,
             inbox=inbox,
             image_edge_px=image_edge_px,
@@ -201,9 +243,12 @@ async def save_inbound_attachments(
             fetch_blob=fetch_blob,
             strip_wrapper=strip_wrapper,
             scale_image=scale_image,
+            remaining_bytes=MAX_INBOUND_ATTACHMENT_TOTAL_BYTES - total_bytes,
         )
-        if path is not None:
+        if saved is not None:
+            path, size = saved
             paths.append(str(path))
+            total_bytes += size
     return paths
 
 
@@ -217,13 +262,26 @@ async def _save_one_attachment(
     fetch_blob: BlobFetcher,
     strip_wrapper: Callable[[bytes], bytes],
     scale_image: ImageScaler,
-) -> Path | None:
+    remaining_bytes: int,
+) -> tuple[Path, int] | None:
     if not isinstance(raw, dict):
         return None
     try:
         meta = AttachmentMeta.from_dict(raw)
     except Exception:
         log.warning("attachment meta parse failed: %r", raw)
+        return None
+    if (
+        meta.size < 0
+        or meta.size > MAX_INBOUND_ATTACHMENT_BYTES
+        or meta.size > remaining_bytes
+    ):
+        log.warning(
+            "attachment declared size exceeds inbound limit (%s/%s: %d bytes)",
+            meta.blob_id,
+            meta.filename,
+            meta.size,
+        )
         return None
     ciphertext = await fetch_blob(http, meta.blob_id)
     if ciphertext is None:
@@ -239,6 +297,20 @@ async def _save_one_attachment(
         )
         return None
 
+    plaintext = strip_wrapper(plaintext)
+    plaintext_size = len(plaintext)
+    if (
+        plaintext_size > MAX_INBOUND_ATTACHMENT_BYTES
+        or plaintext_size > remaining_bytes
+    ):
+        log.warning(
+            "attachment plaintext exceeds inbound limit (%s/%s: %d bytes)",
+            meta.blob_id,
+            meta.filename,
+            plaintext_size,
+        )
+        return None
+
     # Basename-reduce both the filename and the blob_id fallback — neither
     # may escape the inbox — with a final literal so the name is never
     # empty. Mirrors the bridge saver.
@@ -246,25 +318,38 @@ async def _save_one_attachment(
         Path(meta.filename).name or Path(str(meta.blob_id)).name or "attachment"
     )
     try:
-        target.write_bytes(strip_wrapper(plaintext))
+        target.write_bytes(plaintext)
     except OSError as exc:
         log.warning("attachment save failed (%s): %s", target, exc)
         return None
-    return await _normalize_saved_image(
+    normalized = await normalize_saved_image(
         target=target,
         image_edge_px=image_edge_px,
         log=log,
         scale_image=scale_image,
     )
+    return (normalized, plaintext_size) if normalized is not None else None
 
 
-async def _normalize_saved_image(
+async def normalize_saved_image(
     *,
     target: Path,
     image_edge_px: int,
     log: Log,
     scale_image: ImageScaler,
-) -> Path:
+) -> Path | None:
+    unsafe = await asyncio.to_thread(_image_exceeds_pixel_cap, target)
+    if unsafe:
+        log.warning(
+            "attachment image exceeds the %d-pixel safety cap (%s)",
+            MAX_INBOUND_IMAGE_PIXELS,
+            target,
+        )
+        try:
+            target.unlink()
+        except OSError:
+            pass
+        return None
     original = target.with_name(f"{target.stem}.origin{target.suffix}")
     resized = await asyncio.to_thread(
         scale_image,

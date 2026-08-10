@@ -31,12 +31,22 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from typing import Any
 
 from ..crypto.message import MessagePayload
 from ..crypto.ws_client import INITIAL_BACKOFF, MAX_BACKOFF
+from ..limits import (
+    MAX_INBOUND_ATTACHMENTS,
+    MAX_INBOUND_ATTACHMENT_BYTES,
+    MAX_INBOUND_ATTACHMENT_TOTAL_BYTES,
+)
 from . import disk_cache
-from .inbound_attachments import downscale_oversized_image, is_safe_path_component
+from .inbound_attachments import (
+    downscale_oversized_image,
+    is_safe_path_component,
+    normalize_saved_image,
+)
 from .contact_cache import BlocklistUnavailable
 from .ingress_policy import (
     GateVerdict,
@@ -806,8 +816,6 @@ async def save_inbound_bridge_attachments(
     """
     if not client.workspace or not refs or client._bridge is None:
         return []
-    from pathlib import Path
-
     if not is_safe_path_component(envelope_id):
         client._log.warning(
             "bridge attachments skipped: envelope_id is not a safe path "
@@ -818,69 +826,83 @@ async def save_inbound_bridge_attachments(
     inbox = Path(client.workspace) / ".puffo" / "inbox" / envelope_id
     inbox.mkdir(parents=True, exist_ok=True)
     paths: list[str] = []
-    for raw in refs:
-        if not isinstance(raw, dict):
-            continue
-        blob_id = raw.get("blob_id")
-        if not blob_id:
-            client._log.warning(
-                "bridge attachment ref missing blob_id: %r",
-                raw,
-            )
-            continue
-        try:
-            data = await client._bridge.download_blob(blob_id)
-        except Exception as exc:  # noqa: BLE001 — one bad ref never fatal
-            client._log.warning(
-                "bridge attachment download raised (%s): %s",
-                blob_id,
-                exc,
-            )
-            continue
-        if data is None:
-            # Missing / oversized / unfetchable — download_blob
-            # already logged; skip without failing the turn.
-            continue
-        # Sanitise filename to block ``../`` / absolute-path
-        # write-outside-inbox via a malicious sender. The blob_id
-        # fallback is basename-reduced too — a blob_id carrying path
-        # separators must not escape the inbox — and a final literal
-        # guarantees a non-empty name.
-        safe_name = (
-            Path(str(raw.get("filename") or "")).name
-            or Path(str(blob_id)).name
-            or "attachment"
+    total_bytes = 0
+    if len(refs) > MAX_INBOUND_ATTACHMENTS:
+        client._log.warning(
+            "bridge attachment count exceeds cap; processing first %d of %d",
+            MAX_INBOUND_ATTACHMENTS,
+            len(refs),
         )
-        target = inbox / safe_name
-        try:
-            target.write_bytes(data)
-        except OSError as exc:
-            client._log.warning(
-                "bridge attachment save failed (%s): %s",
-                target,
-                exc,
-            )
-            continue
-        # Shrink oversized images off-loop, same as the native saver.
-        origin = target.with_name(f"{target.stem}.origin{target.suffix}")
-        resized = await asyncio.to_thread(
-            downscale_oversized_image,
-            target,
-            origin,
-            client._image_edge_px,
+    for raw in refs[:MAX_INBOUND_ATTACHMENTS]:
+        saved = await _save_one_bridge_attachment(
+            client,
+            raw=raw,
+            inbox=inbox,
+            remaining_bytes=MAX_INBOUND_ATTACHMENT_TOTAL_BYTES - total_bytes,
         )
-        if resized:
-            compressed = target.with_name(f"{target.stem}.compressed{target.suffix}")
-            try:
-                target.rename(compressed)
-                paths.append(str(compressed))
-            except OSError as exc:
-                client._log.warning(
-                    "could not rename compressed image %s: %s",
-                    target,
-                    exc,
-                )
-                paths.append(str(target))
-        else:
-            paths.append(str(target))
+        if saved is not None:
+            path, size = saved
+            paths.append(str(path))
+            total_bytes += size
     return paths
+
+
+async def _save_one_bridge_attachment(
+    client,
+    *,
+    raw: Any,
+    inbox: Path,
+    remaining_bytes: int,
+) -> tuple[Path, int] | None:
+    if not isinstance(raw, dict):
+        return None
+    blob_id = raw.get("blob_id")
+    if not blob_id:
+        client._log.warning("bridge attachment ref missing blob_id: %r", raw)
+        return None
+    declared = raw.get("size_bytes")
+    if declared is not None and (
+        isinstance(declared, bool)
+        or not isinstance(declared, int)
+        or declared < 0
+        or declared > MAX_INBOUND_ATTACHMENT_BYTES
+        or declared > remaining_bytes
+    ):
+        client._log.warning(
+            "bridge attachment declared size exceeds inbound limit (%s: %r bytes)",
+            blob_id,
+            declared,
+        )
+        return None
+    try:
+        data = await client._bridge.download_blob(blob_id)
+    except Exception as exc:  # noqa: BLE001 — one bad ref never fatal
+        client._log.warning("bridge attachment download raised (%s): %s", blob_id, exc)
+        return None
+    if data is None:
+        return None
+    if len(data) > MAX_INBOUND_ATTACHMENT_BYTES or len(data) > remaining_bytes:
+        client._log.warning(
+            "bridge attachment plaintext exceeds inbound limit (%s: %d bytes)",
+            blob_id,
+            len(data),
+        )
+        return None
+    safe_name = (
+        Path(str(raw.get("filename") or "")).name
+        or Path(str(blob_id)).name
+        or "attachment"
+    )
+    target = inbox / safe_name
+    try:
+        target.write_bytes(data)
+    except OSError as exc:
+        client._log.warning("bridge attachment save failed (%s): %s", target, exc)
+        return None
+    normalized = await normalize_saved_image(
+        target=target,
+        image_edge_px=client._image_edge_px,
+        log=client._log,
+        scale_image=downscale_oversized_image,
+    )
+    return (normalized, len(data)) if normalized is not None else None
