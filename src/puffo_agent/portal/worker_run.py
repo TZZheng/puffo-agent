@@ -506,11 +506,22 @@ class StandardWorkerRun:
         if uploader is None:
             return
         while not self.worker._stop.is_set():
-            result = await uploader.upload_once()
-            if result.state == "degraded":
+            try:
+                result = await uploader.upload_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A local store failure must not silently retire the loop and
+                # strand every later event; surface it and keep draining.
+                logger.warning(
+                    "runtime event upload failed; retrying", exc_info=True
+                )
                 delay = RUNTIME_EVENT_DEGRADED_RETRY_SECONDS
             else:
-                delay = 0.1 if result.state == "uploaded" else 1.0
+                if result.state == "degraded":
+                    delay = RUNTIME_EVENT_DEGRADED_RETRY_SECONDS
+                else:
+                    delay = 0.1 if result.state == "uploaded" else 1.0
             try:
                 await asyncio.wait_for(self.worker._stop.wait(), timeout=delay)
             except asyncio.TimeoutError:

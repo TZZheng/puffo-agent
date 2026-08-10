@@ -6,10 +6,12 @@ import asyncio
 import inspect
 import json
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Iterable
+from typing import Any, Awaitable, Callable, Iterable, TypeVar
 
 from ._logging import log_runtime_event
 from .harness.driver import HarnessEvent, HarnessEventType
@@ -26,6 +28,8 @@ APPEND_PATH = "/v2/agent-runtime/events:append"
 # Agent to a Server without the append endpoint.  Retain FIFO evidence until
 # the operator repairs that boundary rather than treating the head as bad.
 _DEGRADED_CHANNEL_HTTP_STATUSES = frozenset({401, 403, 404, 405})
+
+_Result = TypeVar("_Result")
 
 
 def runtime_event_outbox_path(agent_state_dir: str | Path) -> Path:
@@ -58,7 +62,15 @@ class UploadResult:
 
 
 class RuntimeEventOutbox:
-    """One per Agent. All writes use immediate SQLite transactions."""
+    """One per Agent. All writes use immediate SQLite transactions.
+
+    ``synchronous=FULL`` makes every commit wait on an fsync, so the DB work
+    is owned by one dedicated thread rather than the caller's thread.  Async
+    callers await that thread, which keeps the daemon's shared event loop
+    free while the durability guarantee is unchanged.  A single owning thread
+    also means the connection is never used concurrently, so SQLite
+    serialization is not being relied on.
+    """
 
     def __init__(
         self,
@@ -77,11 +89,26 @@ class RuntimeEventOutbox:
         self.terminal_reserve_rows = terminal_reserve_rows
         self.terminal_reserve_bytes = terminal_reserve_bytes
         self.logger = logger
-        self._db = sqlite3.connect(self.path)
-        self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=FULL")
-        self._db.executescript(
+        self._worker = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="runtime-event-outbox"
+        )
+        self._worker_ident = 0
+        self._closed = False
+        try:
+            self._db = self._worker.submit(self._connect).result()
+        except BaseException:
+            self._worker.shutdown(wait=False)
+            raise
+        self._lock = asyncio.Lock()
+
+    def _connect(self) -> sqlite3.Connection:
+        """Open the durable connection on the thread that will own it."""
+        self._worker_ident = threading.get_ident()
+        db = sqlite3.connect(self.path, check_same_thread=False)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+        db.executescript(
             """
             CREATE TABLE IF NOT EXISTS events (
               sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -97,11 +124,30 @@ class RuntimeEventOutbox:
             );
             """
         )
-        self._db.commit()
-        self._lock = asyncio.Lock()
+        db.commit()
+        return db
+
+    def _call(self, work: Callable[[], _Result]) -> _Result:
+        """Run DB work on the owning thread and block for its result."""
+        if threading.get_ident() == self._worker_ident:
+            return work()
+        return self._worker.submit(work).result()
+
+    async def _acall(self, work: Callable[[], _Result]) -> _Result:
+        """Await DB work on the owning thread without blocking the loop."""
+        if threading.get_ident() == self._worker_ident:
+            return work()
+        return await asyncio.wrap_future(self._worker.submit(work))
 
     def close(self) -> None:
-        self._db.close()
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            # Drain queued work before closing so no job races the close.
+            self._worker.submit(self._db.close).result()
+        finally:
+            self._worker.shutdown(wait=True)
 
     async def aclose(self) -> None:
         self.close()
@@ -115,6 +161,9 @@ class RuntimeEventOutbox:
         ).encode("utf-8")
 
     def usage(self) -> tuple[int, int]:
+        return self._call(self._usage)
+
+    def _usage(self) -> tuple[int, int]:
         row = self._db.execute(
             "SELECT COUNT(*) AS rows, COALESCE(SUM(byte_count), 0) AS bytes "
             "FROM events"
@@ -142,48 +191,61 @@ class RuntimeEventOutbox:
             event.type == "turn.finished" if terminal is None else terminal
         )
         async with self._lock:
-            rows, bytes_ = self.usage()
-            row_limit = self.max_rows
-            byte_limit = self.max_bytes
-            if not is_terminal:
-                row_limit -= self.terminal_reserve_rows
-                byte_limit -= self.terminal_reserve_bytes
-            if rows + 1 > row_limit or bytes_ + len(encoded) > byte_limit:
-                self._log(
-                    "runtime.capacity", state="blocked",
-                    event_id=event.event_id, event_type=event.type,
-                    error_code="capacity",
-                )
-                raise OutboxCapacityError(
-                    "enqueue would exceed runtime event outbox capacity"
-                )
-            try:
-                cursor = self._db.execute(
-                    "INSERT INTO events"
-                    "(event_id,event_type,event_json,byte_count) VALUES(?,?,?,?)",
-                    (event.event_id, event.type, encoded, len(encoded)),
-                )
-                self._db.commit()
-            except sqlite3.IntegrityError:
-                row = self._db.execute(
-                    "SELECT sequence,event_json FROM events WHERE event_id=?",
-                    (event.event_id,),
-                ).fetchone()
-                if row is None or bytes(row["event_json"]) != encoded:
-                    raise ValueError("event_id reused with different content")
-                return int(row["sequence"])
-            sequence = int(cursor.lastrowid)
-            self._log(
-                "runtime.enqueued", event_id=event.event_id,
-                event_type=event.type, outbox_sequence=sequence,
-                agent_id=event.agent_id, session_ref=event.session_ref,
-                turn_ref=event.turn_ref,
+            # The lock is acquired in call order, so submission order decides
+            # sequence order; capacity check, INSERT and commit are one job so
+            # no other writer can slip between them.
+            return await self._acall(
+                lambda: self._insert(event, encoded, is_terminal)
             )
-            return sequence
+
+    def _insert(
+        self, event: RuntimeEvent, encoded: bytes, is_terminal: bool
+    ) -> int:
+        rows, bytes_ = self._usage()
+        row_limit = self.max_rows
+        byte_limit = self.max_bytes
+        if not is_terminal:
+            row_limit -= self.terminal_reserve_rows
+            byte_limit -= self.terminal_reserve_bytes
+        if rows + 1 > row_limit or bytes_ + len(encoded) > byte_limit:
+            self._log(
+                "runtime.capacity", state="blocked",
+                event_id=event.event_id, event_type=event.type,
+                error_code="capacity",
+            )
+            raise OutboxCapacityError(
+                "enqueue would exceed runtime event outbox capacity"
+            )
+        try:
+            cursor = self._db.execute(
+                "INSERT INTO events"
+                "(event_id,event_type,event_json,byte_count) VALUES(?,?,?,?)",
+                (event.event_id, event.type, encoded, len(encoded)),
+            )
+            self._db.commit()
+        except sqlite3.IntegrityError:
+            row = self._db.execute(
+                "SELECT sequence,event_json FROM events WHERE event_id=?",
+                (event.event_id,),
+            ).fetchone()
+            if row is None or bytes(row["event_json"]) != encoded:
+                raise ValueError("event_id reused with different content")
+            return int(row["sequence"])
+        sequence = int(cursor.lastrowid)
+        self._log(
+            "runtime.enqueued", event_id=event.event_id,
+            event_type=event.type, outbox_sequence=sequence,
+            agent_id=event.agent_id, session_ref=event.session_ref,
+            turn_ref=event.turn_ref,
+        )
+        return sequence
 
     def prefix(
         self, *, max_rows: int = 50, max_bytes: int = 256 * 1024
     ) -> list[OutboxRow]:
+        return self._call(lambda: self._prefix(max_rows, max_bytes))
+
+    def _prefix(self, max_rows: int, max_bytes: int) -> list[OutboxRow]:
         result: list[OutboxRow] = []
         # Account for the complete JSON envelope, including wrapper and commas.
         total = len(b'{"events":[]}')
@@ -209,6 +271,9 @@ class RuntimeEventOutbox:
 
     def increment_retries(self, sequences: Iterable[int]) -> None:
         values = tuple(int(value) for value in sequences)
+        self._call(lambda: self._increment_retries(values))
+
+    def _increment_retries(self, values: tuple[int, ...]) -> None:
         if not values:
             return
         placeholders = ",".join("?" for _ in values)
@@ -223,6 +288,12 @@ class RuntimeEventOutbox:
             raise ValueError("append response does not exactly match batch")
         if not rows:
             return
+        # Verify and delete in one job so the batch cannot change in between.
+        self._call(lambda: self._acknowledge(rows, accepted_ids))
+
+    def _acknowledge(
+        self, rows: list[OutboxRow], accepted_ids: list[str]
+    ) -> None:
         first, last = rows[0].sequence, rows[-1].sequence
         actual = [
             str(row["event_id"]) for row in self._db.execute(
@@ -239,14 +310,37 @@ class RuntimeEventOutbox:
 
     def discard(self, row: OutboxRow, *, error_code: str) -> None:
         """Quarantine a permanently rejected head by removing it from FIFO."""
-        self._db.execute("DELETE FROM events WHERE sequence = ?", (row.sequence,))
-        self._db.commit()
+        self._call(lambda: self._discard(row.sequence))
         self._log("runtime.discarded", outbox_sequence=row.sequence,
                   event_id=row.event_id, error_code=error_code)
+
+    def _discard(self, sequence: int) -> None:
+        self._db.execute("DELETE FROM events WHERE sequence = ?", (sequence,))
+        self._db.commit()
 
     def set_active_turn(
         self, turn_ref: str | None, *, session_ref: str = "",
         native_session_id: str = "",
+    ) -> None:
+        self._call(
+            lambda: self._set_active_turn(
+                turn_ref, session_ref, native_session_id
+            )
+        )
+
+    async def aset_active_turn(
+        self, turn_ref: str | None, *, session_ref: str = "",
+        native_session_id: str = "",
+    ) -> None:
+        """Commit the active turn without blocking the caller's event loop."""
+        await self._acall(
+            lambda: self._set_active_turn(
+                turn_ref, session_ref, native_session_id
+            )
+        )
+
+    def _set_active_turn(
+        self, turn_ref: str | None, session_ref: str, native_session_id: str
     ) -> None:
         values = {
             "active_turn_ref": turn_ref or "",
@@ -262,6 +356,13 @@ class RuntimeEventOutbox:
                 )
 
     def state(self) -> dict[str, str]:
+        return self._call(self._state)
+
+    async def astate(self) -> dict[str, str]:
+        """Read persisted state without blocking the caller's event loop."""
+        return await self._acall(self._state)
+
+    def _state(self) -> dict[str, str]:
         return {
             str(row["key"]): str(row["value"])
             for row in self._db.execute("SELECT key,value FROM state")
@@ -291,11 +392,46 @@ class RuntimeEventUploader:
         self._lock = asyncio.Lock()
         self._isolate_head = False
 
+    async def _increment_retries(self, rows: list[OutboxRow]) -> None:
+        sequences = tuple(row.sequence for row in rows)
+        await self.outbox._acall(
+            lambda: self.outbox.increment_retries(sequences)
+        )
+
+    async def _discard_head(self, row: OutboxRow) -> None:
+        error_code = self.degraded_error
+        await self.outbox._acall(
+            lambda: self.outbox.discard(row, error_code=error_code)
+        )
+
+    async def _isolate_or_discard(
+        self, rows: list[OutboxRow], error_code: str
+    ) -> UploadResult:
+        """Reject a batch by retrying its head alone before discarding it.
+
+        A batch rejection does not identify its bad member, so FIFO evidence
+        is retained until a singleton attempt names the head.
+        """
+        self.degraded_error = error_code
+        if len(rows) > 1:
+            self._isolate_head = True
+            return UploadResult("retry", error_code=error_code)
+        self.outbox._log(
+            "runtime.retry", outbox_sequence=rows[0].sequence,
+            retry_count=rows[0].retry_count,
+            state="degraded", error_code=error_code,
+        )
+        await self._discard_head(rows[0])
+        self._isolate_head = False
+        return UploadResult("discarded", error_code=error_code)
+
     async def upload_once(self) -> UploadResult:
         async with self._lock:
-            rows = self.outbox.prefix(
-                max_rows=1 if self._isolate_head else self.batch_rows,
-                max_bytes=self.batch_bytes
+            batch_rows = 1 if self._isolate_head else self.batch_rows
+            rows = await self.outbox._acall(
+                lambda: self.outbox.prefix(
+                    max_rows=batch_rows, max_bytes=self.batch_bytes
+                )
             )
             if not rows:
                 return UploadResult("idle")
@@ -306,7 +442,7 @@ class RuntimeEventUploader:
             # sent as an over-limit HTTP request.
             if len(body) > self.batch_bytes:
                 self.degraded_error = "body_too_large"
-                self.outbox.discard(rows[0], error_code=self.degraded_error)
+                await self._discard_head(rows[0])
                 return UploadResult("discarded", error_code=self.degraded_error)
             self.outbox._log(
                 "runtime.batch_attempt",
@@ -321,7 +457,7 @@ class RuntimeEventUploader:
                     response = await response
                 status, payload = await _decode_response(response)
             except Exception:
-                self.outbox.increment_retries(row.sequence for row in rows)
+                await self._increment_retries(rows)
                 self.outbox._log(
                     "runtime.retry", outbox_sequence=rows[0].sequence,
                     retry_count=rows[0].retry_count + 1,
@@ -329,7 +465,7 @@ class RuntimeEventUploader:
                 )
                 return UploadResult("retry", error_code="transport")
             if status == 429 or status >= 500:
-                self.outbox.increment_retries(row.sequence for row in rows)
+                await self._increment_retries(rows)
                 self.outbox._log(
                     "runtime.retry", outbox_sequence=rows[0].sequence,
                     retry_count=rows[0].retry_count + 1,
@@ -345,42 +481,17 @@ class RuntimeEventUploader:
                 )
                 return UploadResult("degraded", error_code=self.degraded_error)
             if status < 200 or status >= 300:
-                # A batch rejection does not identify its bad member.  Retry
-                # its head alone before discarding anything, preserving FIFO
-                # evidence and letting valid followers progress.
-                if len(rows) > 1:
-                    self.degraded_error = f"http_{status}"
-                    self._isolate_head = True
-                    return UploadResult("retry", error_code=self.degraded_error)
-                self.degraded_error = f"http_{status}"
-                self.outbox._log(
-                    "runtime.retry", outbox_sequence=rows[0].sequence,
-                    retry_count=rows[0].retry_count,
-                    state="degraded", error_code=self.degraded_error,
-                )
-                self.outbox.discard(rows[0], error_code=self.degraded_error)
-                self._isolate_head = False
-                return UploadResult("discarded", error_code=self.degraded_error)
+                return await self._isolate_or_discard(rows, f"http_{status}")
             try:
                 accepted = payload["accepted"]
                 accepted_ids = [str(item["event_id"]) for item in accepted]
                 if len(accepted_ids) != len(rows):
                     raise ValueError("partial acknowledgement")
-                self.outbox.acknowledge(rows, accepted_ids)
-            except (KeyError, TypeError, ValueError):
-                if len(rows) > 1:
-                    self.degraded_error = "malformed_response"
-                    self._isolate_head = True
-                    return UploadResult("retry", error_code=self.degraded_error)
-                self.degraded_error = "malformed_response"
-                self.outbox._log(
-                    "runtime.retry", outbox_sequence=rows[0].sequence,
-                    retry_count=rows[0].retry_count,
-                    state="degraded", error_code=self.degraded_error,
+                await self.outbox._acall(
+                    lambda: self.outbox.acknowledge(rows, accepted_ids)
                 )
-                self.outbox.discard(rows[0], error_code=self.degraded_error)
-                self._isolate_head = False
-                return UploadResult("discarded", error_code=self.degraded_error)
+            except (KeyError, TypeError, ValueError):
+                return await self._isolate_or_discard(rows, "malformed_response")
             self.outbox._log(
                 "runtime.acknowledged", first_sequence=rows[0].sequence,
                 last_sequence=rows[-1].sequence, event_count=len(rows),

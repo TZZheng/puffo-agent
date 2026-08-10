@@ -595,7 +595,7 @@ def build_local_runtime_adapter(
         elif event_type in {"turn.completed", "turn.abandoned"}:
             active_turn = None
         else:
-            active_turn = outbox.state().get("active_turn_ref") or None
+            active_turn = (await outbox.astate()).get("active_turn_ref") or None
         if event_type in {
             "turn.started",
             "turn.completed",
@@ -603,7 +603,7 @@ def build_local_runtime_adapter(
             "session.opened",
             "session.resumed",
         }:
-            outbox.set_active_turn(
+            await outbox.aset_active_turn(
                 active_turn,
                 session_ref=logical_session,
                 native_session_id=manager.native_session_id,

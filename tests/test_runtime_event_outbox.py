@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +15,7 @@ from puffo_agent.agent.runtime_event_outbox import (
     RuntimeEventOutbox,
     RuntimeEventProjectingSink,
     RuntimeEventUploader,
+    UploadResult,
     runtime_event_outbox_path,
 )
 from puffo_agent.agent.harness.driver import HarnessEvent, SessionRef, TurnRef
@@ -381,6 +384,85 @@ async def test_worker_retries_degraded_event_channel_until_recovery(
     assert attempts == 2
     assert uploader.degraded_error == ""
     assert outbox.prefix() == []
+    outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_upload_loop_survives_local_store_failure_and_reports_it(
+    monkeypatch, caplog,
+):
+    """A transient local-store error must not silently retire the uploader.
+
+    Without the guard the raised ``OperationalError`` escapes
+    ``_upload_runtime_events``, the task dies, and every later event stalls
+    with no log line naming the cause.
+    """
+    monkeypatch.setattr(
+        worker_run_module, "RUNTIME_EVENT_DEGRADED_RETRY_SECONDS", 0.0
+    )
+    caplog.set_level(logging.WARNING)
+    stop = asyncio.Event()
+    attempts = 0
+
+    class FlakyUploader:
+        async def upload_once(self):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("database is locked")
+            stop.set()
+            return UploadResult("uploaded", 1)
+
+    run = StandardWorkerRun(SimpleNamespace(_stop=stop))
+    await run._upload_runtime_events(FlakyUploader())
+
+    assert attempts == 2
+    reported = [
+        record for record in caplog.records
+        if record.levelno >= logging.WARNING and record.exc_info is not None
+        and isinstance(record.exc_info[1], sqlite3.OperationalError)
+    ]
+    assert len(reported) == 1
+    assert "database is locked" in str(reported[0].exc_info[1])
+
+
+@pytest.mark.asyncio
+async def test_durable_commits_run_off_loop_and_preserve_submission_order(
+    tmp_path,
+):
+    """``synchronous=FULL`` commits must never run on the shared event loop.
+
+    Moving them off the loop must not reorder concurrent enqueues, so the
+    persisted sequence still follows submission order and the batch
+    acknowledgement still empties the outbox.
+    """
+    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    loop_thread = threading.get_ident()
+    executing_threads: set[int] = set()
+    outbox._db.set_trace_callback(
+        lambda _statement: executing_threads.add(threading.get_ident())
+    )
+
+    async def accept(_path, body):
+        return 200, {"accepted": [
+            {"event_id": item["event_id"]}
+            for item in json.loads(body)["events"]
+        ]}
+
+    await asyncio.gather(*(outbox.enqueue(event(index)) for index in range(5)))
+
+    rows = outbox.prefix()
+    assert [row.event_id for row in rows] == [
+        event(index).event_id for index in range(5)
+    ]
+    sequences = [row.sequence for row in rows]
+    assert sequences == sorted(set(sequences))
+
+    uploader = RuntimeEventUploader(outbox, accept)
+    assert (await uploader.upload_once()).state == "uploaded"
+    assert outbox.prefix() == []
+
+    assert executing_threads and loop_thread not in executing_threads
     outbox.close()
 
 
