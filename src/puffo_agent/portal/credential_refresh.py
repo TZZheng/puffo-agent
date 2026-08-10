@@ -216,6 +216,15 @@ def _disk_expires_in_seconds(host_home: Path) -> Optional[int]:
     return int(ms / 1000 - time.time())
 
 
+def _is_fresh(expires_in: int | None) -> bool:
+    """One definition of "this credential doesn't need rotating yet".
+
+    ``None`` (no credential, or an unreadable one) is not fresh — the
+    absence of an expiry is not evidence of a valid token.
+    """
+    return expires_in is not None and expires_in > REFRESH_SAFETY_MARGIN_SECONDS
+
+
 class RefreshOutcome(enum.Enum):
     """Result of a single backend refresh attempt."""
     REFRESHED = "refreshed"
@@ -918,7 +927,7 @@ class CredentialRefresher:
         fires — N concurrent callers see "another caller already
         refreshed" and skip the backend invocation."""
         expires = self.expires_in_seconds()
-        if expires is not None and expires > REFRESH_SAFETY_MARGIN_SECONDS:
+        if _is_fresh(expires):
             self._sync_views()
             return True
         await self._refresh_now(expires_in=expires, by_agent=False)
@@ -1136,8 +1145,7 @@ class CredentialRefresher:
         UNCHANGED at or below the margin means we asked for a rotation we
         genuinely needed and did not get one.
         """
-        expires_in = self.expires_in_seconds()
-        return expires_in is not None and expires_in > REFRESH_SAFETY_MARGIN_SECONDS
+        return _is_fresh(self.expires_in_seconds())
 
     def _propagate_outcome(self, outcome: RefreshOutcome) -> None:
         if outcome is RefreshOutcome.REFRESHED:

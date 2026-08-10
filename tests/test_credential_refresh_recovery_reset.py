@@ -15,11 +15,13 @@ import json
 import time
 from pathlib import Path
 
+from puffo_agent.portal import credential_refresh
 from puffo_agent.portal.credential_refresh import (
     REFRESH_BROKEN_THRESHOLD,
     REFRESH_SAFETY_MARGIN_SECONDS,
     CredentialRefresher,
     RefreshOutcome,
+    _is_fresh,
 )
 
 
@@ -166,6 +168,54 @@ def test_benign_unchanged_does_not_clear_an_existing_break(tmp_path, monkeypatch
     r._propagate_outcome(RefreshOutcome.UNCHANGED)
 
     assert RuntimeState.load(aid).health == "refresh_broken"
+
+
+# ── the freshness predicate itself ─────────────────────────────────
+
+
+def test_already_expired_credential_is_not_fresh():
+    # Intent, not accident: a negative remaining lifetime has to fail the
+    # check. `> MARGIN` gets this right today, but nothing pinned it, so a
+    # future rewrite to `abs(...)` or `!= 0` would pass every other test.
+    assert _is_fresh(-1) is False
+    assert _is_fresh(-REFRESH_SAFETY_MARGIN_SECONDS * 10) is False
+
+
+def test_margin_boundary_is_exclusive():
+    assert _is_fresh(REFRESH_SAFETY_MARGIN_SECONDS) is False
+    assert _is_fresh(REFRESH_SAFETY_MARGIN_SECONDS + 1) is True
+
+
+def test_no_credential_is_not_fresh():
+    assert _is_fresh(None) is False
+
+
+def test_ensure_fresh_and_the_outcome_check_share_one_predicate(monkeypatch):
+    # Drift guard (Solution's QA nit). ensure_fresh() short-circuits on the
+    # same "comfortably valid" question that _credential_is_fresh answers.
+    # They were separate expressions; if they drift, a credential can be
+    # fresh enough to skip refreshing but stale enough to count UNCHANGED
+    # as a failure — the exact conflation PUF-349 removed. Both now route
+    # through _is_fresh, and this fails if either stops doing so.
+    seen: list[int | None] = []
+    real = credential_refresh._is_fresh
+
+    def spy(expires_in):
+        seen.append(expires_in)
+        return real(expires_in)
+
+    monkeypatch.setattr(credential_refresh, "_is_fresh", spy)
+
+    import asyncio
+    from pathlib import Path as _P
+
+    r = CredentialRefresher(host_home=_P("/nonexistent-host-home"))
+    asyncio.run(r.ensure_fresh())
+    assert seen, "ensure_fresh() no longer consults _is_fresh"
+
+    seen.clear()
+    r._credential_is_fresh()
+    assert seen, "_credential_is_fresh() no longer consults _is_fresh"
 
 
 # ── the reported trace, end to end ─────────────────────────────────
