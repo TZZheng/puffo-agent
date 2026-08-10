@@ -656,6 +656,51 @@ class InboxStoreMixin:
             assert run is not None
             return run
 
+    async def transfer_turn_session(
+        self,
+        turn_id: str,
+        *,
+        from_provider_session_id: str | None,
+        to_provider_session_id: str,
+    ) -> TurnRun:
+        """Move an active Turn to a replacement provider session atomically.
+
+        A provider retry can land in a *new* session which receives the turn's
+        rows as a fresh payload rather than through the original transcript.
+        Ownership must then follow the rows durably: this is the only sanctioned
+        way ``turn_runs.provider_session_id`` may change, and it succeeds only
+        while the turn is still active and still owned by the caller's session.
+        """
+        if not turn_id:
+            raise LifecycleConflict("turn ID is required")
+        if not to_provider_session_id:
+            raise LifecycleConflict("a replacement provider session is required")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await db.execute(
+                    "UPDATE turn_runs SET provider_session_id = ? "
+                    "WHERE turn_id = ? AND state = ? AND provider_session_id IS ?",
+                    (
+                        to_provider_session_id,
+                        turn_id,
+                        ProcessingState.IN_TURN.value,
+                        from_provider_session_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise LifecycleConflict(
+                        "turn is not active under the previous provider session"
+                    )
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+            run = await self._get_turn_run_unlocked(db, turn_id)
+            assert run is not None
+            return run
+
     async def _admit_messages_unlocked(
         self,
         message_ids: Iterable[str],
@@ -758,10 +803,14 @@ class InboxStoreMixin:
         *,
         turn_id: str,
         processed_at: int | None = None,
+        provider_session_id: str | None = None,
     ) -> TurnRun:
         async with self._inbox_lock:
             return await self._mark_processed_unlocked(
-                message_ids, turn_id=turn_id, processed_at=processed_at
+                message_ids,
+                turn_id=turn_id,
+                processed_at=processed_at,
+                provider_session_id=provider_session_id,
             )
 
     async def _mark_processed_unlocked(
@@ -770,6 +819,7 @@ class InboxStoreMixin:
         *,
         turn_id: str,
         processed_at: int | None = None,
+        provider_session_id: str | None = None,
     ) -> TurnRun:
         ids = self._exact_ids(message_ids)
         completed = processed_at if processed_at is not None else _now_ms()
@@ -777,6 +827,19 @@ class InboxStoreMixin:
         placeholders = ",".join("?" for _ in ids)
         await db.execute("BEGIN IMMEDIATE")
         try:
+            # An optional durable-owner gate: the caller asserts *which*
+            # provider session it proved the bodies to, and the same
+            # transaction that finalizes the rows checks that claim against
+            # ``turn_runs``. An in-memory session assignment alone can no
+            # longer acknowledge Inbox work.
+            if provider_session_id is not None:
+                async with db.execute(
+                    "SELECT provider_session_id FROM turn_runs WHERE turn_id = ?",
+                    (turn_id,),
+                ) as cursor:
+                    owner = await cursor.fetchone()
+                if owner is None or owner["provider_session_id"] != provider_session_id:
+                    raise LifecycleConflict("turn belongs to another provider session")
             expected = await self._turn_message_ids(db, turn_id)
             if len(expected) != len(ids) or set(expected) != set(ids):
                 raise LifecycleConflict("completion IDs do not exactly match the turn")

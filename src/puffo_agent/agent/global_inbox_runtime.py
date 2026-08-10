@@ -882,7 +882,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 if retries == 0:
                     await self.run_turn(planned)
                 else:
-                    await self._run_retry(planned)
+                    await self._run_retry(await self._prepare_retry_attempt(planned))
                 return
             except Exception as exc:
                 from .core import AgentAPIError
@@ -899,10 +899,38 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 retries += 1
                 await self.retry_sleep(min(2 ** (retries - 1), 4))
                 self.active.provider_turn_id = None
-                self.adapter.register_admission_callback(
-                    lambda event: self._admit_retry_attempt(planned, event),
-                    planned.planning_cycle_key,
-                )
+
+    async def _prepare_retry_attempt(self, planned: PlannedTurn) -> PlannedTurn:
+        """Build the retry payload from the turn's exact durable rows.
+
+        A retry reaches either the *same* provider session — which still holds
+        the original input in its transcript and only needs the cheap kick — or
+        a *replacement* session, which receives ``provider_input`` as the
+        adapter's fallback. A notice turn's original input carries no bodies at
+        all, so a replacement session would otherwise be asked to finish rows it
+        never saw. Rebuilding per attempt (the same reconstruction the crash
+        file uses) keeps that fallback equal to what was durably admitted, and
+        never touches the resumed transcript path.
+        """
+        attempt = planned
+        if self.active.message_ids:
+            rows = await self.store.get_in_turn_messages(
+                planned.turn_id, self.active.provider_session_id
+            )
+            if tuple(row.envelope_id for row in rows) != tuple(
+                self.active.message_ids
+            ):
+                # Not retryable: the durable union no longer matches the active
+                # turn, so no faithful payload exists. Fail into the requeue.
+                raise RuntimeError("durable turn membership changed before retry")
+            attempt = self._reconstruct_exact_turn(
+                turn_id=planned.turn_id, rows=rows
+            )
+        self.adapter.register_admission_callback(
+            lambda event: self._admit_retry_attempt(attempt, event),
+            attempt.planning_cycle_key,
+        )
+        return attempt
 
     async def _mark_active_processed(
         self,
@@ -914,7 +942,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         self._degraded_attempts = 0
         if self.active.message_ids:
             await self.store.mark_processed(
-                tuple(self.active.message_ids), turn_id=planned.turn_id
+                tuple(self.active.message_ids),
+                turn_id=planned.turn_id,
+                provider_session_id=self.active.provider_session_id,
             )
         else:
             # The Turn admitted no rows, so the unchanged pending set keeps a
@@ -1124,10 +1154,30 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             or self.active.turn_id != planned.turn_id
         ):
             raise RuntimeError("provider retry admission crossed the active turn")
+        # Same durable-admission rule as ``_admit``: a session-less provider
+        # cannot own recoverable Inbox rows.
+        if not event.provider_session_id:
+            raise RuntimeError("provider does not support durable Inbox admission")
+        transferred = event.provider_session_id != self.active.provider_session_id
+        if transferred:
+            # A replacement session received the rebuilt exact bodies as its
+            # fallback payload; durable ownership must move with them, in one
+            # atomic transition, before any row of this turn can be completed.
+            # A conflict here raises out of the admission callback, so the turn
+            # fails into the ordinary requeue instead of finalizing.
+            await self.store.transfer_turn_session(
+                planned.turn_id,
+                from_provider_session_id=self.active.provider_session_id,
+                to_provider_session_id=event.provider_session_id,
+            )
         self.active.provider_session_id = event.provider_session_id
         self.active.provider_turn_id = event.provider_turn_id
         if self.coordinator is not None:
             self.coordinator.provider_session_id = event.provider_session_id
+        if transferred:
+            # Keep the crash join pointing at the session that now owns the
+            # turn, so a restart resumes instead of unwinding on stale identity.
+            self._write_current_turn(planned)
 
     def _clear_terminal_turn(self) -> None:
         self.adapter.register_admission_callback(None, "")
@@ -1429,7 +1479,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         turn_id: str,
         recovery_started: float,
     ) -> bool:
-        await self.store.mark_processed(tuple(self.active.message_ids), turn_id=turn_id)
+        await self.store.mark_processed(
+            tuple(self.active.message_ids),
+            turn_id=turn_id,
+            provider_session_id=self.active.provider_session_id,
+        )
         log_runtime_event(
             logger,
             "turn.processed",
