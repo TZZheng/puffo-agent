@@ -27,6 +27,7 @@ _TERMINAL_VALIDATION_ERRORS = frozenset(
         "unsupported_version",
         "invalid_command",
         "foreign_agent",
+        "foreign_operator",
         "unsupported_operation",
         "invalid_target",
         "invalid_decision",
@@ -67,8 +68,14 @@ async def execute_runtime_command(
     require_version: bool,
     permission_turn_from_active: bool,
     cloud_wire: bool = False,
+    expected_operator_slug: str = "",
 ) -> CommandResult:
-    """Validate and deliver one command; completion remains event-driven."""
+    """Validate and deliver one command; completion remains event-driven.
+
+    ``expected_operator_slug`` is the cloud-wire lane's configured operator;
+    the local control lane authenticates its operator cryptographically at
+    pairing time and passes none.
+    """
     context = _command_context(
         command,
         expected_agent_id=expected_agent_id,
@@ -76,6 +83,7 @@ async def execute_runtime_command(
         require_version=require_version,
         permission_turn_from_active=permission_turn_from_active,
         cloud_wire=cloud_wire,
+        expected_operator_slug=expected_operator_slug,
     )
     result = await _execute_command(context)
     _cache_result(context.cache_key, context.command_copy, result)
@@ -93,6 +101,7 @@ class _CommandContext:
         require_version: bool,
         permission_turn_from_active: bool,
         cloud_wire: bool,
+        expected_operator_slug: str = "",
     ) -> None:
         self.command = command
         self.expected_agent_id = expected_agent_id
@@ -100,6 +109,7 @@ class _CommandContext:
         self.require_version = require_version
         self.permission_turn_from_active = permission_turn_from_active
         self.cloud_wire = cloud_wire
+        self.expected_operator_slug = expected_operator_slug
         self.command_id = _required_text(command, "command_id")
         self.wire_op = _required_text(command, "op")
         self.agent_id = _required_text(command, "agent_id")
@@ -149,6 +159,17 @@ def _validation_failure(context: _CommandContext) -> CommandResult | None:
         return _failure("invalid_command")
     if context.cloud_wire and not context.operator_slug:
         return _failure("invalid_command")
+    # ``operator_slug`` is a client-checked authorization fact on this wire,
+    # not a server attestation: puffo-server's ``AgentServerMsg`` has no
+    # ``RuntimeCommand`` variant, so nothing server-side emits — or
+    # verifies — this frame today. The transport's own precedent is to
+    # compare a claimed identity against configured identity (the keyless
+    # lane gates operator-control messages on
+    # ``sender_slug == client.operator_slug``), so a mismatching claim, or
+    # any claim at all when no operator is configured to grant it, is
+    # rejected rather than trusted.
+    if context.cloud_wire and context.operator_slug != context.expected_operator_slug:
+        return _failure("foreign_operator")
     if context.agent_id != context.expected_agent_id:
         return _failure("foreign_agent")
     if context.wire_op not in {cancel, permission}:

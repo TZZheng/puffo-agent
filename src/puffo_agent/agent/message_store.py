@@ -51,8 +51,11 @@ _SCHEMA_INIT_LOCKS: weakref.WeakKeyDictionary[
 DENIED_DM_PLACEHOLDER = "[message from a denied sender was discarded]"
 
 # A held foreign DM is withheld from the model on the push path, so every
-# pull-side read must withhold it too. Applied to the DM and thread reads —
-# the channel reads cannot reach a gated row, which is always a DM.
+# pull-side read must withhold it too. Applied to the DM, thread, and
+# single-envelope model-visible reads — the channel reads cannot reach a
+# gated row, which is always a DM. Runtime-internal envelope reads
+# (redelivery dedupe, gate promotion, held/admission bookkeeping) stay
+# deliberately unfiltered: they exist to act on the held row.
 _NOT_GATED = (
     "(receipt_disposition IS NULL OR receipt_disposition != 'foreign_dm_gated')"
 )
@@ -1028,6 +1031,30 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         async with self._inbox_lock:
             db = await self._ensure_db()
             return await self._get_message_by_envelope_unlocked(db, envelope_id)
+
+    async def get_visible_message_by_envelope(
+        self,
+        envelope_id: str,
+    ) -> Optional[StoredMessage]:
+        """Model-visible sibling of ``get_message_by_envelope``.
+
+        Withholds a ``foreign_dm_gated`` row exactly as the DM and thread
+        reads do, so a stranger's held DM cannot reach the model through a
+        single-envelope lookup while the operator has yet to approve it.
+        Runtime-internal callers keep the unfiltered read — redelivery
+        dedupe, gate promotion, and held/admission bookkeeping all have to
+        see the held row.
+        """
+        if not envelope_id:
+            return None
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            async with db.execute(
+                f"SELECT * FROM messages WHERE envelope_id = ? AND {_NOT_GATED}",
+                (envelope_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+        return None if row is None else self._row_to_msg(row)
 
     async def _get_message_by_envelope_unlocked(
         self, db: aiosqlite.Connection, envelope_id: str

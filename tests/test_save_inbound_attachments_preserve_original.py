@@ -16,6 +16,10 @@ from types import SimpleNamespace
 from PIL import Image
 
 from puffo_agent.agent import puffo_core_client as pcc
+from puffo_agent.agent.bridge_transport import (
+    payload_from_bridge_frame,
+    save_inbound_bridge_attachments,
+)
 from puffo_agent.agent.puffo_core_client import (
     _DEFAULT_IMAGE_EDGE_PX,
     _HIGH_RES_IMAGE_EDGE_PX,
@@ -264,3 +268,60 @@ def test_mixed_envelope_only_oversized_splits(tmp_path, monkeypatch):
         str(inbox / "thumb.png"),
         str(inbox / "big.compressed.png"),
     }
+
+
+def test_traversal_envelope_id_and_unnamed_blob_stay_inside_the_inbox(
+    tmp_path, monkeypatch
+):
+    """The envelope id is a directory name and the filename may be empty.
+
+    A traversal-shaped ``envelope_id`` reached ``mkdir(parents=True)``
+    verbatim on both savers and became the store's primary key on the one
+    lane the Server does not format-check, and the native saver's filename
+    fallback was the raw ``blob_id`` — a server-issued string, not a path
+    component. Everything now stays under ``<workspace>/.puffo/inbox/``.
+    """
+    _patch_decrypt(monkeypatch, {"a/../../blob-9": _png_bytes(10, 10)})
+    stub = _stub_self(tmp_path)
+    meta = _meta("a/../../blob-9", "shot.png")
+
+    escaped = asyncio.run(
+        PuffoCoreMessageClient._save_inbound_attachments(
+            stub, envelope_id="../../evil", metas_raw=[meta],
+        )
+    )
+    assert escaped == []
+    assert not (tmp_path.parent / "evil").exists()
+    assert not (tmp_path / ".puffo").exists()
+
+    # Same rejection on the keyless lane: at the saver, and at frame parse
+    # before the id can become a primary key.
+    bridge_stub = SimpleNamespace(
+        workspace=str(tmp_path),
+        _log=logging.getLogger("puf308-test"),
+        _bridge=object(),
+        _image_edge_px=_DEFAULT_IMAGE_EDGE_PX,
+    )
+    assert asyncio.run(
+        save_inbound_bridge_attachments(
+            bridge_stub,
+            envelope_id="../../evil",
+            refs=[{"blob_id": "blob-9", "filename": "shot.png"}],
+        )
+    ) == []
+    assert payload_from_bridge_frame(
+        bridge_stub, {"envelope_id": "../../evil", "plaintext": "x"},
+    ) is None
+    assert not (tmp_path / ".puffo").exists()
+
+    # Empty filename ⇒ the blob_id fallback, basename-reduced.
+    paths = asyncio.run(
+        PuffoCoreMessageClient._save_inbound_attachments(
+            stub,
+            envelope_id="msg_a1b2",
+            metas_raw=[_meta("a/../../blob-9", "")],
+        )
+    )
+    inbox = tmp_path / ".puffo" / "inbox" / "msg_a1b2"
+    assert paths == [str(inbox / "blob-9")]
+    assert [p.name for p in inbox.iterdir()] == ["blob-9"]

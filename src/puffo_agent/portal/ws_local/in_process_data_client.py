@@ -71,7 +71,10 @@ class InProcessDataClient:
         )
 
     async def get_message_by_envelope(self, envelope_id: str) -> Any:
-        return await self._store.get_message_by_envelope(envelope_id)
+        # Model-visible lane (get_post / get_post_segment): a foreign DM
+        # held for operator approval stays withheld, matching the HTTP
+        # data service and the DM/thread reads.
+        return await self._store.get_visible_message_by_envelope(envelope_id)
 
     async def get_send_encryption(
         self, slug: str, thread_root_id: str | None,

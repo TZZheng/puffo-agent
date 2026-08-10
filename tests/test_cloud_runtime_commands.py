@@ -65,6 +65,7 @@ def runtime_fixture():
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client.slug = "server-agent-slug"
     client.agent_id = "local-agent-id"
+    client.operator_slug = "operator-0001"
     return client, manager, driver
 
 
@@ -92,6 +93,7 @@ async def test_cloud_cancel_reaches_real_manager_once_across_duplicate_frames():
         reconnected = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
         reconnected.slug = client.slug
         reconnected.agent_id = client.agent_id
+        reconnected.operator_slug = client.operator_slug
         duplicate = await reconnected._dispatch_bridge_frame(frame)
         assert first == duplicate == {
             "ok": True, "delivered": True, "completed": False,
@@ -230,6 +232,7 @@ async def test_transient_runtime_unavailable_is_not_cached():
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client.slug = "server-agent-slug"
     client.agent_id = "local-agent-id"
+    client.operator_slug = "operator-0001"
     frame = command("cancel_turn", "transient-manager", turn_ref="turn-1")
     unavailable = await client._dispatch_bridge_frame(frame)
     assert unavailable["error_code"] == "runtime_unavailable"
@@ -363,6 +366,7 @@ async def test_missing_command_object_returns_typed_closed_result():
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client.slug = "server-agent-slug"
     client.agent_id = "local-agent-id"
+    client.operator_slug = "operator-0001"
     result = await client._dispatch_bridge_frame({
         "type": "runtime_command", "command": None,
     })
@@ -509,6 +513,7 @@ async def test_real_manager_driver_outcome_uses_canonical_outbox_upload(
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
     client.slug = "server-agent-slug"
     client.agent_id = "local-agent-id"
+    client.operator_slug = "operator-0001"
     invalid = command(op, f"invalid-{outcome}", **target)
     invalid["command"]["agent_id"] = "foreign-agent"
     assert (await client._dispatch_bridge_frame(invalid))["error_code"] == (
@@ -527,3 +532,43 @@ async def test_real_manager_driver_outcome_uses_canonical_outbox_upload(
     await _upload_projected_outcome(outbox, public_type)
     await manager.close()
     outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_cloud_command_operator_slug_is_checked_against_configured_operator():
+    """``operator_slug`` is verified, not merely required.
+
+    Nothing server-side emits or attests this frame — ``AgentServerMsg``
+    carries no ``RuntimeCommand`` variant — so the claim is worth exactly
+    what the client checks. The transport's own precedent is applied: the
+    keyless lane already gates operator-control messages on
+    ``sender_slug == client.operator_slug``, so a mismatching claim, or any
+    claim at all when no operator is configured to grant it, is terminal.
+    """
+    client, manager, driver = runtime_fixture()
+    try:
+        foreign = command("cancel_turn", "foreign-operator", turn_ref="turn-1")
+        foreign["command"]["operator_slug"] = "attacker-0002"
+        assert (await client._dispatch_bridge_frame(foreign))["error_code"] == (
+            "foreign_operator"
+        )
+        assert driver.cancel_calls == []
+
+        # No operator configured ⇒ nobody can resolve permissions here.
+        client.operator_slug = ""
+        assert (
+            await client._dispatch_bridge_frame(
+                command("cancel_turn", "unconfigured-operator", turn_ref="turn-1")
+            )
+        )["error_code"] == "foreign_operator"
+        assert driver.cancel_calls == []
+
+        # The configured operator still gets through.
+        client.operator_slug = "operator-0001"
+        delivered = await client._dispatch_bridge_frame(
+            command("cancel_turn", "matching-operator", turn_ref="turn-1")
+        )
+        assert delivered == {"ok": True, "delivered": True, "completed": False}
+        assert driver.cancel_calls == [TurnRef("driver-turn-1")]
+    finally:
+        unregister_runtime_manager("local-agent-id", manager)

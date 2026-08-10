@@ -1587,3 +1587,38 @@ async def test_held_dm_bodies_stay_unreadable_and_odd_anchors_page_empty(tmp_pat
     assert page.items == ()
     assert page.has_more is False
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_gated_dm_is_withheld_from_the_model_visible_envelope_read():
+    """``get_post`` must not hand back a DM the operator has not approved.
+
+    The single-envelope lookup is the model's narrowest read and was the
+    one place a ``foreign_dm_gated`` row stayed readable while every
+    sibling read withheld it. The unfiltered read stays unfiltered on
+    purpose: redelivery dedupe and gate promotion act *on* the held row.
+    """
+    store = _temp_store()
+    secret = "held-body-the-operator-has-not-approved"
+    gated = await store.store_receipt(
+        _dm_payload("gated-dm", "mallory-0009", "bot-0001", content=secret),
+        server_seq=11,
+        disposition=ReceiptDisposition.FOREIGN_DM_GATED,
+        reason="foreign dm awaiting approval",
+    )
+    assert gated.status is ReceiptWriteStatus.COMMITTED
+
+    assert await store.get_visible_message_by_envelope("gated-dm") is None
+    raw = await store.get_message_by_envelope("gated-dm")
+    assert raw is not None
+    assert secret in str(raw.content)
+
+    # Approval releases the same row through the same read.
+    promoted = await store.promote_gated_receipt(
+        "gated-dm", 11, reason="operator approved",
+    )
+    assert promoted.status is ReceiptWriteStatus.COMMITTED
+    released = await store.get_visible_message_by_envelope("gated-dm")
+    assert released is not None
+    assert secret in str(released.content)
+    await store.close()

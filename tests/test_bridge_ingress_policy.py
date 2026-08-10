@@ -48,7 +48,9 @@ class _OfflineBridge:
         self.acked.extend(envelope_ids)
 
 
-def _client(tmp_path, *, operator_slug: str = "") -> PuffoCoreMessageClient:
+def _client(
+    tmp_path, *, operator_slug: str = "", catchup_stale_hours: float = 0,
+) -> PuffoCoreMessageClient:
     """A keyless bridge client whose signed HTTP is dead (as in a real
     sandbox), so every gate must decide from local state alone."""
     ks = KeyStore(str(tmp_path / "keys"))
@@ -60,7 +62,7 @@ def _client(tmp_path, *, operator_slug: str = "") -> PuffoCoreMessageClient:
         keystore=ks,
         http_client=http,
         message_store=MessageStore(str(tmp_path / "messages.db")),
-        catchup_stale_hours=0,
+        catchup_stale_hours=catchup_stale_hours,
         operator_slug=operator_slug,
         bridge_client=_OfflineBridge(),
     )
@@ -253,4 +255,50 @@ async def test_seqless_bridge_frames_carry_their_verdict_into_storage(tmp_path):
     # The frame carried a display name and no owner field, so the display
     # name is cached and the owner is not claimed either way.
     assert STRANGER not in client._owner_slug_cache
+    await client.store.close()
+
+
+@pytest.mark.asyncio
+async def test_bridge_stale_stranger_dm_is_gated_before_terminalization(tmp_path):
+    """Catch-up staleness must not admit what the gate would have held.
+
+    The bridge ran its stale arm ahead of the foreign-DM gate, so a
+    stranger's backlog DM was stored TERMINAL and acked: the body sat in
+    the database as readable plaintext, the Server dropped its copy, and
+    ``tombstone_gated_dms_from`` — which matches only still-gated rows —
+    could no longer withdraw it when the operator said no. Non-DM stale
+    traffic still terminalizes on the same lane.
+    """
+    marker = "stale-bridge-body-that-must-stay-held"
+    client = _client(tmp_path, operator_slug=OPERATOR, catchup_stale_hours=1)
+    await client.store.open()
+
+    await client._dispatch_bridge_frame(
+        _wire_dm_frame(STRANGER, marker, envelope_id="env_stale_wire")
+    )
+    held = await client.store.get_message_by_envelope("env_stale_wire")
+    assert held is not None
+    assert held.receipt_disposition == "foreign_dm_gated"
+    assert client._bridge.acked == []
+    assert await client.store.get_visible_message_by_envelope(
+        "env_stale_wire"
+    ) is None
+    assert await client.store.tombstone_gated_dms_from(STRANGER) == 1
+
+    # Stale non-DM traffic: the gate returns no verdict and the stale arm
+    # decides, exactly as before the reorder.
+    await client._dispatch_bridge_frame(
+        _wire_dm_frame(
+            STRANGER,
+            "old channel chatter",
+            envelope_id="env_stale_chan",
+            envelope_kind="channel",
+            channel_id="ch_1",
+            space_id="sp_home",
+            recipient_slug=None,
+        )
+    )
+    stale_row = await client.store.get_message_by_envelope("env_stale_chan")
+    assert stale_row is not None
+    assert stale_row.receipt_disposition == "terminal"
     await client.store.close()

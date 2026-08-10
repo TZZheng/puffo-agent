@@ -184,16 +184,20 @@ class InboundReceiptHandler:
         outcome = await self._operator_control_outcome(committer)
         if outcome is not None:
             return outcome
-        outcome = await self._stale_outcome(committer)
-        if outcome is not None:
-            return outcome
-
         # The gate decides on the text alone. Materializing attachments first
         # would hand an unapproved stranger a file write into the workspace
         # the model reads, which no later approval outcome undoes — the same
-        # split the bridge lane already makes.
+        # split the bridge lane already makes. It also runs *before* the
+        # stale arm: catch-up staleness is a freshness judgement, not an
+        # admission one, and terminalizing first would store an unapproved
+        # stranger's body as acked readable plaintext that a later denial
+        # can no longer tombstone (``tombstone_gated_dms_from`` only matches
+        # still-gated rows).
         raw_text = self._raw_text(payload)
         outcome = await self._foreign_dm_outcome(committer, raw_text)
+        if outcome is not None:
+            return outcome
+        outcome = await self._stale_outcome(committer)
         if outcome is not None:
             return outcome
         attachment_paths = await self._save_attachments(payload)

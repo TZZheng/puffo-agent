@@ -151,6 +151,22 @@ def _preserve_original(path: Path, original_path: Path | None) -> None:
         logger.warning("could not preserve original image %s: %s", original_path, exc)
 
 
+def is_safe_path_component(value: Any) -> bool:
+    """Whether ``value`` may be used as one local directory name.
+
+    An ingress ``envelope_id`` reaches the filesystem as
+    ``<workspace>/.puffo/inbox/<envelope_id>/``, so only a plain single
+    path component may be used verbatim. Deliberately not a
+    ``msg_<UUID>`` whitelist: every server-issued id passes, and a
+    locally originated id need not carry the server's prefix.
+    """
+    if not isinstance(value, str) or not value or value in (".", ".."):
+        return False
+    if "/" in value or "\\" in value or "\0" in value:
+        return False
+    return Path(value).name == value
+
+
 async def save_inbound_attachments(
     *,
     workspace: str,
@@ -165,6 +181,12 @@ async def save_inbound_attachments(
 ) -> list[str]:
     """Save decrypted attachments and return model-readable absolute paths."""
     if not workspace or not metas_raw:
+        return []
+    if not is_safe_path_component(envelope_id):
+        log.warning(
+            "attachments skipped: envelope_id is not a safe path component (%r)",
+            envelope_id,
+        )
         return []
     inbox = Path(workspace) / ".puffo" / "inbox" / envelope_id
     inbox.mkdir(parents=True, exist_ok=True)
@@ -217,7 +239,12 @@ async def _save_one_attachment(
         )
         return None
 
-    target = inbox / (Path(meta.filename).name or meta.blob_id)
+    # Basename-reduce both the filename and the blob_id fallback — neither
+    # may escape the inbox — with a final literal so the name is never
+    # empty. Mirrors the bridge saver.
+    target = inbox / (
+        Path(meta.filename).name or Path(str(meta.blob_id)).name or "attachment"
+    )
     try:
         target.write_bytes(strip_wrapper(plaintext))
     except OSError as exc:

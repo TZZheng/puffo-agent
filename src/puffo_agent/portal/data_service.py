@@ -323,14 +323,18 @@ async def list_thread_messages(request: web.Request) -> web.Response:
 
 
 async def get_message_by_envelope(request: web.Request) -> web.Response:
-    """GET a single message by envelope_id. 404 if not stored."""
+    """GET a single message by envelope_id. 404 if not stored.
+
+    Model-visible read: a foreign DM still held for operator approval is
+    withheld here (404) just as it is from the DM and thread reads.
+    """
     agent_id = request.match_info["agent_id"]
     envelope_id = request.match_info["envelope_id"]
     store = await _store_for(request.app, agent_id)
     if store is None:
         return web.json_response({"error": "agent db not found"}, status=404)
     try:
-        msg = await store.get_message_by_envelope(envelope_id)
+        msg = await store.get_visible_message_by_envelope(envelope_id)
     except Exception as exc:
         logger.exception(
             "data-service: lookup by envelope_id failed (agent=%s env=%s)",

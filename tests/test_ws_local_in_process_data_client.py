@@ -20,7 +20,7 @@ def _make_client() -> tuple[InProcessDataClient, MagicMock, MagicMock]:
     store.lookup_channel_space = AsyncMock(return_value="sp_x")
     store.get_channel_roots = AsyncMock(return_value=[])
     store.get_thread_messages = AsyncMock(return_value=[])
-    store.get_message_by_envelope = AsyncMock(return_value=None)
+    store.get_visible_message_by_envelope = AsyncMock(return_value=None)
     worker = MagicMock()
     worker.set_profile = MagicMock(return_value=None)
     return InProcessDataClient(store, worker), store, worker
@@ -76,9 +76,11 @@ async def test_get_thread_messages_forwards_kwargs():
 
 @pytest.mark.asyncio
 async def test_get_message_by_envelope_forwards():
+    """Forwards to the model-visible read: this shim serves ``get_post``,
+    so a foreign DM still held for approval must stay withheld here."""
     client, store, _ = _make_client()
     await client.get_message_by_envelope("msg_q")
-    store.get_message_by_envelope.assert_awaited_once_with("msg_q")
+    store.get_visible_message_by_envelope.assert_awaited_once_with("msg_q")
 
 
 @pytest.mark.asyncio

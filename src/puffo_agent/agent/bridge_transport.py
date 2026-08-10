@@ -18,7 +18,7 @@ foreign-DM approval are therefore Agent-enforced here, through the very
 same gates the native path runs — see ``ingress_policy``, which holds the
 single implementation and the cited server evidence. ``store_bridge_payload``
 runs them in the native order (blocked → self echo → operator control →
-stale → foreign DM → eligible) and only maps each verdict onto the bridge's
+foreign DM → stale → eligible) and only maps each verdict onto the bridge's
 own storage lane.
 
 Known keyless gap: outbound-DM allowlisting on self-echo
@@ -36,7 +36,7 @@ from typing import Any
 from ..crypto.message import MessagePayload
 from ..crypto.ws_client import INITIAL_BACKOFF, MAX_BACKOFF
 from . import disk_cache
-from .inbound_attachments import downscale_oversized_image
+from .inbound_attachments import downscale_oversized_image, is_safe_path_component
 from .contact_cache import BlocklistUnavailable
 from .ingress_policy import (
     GateVerdict,
@@ -137,23 +137,7 @@ async def dispatch_bridge_frame(
                     "bridge pending delivery made no progress; stopping drain"
                 )
     elif kind == "runtime_command":
-        from .harness.runtime_commands import execute_runtime_command
-
-        command = frame.get("command")
-        if not isinstance(command, dict):
-            return {
-                "ok": False,
-                "error": "invalid_command",
-                "error_code": "invalid_command",
-            }
-        return await execute_runtime_command(
-            command,
-            expected_agent_id=client.slug,
-            manager_agent_id=client.agent_id,
-            require_version=True,
-            permission_turn_from_active=True,
-            cloud_wire=True,
-        )
+        return await _bridge_runtime_command(client, frame)
     elif kind == "added_to_space":
         # Server push (AgentServerMsg::AddedToSpace) the moment this
         # agent is added to a Space — refresh the known-spaces view
@@ -192,6 +176,35 @@ async def dispatch_bridge_frame(
         )
     else:
         client._log.debug("bridge frame ignored: type=%s", kind)
+
+
+async def _bridge_runtime_command(client, frame: dict) -> Any:
+    """Execute one cloud-wire ``runtime_command`` frame.
+
+    The claimed ``operator_slug`` is checked against this client's
+    configured operator; an agent with no operator configured has nobody
+    who could grant runtime permissions over this wire, so it matches no
+    claim. See ``harness.runtime_commands`` for why the comparison is the
+    client's to make.
+    """
+    from .harness.runtime_commands import execute_runtime_command
+
+    command = frame.get("command")
+    if not isinstance(command, dict):
+        return {
+            "ok": False,
+            "error": "invalid_command",
+            "error_code": "invalid_command",
+        }
+    return await execute_runtime_command(
+        command,
+        expected_agent_id=client.slug,
+        manager_agent_id=client.agent_id,
+        require_version=True,
+        permission_turn_from_active=True,
+        cloud_wire=True,
+        expected_operator_slug=getattr(client, "operator_slug", "") or "",
+    )
 
 
 async def _handle_bridge_message_frame(client, frame: dict) -> None:
@@ -451,11 +464,14 @@ async def _bridge_storage_row(client, payload: MessagePayload) -> dict[str, Any]
 async def _bridge_gate_verdict(client, payload, row) -> GateVerdict | None:
     """Run the shared ingress gates in the native order.
 
-    Blocked → self echo → operator control → stale → foreign DM. The
-    first four keep a message off the model entirely; the last holds it
-    for operator approval. Only the two transport-local checks (self
-    echo, catch-up staleness) are decided here — everything with a
-    policy meaning comes from ``ingress_policy``.
+    Blocked → self echo → operator control → foreign DM → stale. All but
+    the foreign-DM arm keep a message off the model entirely; that one
+    holds it for operator approval, and it runs ahead of the stale arm so
+    an unapproved stranger's DM arriving during catch-up is held (unacked,
+    still tombstonable on denial) instead of terminalized as acked
+    plaintext. Only the two transport-local checks (self echo, catch-up
+    staleness) are decided here — everything with a policy meaning comes
+    from ``ingress_policy``.
     """
     verdict = await blocked_gate(client, payload)
     if verdict is not None:
@@ -474,13 +490,16 @@ async def _bridge_gate_verdict(client, payload, row) -> GateVerdict | None:
     )
     if verdict is not None:
         return verdict
+    verdict = await foreign_dm_gate(client, payload, _bridge_raw_text(payload))
+    if verdict is not None:
+        return verdict
     if client._is_stale_for_catchup(payload.sent_at):
         return GateVerdict(
             gate="stale",
             disposition=ReceiptDisposition.TERMINAL,
             reason="keyless bridge stale history",
         )
-    return await foreign_dm_gate(client, payload, _bridge_raw_text(payload))
+    return None
 
 
 async def _commit_bridge_verdict(
@@ -708,9 +727,14 @@ def payload_from_bridge_frame(client, frame: dict) -> MessagePayload | None:
     here.
     """
     envelope_id = frame.get("envelope_id")
-    if not envelope_id:
+    # This is the only ingress lane with no server-side id-format check, and
+    # the id becomes both the store's primary key and a local directory
+    # name, so a traversal-shaped id is rejected here rather than deeper in.
+    if not envelope_id or not is_safe_path_component(envelope_id):
         client._log.warning(
-            "bridge message frame missing envelope_id — skipping (keys=%s)",
+            "bridge message frame missing or unsafe envelope_id (%r) — "
+            "skipping (keys=%s)",
+            envelope_id,
             sorted(frame.keys()),
         )
         return None
@@ -784,6 +808,13 @@ async def save_inbound_bridge_attachments(
         return []
     from pathlib import Path
 
+    if not is_safe_path_component(envelope_id):
+        client._log.warning(
+            "bridge attachments skipped: envelope_id is not a safe path "
+            "component (%r)",
+            envelope_id,
+        )
+        return []
     inbox = Path(client.workspace) / ".puffo" / "inbox" / envelope_id
     inbox.mkdir(parents=True, exist_ok=True)
     paths: list[str] = []

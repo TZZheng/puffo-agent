@@ -288,7 +288,9 @@ class _ScriptedHttp:
         return {}
 
 
-def _native_client(tmp_path) -> PuffoCoreMessageClient:
+def _native_client(
+    tmp_path, *, catchup_stale_hours: float = 0,
+) -> PuffoCoreMessageClient:
     """A signed (non-bridge) client whose workspace is on disk."""
     ks = KeyStore(str(tmp_path / "keys"))
     real_http = PuffoCoreHttpClient("http://127.0.0.1:1", ks, SELF_SLUG)
@@ -299,7 +301,7 @@ def _native_client(tmp_path) -> PuffoCoreMessageClient:
         keystore=ks,
         http_client=real_http,
         message_store=MessageStore(str(tmp_path / "messages.db")),
-        catchup_stale_hours=0,
+        catchup_stale_hours=catchup_stale_hours,
         operator_slug=OPERATOR_SLUG,
         workspace=str(tmp_path / "ws"),
     )
@@ -492,4 +494,65 @@ async def test_native_ingress_withholds_uncleared_sender_content(
     assert outcome is TransportOutcome.ACK
     assert saved == ["env_friend"]
     assert (inbox_root / "env_friend").exists()
+    await client.store.close()
+
+
+@pytest.mark.asyncio
+async def test_catchup_stale_stranger_dm_is_gated_before_terminalization(
+    tmp_path, monkeypatch
+):
+    """Staleness is a freshness judgement, not an admission one.
+
+    A stranger's DM arriving during catch-up used to hit the stale arm
+    first and land TERMINAL: acked away server-side, body stored as
+    model-readable plaintext, and out of reach of
+    ``tombstone_gated_dms_from``, which only matches still-gated rows — so
+    a later denial could no longer withdraw what the operator refused. The
+    gate now decides first, while a cleared sender's stale message still
+    terminalizes exactly as before.
+    """
+    marker = "stale-stranger-body-the-operator-has-not-approved"
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "home"))
+    client = _native_client(tmp_path, catchup_stale_hours=1)
+    await client.store.open()
+    client.http.blocklist_reachable = True
+    _stub_side_effects(client, Path(client.workspace) / ".puffo" / "inbox")
+
+    payloads = {
+        "env_stale_stranger": _dm_payload(
+            STRANGER_SLUG, marker, envelope_id="env_stale_stranger",
+        ),
+        "env_stale_friend": _dm_payload(
+            FRIEND_SLUG, "old but cleared", envelope_id="env_stale_friend",
+        ),
+    }
+    handler = _handler(client, payloads)
+    assert client._is_stale_for_catchup(payloads["env_stale_stranger"].sent_at)
+
+    outcome = await handler.handle(
+        _delivery("env_stale_stranger", STRANGER_SLUG, 1)
+    )
+    assert outcome is not TransportOutcome.ACK
+    held = await client.store.get_message_by_envelope("env_stale_stranger")
+    assert held is not None
+    assert held.receipt_disposition == "foreign_dm_gated"
+    assert await client.store.get_visible_message_by_envelope(
+        "env_stale_stranger"
+    ) is None
+
+    # A cleared sender's stale message still terminalizes and still acks.
+    client._contacts.note_allowed(FRIEND_SLUG)
+    friend_outcome = await handler.handle(
+        _delivery("env_stale_friend", FRIEND_SLUG, 2)
+    )
+    assert friend_outcome is TransportOutcome.ACK
+    friend_row = await client.store.get_message_by_envelope("env_stale_friend")
+    assert friend_row is not None
+    assert friend_row.receipt_disposition == "terminal"
+
+    # Denial still reaches the held row — the guarantee terminalizing lost.
+    assert await client.store.tombstone_gated_dms_from(STRANGER_SLUG) == 1
+    tombstoned = await client.store.get_message_by_envelope("env_stale_stranger")
+    assert tombstoned is not None
+    assert marker not in str(tombstoned.content)
     await client.store.close()
