@@ -346,16 +346,25 @@ def render_profile_briefing(
     role: str = "",
     role_short: str = "",
     soul: str = "",
+    puffo_handle: str = "",
 ) -> str:
     """Identity framing for ``briefing/profile.md``: display name,
     role lines, soul body. Deliberately NO ``## Instructions`` and no
     runtime-behavior sections — those live in the agent-root
     profile.md / primer. Missing fields degrade to a minimal identity
-    line derived from agent id + display name."""
-    name = display_name or agent_id or "agent"
+    line derived from agent id + display name.
+
+    ``puffo_handle`` is the agent's authenticated ``puffo_core.slug`` —
+    its unique identity on the network, and what peers actually address.
+    An imported agent can keep a local directory ``agent_id`` that
+    differs from it, so the handle wins for the model-facing line while
+    ``agent_id`` keeps naming local storage.
+    """
+    handle = puffo_handle or agent_id
+    name = display_name or handle or "agent"
     identity = f"You are {name}"
-    if agent_id:
-        identity += f" (agent `{agent_id}`)"
+    if handle:
+        identity += f" (agent `{handle}`)"
     identity += "."
     lines = [f"# {name}", "", identity]
     if role:
@@ -375,12 +384,15 @@ def sync_profile_briefing(
     role: str = "",
     role_short: str = "",
     soul: str = "",
+    puffo_handle: str = "",
 ) -> Path:
     """(Re)write the managed block of ``briefing/profile.md`` from the
     native profile surfaces (agent.yml identity fields + the ``# Soul``
     body of agent-root profile.md). Content between the
     ``puffo:managed-profile`` markers is regenerated on every managed
-    rebuild; user-authored text outside the markers is preserved."""
+    rebuild; user-authored text outside the markers is preserved — which
+    is also how an imported agent picks up its authenticated
+    ``puffo_handle`` with no migration step."""
     memory_root = Path(memory_root)
     ensure_memory_tree(memory_root)
     path = memory_root / BRIEFING_DIR / PROFILE_BRIEFING_NAME
@@ -390,6 +402,7 @@ def sync_profile_briefing(
         role=role,
         role_short=role_short,
         soul=soul,
+        puffo_handle=puffo_handle,
     )
     block = f"{PROFILE_MANAGED_BEGIN}\n{rendered}{PROFILE_MANAGED_END}\n"
     if path.exists():

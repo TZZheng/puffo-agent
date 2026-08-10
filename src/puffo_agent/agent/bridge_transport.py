@@ -3,6 +3,28 @@
 The public message client remains the compatibility facade. These functions
 own bridge wire decoding, persistence, ACK scheduling, and blob handling while
 calling the facade for shared policy such as directory and thread resolution.
+
+Ingress policy contract
+-----------------------
+The bridge is a *transport*, not a policy layer. For a keyless agent the
+server guarantees only sender authentication / cert-chain validation,
+device targeting, revocation, replay dedupe, and a DM-only blocklist row
+keyed on the recipient's own slug. It applies no foreign-DM approval, has
+no operator-control concept on the wire, never checks a blocklist
+channel-side, and does not filter at relay/backfill time.
+
+Blocked contacts (DM and channel), operator control messages, and
+foreign-DM approval are therefore Agent-enforced here, through the very
+same gates the native path runs — see ``ingress_policy``, which holds the
+single implementation and the cited server evidence. ``store_bridge_payload``
+runs them in the native order (blocked → self echo → operator control →
+stale → foreign DM → eligible) and only maps each verdict onto the bridge's
+own storage lane.
+
+Known keyless gap: outbound-DM allowlisting on self-echo
+(``_maybe_allowlist_outbound_dm``) needs a signed ``POST /allowlists`` this
+transport cannot make, so a bridge agent that DMs a stranger first does not
+pre-allowlist them; their reply goes through the normal foreign-DM gate.
 """
 
 from __future__ import annotations
@@ -15,6 +37,12 @@ from ..crypto.message import MessagePayload
 from ..crypto.ws_client import INITIAL_BACKOFF, MAX_BACKOFF
 from . import disk_cache
 from .inbound_attachments import downscale_oversized_image
+from .ingress_policy import (
+    GateVerdict,
+    blocked_gate,
+    foreign_dm_gate,
+    operator_control_gate,
+)
 from .message_context import MENTION_RE, maybe_redact_long_text
 from .message_store import ReceiptDisposition, ReceiptWriteStatus
 
@@ -347,15 +375,18 @@ async def store_bridge_payload(
     Such messages therefore use the explicit local-ordinal lane instead
     of inventing a freshness boundary. Once the bridge exposes a trusted
     server sequence this path can use ``store_receipt`` directly.
+
+    Every shared policy gate runs before persistence, in the native
+    order — see the module's ingress policy contract.
     """
     if server_seq is None and await client.store.get_message_by_envelope(
         payload.envelope_id
     ):
         return True
     row = await _bridge_storage_row(client, payload)
-    terminal = await _terminal_bridge_payload(client, payload, row, server_seq)
-    if terminal is not None:
-        return terminal
+    verdict = await _bridge_gate_verdict(client, payload, row)
+    if verdict is not None:
+        return await _commit_bridge_verdict(client, payload, row, server_seq, verdict)
     await _populate_bridge_prompt_content(client, payload, row)
     return await _persist_eligible_bridge_payload(client, payload, row, server_seq)
 
@@ -385,26 +416,64 @@ async def _bridge_storage_row(client, payload: MessagePayload) -> dict[str, Any]
     }
 
 
-async def _terminal_bridge_payload(
-    client, payload, row, server_seq: int | None
-) -> bool | None:
-    reason = (
-        "keyless bridge client echo"
-        if payload.sender_slug == client.slug
-        else "keyless bridge stale history"
-        if client._is_stale_for_catchup(payload.sent_at)
-        else None
+async def _bridge_gate_verdict(client, payload, row) -> GateVerdict | None:
+    """Run the shared ingress gates in the native order.
+
+    Blocked → self echo → operator control → stale → foreign DM. The
+    first four keep a message off the model entirely; the last holds it
+    for operator approval. Only the two transport-local checks (self
+    echo, catch-up staleness) are decided here — everything with a
+    policy meaning comes from ``ingress_policy``.
+    """
+    verdict = await blocked_gate(client, payload)
+    if verdict is not None:
+        return verdict
+    if payload.sender_slug == client.slug:
+        return GateVerdict(
+            gate="self_echo",
+            disposition=ReceiptDisposition.TERMINAL,
+            reason="keyless bridge client echo",
+        )
+    verdict = await operator_control_gate(
+        client,
+        payload,
+        thread_root_id=row["thread_root_id"] or "",
+        text=str(payload.content) if payload.content else "",
     )
-    if reason is None:
-        return None
+    if verdict is not None:
+        return verdict
+    if client._is_stale_for_catchup(payload.sent_at):
+        return GateVerdict(
+            gate="stale",
+            disposition=ReceiptDisposition.TERMINAL,
+            reason="keyless bridge stale history",
+        )
+    return await foreign_dm_gate(client, payload, _bridge_raw_text(payload))
+
+
+async def _commit_bridge_verdict(
+    client, payload, row, server_seq: int | None, verdict: GateVerdict
+) -> bool:
+    """Persist a gate verdict through the bridge's storage lane.
+
+    A verdict carrying replacement ``content`` (the blocked tombstone)
+    overwrites the body first, so the original plaintext never reaches
+    the database. Returns whether the envelope may be acked — a gated
+    foreign DM must not be, since it stays queued server-side until the
+    operator answers.
+    """
+    if verdict.content is not None:
+        row = dict(row)
+        row["content"] = verdict.content
+        row["content_type"] = "text/plain"
     if server_seq is None:
         await client.store.store(row)
-        return True
+        return verdict.disposition is not ReceiptDisposition.FOREIGN_DM_GATED
     result = await client.store.store_receipt(
         row,
         server_seq=server_seq,
-        disposition=ReceiptDisposition.TERMINAL,
-        reason=reason,
+        disposition=verdict.disposition,
+        reason=verdict.reason,
     )
     runtime = getattr(client, "global_runtime", None)
     if (
@@ -420,18 +489,29 @@ async def _terminal_bridge_payload(
     return result.acknowledge
 
 
-async def _bridge_text_and_attachments(client, payload) -> tuple[str, list[str]]:
-    attachment_paths: list[str] = []
+def _bridge_raw_text(payload) -> str:
+    """The message body as plain text, with no side effects.
+
+    Split out of ``_bridge_text_and_attachments`` so the foreign-DM gate
+    can quote a preview without triggering the attachment downloads that
+    only an admitted message needs.
+    """
     content = payload.content
     if isinstance(content, str):
-        raw_text = content
-    elif isinstance(content, dict):
+        return content
+    if isinstance(content, dict):
         text, caption = content.get("text"), content.get("caption")
-        raw_text = (
-            text
-            if isinstance(text, str)
-            else (caption if isinstance(caption, str) else "")
-        )
+        if isinstance(text, str):
+            return text
+        return caption if isinstance(caption, str) else ""
+    return ""
+
+
+async def _bridge_text_and_attachments(client, payload) -> tuple[str, list[str]]:
+    attachment_paths: list[str] = []
+    raw_text = _bridge_raw_text(payload)
+    content = payload.content
+    if isinstance(content, dict):
         metas = content.get("attachments") or []
         if payload.content_type == "puffo/message+attachments/v1" and isinstance(
             metas, list
@@ -440,8 +520,6 @@ async def _bridge_text_and_attachments(client, payload) -> tuple[str, list[str]]
                 envelope_id=payload.envelope_id,
                 metas_raw=metas,
             )
-    else:
-        raw_text = ""
     if isinstance(payload.attachments, list) and payload.attachments:
         attachment_paths.extend(
             await client._save_inbound_bridge_attachments(

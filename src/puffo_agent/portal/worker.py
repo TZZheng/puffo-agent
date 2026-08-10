@@ -64,13 +64,17 @@ def _rebuild_managed_system_prompt(
     display_name: str = "",
     role: str = "",
     role_short: str = "",
+    puffo_handle: str = "",
 ) -> str:
     """Dispatch wrapper: write the right system-prompt file(s) for the
     agent's harness. Codex agents get ``$CODEX_HOME/AGENTS.md``; other
     harnesses use the shared Claude/Gemini prompt-file builder.
     Returns the assembled prompt body either way. The identity fields
     feed the managed ``memory/briefing/profile.md`` re-sync inside the
-    rebuild.
+    rebuild. ``puffo_handle`` is the authenticated ``puffo_core.slug``
+    the model should call itself on the network; ``agent_id`` continues
+    to name every local path (keystore, agent dir, RPC namespace) and so
+    stays separate.
     """
     if harness_name == "codex":
         return rebuild_agent_codex_md(
@@ -83,6 +87,7 @@ def _rebuild_managed_system_prompt(
             display_name=display_name,
             role=role,
             role_short=role_short,
+            puffo_handle=puffo_handle,
         )
     return rebuild_agent_claude_md(
         shared_dir=shared_path,
@@ -95,6 +100,7 @@ def _rebuild_managed_system_prompt(
         display_name=display_name,
         role=role,
         role_short=role_short,
+        puffo_handle=puffo_handle,
     )
 
 
@@ -1197,12 +1203,17 @@ async def _process_refresh_flags(
     display_name: str = "",
     role: str = "",
     role_short: str = "",
+    puffo_handle: str = "",
 ) -> None:
     """Consume any worker-scope refresh flags into a single
     ``adapter.reload(prompt, with_session=…)`` call at turn start.
     Order: host sync → CLAUDE.md rebuild → session drop. A changed
     primer/profile slice drops the session too (``--resume`` would replay
-    the stale baked prompt); memory-only or no-op rebuilds keep it."""
+    the stale baked prompt); memory-only or no-op rebuilds keep it.
+    ``puffo_handle`` rides along with the other identity fields: this
+    rebuild regenerates the managed profile block, so omitting it would
+    revert an imported agent's model-facing handle to ``agent_id`` on the
+    first refresh flag."""
     host_sync_seen = refresh_host_sync_flag.exists()
     agent_seen = refresh_agent_flag.exists()
     session_seen = refresh_session_flag.exists()
@@ -1226,6 +1237,7 @@ async def _process_refresh_flags(
                 display_name=display_name,
                 role=role,
                 role_short=role_short,
+                puffo_handle=puffo_handle,
             )
             from ..agent.shared_content import MEMORY_SECTION_HEADER
 

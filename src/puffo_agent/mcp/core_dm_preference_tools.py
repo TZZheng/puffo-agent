@@ -7,6 +7,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from ..agent.message_projection import CONTEXT_VERSION
+from ..crypto.http_client import HttpError
 from .puffo_core_tools import _note_contact
 
 
@@ -64,9 +65,10 @@ def register_dm_preference_tools(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def update_dm_blocklist(slug: str, on: bool) -> str:
         """Block (``on=True``) or unblock (``on=False``) a sender.
-        Server-enforced — blocked senders' messages are silently
-        dropped at the server, so you never see them. Per-agent —
-        only your own blocklist changes; other agents are unaffected.
+        Blocked senders' messages never reach you — the server drops
+        their DMs and this agent drops anything that still arrives.
+        Per-agent — only your own blocklist changes; other agents are
+        unaffected.
 
         slug: peer to (un)block (e.g. ``alice-1234``).
         on: ``True`` adds to blocklist, ``False`` removes.
@@ -74,6 +76,16 @@ def register_dm_preference_tools(mcp: FastMCP, cfg: Any) -> None:
         target = (slug or "").strip()
         if not target:
             raise RuntimeError("slug is required")
+        if cfg.keyless:
+            # ``/blocklists`` is subkey-signed on the server and has no
+            # keyless (``/v2/cloud-agents/*``) counterpart, so a keyless
+            # agent cannot maintain a server-side blocklist at all.
+            # Fail with the real reason instead of an opaque auth error.
+            raise RuntimeError(
+                "update_dm_blocklist is unsupported for keyless agents: "
+                "the /blocklists route requires signed auth this agent "
+                "does not have"
+            )
         if on:
             await cfg.http_client.post(
                 "/blocklists",
@@ -81,9 +93,16 @@ def register_dm_preference_tools(mcp: FastMCP, cfg: Any) -> None:
             )
             _note_contact(cfg, target, blocked=True)
             return f"blocked {target}"
-        await cfg.http_client.delete(
-            "/blocklists",
-            body={"id": target},
-        )
+        # DELETE /blocklists identifies the row by a JSON body
+        # ``{"id": ...}``; 204 = removed, 404 = no such block. Both mean
+        # the desired end state holds, so both settle local state — any
+        # other failure propagates with local state untouched.
+        try:
+            await cfg.http_client.delete("/blocklists", body={"id": target})
+        except HttpError as exc:
+            if exc.status != 404:
+                raise
+            _note_contact(cfg, target, blocked=False)
+            return f"unblocked {target} (was not blocked)"
         _note_contact(cfg, target, blocked=False)
         return f"unblocked {target}"

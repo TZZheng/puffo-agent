@@ -125,6 +125,7 @@ class StandardWorkerRun:
             display_name=agent_cfg.display_name,
             role=agent_cfg.role,
             role_short=agent_cfg.role_short,
+            puffo_handle=agent_cfg.puffo_core.slug,
         )
         paths = WorkerRunPaths(
             agent_id=agent_id,
@@ -356,6 +357,7 @@ class StandardWorkerRun:
             display_name=worker.agent_cfg.display_name,
             role=worker.agent_cfg.role,
             role_short=worker.agent_cfg.role_short,
+            puffo_handle=worker.agent_cfg.puffo_core.slug,
             puffo=context.puffo,
             adapter=worker._adapter,
             refresh_agent_flag=refresh_agent,

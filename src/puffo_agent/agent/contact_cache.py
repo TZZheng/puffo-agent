@@ -26,9 +26,26 @@ class ContactCache:
         self._allow: set[str] = set()
         self._block: set[str] = set()
         self._fetched_at: float = 0.0
+        self._degrade_logged = False
 
     async def refresh(self) -> None:
-        """Replace both sets, preserving stale data when refresh fails."""
+        """Replace both sets, preserving stale data when refresh fails.
+
+        ``/allowlists`` and ``/blocklists`` are subkey-signed and have no
+        keyless counterpart, so a keyless agent can never hydrate from
+        the server. It serves purely local state instead of retrying a
+        request that cannot succeed — logged once so the degrade is
+        visible. Either way a refresh failure is non-fatal: every
+        allow/block decision still answers from what is known.
+        """
+        if getattr(self._http, "keyless", False):
+            if not self._degrade_logged:
+                self._degrade_logged = True
+                self._log.info(
+                    "contact_cache: keyless transport cannot read "
+                    "/allowlists or /blocklists; serving local state only"
+                )
+            return
         try:
             allow = await self._http.get("/allowlists")
             block = await self._http.get("/blocklists")

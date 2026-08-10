@@ -10,6 +10,13 @@ from ..crypto.message import MessagePayload, decrypt_message, read_plaintext_mes
 from ..crypto.primitives import KemKeyPair
 from ..crypto.ws_client import ServerDelivery, TransportOutcome
 from ._logging import log_runtime_event
+from .ingress_policy import (
+    BLOCKED_MESSAGE_PLACEHOLDER,
+    GateVerdict,
+    blocked_gate,
+    foreign_dm_gate,
+    operator_control_gate,
+)
 from .message_context import MENTION_RE, maybe_redact_long_text
 from .message_store import ReceiptDisposition, ReceiptWriteStatus
 
@@ -17,7 +24,7 @@ if TYPE_CHECKING:
     from .puffo_core_client import PuffoCoreMessageClient
 
 
-BLOCKED_MESSAGE_PLACEHOLDER = "[message from a blocked account was dropped]"
+__all__ = ["BLOCKED_MESSAGE_PLACEHOLDER", "InboundReceiptHandler"]
 
 
 @dataclass
@@ -300,33 +307,27 @@ class InboundReceiptHandler:
             stored_payload=stored_payload,
         )
 
+    async def _commit_verdict(
+        self,
+        committer: _ReceiptCommitter,
+        verdict: GateVerdict | None,
+    ) -> TransportOutcome | None:
+        """Persist one shared-gate verdict through the native lane."""
+        if verdict is None:
+            return None
+        return await committer.commit(
+            verdict.disposition,
+            verdict.reason,
+            content=verdict.content,
+        )
+
     async def _blocked_outcome(
         self,
         committer: _ReceiptCommitter,
     ) -> TransportOutcome | None:
-        payload = committer.payload
-        if payload.sender_slug == self.client.slug:
-            return None
-        if not await self.client._contacts.is_blocked(payload.sender_slug):
-            return None
-
-        if payload.envelope_kind == "dm":
-            self.client._log.info(
-                "dm_gate: dropped DM from blocked %s",
-                payload.sender_slug,
-            )
-            reason = "blocked dm tombstone"
-        else:
-            self.client._log.info(
-                "contact: dropped channel message from blocked %s "
-                "(redacted placeholder stored)",
-                payload.sender_slug,
-            )
-            reason = "blocked channel tombstone"
-        return await committer.commit(
-            ReceiptDisposition.TERMINAL,
-            reason,
-            content=BLOCKED_MESSAGE_PLACEHOLDER,
+        return await self._commit_verdict(
+            committer,
+            await blocked_gate(self.client, committer.payload),
         )
 
     async def _self_echo_outcome(
@@ -345,45 +346,15 @@ class InboundReceiptHandler:
         committer: _ReceiptCommitter,
     ) -> TransportOutcome | None:
         payload = committer.payload
-        if not (
-            payload.envelope_kind == "dm"
-            and payload.sender_slug == self.client.operator_slug
-        ):
-            return None
-
-        text = str(payload.content) if payload.content else ""
-        root_id = committer.stored_payload["thread_root_id"] or ""
-        targets, is_direct = self.client._resolve_invite_targets(root_id, text)
-        handled_labels = (
-            await self.client._apply_invite_replies(targets, text) if targets else []
-        )
-        if handled_labels:
-            if is_direct:
-                await self.client._send_invite_bulk_summary(
-                    handled_labels,
-                    text,
-                    root_id,
-                )
-            return await committer.commit(
-                ReceiptDisposition.TERMINAL,
-                "handled invite reply",
-            )
-
-        controls = (
-            (self.client._maybe_handle_leave_reply, "handled leave reply"),
-            (
-                self.client._maybe_handle_permission_reply,
-                "handled permission reply",
-            ),
-            (
-                self.client._maybe_handle_dm_approval_reply,
-                "handled dm approval reply",
+        return await self._commit_verdict(
+            committer,
+            await operator_control_gate(
+                self.client,
+                payload,
+                thread_root_id=committer.stored_payload["thread_root_id"] or "",
+                text=str(payload.content) if payload.content else "",
             ),
         )
-        for handler, reason in controls:
-            if await handler(thread_root_id=root_id, text=text):
-                return await committer.commit(ReceiptDisposition.TERMINAL, reason)
-        return None
 
     async def _stale_outcome(
         self,
@@ -430,29 +401,9 @@ class InboundReceiptHandler:
         committer: _ReceiptCommitter,
         raw_text: str,
     ) -> TransportOutcome | None:
-        payload = committer.payload
-        if payload.envelope_kind != "dm":
-            return None
-        if not await self.client._is_foreign_dm_sender(payload.sender_slug):
-            await self.client._ensure_trusted_contact(payload.sender_slug)
-            return None
-
-        await self.client._maybe_send_dm_notice(payload.sender_slug)
-        trusted = (
-            self.client.auto_accept_dm
-            or await self.client._contacts.is_allowed(payload.sender_slug)
-            or await self.client._shares_space_with(payload.sender_slug)
-        )
-        if trusted:
-            return None
-        if not await self.client._maybe_gate_foreign_dm(
-            sender_slug=payload.sender_slug,
-            text=raw_text,
-        ):
-            return None
-        return await committer.commit(
-            ReceiptDisposition.FOREIGN_DM_GATED,
-            "foreign dm awaiting approval",
+        return await self._commit_verdict(
+            committer,
+            await foreign_dm_gate(self.client, committer.payload, raw_text),
         )
 
     def _cache_channel_space(self, payload: MessagePayload) -> None:
@@ -484,7 +435,7 @@ class InboundReceiptHandler:
             segment_chars=self.client._segment_chars,
             agent_slug=self.client.slug,
         )
-        return {
+        content: dict[str, Any] = {
             "text": llm_text,
             "attachment_paths": attachment_paths,
             "mentions": mentions,
@@ -496,6 +447,11 @@ class InboundReceiptHandler:
             "channel_name": names["channel_name"],
             "space_name": names["space_name"],
         }
+        # Only carried when authenticated facts actually classified the
+        # sender; absent means projection falls back to ``unknown``.
+        if names.get("sender_type"):
+            content["sender_type"] = names["sender_type"]
+        return content
 
     async def _mentions(
         self,
@@ -547,14 +503,51 @@ class InboundReceiptHandler:
 
         sender_display_name = await self.client._fetch_display_name(payload.sender_slug)
         sender_owner_slug = await self.client._fetch_owner_slug(payload.sender_slug)
-        return {
+        is_from_operator = bool(
+            self.client.operator_slug
+            and payload.sender_slug == self.client.operator_slug
+        )
+        context = {
             "channel_name": channel_name,
             "space_name": space_name,
             "sender_display_name": sender_display_name,
             "sender_owner_slug": sender_owner_slug,
-            "is_from_operator": bool(
-                self.client.operator_slug
-                and payload.sender_slug == self.client.operator_slug
-            ),
+            "is_from_operator": is_from_operator,
             "sender_is_agent": bool(sender_owner_slug),
         }
+        sender_type = await self._sender_type(
+            payload,
+            sender_owner_slug=sender_owner_slug,
+            is_from_operator=is_from_operator,
+        )
+        if sender_type:
+            context["sender_type"] = sender_type
+        return context
+
+    async def _sender_type(
+        self,
+        payload: MessagePayload,
+        *,
+        sender_owner_slug: str,
+        is_from_operator: bool,
+    ) -> str:
+        """Classify the sender from authenticated facts only.
+
+        An owner slug is server-issued and only agents carry one, so it
+        is the ground truth for ``agent``. The operator is an
+        authenticated human by configuration. Any other sender is
+        classified from the space roster's ``identity_type``, which the
+        server supplies via ``/spaces/{id}/members``. Nothing else is
+        knowable — ``/identities/profiles`` returns no identity-type
+        field — so an unclassifiable sender stays unset and projects as
+        ``unknown`` rather than being guessed at.
+        """
+        if sender_owner_slug:
+            return "agent"
+        if is_from_operator:
+            return "human"
+        if not payload.space_id:
+            return ""
+        members = await self.client._get_space_members(payload.space_id)
+        roster_type = members.get(payload.sender_slug, "")
+        return roster_type if roster_type in {"human", "agent"} else ""

@@ -662,3 +662,45 @@ def test_process_refresh_flags_deletes_flags_after_processing(tmp_path, monkeypa
     assert puffo.system_prompt == "new prompt"
     assert adapter.reload_calls == [("new prompt", True)]
     assert not agent_flag.exists()
+
+
+def test_process_refresh_flags_keeps_authenticated_puffo_handle(
+    tmp_path, monkeypatch,
+):
+    """A refresh flag regenerates the managed profile block, so the
+    identity line is rewritten from whatever the refresh path forwards.
+    An imported agent pairs under a ``puffo_core.slug`` that differs from
+    its local ``agent_id``; if the handle is dropped here, the first
+    memory write (which drops ``refresh_agent.flag``) silently reverts the
+    model's self-identity to the unaddressable local id."""
+    from puffo_agent.portal import worker as worker_mod
+
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "home"))
+    memory_dir = tmp_path / "memory"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = tmp_path / "profile.md"
+    profile.write_text("# Profile\n", encoding="utf-8")
+    agent_flag = tmp_path / "refresh_agent.flag"
+    agent_flag.write_text("{}", encoding="utf-8")
+
+    _run(worker_mod._process_refresh_flags(
+        agent_id="bot-42",
+        harness_name="claude-code",
+        shared_path=tmp_path / "shared",
+        profile_path=str(profile),
+        memory_path=str(memory_dir),
+        workspace_path=str(workspace),
+        puffo=_FakePuffo(),
+        adapter=_FakeAdapter(),
+        refresh_agent_flag=agent_flag,
+        refresh_host_sync_flag=tmp_path / "refresh_host_sync.flag",
+        refresh_session_flag=tmp_path / "refresh_session.flag",
+        puffo_handle="bot-42-x9f2",
+    ))
+
+    briefing = (memory_dir / "briefing" / "profile.md").read_text(
+        encoding="utf-8",
+    )
+    assert "You are bot-42-x9f2 (agent `bot-42-x9f2`)." in briefing
+    assert "bot-42 (agent" not in briefing

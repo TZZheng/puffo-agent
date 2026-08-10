@@ -1306,6 +1306,7 @@ def compile_agent_memory_briefing(
     display_name: str = "",
     role: str = "",
     role_short: str = "",
+    puffo_handle: str = "",
 ) -> str:
     """Bring the memory tree up to date and return the compiled
     bounded briefing: ensure the tree, migrate legacy flat
@@ -1333,6 +1334,7 @@ def compile_agent_memory_briefing(
         role=role,
         role_short=role_short,
         soul=extract_soul_body(profile_text),
+        puffo_handle=puffo_handle,
     )
     return compile_briefing(memory_dir)
 
@@ -1414,6 +1416,7 @@ def rebuild_agent_codex_md(
     display_name: str = "",
     role: str = "",
     role_short: str = "",
+    puffo_handle: str = "",
 ) -> str:
     """Assemble + write one codex agent's AGENTS.md.
 
@@ -1441,6 +1444,7 @@ def rebuild_agent_codex_md(
             display_name=display_name,
             role=role,
             role_short=role_short,
+            puffo_handle=puffo_handle,
         ),
     )
     write_agents_md(codex_user_dir, agents_md)
@@ -1459,6 +1463,7 @@ def rebuild_agent_claude_md(
     display_name: str = "",
     role: str = "",
     role_short: str = "",
+    puffo_handle: str = "",
 ) -> str:
     """Assemble + write one agent's managed CLAUDE.md / GEMINI.md.
 
@@ -1490,6 +1495,7 @@ def rebuild_agent_claude_md(
             display_name=display_name,
             role=role,
             role_short=role_short,
+            puffo_handle=puffo_handle,
         ),
     )
     write_claude_md(claude_user_dir, claude_md)

@@ -1935,3 +1935,47 @@ async def test_held_timeout_uses_signed_pending_catchup_before_failing(tmp_path)
     )
     assert runtime.held.diagnostic == ""
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_human_channel_sender_projects_as_human(
+    monkeypatch, tmp_path,
+):
+    """An ordinary human in a channel used to reach the model as
+    ``sender_type: unknown`` — only the operator was ever classified
+    human, so the model could not tell a teammate from an unidentified
+    account. The space roster's server-supplied ``identity_type`` is the
+    authenticated fact that fixes it."""
+    from puffo_agent.agent.core import _user_metadata_lines
+
+    async def setup(client, _store, _events, _delivery):
+        async def members(_space_id):
+            return {"alice": "human", "helper-bot": "agent"}
+
+        client._get_space_members = members
+
+    _client, store, _events, _delivery, _ = await listen_delivery(
+        monkeypatch,
+        tmp_path,
+        payload=payload_for("human-1", sender="alice"),
+        seq=31,
+        setup=setup,
+    )
+    pending = await store.get_pending()
+    content = pending[0].content
+    assert content["sender_type"] == "human"
+    assert not content["sender_owner_slug"]
+    assert not content["is_from_operator"]
+
+    lines = _user_metadata_lines(
+        channel_name="Channel", channel_id="ch-1", root_id="", post_id="human-1",
+        space_id="sp-1", space_name="Space", create_at=1, sender="alice",
+        sender_display_name=content["sender_display_name"],
+        sender_is_agent=content["sender_is_agent"],
+        sender_owner_slug=content["sender_owner_slug"],
+        sender_type=content.get("sender_type"),
+        is_from_operator=content["is_from_operator"],
+        is_encrypted=True,
+    )
+    assert "- sender_type: human" in lines
+    await store.close()

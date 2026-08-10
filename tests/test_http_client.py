@@ -132,6 +132,7 @@ class TestHttpClientSigning(AioHTTPTestCase):
             "PUT", "/v2/agent-runtime/reminder-occurrences/{occurrence_id}", self._handle,
         )
         app.router.add_route("DELETE", "/remove", self._handle)
+        app.router.add_route("DELETE", "/blocklists", self._handle)
         return app
 
     async def _handle(self, request: web.Request):
@@ -212,6 +213,33 @@ class TestHttpClientSigning(AioHTTPTestCase):
             assert result == {"ok": True}
             result = await client.delete("/remove")
             assert result == {"ok": True}
+            assert self.captured_body == b""
+        finally:
+            await client.close()
+
+    @unittest_run_loop
+    async def test_delete_with_body_sends_and_signs_the_same_bytes(self):
+        """``DELETE /blocklists`` identifies its target only by a JSON
+        body, and the server verifies the subkey signature over the raw
+        body bytes. A DELETE that signed an empty body while sending a
+        populated one — or dropped the body entirely — would fail auth
+        on every unblock, so this pins body transmission and signature
+        coverage together."""
+        url = f"http://localhost:{self.server.port}"
+        client = PuffoCoreHttpClient(url, self.ks, "alice-0001")
+        try:
+            await client.delete("/blocklists", body={"id": "mallory-0009"})
+            assert json.loads(self.captured_body) == {"id": "mallory-0009"}
+            h = {k.lower(): v for k, v in self.captured_headers.items()}
+            expected_msg = (
+                f"DELETE\n/blocklists\n{h['x-puffo-timestamp']}\n"
+                f"{h['x-puffo-nonce']}\n"
+            ).encode() + self.captured_body
+            assert ed25519_verify(
+                self.subkey.public_key_bytes(),
+                expected_msg,
+                base64url_decode(h["x-puffo-signature"]),
+            )
         finally:
             await client.close()
 

@@ -190,8 +190,18 @@ class PuffoCoreHttpClient:
         _, data = await self._request("PATCH", path, raw)
         return data
 
-    async def delete(self, path: str) -> Any:
-        _, data = await self._request("DELETE", path)
+    async def delete(self, path: str, body: dict | None = None) -> Any:
+        """Signed DELETE, optionally carrying a JSON body.
+
+        Some routes identify their target in the body rather than the
+        path — ``DELETE /blocklists`` takes ``{"id": "<slug>"}``. The
+        body is serialized exactly as ``post()`` does and handed to
+        ``_request``, so ``sign_request`` covers the same bytes that go
+        on the wire (the server verifies the signature over the raw
+        body). Bodyless DELETEs are byte-for-byte unchanged.
+        """
+        raw = json.dumps(body).encode() if body else b""
+        _, data = await self._request("DELETE", path, raw)
         return data
 
     def _egress_headers(self, base: dict[str, str] | None = None) -> dict[str, str]:

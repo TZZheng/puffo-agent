@@ -551,6 +551,7 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
         role=role,
         role_short=role_short,
         soul=extract_soul_body(profile_path.read_text(encoding="utf-8")),
+        puffo_handle=cfg.puffo_core.slug,
     )
 
     _print_agent_create_result(agent_id, target)
@@ -1625,6 +1626,7 @@ def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
                 display_name=cfg.display_name,
                 role=cfg.role,
                 role_short=cfg.role_short,
+                puffo_handle=cfg.puffo_core.slug,
             )
         except BriefingCompileError as exc:
             print(f"error: agent {agent_id!r}: {exc}", file=sys.stderr)
