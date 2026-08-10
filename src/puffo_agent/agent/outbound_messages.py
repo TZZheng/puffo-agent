@@ -79,6 +79,7 @@ async def send_direct_message(
     http: Any,
     fetch_devices: DeviceFetcher,
     log: Log,
+    require_encryption: bool = False,
 ) -> dict[str, Any] | None:
     """Send one always-visible operator-facing DM."""
     if recipient_slug == slug:
@@ -94,6 +95,7 @@ async def send_direct_message(
             store=store,
             fetch_devices=fetch_devices,
             log=log,
+            require_encryption=require_encryption,
         )
         if envelope is None:
             return None
@@ -182,12 +184,18 @@ async def _build_native_dm(
     store: Any,
     fetch_devices: DeviceFetcher,
     log: Log,
+    require_encryption: bool = False,
 ) -> tuple[dict[str, Any] | None, str]:
     session = keystore.load_session(slug)
     signing_key = Ed25519KeyPair.from_secret_bytes(
         decode_secret(session.subkey_secret_key)
     )
-    encrypt = await send_mode.encryption_required(slug, store, root_id or None)
+    # A daemon-authored DM that quotes decrypted inbound content inherits that
+    # trigger's confidentiality. ``root_id`` is "" for these sends, so the
+    # thread-root rule alone would answer plaintext.
+    encrypt = require_encryption or await send_mode.encryption_required(
+        slug, store, root_id or None
+    )
     devices: list[RecipientDevice] = []
     if encrypt:
         devices = await fetch_devices([slug, recipient_slug])

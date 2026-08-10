@@ -1447,11 +1447,16 @@ class PuffoCoreMessageClient:
                 "dm_gate: failed to notify operator of outbound allowlist",
             )
 
-    async def _maybe_gate_foreign_dm(self, *, sender_slug: str, text: str) -> bool:
+    async def _maybe_gate_foreign_dm(
+        self, *, sender_slug: str, text: str, trigger_encrypted: bool = False
+    ) -> bool:
         from . import dm_gate
 
         return await dm_gate.maybe_gate_foreign_dm(
-            self, sender_slug=sender_slug, text=text
+            self,
+            sender_slug=sender_slug,
+            text=text,
+            trigger_encrypted=trigger_encrypted,
         )
 
     async def _maybe_handle_dm_approval_reply(
@@ -1805,6 +1810,7 @@ class PuffoCoreMessageClient:
         recipient_slug: str,
         text: str,
         root_id: str,
+        require_encryption: bool = False,
     ) -> dict[str, Any] | None:
         return await send_direct_message(
             slug=self.slug,
@@ -1816,6 +1822,7 @@ class PuffoCoreMessageClient:
             http=self.http,
             fetch_devices=self._fetch_device_keys,
             log=self._log,
+            require_encryption=require_encryption,
         )
 
     async def _fetch_device_keys(

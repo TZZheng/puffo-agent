@@ -73,6 +73,24 @@ class InProcessDataClient:
     async def get_message_by_envelope(self, envelope_id: str) -> Any:
         return await self._store.get_message_by_envelope(envelope_id)
 
+    async def get_send_encryption(
+        self, slug: str, thread_root_id: str | None,
+    ) -> bool:
+        """Daemon-level send-mode decision, in-process.
+
+        Mirrors ``portal/data_service.py``'s HTTP endpoint so the ws-local
+        lane consults the same policy as the MCP subprocess lane. Without
+        this method ``_send_encryption_required`` fails safe to ``True``,
+        which turned every ws-local plaintext send into a hard failure.
+        """
+        from ...agent import send_mode
+
+        return bool(
+            await send_mode.encryption_required(
+                slug or "", self._store, thread_root_id or None,
+            )
+        )
+
     async def update_profile_cache(
         self, slug: str, display_name: str, avatar_url: str,
     ) -> None:

@@ -181,6 +181,7 @@ async def foreign_dm_gate(
     client: Any,
     payload: Any,
     raw_text: str,
+    trigger_encrypted: bool = False,
 ) -> GateVerdict | None:
     """Hold a DM from an untrusted stranger until the operator approves.
 
@@ -239,7 +240,11 @@ async def foreign_dm_gate(
             reason="foreign dm gated (keyless: no operator prompt)",
         )
 
-    if not await client._maybe_gate_foreign_dm(sender_slug=sender, text=raw_text):
+    if not await client._maybe_gate_foreign_dm(
+        sender_slug=sender,
+        text=raw_text,
+        trigger_encrypted=trigger_encrypted,
+    ):
         return None
     return GateVerdict(
         gate="foreign_dm",

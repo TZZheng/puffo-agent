@@ -1194,3 +1194,91 @@ async def test_abandoned_turn_held_context_is_dropped_and_records_stay_bounded()
             attempt_fingerprint=f"fingerprint-{index}",
         )
     assert len(coordinator._held_evidence) == _MAX_HELD_RECORDS
+
+
+@pytest.mark.asyncio
+async def test_held_override_is_bound_to_the_transmitted_attachment_bytes(tmp_path):
+    """A mutated file at an unchanged path cannot reuse a held approval."""
+    case = await _keyless_held_contract()
+    case.coordinator.workspace = str(tmp_path)
+    target = tmp_path / "evidence.txt"
+    target.write_bytes(b"original-draft-bytes")
+    http = case.coordinator.http_client
+    request = dict(
+        destination=case.destination,
+        attachment_paths=("evidence.txt",),
+        caption="caption",
+    )
+
+    held = await case.coordinator.send(SemanticSendRequest(**request))
+    assert held["state"] == "held"
+    assert http.uploaded == [b"original-draft-bytes"]
+    case.boundary.value = 5
+
+    # Same path, same caption, different bytes: the tool-argument fingerprint
+    # still matches, so only the content digest can reject this.
+    target.write_bytes(b"revised-draft-bytes!")
+    blocked = await case.coordinator.send(
+        SemanticSendRequest(**request, send_anyway=True)
+    )
+    assert blocked["state"] == "failed"
+    assert blocked["error_kind"] == "reconsideration_ineligible"
+    assert blocked["_reconsideration_audit"]["decision_reason"] == (
+        "held_content_changed"
+    )
+    assert len(case.calls) == 1
+    assert http.uploaded == [b"original-draft-bytes"]
+
+    # The unchanged draft stays eligible, and what is uploaded is what was
+    # digested and approved.
+    target.write_bytes(b"original-draft-bytes")
+    sent = await case.coordinator.send(
+        SemanticSendRequest(**request, send_anyway=True)
+    )
+    assert sent["state"] == "sent", sent
+    assert len(case.calls) == 2
+    assert http.uploaded == [b"original-draft-bytes", b"original-draft-bytes"]
+    await case.store.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_teardown_discards_decrypted_held_evidence(tmp_path):
+    """Terminal turns drop held plaintext instead of leaking it forward."""
+    from .test_global_inbox_runtime import Adapter, make_store
+
+    from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
+
+    store = await make_store(tmp_path)
+    cfg, http, unused = _setup_keyless()
+    coordinator = SendCoordinator(
+        slug=cfg.slug, keystore=cfg.keystore, http_client=http,
+        data_client=store,
+    )
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.coordinator = coordinator
+
+    def stage():
+        coordinator._held_evidence[("session-a", "turn-a", "sp_1", "ch_1")] = (
+            _HeldEvidence(
+                latest_seq=5,
+                latest_envelope_id="msg_latest",
+                draft="secret draft",
+                recovered_messages=[{"content": "decrypted row"}],
+            )
+        )
+
+    planned = SimpleNamespace(turn_id="turn-a", notice_generation=None)
+    stage()
+    runtime._finalize_process(planned, True)
+    assert coordinator._held_evidence == {}
+
+    stage()
+    runtime._clear_terminal_turn()
+    assert coordinator._held_evidence == {}
+    await store.close()
+    await unused.close()

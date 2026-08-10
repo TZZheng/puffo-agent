@@ -425,6 +425,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             formatted_bytes=batch.formatted_bytes,
             wrapper_overhead_bytes=wrapper_bytes,
             more_available=batch.more_available,
+            requires_encryption=any(item.is_encrypted for item in batch.items),
         )
 
     async def _plan_notice(
@@ -501,6 +502,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             wrapper_overhead_bytes=len(provider_input.encode("utf-8")),
             more_available=True,
             notice_generation=notice.generation,
+            requires_encryption=any(item.is_encrypted for item in pending_universe),
         )
 
     def _log_planned_batch(self, planned: PlannedTurn) -> None:
@@ -1016,6 +1018,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             self._discard_held_admission_evidence(planned.turn_id)
             self.active.clear()
         if self.coordinator is not None:
+            self._discard_coordinator_held_evidence()
             self.coordinator.provider_session_id = None
         if terminal or not was_active:
             try:
@@ -1127,11 +1130,24 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         self._discard_held_admission_evidence(self.active.turn_id)
         self.active.clear()
         if self.coordinator is not None:
+            self._discard_coordinator_held_evidence()
             self.coordinator.provider_session_id = None
         try:
             self.current_turn_path.unlink()
         except OSError:
             pass
+
+    def _discard_coordinator_held_evidence(self) -> None:
+        """Drop the finished turn's decrypted held context.
+
+        ``_prune_stale_held_locked`` only evicts a record when the coordinator
+        reports a *complete* other identity, and teardown clears the identity
+        to ``("", "")`` — so without this call an abandoned turn's plaintext
+        draft and recovered rows survive until the size cap evicts them.
+        """
+        discard = getattr(self.coordinator, "discard_held_evidence", None)
+        if discard is not None:
+            discard()
 
     def _discard_held_admission_evidence(self, turn_id: str) -> None:
         """Release transient held projections when their owning turn ends."""
@@ -1177,6 +1193,10 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             wrapper_overhead_tokens=self.estimator(prefix + suffix),
             formatted_bytes=sum(len(block.encode("utf-8")) for block in blocks),
             wrapper_overhead_bytes=len((prefix + suffix).encode("utf-8")),
+            # The triggering durable rows carry the same E2EE fact a normal
+            # turn derives from its planned batch; a crash resume must not
+            # silently downgrade to the plaintext default.
+            requires_encryption=any(row.is_encrypted for row in rows),
         )
 
     async def _abandon_recovery_event(self, raw: Any, run: Any) -> None:
@@ -1237,12 +1257,24 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         durable_ids: tuple[str, ...],
         recovery_started: float,
         state: str,
+        activated: bool = False,
     ) -> bool:
         if run is None or run.state != ProcessingState.IN_TURN.value:
             return False
-        if durable_ids:
+        # ``durable_ids`` is the activation snapshot. Once the turn is running,
+        # mid-turn admission grows the durable membership and republishes it on
+        # ``active.message_ids``; requeueing the snapshot would abandon the rows
+        # admitted since, leaving them IN_TURN under a finished run. Before
+        # activation the snapshot is the truth and ``active`` may still hold an
+        # unrelated turn's state, so only an activated run reads it.
+        requeue_ids = (
+            tuple(self.active.message_ids)
+            if activated and self.active.turn_id == run.turn_id
+            else durable_ids
+        )
+        if requeue_ids:
             await self._abandon_recovery_event(raw, run)
-            await self.store.requeue_messages(durable_ids, turn_id=run.turn_id)
+            await self.store.requeue_messages(requeue_ids, turn_id=run.turn_id)
         else:
             await self.store.finalize_empty_turn(
                 turn_id=run.turn_id,
@@ -1257,7 +1289,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             provider_session_id=run.provider_session_id,
             state="requeued",
             mode="recovery",
-            message_count=len(durable_ids),
+            message_count=len(requeue_ids),
             duration_ms=int((time.monotonic() - recovery_started) * 1000),
             error_category=state,
         )
@@ -1273,6 +1305,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         diagnostic: str,
         state: str = "degraded",
         defer_requeued_recovery: bool = False,
+        activated: bool = False,
     ) -> bool:
         requeued = await self._requeue_recovery_run(
             raw,
@@ -1280,6 +1313,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             durable_ids,
             recovery_started,
             state,
+            activated=activated,
         )
         self.health = RuntimeHealth(state, diagnostic)
         self._defer_requeued_recovery = defer_requeued_recovery and requeued
@@ -1481,11 +1515,40 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 diagnostic="crash join identity, route, or target mismatch",
             )
         self._activate_recovery(planned, durable_ids, run.provider_session_id)
+        from . import send_mode
+
+        # A resumed turn establishes the same send-mode facts ``process_once``
+        # does; the module dict is process-local and therefore empty here.
+        send_mode.note_turn_bundle(
+            list(self.send_mode_keys),
+            planned.requires_encryption
+            or any(item.is_encrypted for item in planned.items),
+        )
+        try:
+            return await self._resume_activated_turn(
+                planned=planned,
+                turn_id=turn_id,
+                recovery_started=recovery_started,
+                unwind=unwind,
+            )
+        finally:
+            send_mode.clear_turn_bundle(list(self.send_mode_keys))
+
+    async def _resume_activated_turn(
+        self,
+        *,
+        planned: PlannedTurn,
+        turn_id: str,
+        recovery_started: float,
+        unwind: dict[str, Any],
+    ) -> bool:
+        """Drive an activated crash-resumed turn to a terminal outcome."""
         if not hasattr(self.run_turn, "handle_global_inbox_retry"):
             return await self._unwind_recovery(
                 **unwind,
                 diagnostic="crash recovery retry unavailable",
                 defer_requeued_recovery=True,
+                activated=True,
             )
         try:
             failure = await self._run_recovery_retries(planned)
@@ -1495,6 +1558,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                     diagnostic=failure[0],
                     state=failure[1],
                     defer_requeued_recovery=True,
+                    activated=True,
                 )
             return await self._complete_recovery(turn_id, recovery_started)
         except asyncio.CancelledError:
@@ -1505,4 +1569,5 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 **unwind,
                 diagnostic=f"crash resume terminal failure: {type(exc).__name__}",
                 defer_requeued_recovery=True,
+                activated=True,
             )

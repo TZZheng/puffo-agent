@@ -450,7 +450,12 @@ class InboundReceiptHandler:
     ) -> TransportOutcome | None:
         return await self._commit_verdict(
             committer,
-            await foreign_dm_gate(self.client, committer.payload, raw_text),
+            await foreign_dm_gate(
+                self.client,
+                committer.payload,
+                raw_text,
+                bool(committer.stored_payload.get("is_encrypted")),
+            ),
         )
 
     def _cache_channel_space(self, payload: MessagePayload) -> None:

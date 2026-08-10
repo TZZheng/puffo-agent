@@ -20,6 +20,19 @@ def note_turn_bundle(keys: list[str], has_encrypted: bool) -> None:
             _turn_bundle_encrypted[key] = has_encrypted
 
 
+def raise_turn_bundle(keys: list[str]) -> None:
+    """Mark the turn bundle encrypted; never lower an existing ``True``.
+
+    Mid-turn admission adds rows to a turn that was planned from a
+    different set. An admitted encrypted row must raise the flag, and a
+    plaintext one must not clear an encryption obligation already
+    established by the planned bundle.
+    """
+    for key in keys:
+        if key:
+            _turn_bundle_encrypted[key] = True
+
+
 def clear_turn_bundle(keys: list[str]) -> None:
     for key in keys:
         _turn_bundle_encrypted.pop(key, None)

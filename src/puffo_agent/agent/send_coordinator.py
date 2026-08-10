@@ -178,6 +178,7 @@ class _HeldEvidence:
     latest_envelope_id: str
     synchronized: bool = False
     attempt_fingerprint: str = ""
+    content_digest: str = ""
     draft: str = ""
     based_on_through_seq: int | None = None
     thread_root_id: str = ""
@@ -215,6 +216,10 @@ class _ChannelSendBoundary:
     held_key: tuple[str, str, str, str]
     attempt_fingerprint: str
     reconsideration: _ReconsiderationDecision | None
+    # Bytes read once, before the reconsideration decision, and reused for the
+    # actual upload — so the approved payload is the transmitted payload.
+    materialized: tuple[tuple[str, bytes], ...] = ()
+    content_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -672,7 +677,9 @@ class SendCoordinator:
             body["thread_root_id"] = root_id
             if request.root_id:
                 body["reply_to_id"] = request.root_id
-        refs = await self._upload_keyless_channel_attachments(request)
+        refs = await self._upload_keyless_channel_attachments(
+            request, boundary.materialized
+        )
         if isinstance(refs, dict):
             return refs
         if refs:
@@ -683,10 +690,20 @@ class SendCoordinator:
     async def _upload_keyless_channel_attachments(
         self,
         request: SemanticSendRequest,
+        materialized: Sequence[tuple[str, bytes]] | None = None,
     ) -> list[dict[str, Any]] | dict[str, Any]:
+        # Same binding as the native lane: upload the digested bytes, not a
+        # fresh read of the path.
+        pairs = (
+            list(materialized)
+            if materialized is not None
+            else [
+                (target.name, target.read_bytes())
+                for target in self._validate_attachment_targets(request)
+            ]
+        )
         refs: list[dict[str, Any]] = []
-        for target in self._validate_attachment_targets(request):
-            plaintext = target.read_bytes()
+        for name, plaintext in pairs:
             upload = await self.http_client.post_bytes_unsigned(
                 "/v2/cloud-agents/blobs/upload",
                 plaintext,
@@ -700,8 +717,8 @@ class SendCoordinator:
             refs.append(
                 {
                     "blob_id": blob_id,
-                    "filename": target.name,
-                    "mime_type": mimetypes.guess_type(target.name)[0]
+                    "filename": name,
+                    "mime_type": mimetypes.guess_type(name)[0]
                     or "application/octet-stream",
                     "size_bytes": len(plaintext),
                 }
@@ -731,6 +748,7 @@ class SendCoordinator:
                     based_on_through_seq=boundary.seen_seq,
                     thread_root_id=root_id,
                     visible_draft_basis=visible_draft_basis,
+                    content_digest=boundary.content_digest,
                 )
             result.note = (
                 "No channel message was committed; inspect newer Inbox context."
@@ -857,10 +875,15 @@ class SendCoordinator:
                 kind="freshness_unavailable",
             )
         fingerprint = request.attempt_fingerprint()
+        try:
+            materialized = self._materialize_attachments(request)
+        except Exception as exc:
+            return failed_result(str(exc), kind="validation")
+        content_digest = self._content_digest(materialized)
         reconsideration: _ReconsiderationDecision | None = None
         if request.send_anyway:
             reconsideration = await self._reconsideration_decision(
-                space_id, channel_id, fingerprint
+                space_id, channel_id, fingerprint, content_digest
             )
             if not reconsideration.eligible:
                 result = failed_result(
@@ -879,7 +902,37 @@ class SendCoordinator:
             held_key=(session_id, turn_id, space_id, channel_id),
             attempt_fingerprint=fingerprint,
             reconsideration=reconsideration,
+            materialized=materialized,
+            content_digest=content_digest,
         )
+
+    def _materialize_attachments(
+        self,
+        request: SemanticSendRequest,
+    ) -> tuple[tuple[str, bytes], ...]:
+        """Read every validated attachment once, before any authorization.
+
+        ``attempt_fingerprint`` only covers the tool arguments, so a file
+        mutated at an unchanged path used to reuse a held approval. Reading
+        here — ahead of the reconsideration decision — makes the bytes that
+        were approved the bytes that are uploaded.
+        """
+        return tuple(
+            (target.name, target.read_bytes())
+            for target in self._validate_attachment_targets(request)
+        )
+
+    @staticmethod
+    def _content_digest(materialized: Sequence[tuple[str, bytes]]) -> str:
+        """Order-sensitive digest over the (filename, bytes) pairs."""
+        if not materialized:
+            return ""
+        digest = hashlib.sha256()
+        for name, payload in materialized:
+            digest.update(name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(hashlib.sha256(payload).digest())
+        return digest.hexdigest()
 
     async def _send_channel(
         self,
@@ -902,6 +955,7 @@ class SendCoordinator:
                 channel_id=channel_id,
                 dm_peer=None,
                 require_encryption=True,
+                materialized=boundary.materialized,
             )
         except Exception as exc:
             return failed_result(str(exc), kind="validation")
@@ -1047,6 +1101,7 @@ class SendCoordinator:
                 based_on_through_seq=boundary.seen_seq,
                 thread_root_id=str(resolved.get("root_id") or request.root_id or ""),
                 visible_draft_basis=visible_draft_basis,
+                content_digest=boundary.content_digest,
             )
         result.note = (
             "No message was sent because the channel advanced beyond this "
@@ -1204,6 +1259,21 @@ class SendCoordinator:
             list(missing),
         )
 
+    async def _channel_recipient_slugs(
+        self, space_id: str | None, channel_id: str
+    ) -> list[str]:
+        members = await self.http_client.get(
+            f"/spaces/{space_id}/channels/{channel_id}/members"
+        )
+        recipient_slugs = [
+            row.get("slug")
+            for row in (members or {}).get("members", [])
+            if isinstance(row, Mapping) and row.get("slug")
+        ]
+        if not recipient_slugs:
+            raise RuntimeError(f"channel {channel_id} has no resolvable members")
+        return recipient_slugs
+
     async def _resolve_route_and_content(
         self,
         request: SemanticSendRequest,
@@ -1212,6 +1282,7 @@ class SendCoordinator:
         channel_id: str | None,
         dm_peer: str | None,
         require_encryption: bool,
+        materialized: Sequence[tuple[str, bytes]] | None = None,
     ) -> dict[str, Any]:
         from ..mcp.puffo_core_tools import (
             _fetch_device_keys,
@@ -1222,16 +1293,7 @@ class SendCoordinator:
 
         destination = request.destination.strip()
         if channel_id is not None:
-            members = await self.http_client.get(
-                f"/spaces/{space_id}/channels/{channel_id}/members"
-            )
-            recipient_slugs = [
-                row.get("slug")
-                for row in (members or {}).get("members", [])
-                if isinstance(row, Mapping) and row.get("slug")
-            ]
-            if not recipient_slugs:
-                raise RuntimeError(f"channel {channel_id} has no resolvable members")
+            recipient_slugs = await self._channel_recipient_slugs(space_id, channel_id)
             kind = "channel"
         else:
             recipient_slugs = [self.slug, dm_peer]
@@ -1253,7 +1315,9 @@ class SendCoordinator:
                 "recipient_slugs": recipient_slugs,
             }
 
-        attachments, attachment_note = await self._prepare_attachments(request)
+        attachments, attachment_note = await self._prepare_attachments(
+            request, materialized
+        )
         content: Any
         content_type: str
         visible_text = request.caption if request.attachment_paths else request.text
@@ -1308,34 +1372,41 @@ class SendCoordinator:
     async def _prepare_attachments(
         self,
         request: SemanticSendRequest,
+        materialized: Sequence[tuple[str, bytes]] | None = None,
     ) -> tuple[list[AttachmentMeta], str]:
         if not request.attachment_paths:
             return [], ""
-        targets = self._validate_attachment_targets(request)
+        # Reuse the bytes the boundary already read and digested; re-reading
+        # would reopen the mutate-between-approval-and-upload window.
+        pairs = (
+            list(materialized)
+            if materialized is not None
+            else [
+                (target.name, target.read_bytes())
+                for target in self._validate_attachment_targets(request)
+            ]
+        )
         metas: list[AttachmentMeta] = []
         total = 0
-        for target in targets:
-            plaintext = target.read_bytes()
-            mime_type = (
-                mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-            )
+        for name, plaintext in pairs:
+            mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
             ciphertext, meta = encrypt_attachment(
                 plaintext=plaintext,
-                filename=target.name,
+                filename=name,
                 mime_type=mime_type,
                 blob_id="",
             )
             upload = await self.http_client.post_bytes("/blobs/upload", ciphertext)
             blob_id = upload.get("blob_id") if isinstance(upload, Mapping) else None
             if not blob_id:
-                raise RuntimeError(f"server returned no blob_id for {target.name!r}")
+                raise RuntimeError(f"server returned no blob_id for {name!r}")
             meta.blob_id = blob_id
             metas.append(meta)
             total += len(plaintext)
-        names = ", ".join(path.name for path in targets)
+        names = ", ".join(name for name, _ in pairs)
         return (
             metas,
-            f"\nuploaded {len(targets)} file(s) [{names}] ({total} bytes total)",
+            f"\nuploaded {len(pairs)} file(s) [{names}] ({total} bytes total)",
         )
 
     def _validate_attachment_targets(
@@ -1413,6 +1484,7 @@ class SendCoordinator:
         based_on_through_seq: int | None = None,
         thread_root_id: str = "",
         visible_draft_basis: Sequence[Mapping[str, Any]] = (),
+        content_digest: str = "",
     ) -> None:
         async with self._held_lock:
             old = self._held_evidence.get(key)
@@ -1433,6 +1505,7 @@ class SendCoordinator:
                     latest_seq=latest_seq,
                     latest_envelope_id=latest_envelope_id,
                     attempt_fingerprint=attempt_fingerprint,
+                    content_digest=content_digest,
                     draft=draft,
                     based_on_through_seq=based_on_through_seq,
                     thread_root_id=thread_root_id,
@@ -1512,6 +1585,16 @@ class SendCoordinator:
             )
         return data
 
+    def discard_held_evidence(self) -> None:
+        """Drop every held record when the owning turn tears down.
+
+        Called from the runtime's terminal paths, which are synchronous and
+        run after the turn's sends have finished, so this deliberately skips
+        ``_held_lock`` — ``dict.clear()`` needs no await and there is no
+        concurrent in-turn writer left to serialize against.
+        """
+        self._held_evidence.clear()
+
     async def _consume_held(self, key: tuple[str, str, str, str]) -> None:
         async with self._held_lock:
             self._held_evidence.pop(key, None)
@@ -1558,8 +1641,52 @@ class SendCoordinator:
             )
         return rows
 
+    def _held_snapshot_locked(
+        self, key: tuple[str, str, str, str]
+    ) -> tuple[tuple[int, str] | None, str, str, bool]:
+        """Snapshot the held record; call under ``_held_lock``."""
+        held = self._held_evidence.get(key)
+        if held is None:
+            return None, "", "", False
+        return (
+            (held.latest_seq, held.latest_envelope_id),
+            held.attempt_fingerprint,
+            held.content_digest,
+            bool(held.synchronized),
+        )
+
+    @staticmethod
+    def _held_draft_reason(
+        held_fingerprint: str,
+        held_digest: str,
+        attempt_fingerprint: str,
+        content_digest: str,
+    ) -> str:
+        """Reject anything but the exact draft that was actually held."""
+        if held_fingerprint != attempt_fingerprint:
+            # Only the unchanged draft the model actually reconsidered may
+            # override; a revised draft goes through normal freshness.
+            return "held_draft_mismatch"
+        if held_digest and held_digest != content_digest:
+            # Same path and caption, different bytes: the tool arguments match
+            # but the payload does not, so the old approval does not carry.
+            return "held_content_changed"
+        return ""
+
+    @staticmethod
+    def _normalize_admitted(admitted: Any) -> int | None:
+        if isinstance(admitted, bool) or (
+            admitted is not None and (not isinstance(admitted, int) or admitted < 0)
+        ):
+            return None
+        return admitted
+
     async def _reconsideration_decision(
-        self, space_id: str, channel_id: str, attempt_fingerprint: str
+        self,
+        space_id: str,
+        channel_id: str,
+        attempt_fingerprint: str,
+        content_digest: str = "",
     ) -> _ReconsiderationDecision:
         session_id, turn_id = self._turn_identity()
         if not session_id or not turn_id:
@@ -1568,22 +1695,18 @@ class SendCoordinator:
             )
         key = (session_id, turn_id, space_id, channel_id)
         async with self._held_lock:
-            held = self._held_evidence.get(key)
-            held_pair = (
-                (held.latest_seq, held.latest_envelope_id) if held is not None else None
+            held_pair, held_fingerprint, held_digest, synchronized = (
+                self._held_snapshot_locked(key)
             )
-            held_fingerprint = held.attempt_fingerprint if held is not None else ""
-            synchronized = bool(held and held.synchronized)
         if held_pair is None:
             return _ReconsiderationDecision(
                 False, "missing_held_evidence", session_id, turn_id
             )
-        if held_fingerprint != attempt_fingerprint:
-            # Only the unchanged draft the model actually reconsidered may
-            # override; a revised draft goes through normal freshness.
-            return _ReconsiderationDecision(
-                False, "held_draft_mismatch", session_id, turn_id
-            )
+        reason = self._held_draft_reason(
+            held_fingerprint, held_digest, attempt_fingerprint, content_digest
+        )
+        if reason:
+            return _ReconsiderationDecision(False, reason, session_id, turn_id)
         if not synchronized:
             await self._recover_held(
                 space_id,
@@ -1593,23 +1716,41 @@ class SendCoordinator:
                 attempt_fingerprint,
             )
         async with self._held_lock:
-            current = self._held_evidence.get(key)
-            if current is None:
-                return _ReconsiderationDecision(
-                    False, "missing_held_evidence", session_id, turn_id
-                )
-            if current.attempt_fingerprint != attempt_fingerprint:
-                return _ReconsiderationDecision(
-                    False, "held_draft_mismatch", session_id, turn_id
-                )
-            latest_seq = current.latest_seq
-            latest_envelope_id = current.latest_envelope_id
-            synchronized = current.synchronized
-        admitted = await self._active_boundary(space_id, channel_id)
-        if isinstance(admitted, bool) or (
-            admitted is not None and (not isinstance(admitted, int) or admitted < 0)
-        ):
-            admitted = None
+            current_pair, current_fingerprint, current_digest, synchronized = (
+                self._held_snapshot_locked(key)
+            )
+        if current_pair is None:
+            return _ReconsiderationDecision(
+                False, "missing_held_evidence", session_id, turn_id
+            )
+        reason = self._held_draft_reason(
+            current_fingerprint, current_digest, attempt_fingerprint, content_digest
+        )
+        if reason:
+            return _ReconsiderationDecision(False, reason, session_id, turn_id)
+        return self._admission_verdict(
+            session_id=session_id,
+            turn_id=turn_id,
+            synchronized=synchronized,
+            current_pair=current_pair,
+            held_pair=held_pair,
+            admitted=self._normalize_admitted(
+                await self._active_boundary(space_id, channel_id)
+            ),
+        )
+
+    def _admission_verdict(
+        self,
+        *,
+        session_id: str,
+        turn_id: str,
+        synchronized: bool,
+        current_pair: tuple[int, str],
+        held_pair: tuple[int, str],
+        admitted: int | None,
+    ) -> _ReconsiderationDecision:
+        """Grade the recovered held record against the admitted boundary."""
+        latest_seq, latest_envelope_id = current_pair
         if not synchronized:
             reason = (
                 "held_boundary_superseded"

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from ._logging import log_runtime_event
 from .context_controller import (
@@ -83,6 +83,19 @@ class InboxAdmissionMixin:
     exists solely to keep the compatibility facade readable and bounded.
     """
 
+    def _raise_send_mode_for(self, rows: Sequence[Any]) -> None:
+        """Raise the turn's E2EE obligation for a mid-turn admission.
+
+        The bundle flag was established from the planned batch. Admitting an
+        encrypted row afterwards extends that obligation to the rest of the
+        turn; a plaintext admission must never lower it.
+        """
+        if not any(getattr(row, "is_encrypted", False) for row in rows if row):
+            return
+        from . import send_mode
+
+        send_mode.raise_turn_bundle(list(self.send_mode_keys))
+
     async def _admit_held_recovery(
         self,
         event: ProviderAdmissionEvent,
@@ -137,6 +150,7 @@ class InboxAdmissionMixin:
             if row is not None and row.processing_state is ProcessingState.PENDING
         ]
         fired[0] = True
+        self._raise_send_mode_for(rows)
         try:
             if pending_ids:
                 await self.store.admit_messages(
@@ -795,6 +809,7 @@ class InboxAdmissionMixin:
             provider_session_id=context.provider_session_id,
         )
         fired[0] = True
+        self._raise_send_mode_for(context.selected)
         self.active.message_ids[:] = list(run.message_ids)
         await self._add_visible_message_ids(list(ids) + list(context.prior_context_ids))
         self.active.routes.extend(context.routes)

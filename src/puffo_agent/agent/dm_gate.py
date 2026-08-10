@@ -12,10 +12,16 @@ async def maybe_gate_foreign_dm(
     *,
     sender_slug: str,
     text: str,
+    trigger_encrypted: bool = False,
 ) -> bool:
     """Prompt the operator for a held foreign DM. True = gated (caller
     skips the ack; the DM waits in /messages/pending). One prompt per
     sender — further DMs ride the same y/n.
+
+    ``trigger_encrypted`` is the inbound DM's own confidentiality. The
+    prompt embeds that decrypted text and is sent with ``root_id=""``,
+    so without it the send-mode policy would answer plaintext and
+    republish an E2EE stranger's message in the clear.
     """
     for entry in client._pending_dm_approvals.values():
         if entry.get("sender_slug") == sender_slug:
@@ -41,7 +47,12 @@ async def maybe_gate_foreign_dm(
         detail=preview,
     )
     try:
-        envelope = await client._send_dm(client.operator_slug, prompt, root_id="")
+        envelope = await client._send_dm(
+            client.operator_slug,
+            prompt,
+            root_id="",
+            require_encryption=trigger_encrypted,
+        )
     except Exception as exc:
         client._log.warning(
             "auto_accept_dm: failed to send approval prompt for %s: %s; "
