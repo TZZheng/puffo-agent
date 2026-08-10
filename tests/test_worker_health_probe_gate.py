@@ -5,8 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from types import SimpleNamespace
-
-
+from unittest.mock import AsyncMock, Mock, patch
 
 # ── (2) Worker._reassert_auth_failed_after_failed_probe ────────────────────
 
@@ -249,3 +248,49 @@ def test_reassert_does_not_fire_a_second_operator_dm():
         "reassert path must not fire a second operator DM; "
         f"got {sent!r}"
     )
+
+
+def test_prepared_runtime_retries_transient_warm_before_releasing_gate():
+    from puffo_agent.portal import worker_run
+
+    async def run():
+        adapter = Mock()
+        adapter.warm = AsyncMock(
+            side_effect=[
+                RuntimeError("provider startup race"),
+                RuntimeError("provider startup race"),
+                None,
+            ]
+        )
+        adapter.get_provider_session_id.return_value = "native-session"
+        outbox = Mock()
+        outbox.state.return_value = {}
+        prepared = Mock()
+        worker = SimpleNamespace(
+            _adapter=adapter,
+            _run_post_warm_gate=AsyncMock(),
+            _warm_done=asyncio.Event(),
+        )
+        context = SimpleNamespace(
+            paths=SimpleNamespace(agent_id="agent-a", system_prompt="system"),
+            runtime_event_outbox=outbox,
+            runtime_session_ref="logical-session",
+            prepared_local_runtime=prepared,
+        )
+        with patch.object(
+            worker_run,
+            "LOCAL_WARM_RETRY_DELAYS_SECONDS",
+            (0.0, 0.0),
+        ):
+            assert await worker_run.StandardWorkerRun(worker)._warm(context)
+        return adapter, outbox, prepared, worker
+
+    adapter, outbox, prepared, worker = asyncio.run(run())
+    assert adapter.warm.await_count == 3
+    outbox.set_active_turn.assert_called_once_with(
+        None,
+        session_ref="logical-session",
+        native_session_id="native-session",
+    )
+    prepared.finalize_legacy_session_migration.assert_called_once_with()
+    worker._run_post_warm_gate.assert_awaited_once_with("agent-a")

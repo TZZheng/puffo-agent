@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 logger = worker_module.logger
 RUNTIME_EVENT_DEGRADED_RETRY_SECONDS = 30.0
+LOCAL_WARM_RETRY_DELAYS_SECONDS = (1.0, 2.0)
 
 
 @dataclass(frozen=True)
@@ -264,19 +265,21 @@ class StandardWorkerRun:
 
     async def _warm(self, context: WorkerRunContext) -> bool:
         worker = self.worker
-        warm_ok = False
-        try:
-            await worker._adapter.warm(context.paths.system_prompt)
-            warm_ok = True
-        except Exception as exc:
-            if context.prepared_local_runtime is not None:
-                await self._fail_local_warm(context, exc)
+        if context.prepared_local_runtime is not None:
+            warm_ok = await self._warm_prepared_local_runtime(context)
+            if not warm_ok:
                 return False
-            logger.warning(
-                "agent %s: warm() failed (will retry on first turn): %s",
-                context.paths.agent_id,
-                exc,
-            )
+        else:
+            warm_ok = False
+            try:
+                await worker._adapter.warm(context.paths.system_prompt)
+                warm_ok = True
+            except Exception as exc:
+                logger.warning(
+                    "agent %s: warm() failed (will retry on first turn): %s",
+                    context.paths.agent_id,
+                    exc,
+                )
         if context.prepared_local_runtime is not None:
             assert context.runtime_event_outbox is not None
             persisted = context.runtime_event_outbox.state()
@@ -291,6 +294,50 @@ class StandardWorkerRun:
         else:
             worker._warm_done.set()
         return True
+
+    @staticmethod
+    def _retryable_local_warm_error(exc: Exception) -> bool:
+        if isinstance(exc, worker_module.AgentAPIError):
+            return not exc.is_auth
+        return not isinstance(
+            exc,
+            (
+                AssertionError,
+                FileNotFoundError,
+                ImportError,
+                NotADirectoryError,
+                PermissionError,
+                TypeError,
+                ValueError,
+            ),
+        )
+
+    async def _warm_prepared_local_runtime(
+        self,
+        context: WorkerRunContext,
+    ) -> bool:
+        attempts = len(LOCAL_WARM_RETRY_DELAYS_SECONDS) + 1
+        for index in range(attempts):
+            try:
+                await self.worker._adapter.warm(context.paths.system_prompt)
+                return True
+            except Exception as exc:
+                exhausted = index >= attempts - 1
+                if exhausted or not self._retryable_local_warm_error(exc):
+                    await self._fail_local_warm(context, exc)
+                    return False
+                delay = LOCAL_WARM_RETRY_DELAYS_SECONDS[index]
+                logger.warning(
+                    "agent %s: local Driver warm attempt %d/%d failed: %s; "
+                    "retrying in %.1fs",
+                    context.paths.agent_id,
+                    index + 1,
+                    attempts,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        return False
 
     async def _fail_local_warm(self, context: WorkerRunContext, exc: Exception) -> None:
         worker = self.worker
