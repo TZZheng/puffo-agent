@@ -191,6 +191,21 @@ async def test_dm_history_before():
 
 
 @pytest.mark.asyncio
+async def test_dm_history_since_envelope_filters_by_sent_at():
+    store = _temp_store()
+    await store.open()
+
+    await store.store(_dm_payload("env_1", "alice", "bob", sent_at=100))
+    await store.store(_dm_payload("env_2", "bob", "alice", sent_at=200))
+    await store.store(_dm_payload("env_3", "alice", "bob", sent_at=300))
+
+    msgs = await store.get_dm_history("bob", since_envelope_id="env_2")
+    assert [msg.envelope_id for msg in msgs] == ["env_3"]
+
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_cleanup():
     store = _temp_store()
     await store.open()
@@ -524,6 +539,15 @@ async def test_thread_notes_unknown_root_raises():
     await store.open()
     with pytest.raises(DataNotFound):
         await store.get_thread_notes("msg_missing")
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_thread_notes_empty_root_raises():
+    store = _temp_store()
+    await store.open()
+    with pytest.raises(DataNotFound, match="empty"):
+        await store.get_thread_notes("")
     await store.close()
 
 

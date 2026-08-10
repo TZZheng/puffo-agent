@@ -20,6 +20,8 @@ def _make_client() -> tuple[InProcessDataClient, MagicMock, MagicMock]:
     store.lookup_channel_space = AsyncMock(return_value="sp_x")
     store.get_channel_roots = AsyncMock(return_value=[])
     store.get_thread_messages = AsyncMock(return_value=[])
+    store.get_channel_notes = AsyncMock(return_value=[])
+    store.get_thread_notes = AsyncMock(return_value=[])
     store.get_message_by_envelope = AsyncMock(return_value=None)
     worker = MagicMock()
     worker.set_profile = MagicMock(return_value=None)
@@ -72,6 +74,15 @@ async def test_get_thread_messages_forwards_kwargs():
         root_id="msg_root", limit=10, since_envelope_id=None,
         before_ts=None, after_ts=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_note_queries_forward_kwargs():
+    client, store, _ = _make_client()
+    assert await client.get_channel_notes("ch_42", limit=7) == []
+    assert await client.get_thread_notes("msg_root", limit=3) == []
+    store.get_channel_notes.assert_awaited_once_with("ch_42", limit=7)
+    store.get_thread_notes.assert_awaited_once_with("msg_root", limit=3)
 
 
 @pytest.mark.asyncio

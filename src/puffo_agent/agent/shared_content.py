@@ -517,14 +517,14 @@ tool validates the shape (`type` in {stdio, sse, http}, required
 fields per transport) and refuses malformed specs before touching
 disk.
 
-Either form auto-DMs the operator a one-line confirmation
-("I just installed **X** into your host ~/.claude.json as
-mcpServers['X']") once the host write succeeds. If you have
+Either form auto-DMs the operator a one-line confirmation naming the
+harness-specific host config (`~/.claude.json` for Claude Code or
+`~/.codex/config.toml` for Codex) once the host write succeeds. If you have
 setup-context to share (docs URL, env keys they need to populate,
 gotchas) follow the install call with your own
 ``mcp__puffo__send_message`` - the auto-DM is intentionally
-minimal so the operator can read their own .claude.json as the
-source of truth.
+minimal so the operator can read their harness config as the source
+of truth.
 
 Read the tool's return value carefully - it reports the real
 outcome:
@@ -542,17 +542,23 @@ outcome:
 ### Step 2 - `sync_host_mcp(name="<name>")`
 
 Once the operator pings you back saying host setup is done, call
-this with the same `name` you passed to `install_host_mcp` - the
-entry name under the operator's `mcpServers`, NOT a catalog template
-id. It
-copies the populated entry (now carrying OAuth tokens / API keys)
-from `<operator_home>/.claude.json` into your own
-`<agent>/.claude.json`. The transfer is verbatim - what host has is
-what you get.
+this with the **same `name`** you passed to `install_host_mcp`.
+It is the host-config entry name, not a catalog template id.
+Claude Code copies the populated entry from the operator's
+`.claude.json`. Codex re-merges the registration from the operator's
+`config.toml` and copies that server's file-backed OAuth entry into
+the agent's isolated `CODEX_HOME`. In both cases the credential is
+available to cli-local and cli-docker after refresh.
+
+Codex OAuth must be completed on the host with the file-store command
+included in the install confirmation. Older Codex logins may live in
+an OS-keyring-encrypted store; `sync_host_mcp` detects that case and
+asks for a one-time host re-login into the portable file store instead
+of falsely reporting success.
 
 ### Step 3 - `refresh()`
 
-Respawns your claude subprocess so it re-discovers the new MCP
+Respawns your CLI subprocess so it re-discovers the new MCP
 server. After this, calls to the MCP's tools should succeed.
 
 ## Errors
@@ -567,7 +573,7 @@ server. After this, calls to the MCP's tools should succeed.
   shape.
 - `install_host_mcp` -> "pass exactly one of `template_id` or `spec`"
   - you set both or neither. Pick a form.
-- `sync_host_mcp` -> "no entry for '<name>' in host's ~/.claude.json"
+- `sync_host_mcp` -> "no entry for '<name>' in host config"
   - the operator hasn't finished setup yet (or skipped install).
   Re-DM them via `send_message`.
 - After `refresh()`, MCP calls still fail with auth - the host entry
@@ -629,7 +635,7 @@ orthogonal axes; combine them freely.
 - `harness` (optional) - `"claude-code"` or `"codex"`
 - `model` (optional) - a model id valid for `harness`
 - `host_sync` (optional, bool) - also re-sync operator's host
-  `~/.claude/skills/` + host MCP registrations
+  skills, MCP registrations, and portable credentials
 - `session` (optional, bool) - drop CLI session token so next spawn
   starts a fresh conversation (no `--resume`)
 - `inference_level` (optional) - reasoning effort; per-harness values
@@ -652,8 +658,9 @@ orthogonal axes; combine them freely.
 **When to use:**
 - Edited `CLAUDE.md`, `profile.md`, `memory/*.md` -> `refresh()`.
 - Installed a new skill / MCP -> `refresh()`.
-- Operator added a new skill to their `~/.claude/skills/` -> tell them
-  to call it "host-sync" and use `refresh(host_sync=True[, session=True])`.
+- Operator added a new skill to their harness's host skill directory ->
+  tell them to call it "host-sync" and use
+  `refresh(host_sync=True[, session=True])`.
 - Conversation feels stuck / context is polluted -> `refresh(session=True)`.
 - Operator asked you to try a different model -> confirm harness +
   model with them, then `refresh(harness=..., model=...)`.

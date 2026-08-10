@@ -19,15 +19,12 @@ from pathlib import Path
 from typing import Any
 
 from ...crypto.http_client import HttpError, PuffoCoreHttpClient
+from ...skill_ids import SKILL_ID_RE
 from ..shared_content import _strip_puffo_mcp_prefix_for_codex
 
 logger = logging.getLogger(__name__)
 
 
-# Skill ids that pass the host_tools regex; tightens the picker
-# wire to the same charset the on-disk installer accepts so a
-# malformed id can't escape into a stray directory write.
-_SKILL_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _MCP_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 
 
@@ -106,7 +103,7 @@ def _write_skill_to_dir(
 ) -> str:
     """Idempotent write of a SKILL.md + provenance marker to ``skill_dir``.
     Returns ``"installed"`` / ``"already-present"`` / ``"invalid"``."""
-    if not _SKILL_ID_RE.match(template_id):
+    if not SKILL_ID_RE.match(template_id):
         logger.warning("desired skill %r: invalid id — skipping", template_id)
         return "invalid"
     if not body or not body.strip():
@@ -287,10 +284,12 @@ async def run_spawn_install(
     server_url: str,
     slug: str,
     keys_dir: str,
+    containerized: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Build the puffo-core client from spawn wiring and run
     ``install_desired``, tolerating fetch / crash errors. Shared by the
-    cli-local and cli-docker adapters. Returns ``codex_extra_servers``.
+    cli-local and cli-docker adapters. ``containerized`` rejects
+    host-only MCP command paths. Returns ``codex_extra_servers``.
     """
     if not desired_skills and not desired_mcps:
         return {}
@@ -314,6 +313,7 @@ async def run_spawn_install(
             harness_name=harness_name,
             desired_skills=desired_skills,
             desired_mcps=desired_mcps,
+            containerized=containerized,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -334,11 +334,14 @@ async def install_desired(
     harness_name: str,
     desired_skills: list[str],
     desired_mcps: list[str],
+    containerized: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Run the spawn-time install pass for both harnesses.
 
     Returns ``codex_extra_servers`` — a ``{id: spec}`` map for codex to
     fold into ``[mcp_servers.*]`` config.toml. Always ``{}`` for claude.
+    Containerized installs skip stdio commands that cannot resolve in
+    the Linux runtime.
     """
     # hermes has no skills / MCP surface — bail rather than write into
     # a ``.claude/`` it never reads.
@@ -399,6 +402,17 @@ async def install_desired(
                 agent_id, mid, tpl.get("type"),
             )
             continue
+        if containerized:
+            from ...portal.state import filter_container_mcp_servers
+
+            _reachable, unreachable = filter_container_mcp_servers({mid: spec})
+            if unreachable:
+                logger.warning(
+                    "agent %s: desired mcp %r uses host-local path %r; "
+                    "skipping because it cannot resolve inside the container",
+                    agent_id, mid, unreachable[0][1],
+                )
+                continue
         if is_codex:
             codex_extras[mid] = _codex_extras_entry(spec)
             logger.info(

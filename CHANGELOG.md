@@ -6,6 +6,161 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The shared agent primer is smaller and task-focused.** Core collaboration
+  guidance remains in the prompt, while detailed Puffo tool instructions are
+  organized into on-demand category skills shared by Claude Code and Codex.
+
+- **Messaging tools use consistent envelope and DM semantics.** Agents can
+  address DMs explicitly, page DM history from a prior message, retrieve an
+  envelope by reference, and discover managed skills from Codex's mirror.
+
+## [1.2.0] — 2026-08-10
+
+### Added
+
+- **Codex agents now report and control their live context window.** Local and
+  Docker workers persist the model-reported maximum and selected compact point,
+  attach current usage to completed-turn events, and translate per-agent
+  compact percentages into Codex app-server session limits. The default follows
+  Codex's model-derived limit, while 75%, 50%, or 30% overrides are available.
+
+- **Per-agent Claude Code auto-compaction controls and context telemetry.**
+  Operators can select Claude's session-reported default or an earlier 75%,
+  50%, or 30% threshold for local and Docker CLI agents. The desktop and web
+  interfaces show the session's actual context window and compact point, while
+  completed turns report live usage without persisting it as runtime config.
+
+- **Codex is now supported by `runtime.kind=cli-docker`.** Each agent
+  runs `codex app-server` in its own container while reusing the
+  operator's Codex account credentials. Per-agent Codex state, skills,
+  Puffo MCP tools, and container-reachable host MCP registrations are
+  mounted or synchronized into the runtime.
+
+### Changed
+
+- **Claude Code auto-compaction now uses the supported token-window CLI flag.**
+  The existing 30%, 50%, and 75% controls are translated to
+  `--autocompact <tokens>` for local and Docker agents instead of relying on
+  `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`. Claude's 100K minimum is enforced, and
+  runtime telemetry reports the effective percentage after that adjustment.
+  The bundled Docker runtime now pins a Claude Code release that supports the
+  flag.
+
+- **Port 63387 is now dedicated to `ws-local` message transport.** The legacy
+  Local Bridge HTTP APIs, pairing commands, and browser-facing management
+  surface have been removed; externally hosted agents continue to attach over
+  the `/v1/ws-local` WebSocket endpoint. Browser-originated WebSocket requests
+  and non-loopback bind addresses are rejected.
+
+- **`cli-docker` now supports only Claude Code and Codex.** Gemini CLI
+  and Hermes were removed from the Docker runtime matrix and bundled
+  image. Hermes remains available through `cli-local`.
+
+### Fixed
+
+- **Claude Code uses subscription authentication unless API-key mode is
+  explicitly enabled.** Ambient `ANTHROPIC_API_KEY` values are ignored for
+  local and Docker CLI agents, including per-agent environment and settings
+  overrides. A daemon-owned `anthropic.api_key` is passed to Claude Code only
+  when `anthropic.cli_use_api_key: true` is set. Operators can manage both
+  values with `puffo-agent config --anthropic-api-key KEY` and
+  `--anthropic-cli-use-api-key true|false`. API-key failures now show the
+  correct recovery steps and clear after the next successful turn.
+
+- **Codex Docker agents can write to their mounted workspace reliably.** The
+  container is now the effective filesystem sandbox, avoiding unsupported
+  nested sandboxing, and resumed local and Docker sessions reapply their
+  working directory and permission policy instead of falling back to
+  read-only access.
+
+- **Claude context telemetry no longer invents limits for unknown models.**
+  A transient context query timeout remains retryable on later turns, while
+  configured compact thresholds remain authoritative because Claude's context
+  query reports its raw default even when an environment override is active.
+
+- **Codex host MCP sync now includes portable OAuth credentials.** Codex
+  agents use the file-backed MCP OAuth store, and `sync_host_mcp()` copies
+  the selected credential into the isolated agent home for both
+  `cli-local` and `cli-docker`. Encrypted OS-keyring credentials are
+  detected and reported instead of being falsely reported as synchronized.
+
+- **Codex Docker workers now discover their synchronized MCP servers.**
+  The in-container Puffo MCP subprocess reads the mounted Codex home
+  instead of retaining an inaccessible host path in `CODEX_HOME`.
+
+- **Docker Desktop is now discovered even when it is missing from the
+  daemon's `PATH`.** Docker uses the same cached resolver as Claude Code
+  and Codex, including an explicit `PUFFO_DOCKER_BIN` override,
+  reconstructed user `PATH`, and known desktop-app locations. Every
+  Docker subprocess uses the resolved absolute path, and the desktop
+  home page now shows that install location instead of the Hermes
+  “Coming soon” placeholder. Live paths and known installations take
+  precedence over the executable-validated, user-writable disk cache.
+
+- **Transient Docker failures no longer trigger container recreation.**
+  Container and harness probes distinguish an explicit stale result
+  from an unavailable Docker daemon, refuse `docker rm -f` when state is
+  unknown, and preserve the host-mounted workspace and Codex session
+  during legitimate rebuilds. Docker control commands now have bounded
+  timeouts and kill and reap their child process on timeout or
+  cancellation.
+
+- **`cli-docker` Codex setup now matches the selected harness.** CLI
+  creation resolves and validates Codex before persisting an OpenAI
+  Docker agent, host Codex skills are synchronized into its isolated
+  home, and remote MCP bearer-token environment variable names are
+  forwarded through `docker exec` without exposing their values.
+  Desired MCP templates with host-only commands are skipped for both
+  container harnesses instead of failing later at first tool use.
+
+- **Codex shell commands now run in the cli-docker workspace.** The
+  app-server process runs through `docker exec`, but new threads
+  previously inherited the daemon's host cwd. On Windows that passed a
+  `C:\\...` path into the Linux container, so even read-only commands
+  failed before shell creation. Container threads now use `/workspace`
+  and rotate legacy sessions that persisted the invalid cwd; switching
+  back to `cli-local` also rotates a container thread whose `/workspace`
+  cwd cannot exist on the host.
+
+- **Puffo MCP tools now start inside `cli-docker`.** The image pins the
+  MCP SDK below 2.0 and includes the complete non-GUI dependency set
+  required by the in-container Puffo MCP server. Previously the server
+  exited during import, leaving tools such as
+  `mcp__puffo__send_message` unavailable to Claude Code.
+
+- **Skill ids ending in a newline are no longer accepted.** The daemon
+  validated ids with Python's `$`, which also matches immediately before
+  a trailing newline, so a name like `my-skill\n` passed on its way to
+  `.claude/skills/` while the server's own constraint rejected it. The
+  gap was reachable — `install_skill` takes its name from an
+  agent-supplied tool call. The anchor is now `\Z`, matching the server.
+  The two copies of the rule, in the desired-skill installer and the MCP
+  host tools, were also folded into one shared constant so they can't
+  drift apart again.
+
+## [1.1.6] — 2026-07-28
+
+### Changed
+
+- **`role_short` is now single-source-derived from `role` (PUF-401).**
+  The chip label is always derived from the `<short>: <description>`
+  role on every write path (bridge, CLI, provision, control-WS, agent
+  detail) instead of being stored independently, so it can no longer
+  orphan a stale value. Explicit `role_short` / `--role-short` is
+  deprecated: still accepted for backward compatibility but ignored,
+  with a warning when the supplied value differs from the derived one.
+  A daemon-startup backfill repairs a stale on-disk `role_short` before
+  the first server sync, so a restart fixes the chip instead of pushing
+  the stale value back.
+
+- **Default agent task timeout raised 600s → 1800s (30 min) (PUF-399).**
+  `runtime.task_timeout_seconds` — the per-agent per-turn wall-clock
+  budget — now defaults to 30 minutes so long-running projects aren't
+  cut off at 10 min. Operators can still override it per-agent in
+  `agent.yml`; only the default changed.
+
 ### Added
 
 - **Plaintext (non-E2EE) sending.** Agent replies now go out as
@@ -17,6 +172,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   outside any turn use the plaintext default. Applies to all send
   paths (LLM replies, MCP tools, daemon system DMs); attachments
   remain encrypted blob references.
+
+### Fixed
+
+- **Cap `mcp` below 2.0.** The 2.x SDK dropped the bundled
+  `mcp.server.fastmcp`; pin `mcp>=1.0,<2` until the tool servers move
+  to the standalone `fastmcp` package.
 
 ## [1.1.5] — 2026-07-23
 

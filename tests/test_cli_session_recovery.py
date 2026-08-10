@@ -115,6 +115,39 @@ class _FakeProc:
         self._killed = True
 
 
+class _ContextUsageProc:
+    def __init__(self, context_response: dict):
+        self.stdout = asyncio.StreamReader(limit=STREAM_READER_LIMIT_BYTES)
+        self.frames: list[dict] = []
+        self.context_response = context_response
+        self.stdin = _FakeStdin(on_write=self._on_write)
+        self.returncode = None
+
+    def _on_write(self) -> None:
+        frame = json.loads(self.stdin.buffer.decode("utf-8").splitlines()[-1])
+        self.frames.append(frame)
+        if frame["type"] == "user":
+            event = {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "sess-1",
+                "usage": {
+                    "input_tokens": 3,
+                    "cache_read_input_tokens": 7,
+                    "output_tokens": 2,
+                },
+            }
+        else:
+            event = {
+                "type": "control_response",
+                "response": {
+                    "request_id": frame["request_id"],
+                    **self.context_response,
+                },
+            }
+        self.stdout.feed_data((json.dumps(event) + "\n").encode())
+
+
 def _make_session(tmp_path: Path, audit: bool = True) -> ClaudeSession:
     """Build a ClaudeSession pointed at tmp_path. ``build_command``
     is unused — tests inject ``_proc`` directly.
@@ -201,7 +234,221 @@ def test_input_tokens_include_cache_creation(tmp_path):
 
     out = asyncio.run(drive())
     assert out.input_tokens == 3 + 331  # cache read (142928) excluded
+    assert out.metadata["context_tokens"] == 3 + 331 + 142928
     assert out.output_tokens == 26
+
+
+def test_context_usage_control_response_overrides_result_estimate(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        proc = _ContextUsageProc({
+            "subtype": "success",
+            "response": {
+                "totalTokens": 142_000,
+                "rawMaxTokens": 1_000_000,
+                "autoCompactThreshold": 967_000,
+            },
+        })
+        session._proc = proc
+        return await session._one_turn("hi"), proc.frames
+
+    out, frames = asyncio.run(drive())
+    assert [frame["type"] for frame in frames] == ["user", "control_request"]
+    assert frames[1]["request"] == {"subtype": "get_context_usage"}
+    assert out.metadata["context_tokens"] == 142_000
+    assert session.context_limits() == (1_000_000, 967_000)
+
+
+def test_context_usage_invalid_total_keeps_result_estimate(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        proc = _ContextUsageProc({
+            "subtype": "success",
+            "response": {
+                "totalTokens": "unknown",
+                "rawMaxTokens": 1_000_000,
+            },
+        })
+        session._proc = proc
+        return await session._one_turn("hi")
+
+    out = asyncio.run(drive())
+    assert out.metadata["context_tokens"] == 10
+    assert session.context_limits() == (1_000_000, None)
+
+
+def test_context_usage_error_keeps_result_fallback_and_disables_retry(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        proc = _ContextUsageProc({
+            "subtype": "error",
+            "error": "unsupported request",
+        })
+        session._proc = proc
+        result = await session._one_turn("hi")
+        assert await session._refresh_context_usage() is None
+        return result, proc.frames
+
+    out, frames = asyncio.run(drive())
+    assert out.metadata["context_tokens"] == 10
+    assert session.context_limits() == (None, None)
+    assert [frame["type"] for frame in frames] == ["user", "control_request"]
+
+
+def test_context_usage_timeout_remains_retryable(tmp_path, monkeypatch):
+    session = _make_session(tmp_path, audit=False)
+
+    async def timeout(*_args):
+        raise asyncio.TimeoutError
+
+    async def drive():
+        session._proc = _ContextUsageProc({})
+        monkeypatch.setattr(session, "_read_context_usage_response", timeout)
+        assert await session._refresh_context_usage() is None
+        assert await session._refresh_context_usage() is None
+
+    asyncio.run(drive())
+    assert session._context_usage_supported is not False
+
+
+def test_turn_ignores_late_context_control_response(tmp_path, monkeypatch):
+    late_response = {
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": "ctx_timed_out",
+            "response": {"totalTokens": 42},
+        },
+    }
+    result = {
+        "type": "result",
+        "subtype": "success",
+        "session_id": "sess-1",
+        "result": "still works",
+        "usage": {},
+    }
+    lines = [
+        (json.dumps(late_response) + "\n").encode(),
+        (json.dumps(result) + "\n").encode(),
+    ]
+    session = _make_session(tmp_path, audit=False)
+
+    async def no_refresh():
+        return None
+
+    async def drive():
+        session._proc = _FakeProc(stdout_lines=lines)
+        monkeypatch.setattr(session, "_refresh_context_usage", no_refresh)
+        return await session._one_turn("hi")
+
+    assert asyncio.run(drive()).reply == "still works"
+
+
+def test_context_usage_reader_ignores_unrelated_events(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        reader = asyncio.StreamReader(limit=STREAM_READER_LIMIT_BYTES)
+        events = [
+            b"not-json\n",
+            json.dumps({
+                "type": "system",
+                "subtype": "status",
+                "session_id": "sess-2",
+            }).encode() + b"\n",
+            json.dumps({
+                "type": "system",
+                "subtype": "status",
+                "session_id": "sess-2",
+            }).encode() + b"\n",
+            json.dumps({"type": "assistant", "message": {}}).encode() + b"\n",
+            json.dumps({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "stale",
+                    "response": {},
+                },
+            }).encode() + b"\n",
+            json.dumps({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "wanted",
+                    "response": {"rawMaxTokens": 200_000},
+                },
+            }).encode() + b"\n",
+        ]
+        for event in events:
+            reader.feed_data(event)
+        proc = type("Proc", (), {"stdout": reader})()
+        return await session._read_context_usage_response(proc, "wanted")
+
+    assert asyncio.run(drive()) == {"rawMaxTokens": 200_000}
+    assert session._session_id == "sess-2"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        "invalid",
+        {"subtype": "success", "request_id": "wanted", "response": []},
+    ],
+)
+def test_context_usage_reader_rejects_invalid_response(tmp_path, response):
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        reader = asyncio.StreamReader(limit=STREAM_READER_LIMIT_BYTES)
+        reader.feed_data(json.dumps({
+            "type": "control_response",
+            "response": response,
+        }).encode() + b"\n")
+        proc = type("Proc", (), {"stdout": reader})()
+        await session._read_context_usage_response(proc, "wanted")
+
+    with pytest.raises(RuntimeError, match="invalid"):
+        asyncio.run(drive())
+
+
+def test_context_usage_reader_rejects_closed_stream(tmp_path):
+    session = _make_session(tmp_path, audit=False)
+
+    async def drive():
+        reader = asyncio.StreamReader()
+        reader.feed_eof()
+        proc = type("Proc", (), {"stdout": reader})()
+        await session._read_context_usage_response(proc, "wanted")
+
+    with pytest.raises(ConnectionError, match="stream closed"):
+        asyncio.run(drive())
+
+
+def test_warm_refreshes_context_usage_under_session_lock(tmp_path, monkeypatch):
+    session = _make_session(tmp_path, audit=False)
+    calls = []
+
+    async def ensure(system_prompt):
+        calls.append(("ensure", system_prompt))
+
+    async def refresh():
+        calls.append(("refresh", None))
+
+    monkeypatch.setattr(session, "_ensure_running", ensure)
+    monkeypatch.setattr(session, "_refresh_context_usage", refresh)
+
+    asyncio.run(session.warm("system"))
+    assert calls == [("ensure", "system"), ("refresh", None)]
+
+
+@pytest.mark.parametrize("value", [None, 0, -1, True, 1.5, "200000"])
+def test_context_limits_reject_invalid_sdk_values(tmp_path, value):
+    session = _make_session(tmp_path, audit=False)
+    session._context_usage = {"rawMaxTokens": value}
+    assert session.context_limits() == (None, None)
 
 
 # ── Test 2: stream overflow recovery ─────────────────────────────────────────
@@ -798,3 +1045,79 @@ def test_drain_swallows_readline_error_and_hands_off_to_main_loop(tmp_path):
     out = asyncio.run(drive())
     assert out.metadata.get("stream_error") == "readline_limit"
     assert out.reply == ""
+
+
+# ── Session rotation on model change (PUF-159) ───────────────────────────────
+#
+# A transcript born under one model must not be --resume'd under another:
+# cross-family replay injects the old model's thinking blocks into the new
+# provider's API (a kimi-born session resumed under an Anthropic model makes
+# claude-code send clear_thinking_20251015 without thinking enabled → 400 on
+# every turn until the session rotates).
+
+
+def _write_session_file(tmp_path: Path, sid: str, model: str | None) -> Path:
+    data: dict = {"session_id": sid, "updated_at": 1}
+    if model is not None:
+        data["model"] = model
+    f = tmp_path / "session.json"
+    f.write_text(json.dumps(data), encoding="utf-8")
+    return f
+
+
+def _make_model_session(tmp_path: Path, model: str) -> ClaudeSession:
+    return ClaudeSession(
+        agent_id="test-agent",
+        session_file=tmp_path / "session.json",
+        build_command=lambda args: ["true"],
+        cwd=str(tmp_path),
+        env={},
+        audit=None,
+        model=model,
+    )
+
+
+def test_session_rotates_when_model_changed(tmp_path, caplog):
+    _write_session_file(tmp_path, "sess-kimi", "kimi-k3")
+    with caplog.at_level(logging.INFO):
+        session = _make_model_session(tmp_path, "claude-opus-4-7")
+    assert session._session_id == ""  # fresh session, no --resume
+    assert not (tmp_path / "session.json").exists()  # stale file dropped
+    assert "rotating CLI session" in caplog.text
+
+
+def test_session_kept_when_model_unchanged(tmp_path):
+    _write_session_file(tmp_path, "sess-opus", "claude-opus-4-7")
+    session = _make_model_session(tmp_path, "claude-opus-4-7")
+    assert session._session_id == "sess-opus"
+    assert (tmp_path / "session.json").exists()
+
+
+def test_legacy_session_file_without_model_is_kept(tmp_path):
+    # Pre-PUF-159 files carry no model — keep them (one gratuitous reset per
+    # fleet on upgrade would be worse); the model lands on the next save.
+    _write_session_file(tmp_path, "sess-legacy", None)
+    session = _make_model_session(tmp_path, "claude-opus-4-7")
+    assert session._session_id == "sess-legacy"
+
+
+def test_session_kept_when_no_model_configured(tmp_path):
+    # model="" (legacy caller) → scoping disabled entirely.
+    _write_session_file(tmp_path, "sess-any", "kimi-k3")
+    session = _make_model_session(tmp_path, "")
+    assert session._session_id == "sess-any"
+
+
+def test_save_records_model(tmp_path):
+    session = _make_model_session(tmp_path, "claude-opus-4-7")
+    session._save_session_id("sess-new")
+    data = json.loads((tmp_path / "session.json").read_text(encoding="utf-8"))
+    assert data["session_id"] == "sess-new"
+    assert data["model"] == "claude-opus-4-7"
+
+
+def test_save_omits_model_when_unset(tmp_path):
+    session = _make_model_session(tmp_path, "")
+    session._save_session_id("sess-new")
+    data = json.loads((tmp_path / "session.json").read_text(encoding="utf-8"))
+    assert "model" not in data

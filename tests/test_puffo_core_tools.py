@@ -3,12 +3,14 @@ import os
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.agent.message_store import MessageStore
+from puffo_agent.agent.message_store import DataNotFound, MessageStore
 from puffo_agent.crypto.encoding import base64url_encode
 from puffo_agent.crypto.keystore import KeyStore, Session, StoredIdentity, encode_secret
 from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
@@ -1816,6 +1818,14 @@ def test_parse_note_rejects_non_note():
     assert _parse_note("hi\n/note\nlabel: X") is None
 
 
+def test_parse_note_ignores_blank_and_malformed_lines():
+    parsed = _parse_note(
+        "/note \n\nnot-a-field\nlabel: Ready\n"
+        "mentions: @bob @bob @\nextra: ignored"
+    )
+    assert parsed == {"label": "Ready", "message": "", "mentions": ["bob"]}
+
+
 def test_format_note_omits_empty_message_and_mentions():
     text = _format_note("#c9f748", "Complete", "", [])
     assert text == "/note \ncolor: #c9f748\nlabel: Complete"
@@ -1882,10 +1892,13 @@ async def test_add_note_rejects_bad_preset():
 @pytest.mark.asyncio
 async def test_add_note_unknown_root_errors():
     cfg, http, ms = _setup()
-    mcp = _build_tools(cfg)
-    with pytest.raises(Exception) as exc:
-        await _call(mcp, "add_note", {"root_id": "msg_nope", "preset": "waiting"})
-    assert "root" in str(exc.value).lower()
+    try:
+        mcp = _build_tools(cfg)
+        with pytest.raises(Exception) as exc:
+            await _call(mcp, "add_note", {"root_id": "msg_nope", "preset": "waiting"})
+        assert "root" in str(exc.value).lower()
+    finally:
+        await ms.close()
 
 
 @pytest.mark.asyncio
@@ -2002,6 +2015,95 @@ async def test_get_thread_notes_tool_limit_one():
     out = await _call(mcp, "get_thread_notes", {"root_id": "msg_root", "limit": 1})
     assert "msg_note_1" in out       # Complete is newest → in effect
     assert "msg_note_0" not in out
+
+
+@pytest.mark.asyncio
+async def test_note_query_tools_cover_validation_and_empty_results():
+    cfg, _, _ = _setup()
+    cfg.data_client.get_channel_notes = AsyncMock(return_value=[])
+    cfg.data_client.get_thread_notes = AsyncMock(return_value=[])
+    mcp = _build_tools(cfg)
+
+    with pytest.raises(Exception, match="channel addressing"):
+        await _call(mcp, "get_channel_notes", {"channel": "#general"})
+    with pytest.raises(Exception, match="channel"):
+        await _call(mcp, "get_channel_notes", {"channel": "general"})
+    assert "no active notes" in await _call(
+        mcp, "get_channel_notes", {"channel": "ch_empty"},
+    )
+    with pytest.raises(Exception, match="root_id required"):
+        await _call(mcp, "get_thread_notes", {"root_id": ""})
+    assert "no notes on this thread" in await _call(
+        mcp, "get_thread_notes", {"root_id": "msg_empty"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_note_query_tools_translate_not_found():
+    cfg, _, _ = _setup()
+    cfg.data_client.get_channel_notes = AsyncMock(side_effect=DataNotFound("channel"))
+    cfg.data_client.get_thread_notes = AsyncMock(side_effect=DataNotFound("thread"))
+    mcp = _build_tools(cfg)
+
+    assert "no such channel" in await _call(
+        mcp, "get_channel_notes", {"channel": "ch_missing"},
+    )
+    assert "no such thread" in await _call(
+        mcp, "get_thread_notes", {"root_id": "msg_missing"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_add_note_validates_root_before_lookup():
+    cfg, _, _ = _setup()
+    with pytest.raises(Exception, match="root_id required"):
+        await _call(_build_tools(cfg), "add_note", {"root_id": ""})
+
+
+@pytest.mark.asyncio
+async def test_add_note_rejects_root_without_channel_or_dm():
+    cfg, _, _ = _setup()
+    cfg.data_client.get_message_by_envelope = AsyncMock(return_value=SimpleNamespace(
+        channel_id=None,
+        envelope_kind="system",
+        recipient_slug=None,
+        sender_slug="server",
+    ))
+    with pytest.raises(Exception, match="cannot resolve"):
+        await _call(_build_tools(cfg), "add_note", {"root_id": "msg_system"})
+
+
+@pytest.mark.asyncio
+async def test_add_note_resolves_outbound_dm_peer():
+    cfg, http, _ = _setup()
+    root = SimpleNamespace(
+        envelope_id="msg_dm",
+        thread_root_id=None,
+        channel_id=None,
+        space_id=None,
+        envelope_kind="dm",
+        recipient_slug="alice-0001",
+        sender_slug=cfg.slug,
+        sender_type="agent",
+    )
+    cfg.data_client.get_message_by_envelope = AsyncMock(return_value=root)
+    cfg.data_client.get_send_encryption = AsyncMock(return_value=False)
+
+    result = await _call(
+        _build_tools(cfg), "add_note",
+        {"root_id": "msg_dm", "message": "waiting"},
+    )
+
+    assert "posted" in result
+    post = next(body for method, _, body in http.calls if method == "POST")
+    assert post["signed_payload"]["payload"]["recipient_slug"] == "alice-0001"
+
+
+@pytest.mark.asyncio
+async def test_get_envelope_requires_reference():
+    cfg, _, _ = _setup()
+    with pytest.raises(Exception, match="envelope_ref"):
+        await _call(_build_tools(cfg), "get_envelope", {"envelope_ref": ""})
 async def _store_msg(ms, eid, *, is_encrypted, channel_id="ch_1", thread_root_id=None):
     await ms.store({
         "envelope_id": eid,
