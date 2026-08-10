@@ -131,9 +131,11 @@ class CodexAppServerDriver(Driver):
         process_factory: Callable[[RuntimeSpec], Any] | None = None,
         *,
         executable_version: str = "",
+        request_timeout_seconds: float = 60.0,
     ):
         self.process_factory = process_factory
         self.executable_version = executable_version
+        self.request_timeout_seconds = request_timeout_seconds
         self._proc: Any = None
         self._reader: asyncio.Task | None = None
         self._stderr_reader: asyncio.Task | None = None
@@ -147,7 +149,7 @@ class CodexAppServerDriver(Driver):
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         self._context = ContextStatus(stale=True)
-        self._permission_requests: dict[PermissionRef, int] = {}
+        self._permission_requests: dict[PermissionRef, int | str] = {}
         self._open_output_blocks: set[str] = set()
         self._closed = False
 
@@ -169,6 +171,9 @@ class CodexAppServerDriver(Driver):
                 stderr=asyncio.subprocess.PIPE,
                 cwd=spec.workspace_dir or None,
                 env=dict(spec.environment) or None,
+                # One provider frame can carry a large tool result; the default
+                # 64 KiB stream limit would terminate the reader mid-session.
+                limit=16 * 1024 * 1024,
             )
         else:
             self._proc = self.process_factory(spec)
@@ -385,7 +390,15 @@ class CodexAppServerDriver(Driver):
         self._pending[request_id] = future
         await self._write({"id": request_id, "method": method, "params": params})
         try:
-            return await future
+            return await asyncio.wait_for(future, self.request_timeout_seconds)
+        except asyncio.TimeoutError:
+            # Provider silence must surface as a bounded, retryable failure so
+            # Global Inbox recovery re-enqueues instead of waiting forever.
+            raise AgentAPIError(
+                f"Codex request {method} timed out after "
+                f"{self.request_timeout_seconds:g}s",
+                is_auth=False,
+            ) from None
         finally:
             self._pending.pop(request_id, None)
 
@@ -401,7 +414,16 @@ class CodexAppServerDriver(Driver):
     async def _read_loop(self) -> None:
         try:
             while True:
-                line = await self._proc.stdout.readline()
+                try:
+                    line = await self._proc.stdout.readline()
+                except ValueError:
+                    # A frame beyond the stream limit leaves stdout partially
+                    # consumed; the session cannot be resynchronized, so fall
+                    # through to the bounded failure path below.
+                    logger.warning(
+                        "codex app-server frame exceeded the stdout limit"
+                    )
+                    break
                 if not line:
                     break
                 try:
@@ -412,30 +434,63 @@ class CodexAppServerDriver(Driver):
                         data={"code": "protocol_parse"},
                     )
                     continue
-                if "id" in frame and ("result" in frame or "error" in frame):
-                    future = self._pending.get(frame["id"])
-                    if future is not None and not future.done():
-                        if "error" in frame:
-                            future.set_exception(
-                                _classify_jsonrpc_error(frame["error"])
-                            )
-                        else:
-                            future.set_result(frame.get("result"))
+                if not isinstance(frame, dict):
+                    await self._emit(
+                        HarnessEventType.RUNTIME_WARNING,
+                        data={"code": "protocol_frame"},
+                    )
                     continue
-                if "id" in frame and "method" in frame:
-                    await self._server_request(frame)
-                    continue
-                await self._notification(frame)
+                try:
+                    await self._dispatch_frame(frame)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # One malformed frame must never kill the reader and orphan
+                    # every pending request.
+                    logger.exception("codex frame dispatch failed")
+                    await self._emit(
+                        HarnessEventType.RUNTIME_WARNING,
+                        data={"code": "frame_dispatch_failed"},
+                    )
         finally:
             self._fail_pending_requests("Codex app-server exited")
             if not self._closed:
                 await self._emit(HarnessEventType.RUNTIME_EXITED)
 
+    async def _dispatch_frame(self, frame: dict[str, Any]) -> None:
+        if "id" in frame and ("result" in frame or "error" in frame):
+            request_id = frame["id"]
+            if not _is_request_id(request_id) or isinstance(request_id, str):
+                # We only ever issue integer ids; anything else is unroutable.
+                await self._emit(
+                    HarnessEventType.RUNTIME_WARNING,
+                    data={"code": "protocol_frame"},
+                )
+                return
+            future = self._pending.get(request_id)
+            if future is not None and not future.done():
+                if "error" in frame:
+                    future.set_exception(_classify_jsonrpc_error(frame["error"]))
+                else:
+                    future.set_result(frame.get("result"))
+            return
+        if "id" in frame and "method" in frame:
+            await self._server_request(frame)
+            return
+        await self._notification(frame)
+
     async def _server_request(self, frame: dict[str, Any]) -> None:
+        request_id = frame.get("id")
+        if not _is_request_id(request_id):
+            await self._emit(
+                HarnessEventType.RUNTIME_WARNING,
+                data={"code": "protocol_frame"},
+            )
+            return
         method = str(frame.get("method") or "")
         if "approval" in method.lower() or "permission" in method.lower():
             ref = PermissionRef(f"perm_{uuid.uuid4().hex}")
-            self._permission_requests[ref] = int(frame["id"])
+            self._permission_requests[ref] = request_id
             await self._emit(
                 HarnessEventType.PERMISSION_REQUESTED,
                 turn_ref=self._active,
@@ -449,7 +504,7 @@ class CodexAppServerDriver(Driver):
             return
         await self._write(
             {
-                "id": frame["id"],
+                "id": request_id,
                 "error": {"code": -32601, "message": "unsupported request"},
             }
         )
@@ -480,6 +535,8 @@ class CodexAppServerDriver(Driver):
             await self._handle_completed_item(frame, params)
         elif method == "thread/tokenUsage/updated":
             usage = params.get("tokenUsage", params)
+            if not isinstance(usage, dict):
+                usage = {}
             self._context = ContextStatus(
                 used_tokens=_integer(usage.get("totalTokens")),
                 context_window=_integer(usage.get("modelContextWindow")),
@@ -641,6 +698,11 @@ class CodexAppServerDriver(Driver):
     def _require_active(self, turn: TurnRef) -> None:
         if not self._active_native_turn_id or turn != self._active:
             raise RuntimeError("stale or foreign active turn")
+
+
+def _is_request_id(value: Any) -> bool:
+    """JSON-RPC ids are integers or strings; booleans are not routable ids."""
+    return isinstance(value, (int, str)) and not isinstance(value, bool)
 
 
 def _integer(value: Any) -> int | None:

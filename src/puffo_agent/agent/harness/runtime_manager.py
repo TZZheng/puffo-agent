@@ -44,6 +44,40 @@ class RuntimeStateError(RuntimeError):
     pass
 
 
+class _EventStream(AsyncIterator[HarnessEvent]):
+    """Subscriber handle that releases its queue whether or not it is iterated.
+
+    An async generator only runs its ``finally`` once it has been started, so a
+    subscriber whose turn failed before the first ``__anext__`` would leak its
+    queue forever.  Closing this handle always discards the queue.
+    """
+
+    def __init__(
+        self,
+        subscribers: set[asyncio.Queue[HarnessEvent | None]],
+        queue: asyncio.Queue[HarnessEvent | None],
+    ) -> None:
+        self._subscribers = subscribers
+        self._queue = queue
+        self._closed = False
+
+    def __aiter__(self) -> AsyncIterator[HarnessEvent]:
+        return self
+
+    async def __anext__(self) -> HarnessEvent:
+        if self._closed:
+            raise StopAsyncIteration
+        event = await self._queue.get()
+        if event is None:
+            await self.aclose()
+            raise StopAsyncIteration
+        return event
+
+    async def aclose(self) -> None:
+        self._closed = True
+        self._subscribers.discard(self._queue)
+
+
 class RuntimeManager:
     def __init__(
         self, driver: Driver, spec: RuntimeSpec, *,
@@ -139,6 +173,12 @@ class RuntimeManager:
                     await admitted
             logical = TurnRef(f"turn_{uuid.uuid4().hex}")
             self.active_turn_ref = logical
+            # Production consumes terminals from events(), so a settled future
+            # is only released here; retention stays bounded at one completed
+            # turn instead of growing for the process lifetime.
+            for settled, future in tuple(self._terminal.items()):
+                if future.done():
+                    self._terminal.pop(settled, None)
             loop = asyncio.get_running_loop()
             self._terminal[logical] = loop.create_future()
             try:
@@ -305,18 +345,7 @@ class RuntimeManager:
     def events(self) -> AsyncIterator[HarnessEvent]:
         queue: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
         self._subscribers.add(queue)
-
-        async def iterate() -> AsyncIterator[HarnessEvent]:
-            try:
-                while True:
-                    event = await queue.get()
-                    if event is None:
-                        return
-                    yield event
-            finally:
-                self._subscribers.discard(queue)
-
-        return iterate()
+        return _EventStream(self._subscribers, queue)
 
     async def close(self) -> None:
         async with self._command_lock:
@@ -328,6 +357,14 @@ class RuntimeManager:
             await self._stop_reader()
             await self.driver.close()
             self.opened = None
+            for future in tuple(self._terminal.values()):
+                if not future.done():
+                    future.set_exception(RuntimeStateError("runtime is closed"))
+                    # Mark retrieved: a shielded wait_terminal waiter still
+                    # receives the error, but an unwatched future must not log
+                    # "exception was never retrieved" at collection.
+                    future.exception()
+            self._terminal.clear()
             for queue in tuple(self._subscribers):
                 queue.put_nowait(None)
 
@@ -629,23 +666,8 @@ class RuntimeManagerAdapter(Adapter):
         message = current.get("content")
         if not isinstance(message, str) or not message.strip():
             raise RuntimeStateError("current user input must be non-empty text")
-        stream = self.manager.events()
-        started = await self.manager.start_turn(TurnInput(message))
-        if isinstance(started, UnsupportedCapability) or not started.accepted:
-            return TurnResult(reply="", metadata={"accepted": False})
-        turn = started.turn_ref
-        callback = getattr(self, "_context_admission_callback", None)
-        if callback is not None:
-            await self._fire_admission_callback(ProviderAdmissionEvent(
-                planning_cycle_key=getattr(
-                    self, "_context_admission_planning_cycle_key", ""
-                ),
-                provider_session_id=self.get_provider_session_id(),
-                provider_turn_id=started.native_turn_id or None,
-                admitted_at=datetime.now(timezone.utc),
-            ))
         self.assistant_text_parts = []
-        metadata: dict[str, Any] = {"turn_ref": str(turn)}
+        metadata: dict[str, Any] = {}
         timeout_seconds = float(
             getattr(
                 getattr(self.manager, "spec", None),
@@ -653,9 +675,32 @@ class RuntimeManagerAdapter(Adapter):
                 600.0,
             )
         )
+        # Subscribe before the turn starts so no event can be missed, and let
+        # the timeout cover start_turn itself: provider silence on turn/start
+        # must not leave the Agent turn active forever.
+        stream = self.manager.events()
+        turn: TurnRef | None = None
         timeout = asyncio.timeout(timeout_seconds)
         try:
             async with timeout:
+                started = await self.manager.start_turn(TurnInput(message))
+                if (
+                    isinstance(started, UnsupportedCapability)
+                    or not started.accepted
+                ):
+                    return TurnResult(reply="", metadata={"accepted": False})
+                turn = started.turn_ref
+                metadata["turn_ref"] = str(turn)
+                callback = getattr(self, "_context_admission_callback", None)
+                if callback is not None:
+                    await self._fire_admission_callback(ProviderAdmissionEvent(
+                        planning_cycle_key=getattr(
+                            self, "_context_admission_planning_cycle_key", ""
+                        ),
+                        provider_session_id=self.get_provider_session_id(),
+                        provider_turn_id=started.native_turn_id or None,
+                        admitted_at=datetime.now(timezone.utc),
+                    ))
                 async for event in stream:
                     if event.turn_ref != turn:
                         continue
@@ -697,7 +742,10 @@ class RuntimeManagerAdapter(Adapter):
                 turn,
                 timeout_seconds,
             )
-            await self.manager.timeout_turn(turn)
+            if turn is not None:
+                # A start_turn that timed out already released its own
+                # bookkeeping through the manager's BaseException path.
+                await self.manager.timeout_turn(turn)
             label = (
                 f"{timeout_seconds / 60:g} minute"
                 if timeout_seconds >= 60 and timeout_seconds % 60 == 0

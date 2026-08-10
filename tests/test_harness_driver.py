@@ -6,7 +6,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from puffo_agent.agent.core import PuffoAgent
+from puffo_agent.agent.core import AgentAPIError, PuffoAgent
 from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
 from puffo_agent.agent.message_store import (
     MessageStore,
@@ -1024,6 +1024,71 @@ async def test_codex_driver_reopens_cleanly_after_closing_an_active_turn():
 
     assert second.accepted
     assert len(processes) == 2
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_driver_bounds_a_silent_turn_start_with_a_retryable_error():
+    holder = {}
+
+    def on_frame(frame):
+        proc = holder["proc"]
+        method = frame.get("method")
+        if method == "initialize":
+            proc.feed({"id": frame["id"], "result": {}})
+        elif method == "thread/start":
+            proc.feed({"id": frame["id"], "result": {"thread": {"id": "th_1"}}})
+        # turn/start is deliberately never answered: provider silence must not
+        # leave the Agent turn active forever.
+
+    proc = _FakeProcess(on_frame)
+    holder["proc"] = proc
+    driver = CodexAppServerDriver(
+        lambda _spec: proc, request_timeout_seconds=0.05
+    )
+    await driver.open(RuntimeSpec("/workspace"))
+
+    with pytest.raises(AgentAPIError) as raised:
+        await driver.start_turn(TurnInput("hello"))
+
+    assert raised.value.is_auth is False
+    assert "turn/start" in str(raised.value)
+    assert not driver._pending
+    assert not driver._active.value
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_driver_bounds_a_silent_startup_handshake():
+    proc = _FakeProcess()
+    driver = CodexAppServerDriver(
+        lambda _spec: proc, request_timeout_seconds=0.05
+    )
+
+    with pytest.raises(AgentAPIError) as raised:
+        await driver.open(RuntimeSpec("/workspace"))
+
+    assert raised.value.is_auth is False
+    assert "initialize" in str(raised.value)
+    assert not driver._pending
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_subprocess_stdout_matches_the_claude_frame_limit(monkeypatch):
+    captured: dict = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured.update(kwargs)
+        return _FakeProcess()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    driver = CodexAppServerDriver(request_timeout_seconds=0.05)
+
+    with pytest.raises(AgentAPIError):
+        await driver.open(RuntimeSpec("/workspace"))
+
+    assert captured["limit"] == 16 * 1024 * 1024
     await driver.close()
 
 

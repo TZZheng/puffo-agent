@@ -119,11 +119,38 @@ class _PausedCancelDriver(_ControllableDriver):
         return CancelReceipt(True, turn)
 
 
+class _FailingStartDriver(_ControllableDriver):
+    async def start_turn(self, input):
+        self.start_calls += 1
+        raise RuntimeError("provider refused the turn")
+
+
+class _RejectingStartDriver(_ControllableDriver):
+    async def start_turn(self, input):
+        self.start_calls += 1
+        return UnsupportedCapability("start_turn")
+
+
 def _context():
     return SimpleNamespace(
         messages=[{"role": "user", "content": "current notice"}],
         on_progress=None,
     )
+
+
+async def _complete_active_turn(manager, driver):
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        data={"outcome": "succeeded"},
+    ))
+    for _ in range(500):
+        if manager.active_turn_ref is None:
+            return
+        await asyncio.sleep(0.001)
+    raise AssertionError("provider turn never reached its terminal")
 
 
 @pytest.mark.asyncio
@@ -287,6 +314,94 @@ async def test_terminal_persistence_failure_unblocks_turn_and_retires_runtime():
         await asyncio.wait_for(running, timeout=1)
     assert manager.active_turn_ref is None
     assert manager.opened is None
+
+
+@pytest.mark.asyncio
+async def test_failed_start_releases_the_event_subscriber():
+    driver = _FailingStartDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+    )
+
+    with pytest.raises(RuntimeError, match="provider refused the turn"):
+        await asyncio.wait_for(
+            RuntimeManagerAdapter(manager).run_turn(_context()), timeout=1
+        )
+
+    assert manager._subscribers == set()
+    assert manager._terminal == {}
+    assert manager.active_turn_ref is None
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_unaccepted_receipt_releases_the_event_subscriber():
+    driver = _RejectingStartDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+    )
+
+    result = await asyncio.wait_for(
+        RuntimeManagerAdapter(manager).run_turn(_context()), timeout=1
+    )
+
+    assert result.metadata == {"accepted": False}
+    assert manager._subscribers == set()
+    assert manager._terminal == {}
+    assert manager.active_turn_ref is None
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_silent_turn_start_is_bounded_by_the_task_timeout():
+    driver = _PausedStartDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=0.05),
+        driver_name="codex",
+    )
+
+    result = await asyncio.wait_for(
+        RuntimeManagerAdapter(manager).run_turn(_context()), timeout=2
+    )
+
+    assert result.metadata["runtime_turn_timeout"] is True
+    assert manager.active_turn_ref is None
+    assert manager._subscribers == set()
+    assert manager._terminal == {}
+    driver.release_start.set()
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_terminals_are_pruned_and_released_on_close():
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+    )
+
+    first = await manager.start_turn(TurnInput("first"))
+    await _complete_active_turn(manager, driver)
+    # Production consumes terminals from events(), never wait_terminal, so the
+    # settled future is still retained for a late waiter.
+    assert list(manager._terminal) == [first.turn_ref]
+
+    second = await manager.start_turn(TurnInput("second"))
+    assert list(manager._terminal) == [second.turn_ref]
+
+    waiting = asyncio.create_task(manager.wait_terminal(second.turn_ref))
+    await asyncio.sleep(0)
+    await manager.close()
+
+    assert manager._terminal == {}
+    with pytest.raises(RuntimeStateError, match="runtime is closed"):
+        await asyncio.wait_for(waiting, timeout=1)
 
 
 @pytest.mark.asyncio
