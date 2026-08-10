@@ -30,6 +30,10 @@ jobs:
       - name: install quality tools
         run: pip install -e ".[dev]"
       - name: repository checks
+        # no-commit-to-branch guards local commits; in CI the checkout *is*
+        # main on push, so the hook would fail the job for doing its job.
+        env:
+          SKIP: no-commit-to-branch
         run: pre-commit run --all-files
 
   test:

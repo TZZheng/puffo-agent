@@ -21,6 +21,7 @@ the tree. No IPC port, no auth — the filesystem is the contract.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
@@ -32,6 +33,9 @@ import psutil
 import yaml
 
 from ..limits import DEFAULT_CATCHUP_STALE_HOURS
+
+
+logger = logging.getLogger(__name__)
 
 
 # Where daemon.yml, agents/, etc. live.
@@ -605,6 +609,7 @@ def _load_runtime_config(agent_id: str, raw: dict) -> RuntimeConfig:
     from .runtime_matrix import (
         RUNTIME_CLI_LOCAL,
         migrate_legacy_kind,
+        normalize_inference_level,
         resolve_effective_harness,
         resolve_effective_provider,
         validate_triple,
@@ -613,13 +618,18 @@ def _load_runtime_config(agent_id: str, raw: dict) -> RuntimeConfig:
     raw_kind, provider = raw.get("kind", RUNTIME_CLI_LOCAL), raw.get("provider", "")
     kind = migrate_legacy_kind(raw_kind, agent_id=agent_id)
     harness = raw.get("harness", "claude-code")
-    if raw_kind != kind and kind == RUNTIME_CLI_LOCAL:
-        harness = resolve_effective_harness(kind, provider, "")
     inference = raw.get("inference_level", "") or ""
     if not isinstance(inference, str):
         raise RuntimeError(
             f"agent {agent_id!r}: runtime.inference_level must be a string"
         )
+    if kind == RUNTIME_CLI_LOCAL:
+        migrated = _migrate_local_harness(
+            agent_id, provider, harness, kind_migrated=raw_kind != kind
+        )
+        if migrated != harness:
+            harness = migrated
+            inference = normalize_inference_level(kind, provider, harness, inference)
     result = validate_triple(kind, provider, harness)
     if not result.ok:
         raise RuntimeError(
@@ -646,6 +656,46 @@ def _load_runtime_config(agent_id: str, raw: dict) -> RuntimeConfig:
         max_turns=int(raw.get("max_turns", 10)),
         task_timeout_seconds=float(raw.get("task_timeout_seconds", 600.0)),
     )
+
+
+def _migrate_local_harness(
+    agent_id: str, provider: str, harness: str, *, kind_migrated: bool
+) -> str:
+    """Return the harness a stale ``cli-local`` config should load as.
+
+    Configs written before the host-local Driver runtime landed name a
+    harness it never implements (``hermes``), and a legacy ``kind`` can leave
+    a harness that contradicts the stored provider. Rather than making those
+    agents unloadable, adopt the harness the provider resolves to — but only
+    when that yields a valid triple, so genuinely broken hand-edits still hit
+    the explicit error in ``_load_runtime_config``.
+    """
+    from .runtime_matrix import (
+        HARNESS_CLAUDE_CODE,
+        HARNESS_CODEX,
+        RUNTIME_CLI_LOCAL,
+        resolve_effective_harness,
+        validate_triple,
+    )
+
+    if validate_triple(RUNTIME_CLI_LOCAL, provider, harness).ok:
+        return harness
+    if not kind_migrated and harness in {HARNESS_CLAUDE_CODE, HARNESS_CODEX}:
+        # A Driver harness that fails for some other reason (e.g. an
+        # explicitly mismatched provider) is an operator error, not legacy.
+        return harness
+    resolved = resolve_effective_harness(RUNTIME_CLI_LOCAL, provider, "")
+    if resolved == harness or not validate_triple(
+        RUNTIME_CLI_LOCAL, provider, resolved
+    ).ok:
+        return harness
+    logger.warning(
+        "agent %s: runtime.harness %r is not implemented by the %r runtime, "
+        "auto-migrated to %r for this run; authenticate with `claude login` "
+        "or `codex login`, then update agent.yml.",
+        agent_id or "(?)", harness, RUNTIME_CLI_LOCAL, resolved,
+    )
+    return resolved
 
 
 def _validate_inference_level(agent_id: str, value: str, harness: str) -> None:

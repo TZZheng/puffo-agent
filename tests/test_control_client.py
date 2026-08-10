@@ -375,6 +375,27 @@ async def test_edit_display_name_and_role(home):
 
 
 @pytest.mark.asyncio
+async def test_edit_runtime_harness_swap_keeps_agent_loadable(home):
+    """A cloud-driven harness swap must not persist an unloadable level."""
+    write_test_agent(home, "scout")
+    cfg = AgentConfig.load("scout")
+    cfg.runtime.kind = "cli-local"
+    cfg.runtime.provider = "anthropic"
+    cfg.runtime.harness = "claude-code"
+    cfg.runtime.inference_level = "xhigh"
+    cfg.save()
+
+    res = await execute_command(
+        "edit", "scout", {"runtime": {"harness": "codex", "provider": "openai"}},
+    )
+    assert res["ok"] is True
+
+    loaded = AgentConfig.load("scout")
+    assert loaded.runtime.harness == "codex"
+    assert loaded.runtime.inference_level == ""
+
+
+@pytest.mark.asyncio
 async def test_archive_drops_flag(home):
     from puffo_agent.portal.state import archive_flag_path
 

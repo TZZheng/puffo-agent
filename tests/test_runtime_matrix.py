@@ -26,6 +26,7 @@ from puffo_agent.portal.runtime_matrix import (
     VALID_RUNTIMES,
     harness_applies,
     migrate_legacy_kind,
+    normalize_inference_level,
     resolve_effective_harness,
     resolve_effective_provider,
     validate_triple,
@@ -109,6 +110,26 @@ def test_runtime_defaults_select_the_ratified_local_drivers():
     assert harness_applies(RUNTIME_CLI_LOCAL)
     assert harness_applies(RUNTIME_CLI_DOCKER)
     assert not harness_applies(RUNTIME_WS_LOCAL)
+
+
+@pytest.mark.parametrize(("provider", "harness", "level", "expected"), [
+    # Supported by the named harness → kept.
+    (PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE, "xhigh", "xhigh"),
+    (PROVIDER_OPENAI, HARNESS_CODEX, "minimal", "minimal"),
+    # Level belongs to the other harness → cleared.
+    (PROVIDER_OPENAI, HARNESS_CODEX, "xhigh", ""),
+    (PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE, "minimal", ""),
+    # Empty harness resolves from the provider before the check.
+    (PROVIDER_OPENAI, "", "minimal", "minimal"),
+    (PROVIDER_ANTHROPIC, "", "xhigh", "xhigh"),
+    # Empty stays empty; harnesses with no levels clear everything.
+    (PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE, "", ""),
+    (PROVIDER_OPENAI, HARNESS_HERMES, "high", ""),
+])
+def test_normalize_inference_level(provider, harness, level, expected):
+    assert normalize_inference_level(
+        RUNTIME_CLI_LOCAL, provider, harness, level,
+    ) == expected
 
 
 def test_harness_registry_defaults_are_internally_consistent():

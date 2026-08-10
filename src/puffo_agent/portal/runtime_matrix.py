@@ -233,6 +233,29 @@ def resolve_effective_harness(runtime: str, provider: str, harness: str) -> str:
     return DEFAULT_HARNESS_FOR_PROVIDER.get(provider, HARNESS_CLAUDE_CODE)
 
 
+def normalize_inference_level(
+    runtime: str, provider: str, harness: str, inference_level: str,
+) -> str:
+    """Return ``inference_level`` if the effective harness supports it, else "".
+
+    The single source of truth for the harness↔inference_level rule. Every
+    writer of a runtime config calls this after applying its fields, so no
+    writer can persist a level that ``AgentConfig.load`` then rejects.
+    Value-based (rather than taking a ``RuntimeConfig``) to keep this module
+    free of a ``state`` import cycle.
+    """
+    if not inference_level:
+        return ""
+    from ..mcp.config import supported_inference_levels
+
+    effective = resolve_effective_harness(
+        runtime, resolve_effective_provider(runtime, provider), harness
+    )
+    if inference_level in supported_inference_levels(effective):
+        return inference_level
+    return ""
+
+
 __all__ = [
     # runtime constants
     "RUNTIME_CLI_LOCAL", "RUNTIME_CLI_DOCKER", "RUNTIME_WS_LOCAL",
@@ -253,4 +276,5 @@ __all__ = [
     "ValidationResult",
     "resolve_effective_provider",
     "resolve_effective_harness",
+    "normalize_inference_level",
 ]

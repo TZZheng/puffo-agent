@@ -87,6 +87,120 @@ def test_legacy_agent_config_load_save_preserves_existing_values(home):
     assert saved["triggers"] == {"on_mention": False, "on_dm": True}
 
 
+@pytest.mark.parametrize(
+    ("provider", "expected_harness"),
+    [("", "claude-code"), ("anthropic", "claude-code"), ("openai", "codex")],
+)
+def test_stale_hermes_harness_migrates_to_driver_harness(
+    home, provider, expected_harness,
+):
+    """``cli-local`` + ``hermes`` was valid before the Driver runtime landed.
+
+    Such configs must migrate to the provider-resolved harness rather than
+    leave the agent unloadable.
+    """
+    from puffo_agent.portal.state import AgentConfig
+
+    agent_id = f"stale-hermes-{provider or 'default'}"
+    runtime = {"kind": "cli-local", "harness": "hermes"}
+    if provider:
+        runtime["provider"] = provider
+    _write_agent(agent_id, {"id": agent_id, "runtime": runtime})
+
+    loaded = AgentConfig.load(agent_id)
+    assert loaded.runtime.harness == expected_harness
+    assert loaded.runtime.provider == provider
+
+
+def test_stale_hermes_migration_clears_unsupported_inference_level(home):
+    """``minimal`` is a codex level; migrating to claude-code must drop it."""
+    from puffo_agent.portal.state import AgentConfig
+
+    agent_id = "stale-hermes-level"
+    _write_agent(agent_id, {
+        "id": agent_id,
+        "runtime": {
+            "kind": "cli-local",
+            "provider": "anthropic",
+            "harness": "hermes",
+            "inference_level": "minimal",
+        },
+    })
+
+    loaded = AgentConfig.load(agent_id)
+    assert loaded.runtime.harness == "claude-code"
+    assert loaded.runtime.inference_level == ""
+
+
+def test_stale_hermes_migration_keeps_supported_inference_level(home):
+    from puffo_agent.portal.state import AgentConfig
+
+    agent_id = "stale-hermes-keeps-level"
+    _write_agent(agent_id, {
+        "id": agent_id,
+        "runtime": {
+            "kind": "cli-local",
+            "provider": "openai",
+            "harness": "hermes",
+            "inference_level": "medium",
+        },
+    })
+
+    loaded = AgentConfig.load(agent_id)
+    assert loaded.runtime.harness == "codex"
+    assert loaded.runtime.inference_level == "medium"
+
+
+def test_local_gemini_cli_config_still_fails_to_load(home):
+    """No Driver harness serves google, so this stays an explicit error."""
+    from puffo_agent.portal.state import AgentConfig
+
+    agent_id = "stale-gemini"
+    _write_agent(agent_id, {
+        "id": agent_id,
+        "runtime": {
+            "kind": "cli-local",
+            "provider": "google",
+            "harness": "gemini-cli",
+        },
+    })
+
+    with pytest.raises(RuntimeError, match="not implemented by the Driver runtime"):
+        AgentConfig.load(agent_id)
+
+
+def test_docker_hermes_config_is_left_alone(home):
+    """Migration is scoped to ``cli-local``; hermes is valid on cli-docker."""
+    from puffo_agent.portal.state import AgentConfig
+
+    agent_id = "docker-hermes"
+    _write_agent(agent_id, {
+        "id": agent_id,
+        "runtime": {
+            "kind": "cli-docker",
+            "provider": "openai",
+            "harness": "hermes",
+        },
+    })
+
+    assert AgentConfig.load(agent_id).runtime.harness == "hermes"
+
+
+def test_legacy_kind_with_openai_provider_resolves_codex(home):
+    """A legacy kind carrying the default claude-code harness still migrates."""
+    from puffo_agent.portal.state import AgentConfig
+
+    agent_id = "legacy-openai"
+    _write_agent(agent_id, {
+        "id": agent_id,
+        "runtime": {"kind": "sdk-local", "provider": "openai"},
+    })
+
+    loaded = AgentConfig.load(agent_id)
+    assert loaded.runtime.kind == "cli-local"
+    assert loaded.runtime.harness == "codex"
+
+
 def test_task_timeout_seconds_round_trips(home):
     from puffo_agent.portal.state import AgentConfig
 

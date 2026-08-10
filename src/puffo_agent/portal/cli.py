@@ -1053,6 +1053,46 @@ def cmd_agent_profile(args: argparse.Namespace) -> int:
     return 0
 
 
+def _apply_cli_inference_level(
+    cfg: AgentConfig, args: argparse.Namespace,
+) -> tuple[int, bool, bool]:
+    """Resolve ``--inference-level`` against the (possibly new) harness.
+
+    Returns ``(exit_code, touched, cleared)``. A non-zero exit code means an
+    explicitly supplied level is unusable and the caller must abort; a level
+    left over from a harness swap is cleared silently, matching every other
+    runtime writer.
+    """
+    if args.inference_level is None and args.harness is None:
+        return 0, False, False
+    from ..mcp.config import supported_inference_levels
+    from .runtime_matrix import normalize_inference_level
+
+    def _normalize(level: str) -> str:
+        return normalize_inference_level(
+            cfg.runtime.kind, cfg.runtime.provider, cfg.runtime.harness, level,
+        )
+
+    if args.inference_level is not None:
+        if args.inference_level and not _normalize(args.inference_level):
+            levels = supported_inference_levels(cfg.runtime.harness)
+            print(
+                f"error: inference level {args.inference_level!r} is not "
+                f"supported by {cfg.runtime.harness!r}; expected one of "
+                f"{', '.join(levels)}",
+                file=sys.stderr,
+            )
+            return 2, False, False
+        cfg.runtime.inference_level = args.inference_level
+        return 0, True, False
+
+    normalized = _normalize(cfg.runtime.inference_level)
+    if normalized == cfg.runtime.inference_level:
+        return 0, False, False
+    cfg.runtime.inference_level = normalized
+    return 0, False, True
+
+
 def cmd_agent_runtime(args: argparse.Namespace) -> int:
     """Show or update the runtime: block in agent.yml. Fields are
     optional; invoking with no flags just prints the current block."""
@@ -1084,32 +1124,15 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if args.sandbox is not None:
         cfg.runtime.sandbox = args.sandbox
         touched = True
-    inference_level_cleared = False
     if args.harness is not None:
         cfg.runtime.harness = args.harness
         touched = True
-    if args.inference_level is not None or args.harness is not None:
-        from ..mcp.config import supported_inference_levels
-
-        levels = supported_inference_levels(cfg.runtime.harness)
-        if (
-            args.inference_level is not None
-            and args.inference_level
-            and args.inference_level not in levels
-        ):
-            print(
-                f"error: inference level {args.inference_level!r} is not "
-                f"supported by {cfg.runtime.harness!r}; expected one of "
-                f"{', '.join(levels)}",
-                file=sys.stderr,
-            )
-            return 2
-        if args.inference_level is not None:
-            cfg.runtime.inference_level = args.inference_level
-            touched = True
-        elif cfg.runtime.inference_level and cfg.runtime.inference_level not in levels:
-            cfg.runtime.inference_level = ""
-            inference_level_cleared = True
+    status, level_touched, inference_level_cleared = _apply_cli_inference_level(
+        cfg, args
+    )
+    if status:
+        return status
+    touched = touched or level_touched
     if not touched:
         # No flags → print only. Matches ``agent show``'s runtime lines.
         print(f"id:              {cfg.id}")

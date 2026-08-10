@@ -986,12 +986,17 @@ def _apply_model_refresh(
             )
         agent_cfg.runtime.provider = next(iter(providers))
     if has_inference_level:
+        # Explicit input; already validated against the effective harness.
         agent_cfg.runtime.inference_level = inference_level
-    elif has_model_swap and agent_cfg.runtime.inference_level:
-        from ..mcp.config import supported_inference_levels
+    elif has_model_swap:
+        from .runtime_matrix import normalize_inference_level
 
-        if agent_cfg.runtime.inference_level not in supported_inference_levels(harness):
-            agent_cfg.runtime.inference_level = ""
+        agent_cfg.runtime.inference_level = normalize_inference_level(
+            agent_cfg.runtime.kind,
+            agent_cfg.runtime.provider,
+            agent_cfg.runtime.harness,
+            agent_cfg.runtime.inference_level,
+        )
     try:
         agent_cfg.save()
         logger.info(
@@ -1072,17 +1077,18 @@ def _apply_runtime_refresh(
     agent_cfg.runtime.kind = kind
     if new_harness is not None:
         agent_cfg.runtime.harness = str(new_harness)
-        if agent_cfg.runtime.inference_level:
-            from ..mcp.config import supported_inference_levels
-
-            if agent_cfg.runtime.inference_level not in supported_inference_levels(
-                agent_cfg.runtime.harness
-            ):
-                agent_cfg.runtime.inference_level = ""
     if new_provider is not None:
         agent_cfg.runtime.provider = str(new_provider)
     if new_model is not None:
         agent_cfg.runtime.model = str(new_model)
+    from .runtime_matrix import normalize_inference_level
+
+    agent_cfg.runtime.inference_level = normalize_inference_level(
+        agent_cfg.runtime.kind,
+        agent_cfg.runtime.provider,
+        agent_cfg.runtime.harness,
+        agent_cfg.runtime.inference_level,
+    )
     try:
         agent_cfg.save()
         logger.info("agent %s: refresh_runtime applied (kind=%r)", agent_id, kind)

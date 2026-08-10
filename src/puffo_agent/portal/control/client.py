@@ -311,8 +311,16 @@ def _apply_edit_runtime(cfg: AgentConfig, params: dict) -> tuple[bool, str | Non
         if isinstance(raw.get(key), str):
             setattr(cfg.runtime, key, raw[key])
             changed = True
-    from ..runtime_matrix import validate_triple
+    from ..runtime_matrix import normalize_inference_level, validate_triple
 
+    # Same rule as every other runtime writer: a harness swap must not leave
+    # an inference_level behind that AgentConfig.load would then reject.
+    cfg.runtime.inference_level = normalize_inference_level(
+        cfg.runtime.kind,
+        cfg.runtime.provider,
+        cfg.runtime.harness,
+        cfg.runtime.inference_level,
+    )
     result = validate_triple(
         cfg.runtime.kind, cfg.runtime.provider, cfg.runtime.harness
     )
