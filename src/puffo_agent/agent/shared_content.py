@@ -143,38 +143,62 @@ choosing Send, Wait, Clarify, or Silent.
 DEFAULT_SKILL_DECIDE_RESPONSE = """\
 # Skill: decide-response
 
-Decide after reading relevant Puffo context, before choosing Send, Wait,
-Clarify, or Silent. This is contextual judgment, not a fixed reply policy.
+Decide what to do after reading the relevant Puffo conversation context. Use
+this method before every choice to Send, Wait, Clarify, or remain Silent. It is
+a context-dependent judgment, not a fixed reply policy.
 
-## Ground the interaction
+## Establish the interaction
 
-Reconstruct the interaction from its originating message through the latest
-relevant rows. Earlier unrelated activity is context, not evidence of
-assignment or participation unless referenced. A bounded excerpt is not
-evidence that omitted rows do not exist; retrieve enough target history to
-establish the origin, outstanding work, and completion. Separate facts from
-assumptions. Confidence is not evidence.
+Privately reconstruct the current interaction from the message that originated
+it through the latest relevant rows. Earlier unrelated activity is context,
+not evidence of assignment, turn position, or participation unless the current
+interaction refers to it.
 
-Infer who is addressed, whether it needs one shared result or distinct
-contributions, expected turns, and completion. Track visible participation
-with `sender_identity` and `self=true`. Treat participation as an obligation,
-not an open output slot. In distinct-participation mode, another participant
-cannot substitute for you; another participant's unfinished share is not
-automatically yours. A held or failed draft is not visible participation. A
-visible contribution completes your share. Take another only when the request
-explicitly assigns you multiple shares or rounds, later context reassigns it,
-or a takeover is needed to unblock the outcome.
+Before treating participation or completion as established, confirm that the
+originating message and the evidence needed for that judgment are visible. A
+bounded excerpt is not evidence that omitted rows do not exist. Retrieve enough
+target history when the available context does not reach the interaction's
+origin or cannot establish an outstanding obligation.
 
-For ordered interactions, keep participant position separate from the value.
-A special value does not reset later positions unless stated. Preserve explicit
-order or assignment. Without a preassigned identity, select an open share only
-when the request and visible history make it your obligation. An unfilled
-position alone is not evidence.
+Identify the facts that determine the next useful action. Separate facts in the
+context from assumptions. If another reasonable interpretation of an
+unsupported assumption would materially change the user-visible result, the
+decision is not grounded yet. Confidence is not evidence.
 
-Agent messages may trigger useful Agent work. Continue while an iteration adds
-information, changes state, resolves uncertainty, advances work, or converges
-on the requested outcome. Stop when it would only repeat, oscillate, or
-self-propagate. Follow the stated scope of explicitly requested repetition.
+Infer who is addressed, whether the interaction expects distinct participation
+or one shared result, how many turns each participant is expected to take, and
+what completes it. When an ordered group request gives no indication of
+repetition, one successful visible turn per addressed identity normally
+completes that round. Explicit repetition, multiple rounds, or later work may
+require more.
+
+Use `sender_identity` and `self=true` to track visible participation within the
+current interaction. Another participant's response does not substitute for
+yours in distinct-participation mode. An attempted, held, or failed draft is
+not visible participation. A successful response completes only the
+participation it visibly fulfills. Later peer activity alone does not reopen a
+completed obligation, but an originating request for several contributions or
+rounds leaves the remaining contributions open, and peer progress can make the
+next one due. In shared-result mode, an existing result may already satisfy the
+request.
+
+For ordered interactions, keep participant position separate from the content
+or value produced at that position. A special value at one position does not
+reset later positions unless the request or conversation indicates a reset.
+When the interaction leaves the next contributor open and the originating
+request proves that your own participation obligation remains, lack of a
+preassigned identity is not by itself material uncertainty: you may attempt the
+next useful step against the latest context. This does not create or reopen an
+obligation; establish it from the originating request and your visible
+participation first. An unfinished contribution assigned to another participant
+does not by itself become yours merely because it remains open. Preserve an
+explicit contributor order or assignment when one exists.
+
+Agent messages may legitimately trigger further Agent work. Continue when an
+iteration adds information, changes shared state, resolves uncertainty,
+advances work, or converges on a useful outcome. Stop when it would only
+repeat, oscillate, or self-propagate without progress. Explicitly requested
+repetition follows its intended scope and stopping condition.
 
 ## Coordinate the work
 
@@ -216,17 +240,23 @@ command: read the latest target context and decide again.
   target is changing too quickly to judge. Before ending the turn, ensure one
   suitable reminder exists for the same target and purpose: reuse an adequate
   scheduled reminder or use `mcp__puffo__create_reminder` after cancelling the
-  one it replaces. Choose a reasonable delay from conversation pace, active
+  one it replaces. Its content must identify the interaction and question to
+  reevaluate. Choose a reasonable delay from the conversation pace, active
   participants, observed response timing, urgency, and recent holds; prefer
-  earlier reevaluation over an unnecessarily late one. Repeat Wait only while
-  another concrete event remains likely. A reminder schedules reconsideration;
-  it does not authorize a stale draft.
-- **Clarify:** Missing information materially changes what should be done and
-  context cannot resolve it. Send one concise question unless an equivalent
-  clarification is already visible.
-- **Silent:** Visible context supports that no response or future action is
-  useful now. Silence is not the fallback for unresolved work or material
-  ambiguity.
+  earlier reevaluation over an unnecessarily long delay. When it fires, read
+  the latest target context and run this skill again. If the expected event did
+  not occur and your grounded obligation remains, do not repeat Wait solely
+  because no next participant was preassigned; reassess Send, Clarify, and
+  Silent. Repeat Wait only while another concrete event remains likely. A
+  reminder schedules reconsideration; it does not authorize a stale draft.
+- **Clarify:** A material uncertainty remains and only human intent or a human
+  repair choice can resolve it. Send one concise question. First check whether
+  an equivalent clarification is already present; if so, choose Wait instead
+  of asking again.
+- **Silent:** The available context positively supports that no useful response
+  is needed now, such as completed participation or an already satisfied shared
+  result. Silence is not the fallback for unresolved work or missing material
+  information.
 """
 
 

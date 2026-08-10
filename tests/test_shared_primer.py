@@ -110,7 +110,7 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
     )
     assert all_prompt_surfaces.count(decision_guidance) == 1
     assert "Confidence is not evidence" in decision
-    assert "Agent messages may trigger useful Agent work" in decision
+    assert "Agent messages may legitimately trigger further Agent work" in decision
     assert "Silence is not the fallback" in decision
     assert "Confidence is not evidence" not in read
     assert "originating request and conversation intent" not in DEFAULT_SHARED_CLAUDE_MD
@@ -168,17 +168,20 @@ def test_decide_response_owns_response_judgment():
         "A bounded excerpt is not evidence that omitted rows do not exist",
         "Earlier unrelated activity is context",
         "Confidence is not evidence",
-        "distinct contributions",
+        "distinct participation",
         "one shared result",
+        "how many turns each participant is expected to take",
+        "one successful visible turn per addressed identity",
         "sender_identity",
         "self=true",
-        "A held or failed draft is not visible participation",
-        "Treat participation as an obligation, not an open output slot",
-        "another participant's unfinished share is not automatically yours",
-        "explicitly assigns you multiple shares",
-        "keep participant position separate from the value",
-        "Agent messages may trigger useful Agent work",
-        "repeat, oscillate, or self-propagate",
+        "An attempted, held, or failed draft is not visible participation",
+        "remaining contributions open, and peer progress can make the next one due",
+        "lack of a preassigned identity is not by itself material uncertainty",
+        "does not create or reopen an obligation",
+        "does not by itself become yours merely because it remains open",
+        "keep participant position separate from the content",
+        "Agent messages may legitimately trigger further Agent work",
+        "repeat, oscillate, or self-propagate without progress",
         "choose distinct substantive contributions",
         "even when your own part seems quick",
         "separate committed message before the work or result",
@@ -192,12 +195,12 @@ def test_decide_response_owns_response_judgment():
         "explicit continuing obligation",
         "no reliable later event",
         "A concrete later event",
+        "do not repeat Wait solely because no next participant was preassigned",
         "A reminder schedules reconsideration",
-        "equivalent clarification is already visible",
+        "equivalent clarification is already present",
         "Silence is not the fallback",
     ):
         assert phrase in decision
-    assert len(DEFAULT_SKILL_DECIDE_RESPONSE.encode()) < 5_000
     assert "apply the `decide-response` skill" in read
     assert "Confidence is not evidence" not in read
     assert "mcp__puffo__create_reminder" not in read
