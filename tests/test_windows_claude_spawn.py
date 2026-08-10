@@ -19,6 +19,14 @@ from puffo_agent.agent import cli_bin
 from puffo_agent.agent.cli_bin import spawn_argv, windows_runnable
 
 
+class _StubHarness:
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def name(self) -> str:
+        return self._name
+
+
 @pytest.fixture
 def win(monkeypatch):
     monkeypatch.setattr(cli_bin.sys, "platform", "win32")
@@ -172,12 +180,26 @@ class TestBuildCommandUsesTheResolver:
         assert "--dangerously-skip-permissions" in cmd
         assert cmd[-2:] == ["--extra", "x"]
 
-    def test_resolver_miss_raises_the_friendly_error_not_winerror(
-        self, monkeypatch, tmp_path
-    ):
+    def test_resolver_miss_falls_back_to_the_bare_name(self, monkeypatch, tmp_path):
+        # _build_command must not raise on a miss. Every spawn path calls
+        # _verify() first, which is where CLAUDE_BIN_MISSING belongs; raising
+        # here as well broke argv-shape tests that never spawn and so have no
+        # reason to need the CLI present. Bare name = exactly the old
+        # behaviour, so a machine without claude is no worse off than before.
         from puffo_agent.agent.adapters import local_cli
 
         monkeypatch.setattr(local_cli, "resolve_claude_bin", lambda: None)
         adapter = self._configure(self._adapter(), tmp_path)
+        cmd = local_cli.LocalCLIAdapter._build_command(adapter, ["--verbose"])
+        assert cmd[0] == "claude"
+        assert "--dangerously-skip-permissions" in cmd
+
+    def test_verify_is_where_the_friendly_error_comes_from(self, monkeypatch):
+        from puffo_agent.agent.adapters import local_cli
+
+        monkeypatch.setattr(local_cli, "resolve_claude_bin", lambda: None)
+        adapter = self._adapter()
+        adapter._verified = False
+        adapter.harness = _StubHarness("claude-code")
         with pytest.raises(RuntimeError, match="PUFFO_CLAUDE_BIN"):
-            local_cli.LocalCLIAdapter._build_command(adapter, [])
+            local_cli.LocalCLIAdapter._verify(adapter)

@@ -985,10 +985,14 @@ class LocalCLIAdapter(Adapter):
         # npm-installed CLI died with WinError 2 even though the shell could
         # find it. The resolver was already being called in _verify and its
         # answer thrown away — this uses it, the way the codex adapter does.
+        # A miss falls back to the bare name rather than raising: _verify()
+        # runs ahead of every spawn path and already fails with
+        # CLAUDE_BIN_MISSING, so raising here only moved that error onto
+        # callers that never spawn — argv-shape tests, which legitimately
+        # run without the CLI installed. Falling back keeps their behaviour
+        # exactly as it was before this change.
         claude_bin = resolve_claude_bin()
-        if claude_bin is None:
-            raise RuntimeError(CLAUDE_BIN_MISSING)
-        cmd = spawn_argv(claude_bin)
+        cmd = spawn_argv(claude_bin) if claude_bin else ["claude"]
         # --dangerously-skip-permissions bypasses BOTH the per-tool prompt AND
         # the per-project trust dialog; stream-json has no UI for the dialog,
         # and an untrusted cwd silently drops --mcp-config servers. Non-bypass
