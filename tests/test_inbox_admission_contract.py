@@ -276,12 +276,30 @@ async def _seed_boundary_store(tmp_path):
     for envelope_id, channel_id, seq, text in (
         ("history-peer", "ch-history", 2, "history peer body"),
         ("inbox-peer", "ch-inbox", 3, "inbox peer body"),
-        ("held-peer", "ch-held", 4, "held peer body"),
+        ("held-earlier-peer", "ch-held", 5, "earlier held peer body"),
+        ("held-peer", "ch-held", 7, "held peer body"),
     ):
         await _seed(
             store, envelope_id=envelope_id, channel_id=channel_id,
             seq=seq, text=text,
         )
+    await store.store_receipt(
+        {
+            "envelope_id": "held-self",
+            "envelope_kind": "channel",
+            "sender_slug": "agent-contract",
+            "space_id": "sp_1",
+            "channel_id": "ch-held",
+            "content": "previous self contribution",
+            "content_type": "text/plain",
+            "sent_at": 6,
+            "is_encrypted": True,
+        },
+        server_seq=6,
+        disposition=ReceiptDisposition.TERMINAL,
+        reason="self echo",
+        received_at=6,
+    )
     return store
 
 
@@ -305,7 +323,7 @@ async def _start_boundary_runtime(tmp_path, store):
 
 
 def _boundary_coordinator(store, runtime):
-    transport = HeldTransport(held_envelope_id="held-peer", held_seq=4)
+    transport = HeldTransport(held_envelope_id="held-peer", held_seq=7)
     coordinator = SendCoordinator(
         slug="agent-contract", keystore=None, http_client=transport,
         data_client=store, baseline_source=BaselineAdapter(store),
@@ -477,10 +495,11 @@ async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
     held_result = held_call[1]
     assert held_result["state"] == "held"
     assert held_result["synchronized"] is True
-    assert held_result["latest_seq"] == 4
+    assert held_result["latest_seq"] == 7
     assert held_result["latest_envelope_id"] == "held-peer"
     reconsideration = held_result["reconsideration"]
     assert reconsideration["context_ready"] is True
+    assert "previous self contribution" in reconsideration["new_channel_context"]
     assert "held peer body" in reconsideration["new_channel_context"]
     assert reconsideration["guidance"] == HELD_SEND_RECONSIDERATION_GUIDANCE
     assert held_result["tool_result_admission"].startswith(
@@ -506,18 +525,30 @@ async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
     await _wait_until(
         lambda: h.runtime.active.through_by_channel.get(
             ("sp_1", "ch-held")
-        ) == 4
+        ) == 7
     )
     row = await h.store.get_message_by_envelope("held-peer")
     assert row.processing_state is ProcessingState.IN_TURN
-    assert await h.active_boundary("ch-held") == 4
-    assert h.runtime.active.visible_message_ids == ["held-peer"]
+    self_echo = await h.store.get_message_by_envelope("held-self")
+    assert self_echo is not None
+    assert self_echo.processing_state is None
+    assert await h.active_boundary("ch-held") == 7
+    assert h.runtime.active.message_ids == ["held-earlier-peer", "held-peer"]
+    assert h.runtime.active.visible_message_ids == [
+        "held-earlier-peer",
+        "held-self",
+        "held-peer",
+    ]
 
     # A duplicate callback cannot change the turn or reoffer the row.
     await h.emit_tool_result(
         tool_name="send_message", arguments=send_arguments, result=held_result,
     )
-    assert h.runtime.active.visible_message_ids == ["held-peer"]
+    assert h.runtime.active.visible_message_ids == [
+        "held-earlier-peer",
+        "held-self",
+        "held-peer",
+    ]
 
     inbox_call = await h.mcp.call_tool("read_inbox", {"target": target, "limit": 1})
     assert inbox_call[1]["messages"] == []
@@ -531,7 +562,7 @@ async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
     assert len(h.transport.calls) == 2
     assert h.transport.calls[-1][1]["freshness"] == {
         "context_baseline_seq": 0,
-        "seen_seq": 4,
+        "seen_seq": 7,
         "mode": "send_anyway",
     }
 

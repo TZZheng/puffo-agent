@@ -24,6 +24,11 @@ from puffo_agent.agent.harness.runtime_manager import (
     RuntimeManagerAdapter,
     RuntimeStateError,
 )
+from puffo_agent.agent.runtime_event_outbox import (
+    RuntimeEventOutbox,
+    RuntimeEventProjectingSink,
+)
+from puffo_agent.agent.runtime_events import RuntimeEventProjector
 
 
 class _ControllableDriver(Driver):
@@ -282,3 +287,106 @@ async def test_terminal_persistence_failure_unblocks_turn_and_retires_runtime():
         await asyncio.wait_for(running, timeout=1)
     assert manager.active_turn_ref is None
     assert manager.opened is None
+
+
+@pytest.mark.asyncio
+async def test_continuation_failure_persists_terminal_before_next_turn(tmp_path):
+    driver = _ControllableDriver()
+    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    sink = RuntimeEventProjectingSink(
+        outbox,
+        RuntimeEventProjector(agent_id="agent", session_ref="session"),
+    )
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+        event_sink=sink,
+    )
+    adapter = RuntimeManagerAdapter(manager)
+
+    first = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    while not manager.native_turn_id:
+        await asyncio.sleep(0)
+
+    async def reject_admission(_event):
+        raise RuntimeError("held admission failed")
+
+    manager.register_continuation(
+        reject_admission,
+        "held-cycle",
+        tool_names=("send_message",),
+        tool_arguments={"channel": "ch-1"},
+        correlation_receipt="receipt",
+    )
+    await driver.queue.put(HarnessEvent.normalized(
+        type="turn.started",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        native_session_id=manager.native_session_id,
+        native_turn_id=manager.native_turn_id,
+    ))
+    await driver.queue.put(HarnessEvent.normalized(
+        type="turn.tool_completed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        native_session_id=manager.native_session_id,
+        native_turn_id=manager.native_turn_id,
+        data={
+            "tool_call_ref": "tool-1",
+            "label": "send_message",
+            "outcome": "succeeded",
+        },
+        native_payload={
+            "_puffo_internal": "tool_result",
+            "tool_call_id": "tool-1",
+            "tool_name": "send_message",
+            "arguments": {"channel": "ch-1"},
+            "result_omitted": True,
+            "is_error": False,
+        },
+    ))
+
+    with pytest.raises(RuntimeStateError, match="outcome abandoned"):
+        await asyncio.wait_for(first, timeout=1)
+    assert manager.active_turn_ref is None
+    assert sink.validator.active_turn_ref is None
+
+    driver.started = asyncio.Event()
+    second = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    while manager.native_turn_id != "native-turn-2":
+        await asyncio.sleep(0)
+    await driver.queue.put(HarnessEvent.normalized(
+        type="turn.started",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        native_session_id=manager.native_session_id,
+        native_turn_id=manager.native_turn_id,
+    ))
+    await driver.queue.put(HarnessEvent.normalized(
+        type="turn.completed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        native_session_id=manager.native_session_id,
+        native_turn_id=manager.native_turn_id,
+        data={"outcome": "succeeded"},
+    ))
+    assert (await asyncio.wait_for(second, timeout=1)).reply == ""
+    assert sink.validator.active_turn_ref is None
+    assert [row.event_type for row in outbox.prefix()] == [
+        "turn.started",
+        "activity.updated",
+        "turn.finished",
+        "turn.started",
+        "activity.updated",
+        "turn.finished",
+    ]
+
+    await adapter.aclose()
+    outbox.close()

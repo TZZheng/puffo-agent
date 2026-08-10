@@ -25,6 +25,7 @@ from .message_store import (
     PRIOR_CONTEXT_MAX_BYTES,
     PRIOR_CONTEXT_MAX_ITEMS,
     ProcessingState,
+    ReceiptDisposition,
     StoredMessage,
 )
 
@@ -126,6 +127,7 @@ class InboxAdmissionMixin:
                 row.processing_state is ProcessingState.IN_TURN
                 and row.processing_turn_id == active_turn_id
             )
+            and row.receipt_disposition is not ReceiptDisposition.TERMINAL
             for row in rows
         ):
             raise RuntimeError("held admission rows crossed another turn boundary")

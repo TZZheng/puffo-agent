@@ -472,23 +472,28 @@ class RuntimeManager:
 
     async def _fail_runtime_locked(self, reason: str) -> None:
         active = self.active_turn_ref
-        if active is not None:
-            abandoned = HarnessEvent(
-                type=HarnessEventType.TURN_ABANDONED,
-                driver=self.driver_name,
-                session_ref=self.session_ref,
-                turn_ref=active,
-                native_session_id=self.native_session_id,
-                native_turn_id=self.native_turn_id,
-                data={
-                    "outcome": "abandoned",
-                    "error_code": reason,
-                    "retryable": True,
-                },
-            )
-            self._fanout_event(abandoned)
-            self._complete_turn(abandoned, active)
         try:
+            if active is not None:
+                abandoned = HarnessEvent(
+                    type=HarnessEventType.TURN_ABANDONED,
+                    driver=self.driver_name,
+                    session_ref=self.session_ref,
+                    turn_ref=active,
+                    native_session_id=self.native_session_id,
+                    native_turn_id=self.native_turn_id,
+                    data={
+                        "outcome": "abandoned",
+                        "error_code": reason,
+                        "retryable": True,
+                    },
+                )
+                try:
+                    await self._publish_terminal_locked(abandoned, active)
+                except Exception:
+                    logger.exception(
+                        "failed to persist terminal runtime event after %s",
+                        reason,
+                    )
             await self.driver.close()
         except Exception:
             logger.exception("failed to close provider runtime after %s", reason)
