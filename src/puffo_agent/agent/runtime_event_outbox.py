@@ -41,6 +41,19 @@ class OutboxCapacityError(RuntimeError):
     pass
 
 
+class _MalformedAppendResponse(Exception):
+    """An append response whose body is not a decodable acknowledgement.
+
+    ``status`` is carried whenever the HTTP framing was readable, so a 2xx with
+    an empty or undecodable body is still judged by the acknowledgement
+    boundary instead of being mistaken for a transport fault.
+    """
+
+    def __init__(self, status: int | None = None):
+        super().__init__("append response body must be an object")
+        self.status = status
+
+
 @dataclass(frozen=True, slots=True)
 class OutboxRow:
     sequence: int
@@ -172,6 +185,11 @@ class RuntimeEventOutbox:
 
     def can_start_turn(self, *, estimated_start_bytes: int = 0) -> bool:
         rows, bytes_ = self.usage()
+        return self._fits_turn(rows, bytes_, estimated_start_bytes)
+
+    def _fits_turn(
+        self, rows: int, bytes_: int, estimated_start_bytes: int
+    ) -> bool:
         return (
             rows + 2 + self.terminal_reserve_rows <= self.max_rows
             and bytes_ + estimated_start_bytes
@@ -180,8 +198,19 @@ class RuntimeEventOutbox:
 
     def require_turn_capacity(self, *, estimated_start_bytes: int = 0) -> None:
         if not self.can_start_turn(estimated_start_bytes=estimated_start_bytes):
-            self._log("runtime.capacity", state="blocked", error_code="capacity")
-            raise OutboxCapacityError("runtime event outbox is at capacity")
+            self._refuse_turn()
+
+    async def arequire_turn_capacity(
+        self, *, estimated_start_bytes: int = 0
+    ) -> None:
+        """Enforce turn capacity without blocking the caller's event loop."""
+        rows, bytes_ = await self._acall(self._usage)
+        if not self._fits_turn(rows, bytes_, estimated_start_bytes):
+            self._refuse_turn()
+
+    def _refuse_turn(self) -> None:
+        self._log("runtime.capacity", state="blocked", error_code="capacity")
+        raise OutboxCapacityError("runtime event outbox is at capacity")
 
     async def enqueue(
         self, event: RuntimeEvent, *, terminal: bool | None = None
@@ -404,6 +433,32 @@ class RuntimeEventUploader:
             lambda: self.outbox.discard(row, error_code=error_code)
         )
 
+    async def _reject_acknowledgement(
+        self, rows: list[OutboxRow], status: int | None
+    ) -> UploadResult:
+        """Refuse to read an unvalidated response as an acknowledgement.
+
+        HTTP status alone never authorises deleting durable evidence: a 2xx
+        whose body does not acknowledge this exact batch degrades the channel
+        with every row retained, and a body that cannot even be attributed to
+        a status is retried.
+        """
+        if status is not None and 200 <= status < 300:
+            self.degraded_error = "malformed_response"
+            self.outbox._log(
+                "runtime.retry", outbox_sequence=rows[0].sequence,
+                retry_count=rows[0].retry_count,
+                state="degraded", error_code=self.degraded_error,
+            )
+            return UploadResult("degraded", error_code=self.degraded_error)
+        await self._increment_retries(rows)
+        self.outbox._log(
+            "runtime.retry", outbox_sequence=rows[0].sequence,
+            retry_count=rows[0].retry_count + 1,
+            error_code="malformed_response",
+        )
+        return UploadResult("retry", error_code="malformed_response")
+
     async def _isolate_or_discard(
         self, rows: list[OutboxRow], error_code: str
     ) -> UploadResult:
@@ -456,6 +511,8 @@ class RuntimeEventUploader:
                 if inspect.isawaitable(response):
                     response = await response
                 status, payload = await _decode_response(response)
+            except _MalformedAppendResponse as exc:
+                return await self._reject_acknowledgement(rows, exc.status)
             except Exception:
                 await self._increment_retries(rows)
                 self.outbox._log(
@@ -491,7 +548,7 @@ class RuntimeEventUploader:
                     lambda: self.outbox.acknowledge(rows, accepted_ids)
                 )
             except (KeyError, TypeError, ValueError):
-                return await self._isolate_or_discard(rows, "malformed_response")
+                return await self._reject_acknowledgement(rows, status)
             self.outbox._log(
                 "runtime.acknowledged", first_sequence=rows[0].sequence,
                 last_sequence=rows[-1].sequence, event_count=len(rows),
@@ -610,6 +667,13 @@ class RuntimeEventProjectingSink:
             )
 
 
+def _readable_status(status: Any) -> int | None:
+    try:
+        return int(status)
+    except (TypeError, ValueError):
+        return None
+
+
 async def _decode_response(response: Any) -> tuple[int, dict[str, Any]]:
     if isinstance(response, tuple) and len(response) == 2:
         status, payload = response
@@ -620,8 +684,12 @@ async def _decode_response(response: Any) -> tuple[int, dict[str, Any]]:
         payload = response.json()
         if inspect.isawaitable(payload):
             payload = await payload
+    code = _readable_status(status)
     if isinstance(payload, (bytes, bytearray, str)):
-        payload = json.loads(payload)
+        try:
+            payload = json.loads(payload)
+        except ValueError as exc:
+            raise _MalformedAppendResponse(code) from exc
     if not isinstance(payload, dict):
-        raise ValueError("append response body must be an object")
+        raise _MalformedAppendResponse(code)
     return int(status), payload

@@ -71,6 +71,7 @@ RUNTIME_EVENT_NAMES = frozenset({
     "runtime.batch_attempt",
     "runtime.acknowledged",
     "runtime.retry",
+    "runtime.discarded",
     "runtime.capacity",
     "runtime.recovery",
 })

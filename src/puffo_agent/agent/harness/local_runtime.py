@@ -566,7 +566,7 @@ def build_local_runtime_adapter(
     projecting_sink = RuntimeEventProjectingSink(outbox, projector)
     manager: RuntimeManager
 
-    def require_initial_capacity() -> None:
+    async def require_initial_capacity() -> None:
         sizing_projector = RuntimeEventProjector(
             agent_id=prepared.preparer.agent_id,
             session_ref=projector.session_ref,
@@ -583,31 +583,31 @@ def build_local_runtime_adapter(
             len(outbox.canonical_bytes(value))
             for value in sizing_projector.project_all(sizing_start)
         )
-        outbox.require_turn_capacity(estimated_start_bytes=estimated)
+        # The durable usage read runs on the outbox worker thread: this hook is
+        # awaited from the daemon loop, which must not block on SQLite.
+        await outbox.arequire_turn_capacity(estimated_start_bytes=estimated)
 
     async def persist_event(event: HarnessEvent) -> None:
         logical_session = str(event.session_ref or manager.session_ref)
         projector.session_ref = logical_session
         await projecting_sink(event)
         event_type = getattr(event.type, "value", event.type)
+        # Only the session and turn boundaries rewrite durable state; every
+        # other event (a streamed delta above all) must reach the outbox no
+        # more than once, so the state read stays inside the branch using it.
         if event_type == "turn.started":
             active_turn = str(event.turn_ref)
         elif event_type in {"turn.completed", "turn.abandoned"}:
             active_turn = None
-        else:
+        elif event_type in {"session.opened", "session.resumed"}:
             active_turn = (await outbox.astate()).get("active_turn_ref") or None
-        if event_type in {
-            "turn.started",
-            "turn.completed",
-            "turn.abandoned",
-            "session.opened",
-            "session.resumed",
-        }:
-            await outbox.aset_active_turn(
-                active_turn,
-                session_ref=logical_session,
-                native_session_id=manager.native_session_id,
-            )
+        else:
+            return
+        await outbox.aset_active_turn(
+            active_turn,
+            session_ref=logical_session,
+            native_session_id=manager.native_session_id,
+        )
 
     manager = RuntimeManager(
         driver,

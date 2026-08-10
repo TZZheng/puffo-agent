@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
+import puffo_agent
 from puffo_agent.agent.harness.driver import HarnessEvent, SessionRef, TurnRef
-from puffo_agent.agent._logging import log_runtime_event
+from puffo_agent.agent._logging import RUNTIME_EVENT_NAMES, log_runtime_event
 from puffo_agent.agent.runtime_events import (
     DeltaCoalescer,
     LifecycleValidator,
@@ -377,6 +380,34 @@ def test_log_command_normalization_and_projection_boundaries_are_closed(caplog):
     assert secret not in "\n".join(
         record.getMessage() for record in caplog.records
     )
+
+
+_LOGGED_EVENT_NAME = re.compile(
+    r'(?:log_runtime_event\(\s*[^,()]+,\s*|_log\(\s*)"([a-z_]+\.[a-z_]+)"'
+)
+
+
+def test_every_logged_runtime_event_name_is_supported():
+    """An unlisted name is dropped silently, so evidence disappears unseen.
+
+    ``runtime.discarded`` is the record that a permanently rejected event left
+    the outbox; it and every other literal emission site must be admitted by
+    the allowlist rather than swallowed by the unsupported-event guard.
+    """
+    assert "runtime.discarded" in RUNTIME_EVENT_NAMES
+
+    source_root = Path(puffo_agent.__file__).parent
+    emitted: dict[str, str] = {}
+    for module in sorted(source_root.rglob("*.py")):
+        for match in _LOGGED_EVENT_NAME.finditer(module.read_text()):
+            emitted.setdefault(match.group(1), module.name)
+
+    assert emitted, "no runtime event emission sites were found to check"
+    unsupported = {
+        name: module for name, module in emitted.items()
+        if name not in RUNTIME_EVENT_NAMES
+    }
+    assert unsupported == {}
 
 
 def test_second_output_block_is_accepted_and_terminal_state_is_pruned():

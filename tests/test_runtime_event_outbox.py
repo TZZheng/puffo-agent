@@ -130,6 +130,7 @@ async def test_turn_capacity_requires_complete_initial_pair_and_terminal(tmp_pat
         max_bytes=pair_bytes + terminal_bytes, terminal_reserve_bytes=terminal_bytes,
     )
     assert exact.can_start_turn(estimated_start_bytes=pair_bytes)
+    await exact.arequire_turn_capacity(estimated_start_bytes=pair_bytes)
     await exact.enqueue(start)
     await exact.enqueue(activity)
     await exact.enqueue(terminal, terminal=True)
@@ -149,6 +150,16 @@ async def test_turn_capacity_requires_complete_initial_pair_and_terminal(tmp_pat
     assert not short.can_start_turn(estimated_start_bytes=pair_bytes)
     with pytest.raises(OutboxCapacityError):
         short.require_turn_capacity(estimated_start_bytes=pair_bytes)
+    # The hook the daemon loop awaits must refuse identically while reading
+    # usage off the loop thread, so admission never blocks on SQLite.
+    reading_threads: set[int] = set()
+    short._db.set_trace_callback(
+        lambda _statement: reading_threads.add(threading.get_ident())
+    )
+    with pytest.raises(OutboxCapacityError):
+        await short.arequire_turn_capacity(estimated_start_bytes=pair_bytes)
+    short._db.set_trace_callback(None)
+    assert reading_threads and threading.get_ident() not in reading_threads
     assert short.usage() == (0, 0)
     await short.enqueue(terminal, terminal=True)
     assert [row.event_type for row in short.prefix()] == ["turn.finished"]
@@ -299,7 +310,13 @@ async def test_order_uses_sequence_not_occurred_at(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_malformed_head_is_discarded_so_later_sequence_can_progress(tmp_path):
+async def test_malformed_2xx_body_retains_fifo_instead_of_acknowledging(tmp_path):
+    """A 2xx whose body does not name this batch is not an acknowledgement.
+
+    HTTP status alone must never authorise deleting durable evidence, so every
+    row survives repeated attempts and the channel degrades under a named code
+    until a validated acknowledgement arrives.
+    """
     outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
     await outbox.enqueue(event(1))
     await outbox.enqueue(event(2))
@@ -308,12 +325,12 @@ async def test_malformed_head_is_discarded_so_later_sequence_can_progress(tmp_pa
         return 200, {"accepted": [{"event_id": "evt_2"}]}
 
     uploader = RuntimeEventUploader(outbox, malformed)
-    # A rejected multi-row batch isolates its head before any discard.
-    assert (await uploader.upload_once()).state == "retry"
-    result = await uploader.upload_once()
-    assert result.state == "discarded"
+    for _ in range(2):
+        result = await uploader.upload_once()
+        assert result.state == "degraded"
+        assert result.error_code == "malformed_response"
     assert [row.event_id for row in outbox.prefix()] == [
-        "evt_2_turn.started",
+        "evt_1_turn.started", "evt_2_turn.started",
     ]
     accepted = []
 
@@ -321,10 +338,34 @@ async def test_malformed_head_is_discarded_so_later_sequence_can_progress(tmp_pa
         accepted.extend(value["event_id"] for value in json.loads(body)["events"])
         return 200, {"accepted": [{"event_id": value} for value in accepted]}
 
-    uploader = RuntimeEventUploader(outbox, accept)
-    assert (await uploader.upload_once()).state == "uploaded"
-    assert accepted == ["evt_2_turn.started"]
+    assert (await RuntimeEventUploader(outbox, accept).upload_once()).state == (
+        "uploaded"
+    )
+    assert accepted == ["evt_1_turn.started", "evt_2_turn.started"]
     assert outbox.prefix() == []
+    outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_2xx_body_is_retained_under_the_same_named_code(tmp_path):
+    """An undecodable 2xx body is the same fault class as a malformed one.
+
+    The empty body of ``worker_run``'s ``HttpError`` translation must not be
+    read as consent to drop the batch, and it must not hide behind the generic
+    transport code.
+    """
+    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    await outbox.enqueue(event(1))
+
+    async def empty(_path, _body):
+        return 200, ""
+
+    uploader = RuntimeEventUploader(outbox, empty)
+    for _ in range(2):
+        result = await uploader.upload_once()
+        assert result.state == "degraded"
+        assert result.error_code == "malformed_response"
+    assert [row.event_id for row in outbox.prefix()] == ["evt_1_turn.started"]
     outbox.close()
 
 

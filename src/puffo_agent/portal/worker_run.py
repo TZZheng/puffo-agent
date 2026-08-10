@@ -663,4 +663,30 @@ class StandardWorkerRun:
         worker.runtime.status = "stopped"
         worker.runtime.save(context.paths.agent_id)
         if context.runtime_event_outbox is not None:
+            # The Runtime Manager's reader is what feeds this outbox, so it has
+            # to stop first. ``Worker.stop`` closes the adapter only after
+            # awaiting this task, which would leave a window where an in-flight
+            # driver event is persisted onto an already shut-down executor.
+            await self._close_local_adapter(context.paths.agent_id)
             context.runtime_event_outbox.close()
+
+    async def _close_local_adapter(self, agent_id: str) -> None:
+        """Stop the local Driver's event reader before its durable sink goes."""
+        worker = self.worker
+        if worker._adapter is None:
+            return
+        try:
+            await asyncio.wait_for(worker._adapter.aclose(), timeout=5.0)
+        except asyncio.TimeoutError:
+            # Bounded so a wedged Driver cannot outlive the cancel budget
+            # ``Worker.stop`` allows; the adapter is left for stop() to retry.
+            logger.warning(
+                "agent %s: local Driver close timed out; closing the runtime "
+                "event outbox anyway", agent_id,
+            )
+            return
+        except Exception:
+            logger.exception(
+                "agent %s: failed to close local Driver during cleanup", agent_id
+            )
+        worker._adapter = None
