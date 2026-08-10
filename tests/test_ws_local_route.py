@@ -506,20 +506,26 @@ async def _processed(store, envelope_id):
 
 
 async def _seed_v1_store(tmp_path):
-    from puffo_agent.agent.message_store import MessageStore, ReceiptDisposition
+    from puffo_agent.agent.message_store import MessageStore
 
     store = MessageStore(tmp_path / "messages.db")
     await store.open()
+    await _store_v1_receipt(store)
+    return store
+
+
+async def _store_v1_receipt(store, envelope_id: str = "v1-one"):
+    from puffo_agent.agent.message_store import ReceiptDisposition
+
     await store.store_receipt(
         {
-            "envelope_id": "v1-one", "envelope_kind": "channel",
+            "envelope_id": envelope_id, "envelope_kind": "channel",
             "sender_slug": "alice", "space_id": "sp", "channel_id": "ch",
             "content": {"text": "hello v1", "sender_display_name": "Alice"},
             "content_type": "puffo/message+attachments/v1", "sent_at": 1,
         },
         server_seq=1, disposition=ReceiptDisposition.ELIGIBLE, reason="test receipt",
     )
-    return store
 
 
 @pytest.mark.asyncio
@@ -632,7 +638,9 @@ async def _start_v2_attached(monkeypatch, tmp_path, store):
     import puffo_agent.agent.send_coordinator as coordinator_mod
 
     monkeypatch.setattr(coordinator_mod, "SendCoordinator", _RecordingCoordinator)
-    monkeypatch.setattr(route_mod, "_build_tool_dispatch", lambda _point: {})
+    monkeypatch.setattr(
+        route_mod, "_build_tool_dispatch", lambda _point, _runtime=None: {},
+    )
     class V2Cfg(FakeCfg):
         def resolve_workspace_dir(self):
             return tmp_path
@@ -721,5 +729,98 @@ async def test_v2_receipt_to_global_bundle_admitted_end_and_owned_runtime_cleanu
     transport._inbound.put_nowait(None)
     await served
     assert client.global_runtime is None
+    assert not hasattr(client, "_ws_local_owned_runtime")
+    await store.close()
+
+
+class _DropConnectedTransport(FakeTransport):
+    """Authenticates fine, then loses the ``connected`` frame write."""
+
+    async def send(self, raw: str) -> None:
+        if json.loads(raw)["type"] == "connected":
+            raise RuntimeError("connected frame write dropped")
+        await super().send(raw)
+
+
+@pytest.mark.asyncio
+async def test_pre_attach_failure_leaves_the_client_untouched(monkeypatch, tmp_path):
+    """F1/B3: a connection that dies before attach owns nothing on the client.
+
+    The owned runtime used to be installed at session construction — before
+    ``registry.acquire`` and before the ``connected`` frame — so a connection
+    that never attached left a never-started runtime bound to its own dead
+    bridge on the long-lived client, which the next connection then reused.
+    """
+    import puffo_agent.agent.send_coordinator as coordinator_mod
+
+    from puffo_agent.agent.message_store import MessageStore
+
+    monkeypatch.setattr(coordinator_mod, "SendCoordinator", _RecordingCoordinator)
+    store = MessageStore(tmp_path / "messages.db")
+    await store.open()
+    client = V1Client(store, tmp_path)
+    reporter = FakeReporter()
+    hub = _v1_hub(client, tmp_path, reporter)
+    monkeypatch.setattr(
+        route_mod, "authenticate_bundle",
+        lambda _blob, _pw: AuthedAgent("puffotest-1", "puffotest", "Puffo Test"),
+    )
+    transport = _DropConnectedTransport()
+    transport.feed({"type": "connect", "bundle": "Yg==", "password": "pw"})
+
+    await serve_attached(transport, hub)
+
+    assert transport.closed
+    assert not client.started.is_set()  # the consumer never ran
+    assert reporter.heartbeats == 0  # ... and neither did the attach
+    assert hub.registry.current("puffotest") is None  # slot freed
+    assert client.global_runtime is None
+    assert getattr(client, "send_coordinator", None) is None
+    assert getattr(client, "send_delegate", None) is None
+    assert not hasattr(client, "_ws_local_owned_runtime")
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_binds_turn_dispatch_to_the_new_bridge(monkeypatch, tmp_path):
+    """The reconnect contract: a planned turn lands on the live connection.
+
+    Detach unwinds the connection-owned runtime completely, so the reattach
+    builds a fresh one whose ``run_turn`` closes over the *new* bridge and
+    session rather than the previous connection's orphaned closure.
+    """
+    import puffo_agent.agent.send_coordinator as coordinator_mod
+
+    from puffo_agent.agent.message_store import MessageStore
+
+    monkeypatch.setattr(coordinator_mod, "SendCoordinator", _RecordingCoordinator)
+    store = MessageStore(tmp_path / "messages.db")
+    await store.open()
+    client = V1Client(store, tmp_path)
+    hub = _v1_hub(client, tmp_path, FakeReporter())
+
+    first, served = await _attach_v1(monkeypatch, hub, client)  # nothing pending
+    first_runtime = client.global_runtime
+    assert first_runtime is not None
+    first._inbound.put_nowait(None)
+    await served
+    assert client.global_runtime is None
+    assert not hasattr(client, "_ws_local_owned_runtime")
+
+    await _store_v1_receipt(store)
+    client.started.clear()
+    second, served = await _attach_v1(monkeypatch, hub, client)
+    assert client.global_runtime is not None
+    assert client.global_runtime is not first_runtime
+
+    bundles = await _poll(lambda: _ready(second.by_type("bundle")))
+    assert "<global_inbox_notice>" in bundles[0]["messages"][0]["text"]
+    assert first.by_type("bundle") == []  # dispatch follows the live session
+
+    second._inbound.put_nowait(None)
+    await served
+    assert client.global_runtime is None
+    assert client.send_coordinator is None
+    assert client.send_delegate is None
     assert not hasattr(client, "_ws_local_owned_runtime")
     await store.close()

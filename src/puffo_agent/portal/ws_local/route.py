@@ -171,11 +171,21 @@ class _WsLocalContextAdapter:
         )
 
 
-def _build_tool_dispatch(point: AttachPoint):
+def _build_tool_dispatch(point: AttachPoint, runtime=None):
     from ...mcp.puffo_core_tools import PuffoCoreToolsConfig
 
     client = point.client
-    send_coordinator = getattr(client, "send_delegate", None)
+    # The runtime this session actually runs on is passed in explicitly: a
+    # connection-owned runtime is no longer published on the client at
+    # construction time (see ``_install_owned_runtime``). For the reused
+    # worker runtime these are the same objects the client carries.
+    send_coordinator = (
+        getattr(runtime, "send_delegate", None)
+        or getattr(client, "send_delegate", None)
+    )
+    inbox_runtime = runtime if runtime is not None else getattr(
+        client, "global_runtime", None
+    )
     cfg = PuffoCoreToolsConfig(
         slug=client.slug,
         agent_id=point.agent_id,
@@ -187,7 +197,7 @@ def _build_tool_dispatch(point: AttachPoint):
         workspace=getattr(client, "workspace", None),
         message_client=client,
         send_coordinator=send_coordinator,
-        inbox_runtime=getattr(client, "global_runtime", None),
+        inbox_runtime=inbox_runtime,
         # T23: the daemon owns the single per-agent bridge WS, so only
         # the in-process ws-local tools can drive it. None on native
         # agents → send_message keeps the signed-crypto path. The
@@ -217,14 +227,18 @@ async def serve_attached(transport: Transport, hub: WsLocalHub) -> None:
     """Wire the hub into ``serve_connection``. Split out from the aiohttp
     boilerplate so it's exercisable over any transport."""
 
+    # Scoped to this connection: it carries the connection-owned runtime from
+    # construction to attach without publishing it on the long-lived client,
+    # so a connection that never attaches owns nothing to unwind.
+    connection: dict[str, Any] = {}
     await serve_connection(
         transport,
         authenticate=authenticate_bundle,
         is_servable=hub.is_servable,
         agent_context=partial(_ws_agent_context, hub),
         registry=hub.registry,
-        make_session=partial(_make_ws_session, hub),
-        start_consumer=partial(_start_ws_consumer, hub),
+        make_session=partial(_make_ws_session, hub, connection),
+        start_consumer=partial(_start_ws_consumer, hub, connection),
         new_session_id=lambda: f"wsl_{uuid.uuid4().hex}",
         base64_decode=base64.b64decode,
     )
@@ -247,9 +261,13 @@ async def _ws_agent_context(hub: WsLocalHub, slug: str) -> dict:
 
 
 def _make_ws_session(
-    hub: WsLocalHub, authed, session_id, transport, bridge, capabilities
+    hub: WsLocalHub, connection: dict, authed, session_id, transport, bridge,
+    capabilities,
 ) -> WsLocalSession:
     point, client = hub.get(authed.slug), hub.get(authed.slug).client
+    # No ``await`` between this read and ``registry.acquire`` in the endpoint,
+    # so the decision and the claim are atomic on the event loop: a reused
+    # runtime here can only be the worker's, never a detaching connection's.
     runtime = getattr(client, "global_runtime", None)
     holder: dict[str, WsLocalSession] = {}
     if runtime is None:
@@ -260,8 +278,9 @@ def _make_ws_session(
         # capability check belongs at the wire-shape seam
         # (``WsLocalBridge.dispatch_planned``), not at construction.
         runtime = _make_owned_runtime(point, bridge, holder)
-        client.global_runtime = runtime
-        client._ws_local_owned_runtime = runtime
+        # F1/B3: publishing it on the client is deferred to the attach scope
+        # that unwinds it. Until then it belongs to this connection alone.
+        connection["owned_runtime"] = runtime
     bridge._runtime = runtime
     session = WsLocalSession(
         slug=authed.slug,
@@ -269,7 +288,7 @@ def _make_ws_session(
         transport=transport,
         queue=BundleQueue(),
         reporter=point.reporter,
-        tool_dispatch=_build_tool_dispatch(point),
+        tool_dispatch=_build_tool_dispatch(point, runtime),
         on_acked=bridge.on_acked,
         on_admitted=bridge.on_admitted,
         on_tool_result=bridge.on_tool_result,
@@ -319,9 +338,24 @@ def _make_owned_runtime(point: AttachPoint, bridge, holder: dict[str, WsLocalSes
     )
     runtime.coordinator = coordinator
     runtime.send_delegate = TrackingSendDelegate(coordinator, runtime.attempts, runtime)
-    client.send_coordinator = coordinator
-    client.send_delegate = runtime.send_delegate
     return runtime
+
+
+def _install_owned_runtime(client, runtime) -> None:
+    """Publish a connection-owned runtime on the long-lived client.
+
+    The single install site, called only once the registry slot is claimed
+    and the attach has begun, so ``_stop_ws_consumer``'s guarded reset is
+    always reached. Installing earlier (at construction) left a rejected
+    duplicate or a dropped ``connected`` write with an orphaned runtime that
+    a later connection would reuse against a dead session (F1/B3).
+    """
+    # The ownership marker goes first: it is what ``_stop_ws_consumer``
+    # guards on, so even a partial install is fully unwound.
+    client._ws_local_owned_runtime = runtime
+    client.global_runtime = runtime
+    client.send_coordinator = runtime.coordinator
+    client.send_delegate = runtime.send_delegate
 
 
 class _ConnectedRelay:
@@ -364,17 +398,21 @@ async def _prepare_owned_reminder_sync(point: AttachPoint, client, runtime):
     )
 
 
-async def _start_ws_consumer(hub: WsLocalHub, authed, on_message) -> None:
+async def _start_ws_consumer(
+    hub: WsLocalHub, connection: dict, authed, on_message,
+) -> None:
     from ...agent.global_inbox_runtime import await_listener_with_runtime
 
     point, client = hub.get(authed.slug), hub.get(authed.slug).client
-    owned = getattr(client, "_ws_local_owned_runtime", None)
+    owned = connection.get("owned_runtime")
     heartbeat = asyncio.ensure_future(point.reporter.run_heartbeat_loop())
     reminder_sync = None
     reminder_task = None
     runtime_task = None
     try:
         if owned is not None:
+            # First statement of the scope whose ``finally`` unwinds it.
+            _install_owned_runtime(client, owned)
             reminder_sync = await _prepare_owned_reminder_sync(point, client, owned)
             reminder_task = asyncio.ensure_future(
                 reminder_sync.run(request_snapshot_on_start=False)
