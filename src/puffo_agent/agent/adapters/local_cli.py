@@ -793,15 +793,7 @@ class LocalCLIAdapter(Adapter):
         if self._session is not None:
             return self._session
         extra = self._prepare_mcp_args()
-        strip_claude_api_key_from_settings(
-            self.agent_home_dir / ".claude" / "settings.json",
-        )
-        strip_claude_api_key_from_settings(
-            Path(self.claude_dir) / "settings.json",
-        )
-        strip_claude_api_key_from_settings(
-            Path(self.claude_dir) / "settings.local.json",
-        )
+        self._strip_claude_api_key_settings()
         # Register the PreToolUse permission hook before spawning;
         # settings.json is read fresh every spawn so this is
         # idempotent on every worker restart.
@@ -843,6 +835,23 @@ class LocalCLIAdapter(Adapter):
             env_overrides=self.env_overrides,
         )
         return self._session
+
+    def _strip_claude_api_key_settings(self) -> None:
+        paths: list[Path] = []
+        agent_home_dir = getattr(self, "agent_home_dir", None)
+        if agent_home_dir is not None:
+            paths.extend([
+                Path(agent_home_dir) / ".claude" / "settings.json",
+                Path(agent_home_dir) / ".claude" / "settings.local.json",
+            ])
+        claude_dir = getattr(self, "claude_dir", None)
+        if claude_dir is not None:
+            paths.extend([
+                Path(claude_dir) / "settings.json",
+                Path(claude_dir) / "settings.local.json",
+            ])
+        for settings_path in paths:
+            strip_claude_api_key_from_settings(settings_path)
 
     def _macos_credential_env(self) -> dict[str, str]:
         """macOS-only env hardening:
@@ -960,6 +969,7 @@ class LocalCLIAdapter(Adapter):
         extra_args: list[str],
         env_overrides: dict[str, str] | None = None,
     ) -> list[str]:
+        self._strip_claude_api_key_settings()
         # ``env_overrides`` is merged into the subprocess env on the
         # host by ClaudeSession._spawn; the kwarg here is just for
         # symmetry with the docker adapter.

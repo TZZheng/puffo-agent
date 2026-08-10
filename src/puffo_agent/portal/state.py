@@ -987,6 +987,7 @@ class DaemonConfig:
             port=int(r.get("port", rs_defaults.port)),
         )
         return cfg
+
     def save(self) -> None:
         path = daemon_yml_path()
         path.parent.mkdir(parents=True, exist_ok=True)

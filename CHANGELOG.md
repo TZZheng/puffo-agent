@@ -52,7 +52,7 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   explicitly enabled.** Ambient `ANTHROPIC_API_KEY` values are ignored for
   local and Docker CLI agents. A daemon-owned `anthropic.api_key` is passed to
   Claude Code only when `anthropic.cli_use_api_key: true` is set in
-  `daemon.yml`.
+  `daemon.yml`; both values can also be updated with `puffo-agent config`.
 
 - **Codex Docker agents can write to their mounted workspace reliably.** The
   container is now the effective filesystem sandbox, avoiding unsupported

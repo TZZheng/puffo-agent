@@ -391,10 +391,14 @@ class DockerCLIAdapter(Adapter):
         extra_args: list[str],
         env_overrides: dict[str, str] | None = None,
     ) -> list[str]:
+        self._strip_claude_api_key_settings()
         cmd: list[str] = [getattr(self, "_docker_bin", "docker"), "exec", "-i"]
         if getattr(self, "claude_api_key", ""):
             cmd.extend(["-e", "ANTHROPIC_API_KEY"])
         else:
+            # docker exec cannot unset a variable. An explicit empty value
+            # prevents the container image from supplying an ambient key;
+            # Claude Code treats the empty value as subscription mode.
             cmd.extend(["-e", "ANTHROPIC_API_KEY="])
         # ``env_overrides`` flows in before the container name so
         # docker treats each ``-e KEY=VALUE`` as an exec flag.
@@ -402,7 +406,10 @@ class DockerCLIAdapter(Adapter):
         # errors. Never pass secrets here; use Docker's name-only ``-e NAME``
         # passthrough, as the Codex bearer-token path does.
         for key, value in (env_overrides or {}).items():
-            if key == "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":
+            if key in {
+                "ANTHROPIC_API_KEY",
+                "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+            }:
                 continue
             cmd.extend(["-e", f"{key}={value}"])
         cmd.extend([
@@ -440,6 +447,23 @@ class DockerCLIAdapter(Adapter):
         if api_key:
             env["ANTHROPIC_API_KEY"] = api_key
         return env
+
+    def _strip_claude_api_key_settings(self) -> None:
+        paths: list[Path] = []
+        claude_home_src = getattr(self, "claude_home_src", None)
+        if claude_home_src is not None:
+            paths.extend([
+                Path(claude_home_src) / "settings.json",
+                Path(claude_home_src) / "settings.local.json",
+            ])
+        claude_dir = getattr(self, "claude_dir", None)
+        if claude_dir is not None:
+            paths.extend([
+                Path(claude_dir) / "settings.json",
+                Path(claude_dir) / "settings.local.json",
+            ])
+        for settings_path in paths:
+            strip_claude_api_key_from_settings(settings_path)
 
     def _prepare_mcp_args(self) -> list[str]:
         """Write the per-agent MCP config into the workspace and
@@ -637,12 +661,7 @@ class DockerCLIAdapter(Adapter):
                     "agent %s: seeded per-agent virtual $HOME at %s from %s",
                     self.agent_id, self.agent_home_dir, host_home,
                 )
-            for settings_path in (
-                self.claude_home_src / "settings.json",
-                Path(self.claude_dir) / "settings.json",
-                Path(self.claude_dir) / "settings.local.json",
-            ):
-                strip_claude_api_key_from_settings(settings_path)
+            self._strip_claude_api_key_settings()
             claude_auth_mode = sync_host_claude_code_auth_view(
                 host_home, self.agent_home_dir,
             )
