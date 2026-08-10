@@ -3,7 +3,7 @@
 Home defaults to ``~/.puffo-agent/`` (override with ``PUFFO_AGENT_HOME``)::
 
     ~/.puffo-agent/
-      daemon.yml          # model defaults, Gemini Docker key, daemon settings
+      daemon.yml          # model defaults, reserved provider settings, daemon settings
       daemon.pid          # daemon pid
       agents/
         <agent_id>/
@@ -290,14 +290,13 @@ class DaemonConfig:
     """Contents of ~/.puffo-agent/daemon.yml.
 
     Per-agent identity lives in each agent's ``agent.yml``; the
-    daemon holds model hints, the Gemini Docker key, and reconcile knobs.
+    daemon holds model hints, reserved provider settings, and reconcile knobs.
     """
 
     default_provider: str = "anthropic"
     anthropic: ProviderConfig = field(default_factory=ProviderConfig)
     openai: ProviderConfig = field(default_factory=ProviderConfig)
-    # Required for cli-docker + harness=gemini-cli agents; passed
-    # through as GEMINI_API_KEY to the containerised gemini CLI.
+    # Reserved for future Google/Gemini support; no supported runtime reads it.
     google: ProviderConfig = field(default_factory=ProviderConfig)
     skills_dir: str = ""  # absolute path; empty = no shared skills
     reconcile_interval_seconds: float = 2.0
