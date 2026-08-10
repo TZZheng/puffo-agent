@@ -1207,6 +1207,47 @@ async def test_terminal_snapshot_suppresses_stale_local_schedule_without_event(t
 
 
 @pytest.mark.asyncio
+async def test_remote_cancellation_does_not_ack_local_delivery(tmp_path):
+    _syncer, store, _scheduler, _keys = _sync(
+        tmp_path,
+        _RecordingTransport(),
+        now=[2_000],
+    )
+    reminder = await store.create_reminder(
+        reminder_id="reminder-local-delivery",
+        occurrence_id="occurrence-local-delivery",
+        target="dm:peer-a",
+        content="already delivered locally",
+        intended_at_ms=1_000,
+        created_at_ms=500,
+    )
+    delivered = await store.deliver_due_reminders(now_ms=2_000)
+    assert [item.occurrence_id for item in delivered] == [reminder.occurrence_id]
+
+    result = await store.materialize_remote_terminal_reminder(
+        reminder_id=reminder.reminder_id,
+        occurrence_id=reminder.occurrence_id,
+        intended_at_ms=reminder.intended_at_ms,
+        lifecycle="cancelled",
+        lifecycle_at_ms=1_500,
+        revision=2,
+        payload_format=REMINDER_PAYLOAD_FORMAT,
+    )
+
+    assert result.changed
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None
+    assert (record.state, record.revision, record.server_ack_revision) == (
+        "delivered",
+        2,
+        0,
+    )
+    pending = await store.pending_reminder_sync_records(force=True)
+    assert [item.occurrence_id for item in pending] == [reminder.occurrence_id]
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_snapshot_never_regresses_terminal_or_deletes_or_overwrites_conflict(tmp_path):
     transport = _RecordingTransport()
     sync, store, _scheduler, keys = _sync(tmp_path, transport)

@@ -285,6 +285,31 @@ class ReminderStoreMixin:
             )
         return next_state, None, lifecycle_at_ms, None, None
 
+    @classmethod
+    def _merged_remote_terminal_values(
+        cls,
+        record: ReminderSyncRecord,
+        lifecycle: str,
+        lifecycle_at_ms: int,
+        revision: int,
+    ) -> tuple[
+        str,
+        int | None,
+        int | None,
+        int | None,
+        str | None,
+        int,
+        int,
+    ]:
+        values = cls._terminal_values(record, lifecycle, lifecycle_at_ms)
+        next_state = values[0]
+        next_revision = max(record.revision, revision)
+        # A snapshot only acknowledges the lifecycle it actually returned.
+        next_ack_revision = record.server_ack_revision
+        if next_state == lifecycle:
+            next_ack_revision = max(next_ack_revision, revision)
+        return (*values, next_revision, next_ack_revision)
+
     async def create_reminder(
         self,
         *,
@@ -728,21 +753,24 @@ class ReminderStoreMixin:
                     await db.rollback()
                     return ReminderMaterializationResult(False, conflict=True)
 
-                # A local delivery is irreversible evidence. Otherwise the
-                # authenticated Server terminal is the canonical lifecycle.
                 (
                     next_state,
                     actual_fire_at_ms,
                     cancelled_at_ms,
                     delivered_at_ms,
                     delivered_event_id,
-                ) = self._terminal_values(record, lifecycle, lifecycle_at_ms)
-                next_revision = max(record.revision, revision)
-
+                    next_revision,
+                    next_ack_revision,
+                ) = self._merged_remote_terminal_values(
+                    record,
+                    lifecycle,
+                    lifecycle_at_ms,
+                    revision,
+                )
                 changed = (
                     record.state != next_state
                     or record.revision != next_revision
-                    or record.server_ack_revision < next_revision
+                    or record.server_ack_revision < next_ack_revision
                     or record.payload_format is None
                     or record.actual_fire_at_ms != actual_fire_at_ms
                     or record.cancelled_at_ms != cancelled_at_ms
@@ -775,7 +803,7 @@ class ReminderStoreMixin:
                         delivered_at_ms,
                         delivered_event_id,
                         next_revision,
-                        next_revision,
+                        next_ack_revision,
                         payload_format,
                         occurrence_id,
                     ),
