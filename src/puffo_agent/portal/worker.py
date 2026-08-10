@@ -841,6 +841,7 @@ class Worker:
         )
         self._stop = asyncio.Event()
         self._task: asyncio.Task | None = None
+        self._restart_required = False
         self._adapter: Adapter | None = None
         # Held here so ``stop()`` can close the SQLite + WS handles
         # the client owns. Required on Windows so ``messages.db*``
@@ -935,6 +936,15 @@ class Worker:
             return self._task
         self._task = asyncio.ensure_future(self._run())
         return self._task
+
+    @property
+    def restart_required(self) -> bool:
+        """Whether a post-start fatal failure requires daemon replacement."""
+        return (
+            self._restart_required
+            and self._task is not None
+            and self._task.done()
+        )
 
     async def wait_warm(self, timeout: float | None = None) -> bool:
         """Block until warm() finishes or the worker exits early.

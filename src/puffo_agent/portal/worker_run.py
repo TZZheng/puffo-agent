@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
 
 logger = worker_module.logger
+RUNTIME_EVENT_DEGRADED_RETRY_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -528,8 +529,9 @@ class StandardWorkerRun:
         while not self.worker._stop.is_set():
             result = await uploader.upload_once()
             if result.state == "degraded":
-                return
-            delay = 0.1 if result.state == "uploaded" else 1.0
+                delay = RUNTIME_EVENT_DEGRADED_RETRY_SECONDS
+            else:
+                delay = 0.1 if result.state == "uploaded" else 1.0
             try:
                 await asyncio.wait_for(self.worker._stop.wait(), timeout=delay)
             except asyncio.TimeoutError:
@@ -581,6 +583,7 @@ class StandardWorkerRun:
         agent_id = context.paths.agent_id
         fatal = services.global_runtime_task.done()
         if fatal:
+            worker._restart_required = True
             logger.error(
                 "agent %s: stopping after global inbox runtime failure: %s",
                 agent_id,

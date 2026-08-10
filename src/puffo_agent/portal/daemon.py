@@ -254,8 +254,18 @@ class Daemon:
                     # parallel warms can OOM the host. Awaiting one at
                     # a time keeps peak RSS bounded.
                     await worker.wait_warm(timeout=self._warm_serialise_timeout)
-                elif _worker_needs_restart(worker.agent_cfg, agent_cfg):
-                    logger.info("agent %s: config changed, restarting worker", agent_id)
+                elif (
+                    worker.restart_required
+                    or _worker_needs_restart(worker.agent_cfg, agent_cfg)
+                ):
+                    reason = (
+                        "fatal runtime exit"
+                        if worker.restart_required
+                        else "config changed"
+                    )
+                    logger.info(
+                        "agent %s: %s, restarting worker", agent_id, reason
+                    )
                     await self._stop_worker(agent_id)
                     worker = Worker(
                         self.daemon_cfg,

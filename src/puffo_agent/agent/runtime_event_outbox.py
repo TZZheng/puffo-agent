@@ -385,6 +385,7 @@ class RuntimeEventUploader:
                 "runtime.acknowledged", first_sequence=rows[0].sequence,
                 last_sequence=rows[-1].sequence, event_count=len(rows),
             )
+            self.degraded_error = ""
             self._isolate_head = False
             return UploadResult("uploaded", len(rows))
 

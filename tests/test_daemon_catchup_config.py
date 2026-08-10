@@ -162,3 +162,43 @@ def test_real_reconcile_initializes_multiple_ws_local_workers(
             tmp_path, monkeypatch,
         )
     )
+
+
+async def _assert_reconcile_replaces_post_start_fatal_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+
+    async def no_profile_sync(_config: AgentConfig) -> None:
+        return None
+
+    monkeypatch.setattr(profile_sync, "sync_full_profile", no_profile_sync)
+    config = _configured_agent("restart-agent")
+    config.save()
+    daemon = Daemon(DaemonConfig())
+    try:
+        await daemon._reconcile_once()
+        failed = daemon.workers[config.id]
+        failed._restart_required = True
+        assert failed._task is not None
+        failed._task.cancel()
+        await asyncio.gather(failed._task, return_exceptions=True)
+
+        await daemon._reconcile_once()
+
+        replacement = daemon.workers[config.id]
+        assert replacement is not failed
+        assert replacement.runtime.status == "running"
+        assert failed._client is None
+    finally:
+        await daemon._stop_all_workers()
+
+
+def test_reconcile_replaces_post_start_fatal_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asyncio.run(
+        _assert_reconcile_replaces_post_start_fatal_worker(tmp_path, monkeypatch)
+    )

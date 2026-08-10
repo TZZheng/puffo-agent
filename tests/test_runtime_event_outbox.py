@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +17,8 @@ from puffo_agent.agent.runtime_event_outbox import (
 )
 from puffo_agent.agent.harness.driver import HarnessEvent, SessionRef, TurnRef
 from puffo_agent.agent.runtime_events import RuntimeEvent, RuntimeEventProjector
+from puffo_agent.portal import worker_run as worker_run_module
+from puffo_agent.portal.worker_run import StandardWorkerRun
 
 
 def event(index: int, type_: str = "turn.started") -> RuntimeEvent:
@@ -342,6 +346,41 @@ async def test_channel_level_http_failures_preserve_fifo_and_degrade(tmp_path, s
         "evt_1_turn.started", "evt_2_turn.started",
     ]
     assert [row.retry_count for row in outbox.prefix()] == [0, 0]
+    outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_worker_retries_degraded_event_channel_until_recovery(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(
+        worker_run_module, "RUNTIME_EVENT_DEGRADED_RETRY_SECONDS", 0.0
+    )
+    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    await outbox.enqueue(event(1))
+    stop = asyncio.Event()
+    attempts = 0
+
+    async def recovering_transport(_path, body):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return 404, {}
+        stop.set()
+        accepted = [
+            {"event_id": item["event_id"], "cursor": item["event_id"]}
+            for item in json.loads(body)["events"]
+        ]
+        return 200, {"accepted": accepted}
+
+    uploader = RuntimeEventUploader(outbox, recovering_transport)
+    worker = SimpleNamespace(_stop=stop)
+
+    await StandardWorkerRun(worker)._upload_runtime_events(uploader)
+
+    assert attempts == 2
+    assert uploader.degraded_error == ""
+    assert outbox.prefix() == []
     outbox.close()
 
 
