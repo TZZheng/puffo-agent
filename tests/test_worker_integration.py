@@ -23,6 +23,7 @@ from puffo_agent.mcp.config import (
 )
 from puffo_agent.mcp import config as mcp_config
 from puffo_agent.portal.state import AgentConfig, PuffoCoreConfig
+from puffo_agent.portal.local_service_auth import LOCAL_SERVICE_TOKEN_ENV
 
 
 def _now_ms():
@@ -128,6 +129,7 @@ def test_puffo_core_mcp_env():
     assert env["PUFFO_WORKSPACE"] == "/workspace"
     assert env["PUFFO_RUNTIME_KIND"] == "cli-local"
     assert env["PUFFO_HARNESS"] == "claude-code"
+    assert env[LOCAL_SERVICE_TOKEN_ENV]
 
 
 def test_puffo_core_mcp_env_optional_fields():

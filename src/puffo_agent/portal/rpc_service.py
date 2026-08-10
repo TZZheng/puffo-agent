@@ -18,6 +18,7 @@ from ..agent.reminder_scheduler import normalize_reminder_timestamp
 from . import host_mcp_handler
 from ._port import bind_tcp_with_fallback
 from .host_mcp_handler import HostMcpContext
+from .local_service_auth import require_local_service_auth
 from .state import RpcServiceConfig
 
 logger = logging.getLogger(__name__)
@@ -465,7 +466,7 @@ async def cancel_reminder_route(request: web.Request) -> web.Response:
 
 
 def build_app(cfg: RpcServiceConfig) -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[require_local_service_auth])
     app.router.add_post(
         "/v1/rpc/{agent_id}/install-mcp",
         install_host_mcp_route,

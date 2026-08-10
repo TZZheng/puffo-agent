@@ -343,6 +343,12 @@ def puffo_core_mcp_env(
     ``host.docker.internal``. ``memory_dir`` (optional) pins the
     memory root for the M3 memory tools; when empty the server falls
     back to the workspace-sibling ``memory/`` dir."""
+    from ..portal.local_service_auth import (
+        LOCAL_SERVICE_TOKEN_ENV,
+        issue_local_service_token,
+    )
+
+    effective_agent_id = agent_id or slug
     env: dict[str, str] = {
         "PUFFO_CORE_SLUG": slug,
         "PUFFO_CORE_DEVICE_ID": device_id,
@@ -351,6 +357,7 @@ def puffo_core_mcp_env(
         "PUFFO_WORKSPACE": workspace,
         "PUFFO_DATA_SERVICE_URL": data_service_url,
         "PUFFO_RPC_URL": rpc_url,
+        LOCAL_SERVICE_TOKEN_ENV: issue_local_service_token(effective_agent_id),
         **_python_user_base_env(runtime_kind),
     }
     # The MCP starts with the agent workspace as cwd. A relative PYTHONPATH

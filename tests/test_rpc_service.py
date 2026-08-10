@@ -5,14 +5,35 @@ the MCP-side ``PuffoRpcClient`` and the daemon-side
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import pytest
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient as AiohttpTestClient, TestServer
 
 from puffo_agent.agent.message_store_models import LifecycleConflict
 from puffo_agent.mcp._host_mcp import PuffoRpcClient
 from puffo_agent.portal import rpc_service
 from puffo_agent.portal.host_mcp_handler import HostMcpContext
+from puffo_agent.portal.local_service_auth import (
+    issue_local_service_token,
+    local_service_headers,
+)
+
+
+class TestClient(AiohttpTestClient):
+    """Authenticate test requests for the Agent id selected by the path."""
+
+    async def _request(self, method, path, **kwargs):
+        parts = urlsplit(str(path)).path.split("/")
+        agent_id = unquote(parts[3])
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers.setdefault(
+            "Authorization",
+            local_service_headers(issue_local_service_token(agent_id))[
+                "Authorization"
+            ],
+        )
+        return await super()._request(method, path, headers=headers, **kwargs)
 
 
 def _stub_ctx(agent_id: str = "agent_test") -> HostMcpContext:
@@ -46,6 +67,21 @@ def app_client_factory():
     # Sync teardown — clients close themselves when their event loop
     # tears down, but clearing the global resolver is non-async.
     rpc_service.set_rpc_resolver(None)
+
+
+@pytest.mark.asyncio
+async def test_rpc_service_rejects_request_without_agent_token():
+    """An arbitrary local process cannot invoke one Agent's host RPC."""
+    resolver_calls: list[str] = []
+    rpc_service.set_rpc_resolver(lambda agent_id: resolver_calls.append(agent_id))
+    app = rpc_service.build_app(rpc_service.RpcServiceConfig(enabled=True, port=0))
+    async with AiohttpTestClient(TestServer(app)) as client:
+        response = await client.post(
+            "/v1/rpc/agent_a/send-message",
+            json={"channel": "ch_a", "text": "x"},
+        )
+    assert response.status == 401
+    assert resolver_calls == []
 
 
 @pytest.mark.asyncio
@@ -416,7 +452,11 @@ async def test_puffo_rpc_client_round_trips_all_reminder_objects(
     monkeypatch.setattr(rpc_service.host_mcp_handler, "cancel_reminder", cancel)
     rpc_service.set_rpc_resolver(lambda aid: _stub_ctx(aid))
     app_client = await app_client_factory()
-    client = PuffoRpcClient(str(app_client.make_url("")).rstrip("/"), "agent_a")
+    client = PuffoRpcClient(
+        str(app_client.make_url("")).rstrip("/"),
+        "agent_a",
+        issue_local_service_token("agent_a"),
+    )
     try:
         assert await client.create_reminder(
             content="exact content",

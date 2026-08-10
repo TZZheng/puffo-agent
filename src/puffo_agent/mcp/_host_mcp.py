@@ -10,6 +10,8 @@ from typing import Any, Optional
 
 import aiohttp
 
+from ..portal.local_service_auth import local_service_headers
+
 logger = logging.getLogger(__name__)
 
 
@@ -17,14 +19,20 @@ class PuffoRpcClient:
     """Async client for the daemon's loopback RPC service.
     Transport failures + non-2xx responses raise ``RuntimeError``."""
 
-    def __init__(self, base_url: str, agent_id: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        agent_id: str,
+        local_service_token: str = "",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.agent_id = agent_id
+        self._headers = local_service_headers(local_service_token)
         self._session: Optional[aiohttp.ClientSession] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(headers=self._headers)
             # Match the bare-address repr aiohttp gc-emits on a leak.
             logger.info(
                 "aiohttp ClientSession created (class=PuffoRpcClient "

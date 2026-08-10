@@ -33,6 +33,7 @@ from .host_tools import (
 )
 from .memory_tools import MemoryToolsConfig, register_memory_tools
 from .puffo_core_tools import PuffoCoreToolsConfig, register_core_tools
+from ..portal.local_service_auth import read_local_service_token
 
 logger = logging.getLogger(__name__)
 
@@ -323,6 +324,7 @@ def build_server(
     harness: str = "",
     memory_dir: str = "",
     transport: str = "",
+    local_service_token: str = "",
 ) -> FastMCP:
     ks = (
         _BridgeNoKeysStore(keystore_dir) if transport == "bridge"
@@ -336,13 +338,13 @@ def build_server(
     http = PuffoCoreHttpClient(
         server_url, ks, slug, keyless=(transport == "bridge"),
     )
-    data = DataClient(data_service_url, agent_id)
+    data = DataClient(data_service_url, agent_id, local_service_token)
 
     # None when PUFFO_RPC_URL is unset; tools surface a clear error
     # instead of crashing the whole MCP at startup.
     rpc_url = os.environ.get("PUFFO_RPC_URL", "")
     rpc_client = (
-        PuffoRpcClient(rpc_url, agent_id) if rpc_url else None
+        PuffoRpcClient(rpc_url, agent_id, local_service_token) if rpc_url else None
     )
 
     core_cfg = PuffoCoreToolsConfig(
@@ -410,6 +412,7 @@ def _cfg_from_env() -> dict[str, str]:
         "harness": os.environ.get("PUFFO_HARNESS", ""),
         "memory_dir": os.environ.get("PUFFO_MEMORY_DIR", ""),
         "transport": os.environ.get("PUFFO_CORE_TRANSPORT", ""),
+        "local_service_token": read_local_service_token(),
     }
 
 

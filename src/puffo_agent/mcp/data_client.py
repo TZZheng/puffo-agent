@@ -41,6 +41,7 @@ class StoredMessageDict:
 # drop-in in tests) raise the same type — the MCP tool layer can
 # ``except DataNotFound`` regardless of which one it has.
 from ..agent.message_store import DataNotFound  # noqa: E402  (intentional placement)
+from ..portal.local_service_auth import local_service_headers
 
 
 @dataclass
@@ -80,14 +81,20 @@ def _msg_from_dict(d: dict[str, Any]) -> StoredMessageDict:
 class DataClient:
     """Async client for the daemon's data service."""
 
-    def __init__(self, base_url: str, agent_id: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        agent_id: str,
+        local_service_token: str = "",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.agent_id = agent_id
+        self._headers = local_service_headers(local_service_token)
         self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(headers=self._headers)
             # Match the bare-address repr aiohttp gc-emits on a leak.
             logger.info(
                 "aiohttp ClientSession created (class=DataClient "

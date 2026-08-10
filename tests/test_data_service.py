@@ -12,14 +12,35 @@ import sys
 import tempfile
 from types import SimpleNamespace
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import pytest
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient as AiohttpTestClient, TestServer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.message_store import MessageStore, ReceiptDisposition
 from puffo_agent.portal import data_service as ds
+from puffo_agent.portal.local_service_auth import (
+    issue_local_service_token,
+    local_service_headers,
+)
+
+
+class TestClient(AiohttpTestClient):
+    """Authenticate test requests for the Agent id selected by the path."""
+
+    async def _request(self, method, path, **kwargs):
+        parts = urlsplit(str(path)).path.split("/")
+        agent_id = unquote(parts[3])
+        headers = dict(kwargs.pop("headers", {}) or {})
+        headers.setdefault(
+            "Authorization",
+            local_service_headers(issue_local_service_token(agent_id))[
+                "Authorization"
+            ],
+        )
+        return await super()._request(method, path, headers=headers, **kwargs)
 
 
 def test_msg_to_dict_accepts_legacy_message_without_server_seq() -> None:
@@ -104,6 +125,19 @@ async def test_lookup_channel_space_returns_seen_space() -> None:
 
 
 @pytest.mark.asyncio
+async def test_data_service_rejects_token_scoped_to_another_agent() -> None:
+    """One Agent's MCP token cannot select another Agent's database path."""
+    app = ds.build_app(ds.DataServiceConfig())
+    headers = local_service_headers(issue_local_service_token("agent_a"))
+    async with AiohttpTestClient(TestServer(app)) as client:
+        response = await client.get(
+            "/v1/data/agent_b/channels/ch_1/space",
+            headers=headers,
+        )
+    assert response.status == 401
+
+
+@pytest.mark.asyncio
 async def test_lookup_channel_space_404_for_unknown_channel() -> None:
     home = _isolated_home()
     await _seed_agent(home, "agent-data-2")
@@ -133,7 +167,9 @@ async def test_recent_messages_returns_chronological() -> None:
         from puffo_agent.mcp.data_client import DataClient
 
         data_client = DataClient(
-            str(client.server.make_url("")).rstrip("/"), "agent-data-3",
+            str(client.server.make_url("")).rstrip("/"),
+            "agent-data-3",
+            issue_local_service_token("agent-data-3"),
         )
         try:
             parsed = await data_client.get_channel_history("ch_1", 10)
@@ -326,7 +362,9 @@ async def test_send_encryption_decision_matrix_over_http() -> None:
             from puffo_agent.mcp.data_client import DataClient
             send_mode._turn_bundle_encrypted.clear()
             dc = DataClient(
-                str(client.server.make_url("")).rstrip("/"), "agent-enc-1",
+                str(client.server.make_url("")).rstrip("/"),
+                "agent-enc-1",
+                issue_local_service_token("agent-enc-1"),
             )
             try:
                 assert await dc.get_send_encryption("bot-1", "msg_pt") is False
@@ -336,13 +374,19 @@ async def test_send_encryption_decision_matrix_over_http() -> None:
 
             # Error branches fail safe to E2EE: non-route 404 + dead host.
             dc404 = DataClient(
-                str(client.server.make_url("/bogus")).rstrip("/"), "agent-enc-1",
+                str(client.server.make_url("/bogus")).rstrip("/"),
+                "agent-enc-1",
+                issue_local_service_token("agent-enc-1"),
             )
             try:
                 assert await dc404.get_send_encryption("bot-1", None) is True
             finally:
                 await dc404.close()
-            dc_dead = DataClient("http://127.0.0.1:1", "agent-enc-1")
+            dc_dead = DataClient(
+                "http://127.0.0.1:1",
+                "agent-enc-1",
+                issue_local_service_token("agent-enc-1"),
+            )
             try:
                 assert await dc_dead.get_send_encryption("bot-1", None) is True
             finally:

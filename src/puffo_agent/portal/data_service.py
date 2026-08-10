@@ -3,8 +3,8 @@ its MCP subprocess.
 
 The daemon is the sole SQLite reader/writer; MCP goes through this
 service so cli-docker doesn't open the WAL'd DB across a bind-mount
-boundary (which fails with "disk I/O error"). Loopback-only, no auth
-— same trust boundary as the keystore bind-mount.
+boundary (which fails with "disk I/O error"). Requests carry a daemon-issued,
+per-Agent bearer token so one local process cannot select another Agent's path.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from aiohttp import web
 
 from ..agent.message_store import DataNotFound, MessageStore
 from ._port import bind_tcp_with_fallback
+from .local_service_auth import require_local_service_auth
 from .state import agent_dir
 
 logger = logging.getLogger(__name__)
@@ -433,7 +434,7 @@ async def get_send_encryption(request: web.Request) -> web.Response:
 
 
 def build_app(cfg: DataServiceConfig) -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[require_local_service_auth])
     app[_STORES_KEY] = _AppState()
     app.router.add_get(
         "/v1/data/{agent_id}/channels/{channel_id}/space",

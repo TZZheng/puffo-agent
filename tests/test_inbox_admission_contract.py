@@ -54,6 +54,7 @@ from puffo_agent.mcp.puffo_core_tools import (
 )
 from puffo_agent.portal import rpc_service
 from puffo_agent.portal.host_mcp_handler import HostMcpContext
+from puffo_agent.portal.local_service_auth import issue_local_service_token
 
 
 class ContractDriver(Driver):
@@ -350,7 +351,11 @@ async def _start_boundary_rpc(tmp_path, store, runtime, coordinator):
         rpc_service.RpcServiceConfig(enabled=True, port=0)
     ))
     await server.start_server()
-    rpc = PuffoRpcClient(str(server.make_url("/")), "agent-contract")
+    rpc = PuffoRpcClient(
+        str(server.make_url("/")),
+        "agent-contract",
+        issue_local_service_token("agent-contract"),
+    )
     staged_responses: list[dict] = []
 
     # This harness deliberately wires both backends. Record whichever one the
