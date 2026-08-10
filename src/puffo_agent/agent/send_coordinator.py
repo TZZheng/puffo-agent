@@ -1546,6 +1546,32 @@ class SendCoordinator:
         channel_id: str,
         attempt_fingerprint: str = "",
     ) -> dict[str, Any]:
+        # Validate before the network read, then validate again afterwards so
+        # turn teardown cannot return decrypted held evidence after discarding
+        # the owning record.
+        async with self._held_lock:
+            held = self._held_evidence.get(key)
+            if held is None or held.attempt_fingerprint != attempt_fingerprint:
+                return {
+                    "context_version": CONTEXT_VERSION,
+                    "context_ready": False,
+                }
+
+        channel_members = None
+        try:
+            from ..mcp.puffo_core_tools import _read_channel_members
+
+            data = await _read_channel_members(
+                _CoordinatorConfig(self), space_id, channel_id
+            )
+            members = data.get("members") if isinstance(data, Mapping) else None
+            if isinstance(members, list):
+                channel_members = [
+                    dict(member) for member in members if isinstance(member, Mapping)
+                ]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("held channel membership unavailable: %s", exc)
+
         async with self._held_lock:
             held = self._held_evidence.get(key)
             # A record superseded by another draft at the same head must never
@@ -1561,6 +1587,7 @@ class SendCoordinator:
                 space_id=space_id,
                 channel_id=channel_id,
                 guidance=HELD_SEND_RECONSIDERATION_GUIDANCE,
+                channel_members=channel_members,
             )
 
     def discard_held_evidence(self) -> None:
@@ -1948,6 +1975,7 @@ class _CoordinatorConfig:
         self.http_client = coordinator.http_client
         self.data_client = coordinator.data_client
         self.workspace = coordinator.workspace
+        self.keyless = bool(getattr(coordinator.http_client, "keyless", False))
 
 
 def _http_error_detail(body: str) -> str:

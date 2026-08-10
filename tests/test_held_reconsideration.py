@@ -322,7 +322,23 @@ async def test_held_thread_basis_overrides_only_its_presentation_target():
 
 @pytest.mark.asyncio
 async def test_held_context_makes_returned_participation_facts_explicit():
-    coordinator, _freshness, _http = await coordinator_fixture()
+    coordinator, _freshness, http = await coordinator_fixture()
+    http.responses["/spaces/sp_1/channels/ch_a/members"] = {
+        "members": [
+            {
+                "slug": coordinator.slug,
+                "identity_type": "agent",
+            },
+            {
+                "slug": "peer-agent",
+                "identity_type": "agent",
+            },
+            {
+                "slug": "human-1",
+                "identity_type": "human",
+            },
+        ]
+    }
     key = ("session-a", "turn-a", "sp_1", "ch_a")
     origin = {
         "envelope_id": "origin",
@@ -367,6 +383,16 @@ async def test_held_context_makes_returned_participation_facts_explicit():
         "current_agent_visible_message_ids": ["own-count"],
         "other_visible_agent_count": 1,
         "other_visible_agent_identities": ["@peer-agent"],
+        "channel_membership": {
+            "context_ready": True,
+            "member_count": 3,
+            "agent_member_count": 2,
+            "agent_member_identities": [
+                f"@{coordinator.slug}",
+                "@peer-agent",
+            ],
+            "current_agent_is_member": True,
+        },
     }
 
 
