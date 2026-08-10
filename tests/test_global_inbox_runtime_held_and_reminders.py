@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -787,9 +788,14 @@ async def test_rejected_or_stale_busy_notice_retains_generation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_notice_turn_without_correlated_read_stays_suppressed_for_same_session(
+async def test_notice_turn_without_correlated_read_rearms_for_same_session(
     tmp_path,
 ):
+    """Durable pending work is re-notified on the same warm provider session.
+
+    A Turn that admitted no rows is not an Inbox ACK, so the unchanged pending
+    set must not stay suppressed until unrelated ingress arrives.
+    """
     store = await make_store(tmp_path)
     await receipt(store, "notice-unread", 10)
     adapter = Adapter()
@@ -814,19 +820,26 @@ async def test_notice_turn_without_correlated_read_stays_suppressed_for_same_ses
     assert [row.envelope_id for row in await store.get_pending()] == [
         "notice-unread"
     ]
-    assert after.generation == before.generation
+    assert after.generation == before.generation + 1
     assert after.last_delivered_generation == before.generation
     assert after.last_delivered_provider_session_id == adapter.session
-    assert not after.is_due_for(adapter.session)
-    assert not await runtime.process_once()
-    assert calls == 1
+    assert after.is_due_for(adapter.session)
+    assert await runtime.process_once()
+    assert calls == 2
+    assert runtime._degraded is False
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_notice_restart_suppresses_same_session_and_rediscovers_once_for_replacement(
+async def test_notice_restart_redelivers_same_session_and_rediscovers_once_for_replacement(
     tmp_path,
 ):
+    def described_pending(provider_input):
+        """Return the notice body without its per-delivery generation."""
+        summary = json.loads(provider_input.split("\n", 2)[1])
+        summary.pop("generation")
+        return summary
+
     store = await make_store(tmp_path)
     await receipt(store, "session-notice", 10)
     first_adapter = Adapter()
@@ -844,13 +857,16 @@ async def test_notice_restart_suppresses_same_session_and_rediscovers_once_for_r
     )
     assert await first.process_once()
     accepted = await store.get_notice_state()
-    assert not accepted.is_due_for(first_adapter.session)
+    # The Turn admitted no rows, so the same session stays eligible for a
+    # redelivery rather than stranding the still-pending row.
+    assert accepted.is_due_for(first_adapter.session)
     assert len(first_calls) == 1
 
     resumed_calls = []
 
-    async def resumed_run(_planned):
-        resumed_calls.append(True)
+    async def resumed_run(planned):
+        resumed_calls.append(planned.provider_input)
+        await first_adapter.admit(first_adapter.session)
 
     resumed = GlobalInboxRuntime(
         store=store,
@@ -858,8 +874,9 @@ async def test_notice_restart_suppresses_same_session_and_rediscovers_once_for_r
         run_turn=resumed_run,
         workspace=tmp_path,
     )
-    assert not await resumed.process_once()
-    assert resumed_calls == []
+    assert await resumed.process_once()
+    assert len(resumed_calls) == 1
+    assert described_pending(resumed_calls[0]) == described_pending(first_calls[0])
 
     replacement_adapter = Adapter()
     replacement_adapter.session = "provider-2"
@@ -876,12 +893,13 @@ async def test_notice_restart_suppresses_same_session_and_rediscovers_once_for_r
         workspace=tmp_path,
     )
     assert await replacement.process_once()
-    assert not await replacement.process_once()
     assert len(replacement_calls) == 1
-    assert replacement_calls == first_calls
+    assert described_pending(replacement_calls[0]) == described_pending(first_calls[0])
     final = await store.get_notice_state()
     assert final.last_delivered_provider_session_id == "provider-2"
-    assert not final.is_due_for("provider-2")
+    assert [row.envelope_id for row in await store.get_pending()] == [
+        "session-notice"
+    ]
     await store.close()
 
 
@@ -1010,12 +1028,17 @@ async def test_reconstructed_overdue_reminder_has_one_inbox_event_and_one_turn(t
             }
 
     store = await make_store(tmp_path / "first")
-    adapter = Adapter()
+    # The Turn drains the occurrence through ``read_inbox``, which needs a
+    # provider that can correlate Inbox tool results.
+    adapter = ToolReturnAdapter()
     turns: list[str] = []
 
     async def run_turn(planned):
         turns.append(planned.provider_input)
         await adapter.admit()
+        # Read the notice through the Inbox so the occurrence is genuinely
+        # consumed by this Turn instead of staying pending for a redelivery.
+        await runtime.read_inbox(limit=50)
 
     runtime = GlobalInboxRuntime(
         store=store, adapter=adapter, run_turn=run_turn, workspace=tmp_path,
@@ -1186,14 +1209,18 @@ async def test_changed_pending_generation_replaces_accepted_notice_without_losin
     )
     assert await runtime.process_once()
     accepted = await store.get_notice_state()
-    assert not accepted.is_due_for(adapter.session)
+    # Neither Turn admits a read, so each empty Turn re-arms delivery for the
+    # unchanged pending set instead of suppressing it.
+    assert accepted.is_due_for(adapter.session)
 
     await receipt(store, "second-unread", 11, content=second_body)
     changed = await store.get_notice_state()
     assert changed.generation == accepted.generation + 1
     assert changed.is_due_for(adapter.session)
     assert await runtime.process_once()
-    assert not await runtime.process_once()
+    final = await store.get_notice_state()
+    assert final.generation == changed.generation + 1
+    assert final.is_due_for(adapter.session)
 
     assert len(notices) == 2
     assert notices[0] != notices[1]
@@ -1522,6 +1549,51 @@ async def test_unrecoverable_notice_pressure_retains_pending_in_degraded_state(
     assert runtime.health.state == "degraded"
     assert runtime._degraded is True
     assert [row.envelope_id for row in await store.get_pending()] == ["pressure"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_transient_provider_failure_self_recovers_after_backoff_without_ingress(
+    tmp_path,
+):
+    """A transient provider incident must not strand requeued durable work.
+
+    The degrade is a bounded backoff window the runtime ends by itself, so the
+    still-pending row is retried without any new message or ``notify()``.
+    """
+    store = await make_store(tmp_path)
+    await receipt(store, "transient", 1)
+    adapter = ToolReturnAdapter()
+    calls = 0
+
+    async def run(_planned):
+        nonlocal calls
+        calls += 1
+        await adapter.admit()
+        if calls == 1:
+            raise RuntimeError("provider exhausted")
+        await runtime.read_inbox(limit=50)
+
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=run, workspace=tmp_path,
+    )
+    assert await runtime.process_once()
+    assert runtime._degraded is True
+    assert runtime._degraded_until is not None
+    assert [row.envelope_id for row in await store.get_pending()] == ["transient"]
+
+    # Inside the backoff window the runtime must not busy-retry.
+    assert not await runtime.process_once()
+    assert calls == 1
+
+    # Expire the window only; no ingress, no notify(), no new message.
+    runtime._degraded_until = time.monotonic() - 1
+    assert await runtime.process_once()
+    assert calls == 2
+    assert runtime._degraded is False
+    assert [row.envelope_id for row in await store.get_pending()] == []
+    row = await store.get_message_by_envelope("transient")
+    assert row.processing_state == ProcessingState.PROCESSED.value
     await store.close()
 
 
