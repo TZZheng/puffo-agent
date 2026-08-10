@@ -594,8 +594,10 @@ def resolve_invite_targets(
     text: str,
     pending_invites: Mapping[str, dict[str, Any]],
 ) -> tuple[list[str], bool]:
-    if payload_thread_root_id and payload_thread_root_id in pending_invites:
-        return [payload_thread_root_id], False
+    if payload_thread_root_id:
+        if payload_thread_root_id in pending_invites:
+            return [payload_thread_root_id], False
+        return [], False
     if text.strip().lower() not in {"y", "yes", "n", "no"}:
         return [], False
     return list(pending_invites), True

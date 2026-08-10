@@ -635,6 +635,54 @@ async def test_plaintext_dm_route_has_no_freshness():
 
 
 @pytest.mark.asyncio
+async def test_plaintext_dm_policy_cannot_expose_attachment_keys(tmp_path):
+    """A DM attachment stays E2EE when text-only DMs permit plaintext."""
+    coordinator, _, http = await coordinator_fixture()
+    coordinator.workspace = str(tmp_path)
+    (tmp_path / "evidence.txt").write_text("proof", encoding="utf-8")
+
+    async def plaintext(_slug, _root):
+        return False
+
+    coordinator.data_client.get_send_encryption = plaintext
+    device = KemKeyPair.generate()
+    http.responses["/certs/sync?slugs=agent-0001,alice-1"] = {
+        "entries": [{
+            "seq": 1,
+            "kind": "device_cert",
+            "cert": {
+                "device_id": "dev_dm_attachment",
+                "kem_public_key": base64url_encode(device.public_key_bytes()),
+            },
+        }],
+        "has_more": False,
+    }
+    result = await coordinator.send(SemanticSendRequest(
+        destination="@alice-1",
+        attachment_paths=("evidence.txt",),
+        caption="evidence",
+    ))
+    assert result["state"] == "sent", result
+    message_posts = [
+        path for method, path, _body in http.calls
+        if method == "POST" and path in {"/messages", "/v2/messages/plaintext"}
+    ]
+    assert message_posts == ["/messages"]
+
+
+@pytest.mark.asyncio
+async def test_channel_roster_path_encodes_model_selected_channel_segment():
+    """A destination containing slashes cannot retarget the roster request."""
+    coordinator, _, http = await coordinator_fixture()
+    encoded = "/spaces/sp_1/channels/ch_a%2F..%2Fmembers/members"
+    http.responses[encoded] = {"members": [{"slug": "alice-1"}]}
+    assert await coordinator._channel_recipient_slugs(
+        "sp_1", "ch_a/../members"
+    ) == ["alice-1"]
+    assert ("GET", encoded, None) in http.calls
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("transport", ["encrypted", "plaintext", "keyless"])
 @pytest.mark.parametrize("include_metadata", [True, False])
 async def test_legacy_dm_transports_preserve_optional_metadata(

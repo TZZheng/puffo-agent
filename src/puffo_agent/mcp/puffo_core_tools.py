@@ -207,23 +207,27 @@ async def _read_spaces(cfg: Any) -> Any:
 
 
 async def _read_space_channels(cfg: Any, space_id: str) -> Any:
+    quoted_space_id = urllib.parse.quote(space_id, safe="")
     if cfg.keyless:
         return await cfg.http_client.get_unsigned(
-            f"/v2/cloud-agents/spaces/{space_id}/channels"
+            f"/v2/cloud-agents/spaces/{quoted_space_id}/channels"
         )
-    return await cfg.http_client.get(f"/spaces/{space_id}/channels")
+    return await cfg.http_client.get(f"/spaces/{quoted_space_id}/channels")
 
 
 async def _read_channel_members(
     cfg: Any, space_id: str, channel_id: str,
 ) -> Any:
     """Read the exact channel roster on both transports."""
+    quoted_space_id = urllib.parse.quote(space_id, safe="")
+    quoted_channel_id = urllib.parse.quote(channel_id, safe="")
     if cfg.keyless:
         return await cfg.http_client.get_unsigned(
-            f"/v2/cloud-agents/spaces/{space_id}/channels/{channel_id}/members"
+            "/v2/cloud-agents/spaces/"
+            f"{quoted_space_id}/channels/{quoted_channel_id}/members"
         )
     return await cfg.http_client.get(
-        f"/spaces/{space_id}/channels/{channel_id}/members"
+        f"/spaces/{quoted_space_id}/channels/{quoted_channel_id}/members"
     )
 
 

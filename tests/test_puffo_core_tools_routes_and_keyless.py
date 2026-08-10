@@ -1157,6 +1157,22 @@ async def test_keyless_list_channels_in_space_hits_cloud_agents_route():
 
 
 @pytest.mark.asyncio
+async def test_keyless_directory_path_encodes_model_selected_space_segment():
+    """A space id containing slashes cannot retarget the unsigned route."""
+    cfg, http, _ = _setup_keyless()
+    encoded = "/v2/cloud-agents/spaces/sp_a%2F..%2Fidentities/channels"
+    http.responses[encoded] = {"channels": []}
+    mcp = _build_tools(cfg)
+    result = await _call_structured(
+        mcp,
+        "list_channels_in_space",
+        {"space_id": "sp_a/../identities"},
+    )
+    assert result["count"] == 0
+    assert ("GET_UNSIGNED", encoded, None) in http.calls
+
+
+@pytest.mark.asyncio
 async def test_keyless_list_channels_in_all_spaces_hits_cloud_agents_routes():
     cfg, http, ms = _setup_keyless()
     http.responses["/v2/cloud-agents/spaces"] = {

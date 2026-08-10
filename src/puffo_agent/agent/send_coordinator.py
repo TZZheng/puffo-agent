@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import mimetypes
+import urllib.parse
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -40,14 +41,12 @@ from .send_response_validation import (
 from .shared_content import HELD_SEND_RECONSIDERATION_GUIDANCE
 
 logger = logging.getLogger(__name__)
-
 CHANNEL_SEND_PATH = "/v2/agent-runtime/messages:send"
 KEYLESS_CHANNEL_SEND_PATH = "/v2/cloud-agents/agent-runtime/messages:send"
 _KNOWN_ERROR_STATUSES = {400, 401, 403, 404, 405, 409, 413, 429, 500, 503}
 # Held evidence holds decrypted context, so retention is bounded even when a
 # turn is abandoned without any further coordinated send in that channel.
 _MAX_HELD_RECORDS = 8
-
 
 @dataclass(frozen=True)
 class SemanticSendRequest:
@@ -1269,8 +1268,10 @@ class SendCoordinator:
     async def _channel_recipient_slugs(
         self, space_id: str | None, channel_id: str
     ) -> list[str]:
+        quoted_space_id = urllib.parse.quote(str(space_id or ""), safe="")
+        quoted_channel_id = urllib.parse.quote(channel_id, safe="")
         members = await self.http_client.get(
-            f"/spaces/{space_id}/channels/{channel_id}/members"
+            f"/spaces/{quoted_space_id}/channels/{quoted_channel_id}/members"
         )
         recipient_slugs = [
             row.get("slug")
@@ -1314,7 +1315,9 @@ class SendCoordinator:
             space_id=space_id,
             dm_peer=dm_peer,
         )
-        encrypt = await _send_encryption_required(_CoordinatorConfig(self), root)
+        encrypt = bool(request.attachment_paths) or await _send_encryption_required(
+            _CoordinatorConfig(self), root
+        )
         if require_encryption and not encrypt:
             return {
                 "encrypt": False,
