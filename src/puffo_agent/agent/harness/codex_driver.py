@@ -73,6 +73,19 @@ _RETRYABLE_PROVIDER_ERROR = re.compile(
     r"too many requests|quota|temporar(?:y|ily)|timed? ?out|timeout|"
     r"unavailable|overloaded|connection (?:reset|refused))"
 )
+_TOOL_ITEM_TYPES = frozenset(
+    {"mcpToolCall", "dynamicToolCall", "functionCall", "toolCall"}
+)
+_COMPACTION_ITEM_TYPE = "contextCompaction"
+
+
+def _tool_label(item: dict[str, Any]) -> str:
+    name = str(item.get("name") or item.get("tool") or "")
+    return (
+        name.rsplit("__", 1)[-1]
+        if name.startswith("mcp__") and "__" in name
+        else name
+    )
 
 
 def _safe_jsonrpc_error_message(message: Any) -> str:
@@ -548,6 +561,8 @@ class CodexAppServerDriver(Driver):
                 },
                 native_payload=frame,
             )
+        elif method == "item/started":
+            await self._handle_started_item(frame, params)
         elif method in {"item/completed", "item/agentMessage/completed"}:
             await self._handle_completed_item(frame, params)
         elif method == "thread/tokenUsage/updated":
@@ -612,16 +627,53 @@ class CodexAppServerDriver(Driver):
             sorted(str(key) for key in item),
         )
 
+    async def _handle_started_item(
+        self, frame: dict[str, Any], params: dict[str, Any]
+    ) -> None:
+        """Normalize the started half of an app-server item.
+
+        Only compaction and tool items carry public meaning; every other
+        started type is silently ignored rather than reported as an unknown
+        notification, because ``item/started`` itself is a known method.
+        """
+        item = params.get("item")
+        item_type = str(item.get("type") or "") if isinstance(item, dict) else ""
+        if item_type == _COMPACTION_ITEM_TYPE:
+            await self._emit(
+                HarnessEventType.COMPACTION_STARTED,
+                turn_ref=self._active,
+                native_payload=frame,
+            )
+            return
+        if not isinstance(item, dict) or item_type not in _TOOL_ITEM_TYPES:
+            return
+        await self._emit(
+            HarnessEventType.TOOL_STARTED,
+            turn_ref=self._active,
+            data={
+                "tool_call_ref": str(
+                    item.get("id") or params.get("itemId") or ""
+                ),
+                "label": _tool_label(item) or "Tool",
+            },
+            native_payload=frame,
+        )
+
     async def _handle_completed_item(
         self, frame: dict[str, Any], params: dict[str, Any]
     ) -> None:
         item = params.get("item")
-        if isinstance(item, dict) and str(item.get("type") or "") in {
-            "mcpToolCall",
-            "dynamicToolCall",
-            "functionCall",
-            "toolCall",
-        }:
+        item_type = str(item.get("type") or "") if isinstance(item, dict) else ""
+        if item_type == _COMPACTION_ITEM_TYPE:
+            # Terminal success for `thread/compact/start`; the JSON-RPC reply
+            # to that request is acceptance only.
+            await self._emit(
+                HarnessEventType.COMPACTION_COMPLETED,
+                turn_ref=self._active,
+                native_payload=frame,
+            )
+            return
+        if isinstance(item, dict) and item_type in _TOOL_ITEM_TYPES:
             await self._emit_completed_tool(frame, item, params)
         native_id = (
             item.get("id") if isinstance(item, dict) else None
@@ -646,12 +698,7 @@ class CodexAppServerDriver(Driver):
             str(item.get("id") or params.get("itemId") or ""),
             str(item.get("type") or ""),
         )
-        name = str(item.get("name") or item.get("tool") or "")
-        name = (
-            name.rsplit("__", 1)[-1]
-            if name.startswith("mcp__") and "__" in name
-            else name
-        )
+        name = _tool_label(item)
         arguments = _tool_arguments(item.get("arguments") or item.get("input") or {})
         result = item.get("result", item.get("output", item.get("contentItems")))
         error = (

@@ -8,6 +8,8 @@ import pytest
 from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
+    CompactReceipt,
+    ContextStatus,
     Driver,
     HarnessEvent,
     RuntimeOpened,
@@ -89,6 +91,39 @@ class _ControllableDriver(Driver):
     async def close(self):
         self.close_calls += 1
         await self.queue.put(None)
+
+
+class _CompactingDriver(_ControllableDriver):
+    """A driver whose `compact` is acceptance only, as both real ones are."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.compact_calls = 0
+
+    async def compact(self, request):
+        self.compact_calls += 1
+        return CompactReceipt(True, f"compact-{self.compact_calls}")
+
+    async def context_status(self):
+        return ContextStatus(used_tokens=12, context_window=100)
+
+
+async def _open_compacting_manager(*, wait_seconds=0.05):
+    driver = _CompactingDriver()
+    manager = RuntimeManager(
+        driver, RuntimeSpec("/tmp", task_timeout_seconds=1), driver_name="codex"
+    )
+    await manager.open()
+    adapter = RuntimeManagerAdapter(manager, compaction_wait_seconds=wait_seconds)
+    return driver, manager, adapter
+
+
+async def _feed_compaction_completed(driver, manager):
+    await driver.queue.put(HarnessEvent(
+        type="compaction.completed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+    ))
 
 
 class _PausedStartDriver(_ControllableDriver):
@@ -402,6 +437,53 @@ async def test_completed_terminals_are_pruned_and_released_on_close():
     assert manager._terminal == {}
     with pytest.raises(RuntimeStateError, match="runtime is closed"):
         await asyncio.wait_for(waiting, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_compaction_completes_only_on_the_event_and_never_starts_twice():
+    driver, manager, adapter = await _open_compacting_manager(wait_seconds=10)
+
+    first = asyncio.create_task(adapter.compact_context())
+    second = asyncio.create_task(adapter.compact_context())
+    await asyncio.sleep(0)
+    assert not first.done() and not second.done()
+    # Acceptance is not completion, and one decision starts one provider pass.
+    assert driver.compact_calls == 1
+
+    await _feed_compaction_completed(driver, manager)
+    results = await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+    assert [value.completed for value in results] == [True, True]
+    assert driver.compact_calls == 1
+
+    # An unobserved completion degrades gracefully after the bounded wait,
+    # and leaves the outstanding operation alone rather than restarting it.
+    adapter.compaction_wait_seconds = 0.01
+    unobserved = await adapter.compact_context()
+    assert not unobserved.completed
+    assert "no completion event" in unobserved.diagnostic
+    assert driver.compact_calls == 2
+    assert (await adapter.compact_context()).completed is False
+    assert driver.compact_calls == 2
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_context_commands_are_locked_and_fail_closed_after_close():
+    driver, manager, adapter = await _open_compacting_manager(wait_seconds=10)
+    assert (await adapter.get_context_snapshot()).used_tokens == 12
+
+    waiting = asyncio.create_task(adapter.compact_context())
+    await asyncio.sleep(0)
+    assert driver.compact_calls == 1
+    await manager.close()
+
+    # The pending future is failed and retrieved, so no waiter hangs and no
+    # "exception was never retrieved" warning escapes.
+    assert manager._compaction is None
+    assert (await asyncio.wait_for(waiting, timeout=1)).completed is False
+    for command in (adapter.compact_context, adapter.get_context_snapshot):
+        with pytest.raises(RuntimeStateError, match="runtime is closed"):
+            await command()
 
 
 @pytest.mark.asyncio

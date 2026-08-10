@@ -362,6 +362,20 @@ class ClaudeCodeCliDriver(Driver):
         if type_ == "result":
             await self._handle_result(frame, subtype)
             return
+        if type_ == "system" and (
+            (subtype == "status" and str(frame.get("status") or "") == "compacting")
+            or subtype == "compact_boundary"
+        ):
+            # `/compact` acceptance is not completion: the boundary frame is
+            # the only terminal confirmation the CLI emits.
+            await self._emit(
+                HarnessEventType.COMPACTION_STARTED
+                if subtype == "status"
+                else HarnessEventType.COMPACTION_COMPLETED,
+                turn_ref=self._active if self._active.value else None,
+                native_payload=frame,
+            )
+            return
         await self._emit(
             HarnessEventType.SESSION_UPDATED,
             data={"record_type": type_ or "unknown"},
@@ -496,6 +510,10 @@ class ClaudeCodeCliDriver(Driver):
             native_payload=frame,
         )
         self._active, self._active_native_turn_id = TurnRef(""), ""
+        # A `tool_use` whose `tool_result` never arrives would otherwise keep
+        # its name and arguments alive until close, so a later turn reusing the
+        # id would report the stale call.
+        self._tool_calls.clear()
 
     def _is_exact_replay(self, frame: dict[str, Any]) -> bool:
         if self._pending_replay is None or self._pending_replay.done():

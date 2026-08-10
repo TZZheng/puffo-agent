@@ -39,6 +39,10 @@ from .driver import (
 
 logger = logging.getLogger(__name__)
 
+# Compaction is a provider-side summarization pass over the whole thread, so
+# the per-request timeout is far too tight to bound its completion.
+COMPACTION_WAIT_SECONDS = 120.0
+
 
 class RuntimeStateError(RuntimeError):
     pass
@@ -109,6 +113,7 @@ class RuntimeManager:
         self._command_lock = asyncio.Lock()
         self._permission_refs: set[PermissionRef] = set()
         self._continuation_admissions: list[ToolResultAdmission] = []
+        self._compaction: asyncio.Future[None] | None = None
 
     async def open(self, *, resume: bool = True) -> RuntimeOpened:
         async with self._command_lock:
@@ -230,6 +235,45 @@ class RuntimeManager:
                 raise RuntimeStateError("unknown or stale permission reference")
             return await self.driver.resolve_permission(permission, decision)
 
+    async def context_status(self) -> Any:
+        async with self._command_lock:
+            if self._closed:
+                raise RuntimeStateError("runtime is closed")
+            return await self.driver.context_status()
+
+    async def begin_compaction(
+        self, request: CompactRequest | None = None
+    ) -> asyncio.Future[None] | UnsupportedCapability:
+        """Start at most one provider compaction and hand back its completion.
+
+        A caller arriving while one is still outstanding is coalesced onto the
+        same future rather than issuing a second provider request: one context
+        decision must never run two concurrent summarization passes.
+        """
+        async with self._command_lock:
+            if self._closed:
+                raise RuntimeStateError("runtime is closed")
+            if self._compaction is not None and not self._compaction.done():
+                return self._compaction
+            receipt = await self.driver.compact(request or CompactRequest())
+            if isinstance(receipt, UnsupportedCapability):
+                return receipt
+            self._compaction = asyncio.get_running_loop().create_future()
+            return self._compaction
+
+    def _resolve_compaction_locked(self) -> None:
+        future, self._compaction = self._compaction, None
+        if future is not None and not future.done():
+            future.set_result(None)
+
+    def _fail_compaction_locked(self, reason: str) -> None:
+        future, self._compaction = self._compaction, None
+        if future is not None and not future.done():
+            future.set_exception(RuntimeStateError(reason))
+            # Mark retrieved: a shielded waiter still receives the error, but
+            # an unwatched future must not log "exception was never retrieved".
+            future.exception()
+
     async def wait_terminal(self, turn: TurnRef) -> HarnessEvent:
         future = self._terminal.get(turn)
         if future is None:
@@ -335,6 +379,7 @@ class RuntimeManager:
     async def _retire_runtime_locked(self, *, preserve_session: bool) -> None:
         if self.active_turn_ref is not None:
             raise RuntimeStateError("cannot retire while a turn is active")
+        self._fail_compaction_locked("runtime was retired")
         await self._stop_reader()
         await self.driver.close()
         self.opened = None
@@ -354,6 +399,7 @@ class RuntimeManager:
             self._closed = True
             if self.agent_id:
                 unregister_runtime_manager(self.agent_id, self)
+            self._fail_compaction_locked("runtime is closed")
             await self._stop_reader()
             await self.driver.close()
             self.opened = None
@@ -431,9 +477,17 @@ class RuntimeManager:
             if value:
                 self._permission_refs.add(PermissionRef(str(value)))
         if event.type in {
+            HarnessEventType.COMPACTION_COMPLETED,
+            "compaction.completed",
+        }:
+            # The single consumption point for provider completion; the event
+            # still publishes so subscribers and persistence see it.
+            self._resolve_compaction_locked()
+        if event.type in {
             HarnessEventType.RUNTIME_EXITED,
             "runtime.exited",
         }:
+            self._fail_compaction_locked("runtime exited")
             await self._publish_event(event)
             active = self.active_turn_ref
             try:
@@ -509,6 +563,7 @@ class RuntimeManager:
 
     async def _fail_runtime_locked(self, reason: str) -> None:
         active = self.active_turn_ref
+        self._fail_compaction_locked(reason)
         try:
             if active is not None:
                 abandoned = HarnessEvent(
@@ -650,9 +705,11 @@ class RuntimeManagerAdapter(Adapter):
         manager: RuntimeManager,
         *,
         spec_reloader: Callable[[str], Awaitable[RuntimeSpec]] | None = None,
+        compaction_wait_seconds: float = COMPACTION_WAIT_SECONDS,
     ):
         self.manager = manager
         self.spec_reloader = spec_reloader
+        self.compaction_wait_seconds = compaction_wait_seconds
         self.assistant_text_parts: list[str] = []
 
     @staticmethod
@@ -847,7 +904,7 @@ class RuntimeManagerAdapter(Adapter):
         return value or None
 
     async def get_context_snapshot(self) -> ContextSnapshot:
-        status = await self.manager.driver.context_status()
+        status = await self.manager.context_status()
         if isinstance(status, UnsupportedCapability):
             return await super().get_context_snapshot()
         return normalize_context_snapshot(
@@ -875,17 +932,35 @@ class RuntimeManagerAdapter(Adapter):
         )
 
     async def compact_context(self) -> CompactionResult:
-        receipt = await self.manager.driver.compact(CompactRequest())
+        pending = await self.manager.begin_compaction(CompactRequest())
+        if isinstance(pending, UnsupportedCapability):
+            return CompactionResult(completed=False, diagnostic=pending.diagnostic)
+        try:
+            # Await outside the command lock: the event consumer needs that
+            # lock to resolve the future, so waiting under it would deadlock.
+            # Shield so a timed-out waiter never cancels the future a
+            # coalesced waiter is still holding.
+            await asyncio.wait_for(
+                asyncio.shield(pending), self.compaction_wait_seconds
+            )
+        except asyncio.TimeoutError:
+            # Deliberately leave the manager's future pending: it is what
+            # keeps a retry from starting a second provider compaction for the
+            # same outstanding operation.
+            return CompactionResult(
+                completed=False,
+                provider_session_id=self.get_provider_session_id(),
+                diagnostic=(
+                    "compaction accepted; no completion event within "
+                    f"{self.compaction_wait_seconds:g}s"
+                ),
+            )
+        except RuntimeStateError as exc:
+            return CompactionResult(completed=False, diagnostic=str(exc))
         return CompactionResult(
-            # Driver command acceptance is not completion; the normalized
-            # compaction.completed event is the later confirmation.
-            completed=False,
+            completed=True,
             provider_session_id=self.get_provider_session_id(),
-            diagnostic=(
-                "compaction accepted; awaiting canonical completion event"
-                if not isinstance(receipt, UnsupportedCapability)
-                else receipt.diagnostic
-            ),
+            diagnostic="compaction completed",
         )
 
 

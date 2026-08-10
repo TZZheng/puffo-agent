@@ -76,7 +76,7 @@ class WsLocalSession:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         make_run_id: Callable[[], str] = lambda: f"run_{uuid.uuid4().hex}",
         on_dead: Callable[[str], Awaitable[None]] | None = None,
-        on_admitted: Callable[[Bundle], Awaitable[None]] | None = None,
+        on_admitted: Callable[[Bundle, Any], Awaitable[None]] | None = None,
         on_tool_result: Callable[[str, dict[str, Any], Any], Awaitable[None]] | None = None,
         capabilities: tuple[str, ...] = (),
     ) -> None:

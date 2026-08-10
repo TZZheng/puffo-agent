@@ -959,6 +959,98 @@ async def test_codex_driver_fake_app_server_full_protocol_and_concurrency():
     await _assert_codex_protocol_completion(proc, driver, stream)
 
 
+def _feed_codex_started_items(proc):
+    proc.feed({
+        "method": "item/started",
+        "params": {"item": {
+            "id": "tool-9", "type": "mcpToolCall",
+            "name": "mcp__puffo__read_inbox", "arguments": {"limit": 1},
+        }},
+    })
+    for method in ("item/started", "item/completed"):
+        proc.feed({
+            "method": method,
+            "params": {"item": {"id": "cmp-1", "type": "contextCompaction"}},
+        })
+    # An unrecognised started item is known-method noise, not an unknown
+    # notification.
+    proc.feed({
+        "method": "item/started",
+        "params": {"item": {"id": "x", "type": "enteredReviewMode"}},
+    })
+    proc.feed({"method": "turn/completed", "params": {"turn": {}}})
+
+
+async def _collect_codex_notification_events(stream):
+    collected = []
+    async for value in stream:
+        collected.append(value)
+        kind = getattr(value.type, "value", value.type)
+        if kind == "turn.completed":
+            return collected
+    raise AssertionError("event stream ended before the turn finished")
+
+
+@pytest.mark.asyncio
+async def test_codex_driver_normalizes_started_tool_and_compaction_items():
+    proc, driver = _codex_protocol_driver()
+    stream, _started = await _open_codex_protocol_driver(proc, driver)
+    _feed_codex_started_items(proc)
+
+    events = await _collect_codex_notification_events(stream)
+    kinds = [getattr(value.type, "value", value.type) for value in events]
+    assert kinds == [
+        "turn.tool_started",
+        "compaction.started",
+        "compaction.completed",
+        "turn.completed",
+    ]
+    assert events[0].data == {"tool_call_ref": "tool-9", "label": "read_inbox"}
+    # A compaction item is not an output block, so it must not close one.
+    assert events[2].data == {}
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_driver_emits_compaction_boundary_and_clears_tool_calls():
+    holder = {}
+
+    def on_frame(frame):
+        proc = holder["proc"]
+        if frame.get("type") != "user" or not frame.get("uuid"):
+            return
+        proc.feed({**frame, "isReplay": True})
+        proc.feed({"type": "system", "subtype": "status", "status": "compacting"})
+        proc.feed({"type": "system", "subtype": "compact_boundary"})
+        proc.feed({
+            "type": "assistant",
+            "uuid": "frame-uuid-1",
+            "message": {"content": [
+                {"type": "tool_use", "id": "call-1", "name": "read_inbox",
+                 "input": {"limit": 1}},
+            ]},
+        })
+        # No matching `tool_result`: the turn ends with the call outstanding.
+        proc.feed({"type": "result", "subtype": "success", "usage": {}})
+
+    proc = _FakeProcess(on_frame)
+    holder["proc"] = proc
+    proc.feed({
+        "type": "system", "subtype": "init",
+        "session_id": "claude-1", "slash_commands": [],
+    })
+    driver = ClaudeCodeCliDriver(lambda _args, _spec: proc, replay_timeout=1)
+    await driver.open(RuntimeSpec("/workspace"))
+    stream = driver.events()
+    await driver.start_turn(TurnInput("hello"))
+
+    assert (await _next_matching(stream, "compaction.started")) is not None
+    assert (await _next_matching(stream, "compaction.completed")) is not None
+    await _next_matching(stream, "turn.completed")
+    assert driver._tool_calls == {}
+    await driver.close()
+
+
 @pytest.mark.asyncio
 async def test_codex_driver_resumes_with_native_session_id_after_handshake():
     holder = {}
