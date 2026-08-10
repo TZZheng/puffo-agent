@@ -105,9 +105,11 @@ def test_legacy_agent_config_load_save_preserves_existing_values(home):
     # Legacy kinds keep migrating, resolving the harness from the provider.
     ({"kind": "sdk-local", "provider": "openai"},
      {"kind": "cli-local", "harness": "codex"}, None),
-    # Migration is scoped to cli-local; hermes stays valid on cli-docker.
+    # Migration is scoped to cli-local, and Docker hermes is no longer
+    # supported: a persisted agent.yml fails at load with one explicit
+    # diagnostic, before any worker is constructed.
     ({"kind": "cli-docker", "provider": "openai", "harness": "hermes"},
-     {"harness": "hermes"}, None),
+     None, "design-only"),
     # No Driver harness serves google, so this stays an explicit load error.
     ({"kind": "cli-local", "provider": "google", "harness": "gemini-cli"},
      None, "not implemented by the Driver runtime"),

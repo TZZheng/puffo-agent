@@ -308,12 +308,16 @@ answers WHAT engine runs inside it; provider answers WHICH model vendor.**
 | Harness | Providers | Engine invocation |
 |---|---|---|
 | `claude-code` | anthropic | local Driver or Docker CLI |
-| `hermes` | anthropic, openai | Docker-only one-shot `hermes chat -q <msg>` |
-| `gemini-cli` | google | Docker-only `gemini` CLI |
+| `hermes` | anthropic, openai | design-only — rejected by `validate_triple` |
+| `gemini-cli` | google | design-only — rejected by `validate_triple` |
 | `codex` | openai | local `codex app-server` Driver, honors `--sandbox` policy |
 
-Defaults are provider-aware; for `cli-local`, OpenAI resolves to `codex` rather
-than the Docker-only Hermes path. `validate_triple` rejects mismatched
+`hermes` / `gemini-cli` stay enumerated so a persisted agent.yml carrying one
+fails with an explicit design-only diagnostic rather than "unknown harness";
+no runtime admits them, since their provider admission happens after MCP
+execution and they cannot complete the metadata-notified Inbox contract.
+Defaults are provider-aware; for `cli-local`, OpenAI resolves to `codex`.
+`validate_triple` rejects mismatched
 (runtime, provider, harness) values at config load, including inferred defaults.
 
 **Execution dispatch:** `cli-local` → `LocalRuntimePreparer` +
@@ -463,7 +467,7 @@ seals and posts the reply.
 `adapter.run_turn` dispatches through one of three execution boundaries:
 
 - `cli-local` → a long-lived native Driver for Claude Code or Codex app-server.
-- `cli-docker` → a declarative harness that spawns Claude, Gemini, or Hermes.
+- `cli-docker` → a declarative harness that spawns Claude Code.
   Claude auth comes from the host
   `~/.claude/.credentials.json`, refreshed by the daemon (`credential_refresh.py:1`).
 - `ws-local` → the external tool brings its own engine over `/v1/ws-local`.
@@ -651,7 +655,8 @@ An in-process **MCP** server gives each agent its tool surface. `build_server`
 | **puffo-server** | blind relay: WS control + message relay + signed HTTP | `PuffoCoreWsClient` (`ws_client.py:41`), `PuffoCoreHttpClient` (`http_client.py:26`) | BUILT |
 | **AIM** | server-side identity / device-cert authority | trusted transitively via cert-chain verify (`api/certs.py`) | BUILT (external) |
 | **claude CLI** | claude-code harness engine | `cli_session.py` stream-json + `--resume`; auth via `~/.claude/.credentials.json` | BUILT |
-| **codex / gemini / hermes CLIs** | codex / gemini-cli / hermes harness engines | spawned per turn (`harness/*.py`) | BUILT |
+| **codex CLI** | codex harness engine | `codex app-server` Driver | BUILT |
+| **gemini / hermes CLIs** | gemini-cli / hermes harness engines | dormant adapters in `harness/*.py`; `validate_triple` rejects both | **DESIGNED** |
 | **macOS Keychain** | OS credential store | `macos/keychain.py` | BUILT |
 | **LiteLLM (VK gateway)** | model gateway via `ANTHROPIC_BASE_URL` | *no code on this branch* | **DESIGNED** (cloud) |
 | **E2B** | cloud sandbox | *no code on this branch*; `cli-sandbox` is the RESERVED placeholder, `cli-docker` is the built local container | **DESIGNED** (cloud) |

@@ -5,7 +5,7 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/puffo-agent.svg)](https://pypi.org/project/puffo-agent/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-Local daemon that runs AI bots (Claude / GPT / Gemini) on
+Local daemon that runs AI bots (Claude / GPT) on
 [Puffo](https://puffo.ai). One process supervises many bot accounts;
 each account has its own profile, memory, per-channel triggers, file
 inbox, and a paired web operator.
@@ -46,9 +46,8 @@ loaded as `cli-local` and keep their persisted profile and state.
     Gives the agent shell-level tools on your machine — only enable
     for agents you trust.
   - `cli-docker` — Docker installed and the daemon user able to talk
-    to the daemon socket. Supports `claude-code`, `hermes`, and
-    `gemini-cli` harnesses; codex inside Docker is not yet
-    supported.
+    to the daemon socket. Supports the `claude-code` harness only;
+    codex inside Docker is not yet supported.
 
 ## 2. Install
 
@@ -96,7 +95,7 @@ lazy-creates `~/.puffo-agent/` on first run with sensible defaults (server
 | `puffo-agent stop` | Graceful shutdown from any terminal (`--timeout`, default 60s) |
 | `puffo-agent version` | Print the installed `puffo-agent` version |
 | `puffo-agent check-update` | Compare against the latest GitHub release + print the matching upgrade command |
-| `puffo-agent config` | Optional daemon-wide model defaults and Gemini Docker key. Claude/Codex use CLI login or per-agent gateway credentials. |
+| `puffo-agent config` | Optional daemon-wide model defaults. Claude/Codex use CLI login or per-agent gateway credentials. |
 
 The daemon watches `~/.puffo-agent/agents/<agent-id>/` and reconciles on-disk
 state every couple of seconds — you don't restart it after config changes.
@@ -389,7 +388,7 @@ The `runtime.kind` in an agent's `agent.yml` decides where its brain runs:
 | Runtime&nbsp;kind | What runs | Requires |
 | --- | --- | --- |
 | `cli-local` | A long-lived Driver subprocess: Claude Code or `codex`. Shell + skills run on the host. **Default.** | `claude` or `codex` login, or a configured gateway |
-| `cli-docker` | A per-agent CLI container using `claude-code`, `hermes`, or `gemini-cli`. | Docker |
+| `cli-docker` | A per-agent CLI container running `claude-code`. | Docker |
 | `ws-local` | No LLM — an external AI tool attaches over a localhost WebSocket as the brain. | `.puffoagent` bundle + passcode |
 
 Switch runtime kind / model / harness:
@@ -408,13 +407,9 @@ restarting a migrated agent.
 > **codex** (`runtime.harness=codex`, `cli-local` only) spawns OpenAI's `codex
 > app-server`; authenticate with `codex login` or a configured LiteLLM gateway.
 >
-> **hermes** (`runtime.harness=hermes`, `cli-docker`) runs one-shot `hermes chat -q`
-> per turn; continuity comes from the per-agent `HERMES_HOME` seeded from your
-> `~/.hermes/`. Install the Hermes Agent CLI
-> (`curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash`,
-> then `source ~/.bashrc`) and run `hermes setup` once so
-> `~/.hermes/config.yaml` exists with a provider. Override the binary with
-> `PUFFO_HERMES_BIN=/abs/path/to/hermes` if it isn't on the daemon's `$PATH`.
+> **hermes** and **gemini-cli** are design-only: config validation rejects
+> them on every runtime, because their provider admission happens after MCP
+> execution and they cannot complete the metadata-notified Inbox contract.
 
 **ws-local — bring your own AI.** The operator creates the agent with provider
 "Your own AI", picks an 8-character pairing code, and downloads a `.puffoagent`

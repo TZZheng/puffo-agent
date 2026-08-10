@@ -7,8 +7,8 @@
 #
 # Most users don't need this file at all. The daemon starts with
 # built-in defaults. Gateway keys travel inside each agent's own
-# agent.yml. The daemon-level Google key below is only for Gemini's
-# Docker runtime; `puffo-agent config` writes this file for you.
+# agent.yml. The daemon-level Google key below is reserved and unused
+# today; `puffo-agent config` writes this file for you.
 #
 # Runtime Events v1 needs no daemon-wide switch. Supported cli-local
 # harnesses use a separate bounded per-agent SQLite outbox automatically;
@@ -27,7 +27,7 @@ openai:
   model:   "gpt-5"               # default model hint for cli-local + harness=codex
 
 google:
-  api_key: ""                    # required for cli-docker + harness=gemini-cli
+  api_key: ""                    # reserved; gemini-cli is design-only, no runtime reads it
   model:   "gemini-2.5-pro"
 
 # Optional: absolute path to a directory of shared Claude Code

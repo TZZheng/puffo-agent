@@ -4,6 +4,15 @@ Single source of truth for which combinations are supported, used
 both at agent-load time and at CLI flag-parse time. Some harnesses
 are bound to one provider (``claude-code`` → anthropic, ``gemini-cli``
 → google); ``hermes`` is multi-provider.
+
+Supported today: ``cli-local`` with ``claude-code`` or ``codex``,
+``cli-docker`` with ``claude-code``, and ``ws-local`` (external tool,
+no internal engine). ``hermes`` and ``gemini-cli`` remain design-only —
+no runtime accepts them, because their provider admission happens after
+MCP execution and they cannot correlate a concrete ``read_inbox`` tool
+result, so they cannot complete the metadata-notified Inbox contract.
+They stay enumerated here so a persisted agent.yml carrying one fails
+with that explicit diagnostic instead of a misleading "unknown harness".
 """
 
 from __future__ import annotations
@@ -60,8 +69,9 @@ VALID_HARNESSES: frozenset[str] = frozenset({
 # ── Constraints ───────────────────────────────────────────────────────────────
 
 # Harness → providers it supports. ``resolve_effective_harness`` selects Codex
-# for OpenAI on ``cli-local``; the provider-level Hermes default remains for
-# the ``cli-docker`` compatibility runtime.
+# for OpenAI on ``cli-local``. The design-only Hermes/Gemini entries are kept
+# so provider defaults still resolve to a named harness and ``validate_triple``
+# can reject it with the design-only diagnostic; no runtime admits them.
 HARNESS_PROVIDERS: dict[str, frozenset[str]] = {
     HARNESS_CLAUDE_CODE: frozenset({PROVIDER_ANTHROPIC}),
     HARNESS_HERMES:      frozenset({PROVIDER_ANTHROPIC, PROVIDER_OPENAI}),
@@ -191,12 +201,21 @@ def validate_triple(
             f"harness {harness!r} is not implemented by the Driver runtime"
         ))
 
-    if runtime == RUNTIME_CLI_DOCKER and harness == HARNESS_CODEX:
+    if runtime == RUNTIME_CLI_DOCKER and harness != HARNESS_CLAUDE_CODE:
+        if harness == HARNESS_CODEX:
+            return ValidationResult(False, (
+                f"runtime {RUNTIME_CLI_DOCKER!r} supports only "
+                f"{HARNESS_CLAUDE_CODE!r}; harness {HARNESS_CODEX!r} "
+                "requires the host-local Driver runtime — set runtime.kind "
+                f"to {RUNTIME_CLI_LOCAL!r}"
+            ))
         return ValidationResult(False, (
             f"runtime {RUNTIME_CLI_DOCKER!r} supports only "
-            f"{HARNESS_CLAUDE_CODE!r}, {HARNESS_HERMES!r}, and "
-            f"{HARNESS_GEMINI_CLI!r}; harness {HARNESS_CODEX!r} "
-            "requires the host-local Driver runtime"
+            f"{HARNESS_CLAUDE_CODE!r}; harness {harness!r} is design-only in "
+            "this release — it cannot complete the metadata-notified Inbox "
+            f"contract. Set runtime.kind {RUNTIME_CLI_LOCAL!r} with harness "
+            f"{HARNESS_CLAUDE_CODE!r} or {HARNESS_CODEX!r}, or keep "
+            f"{RUNTIME_CLI_DOCKER!r} with harness {HARNESS_CLAUDE_CODE!r}"
         ))
 
     if provider:

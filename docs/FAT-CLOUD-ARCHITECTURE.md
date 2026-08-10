@@ -122,8 +122,9 @@ All six nails are **[BUILT]** and cited into this worktree.
 
 2. **Drivers / harness selection.** Which harness actually runs the model is
    resolved by the `(runtime, provider, harness)` validity matrix
-   (`src/puffo_agent/portal/runtime_matrix.py`): `claude-code`, `hermes`,
-   `gemini-cli`, `codex`, keyed to providers, with a default per provider
+   (`src/puffo_agent/portal/runtime_matrix.py`): `claude-code` and `codex` are
+   admitted, `hermes` / `gemini-cli` are enumerated but design-only and
+   rejected there; harnesses are keyed to providers, with a default per provider
    (`DEFAULT_HARNESS_FOR_PROVIDER`, `src/puffo_agent/portal/runtime_matrix.py:105`).
    In-sandbox this machinery is unchanged. E2B uses `cli-local`; Anthropic agents
    run the Claude Code Driver and OpenAI agents run the Codex app-server Driver.

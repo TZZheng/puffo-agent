@@ -200,15 +200,19 @@ def test_desktop_save_harness_swap_clears_incompatible_inference_level(
 def test_cli_switch_to_harness_without_inference_support_clears_level(
     tmp_path, monkeypatch,
 ):
-    cfg = _save_codex_agent(tmp_path, monkeypatch, level="high")
+    """Codex-only ``minimal`` cannot survive a one-command switch to the
+    Docker Claude Code runtime, which does not implement that level."""
+    cfg = _save_codex_agent(tmp_path, monkeypatch, level="minimal")
     args = build_parser().parse_args([
         "agent", "runtime", cfg.id,
         "--kind", "cli-docker",
-        "--harness", "hermes",
+        "--provider", "anthropic",
+        "--harness", "claude-code",
     ])
 
     assert args.func(args) == 0
 
     loaded = AgentConfig.load(cfg.id)
-    assert loaded.runtime.harness == "hermes"
+    assert loaded.runtime.provider == "anthropic"
+    assert loaded.runtime.harness == "claude-code"
     assert loaded.runtime.inference_level == ""

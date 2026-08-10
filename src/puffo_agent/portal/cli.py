@@ -204,10 +204,11 @@ def upgrade_command_for_install_mode() -> str:
 
 
 def cmd_config(args: argparse.Namespace) -> int:
-    """Set daemon-wide model defaults and the Gemini Docker key.
+    """Set daemon-wide model defaults and the reserved Google key.
 
     Claude Code and Codex authenticate through their CLI login or a
-    per-agent gateway configuration.
+    per-agent gateway configuration. The Google key is reserved: no
+    supported runtime uses it while gemini-cli is design-only.
     """
     home_dir().mkdir(parents=True, exist_ok=True)
     cfg = DaemonConfig.load()
@@ -236,7 +237,8 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     goog_key = cfg.google.api_key or env_google
     goog_key = prompt(
-        "Default Google API key (blank to skip; needed for cli-docker + gemini-cli)",
+        "Default Google API key (blank to skip; reserved — gemini-cli is "
+        "design-only, so no supported runtime reads it today)",
         goog_key,
     )
     if goog_key:

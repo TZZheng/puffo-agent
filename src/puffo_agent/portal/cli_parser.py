@@ -28,7 +28,7 @@ def _add_core_commands(sub, handlers: CommandHandlers) -> None:
     sub.add_parser(
         "config",
         help=(
-            "Optional: set daemon-wide model defaults and Gemini Docker key. "
+            "Optional: set daemon-wide model defaults. "
             "The daemon runs fine without this — agents can carry their own keys."
         ),
     ).set_defaults(func=handlers["cmd_config"])
@@ -257,8 +257,9 @@ def _add_agent_runtime_parser(agent_sub, handlers: CommandHandlers) -> None:
         choices=["anthropic", "openai", "google"],
         help=(
             "Model provider. anthropic (default) pairs with claude-code; "
-            "openai pairs with codex for cli-local; google pairs with "
-            "gemini-cli for cli-docker. Must match the selected harness."
+            "openai pairs with codex on cli-local. google has no supported "
+            "harness today (gemini-cli is design-only). Must match the "
+            "selected harness."
         ),
     )
     runtime.add_argument("--model", help="Model override (empty string clears)")
@@ -296,17 +297,15 @@ def _add_agent_runtime_parser(agent_sub, handlers: CommandHandlers) -> None:
     )
     runtime.add_argument(
         "--harness",
-        choices=["claude-code", "hermes", "gemini-cli", "codex"],
+        choices=["claude-code", "codex"],
         help=(
             "cli-local / cli-docker: which agent engine runs inside the "
-            "runtime. cli-local supports only 'claude-code' (anthropic) "
-            "and 'codex' (openai); both use long-lived Drivers. "
-            "cli-docker also supports 'hermes' (anthropic + openai) and "
-            "'gemini-cli' (google). 'codex' spawns `codex app-server` as "
-            "a long-lived JSON-RPC subprocess; auth via runtime.api_key or "
-            "operator-side `codex login`. Hermes OAuth routes to "
-            "Anthropic's extra_usage pool, NOT your Claude subscription — "
-            "see NousResearch/hermes-agent#12905."
+            "runtime. cli-local supports 'claude-code' (anthropic) and "
+            "'codex' (openai); cli-docker supports 'claude-code' only. "
+            "Both use long-lived Drivers. 'codex' spawns `codex app-server` "
+            "as a long-lived JSON-RPC subprocess; auth via runtime.api_key "
+            "or operator-side `codex login`. 'hermes' and 'gemini-cli' are "
+            "design-only and rejected by config validation."
         ),
     )
     runtime.set_defaults(func=handlers["cmd_agent_runtime"])
