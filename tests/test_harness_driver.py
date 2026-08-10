@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -46,7 +47,10 @@ from puffo_agent.agent.harness.runtime_manager import (
     unregister_runtime_manager,
 )
 from puffo_agent.agent.runtime_event_outbox import RuntimeEventOutbox, RuntimeEventProjectingSink
-from puffo_agent.agent.runtime_events import RuntimeEventProjector
+from puffo_agent.agent.runtime_events import (
+    LifecycleValidator,
+    RuntimeEventProjector,
+)
 from puffo_agent.portal.control.client import execute_command
 
 
@@ -1308,3 +1312,215 @@ async def test_control_permission_stale_and_cross_agent_references_fail_closed()
         assert cross["error_code"] == "runtime_unavailable"
     finally:
         unregister_runtime_manager("agent_permission", manager)
+
+
+def _two_block_claude_driver():
+    """A Claude turn whose single assistant frame carries two text blocks."""
+    holder = {}
+
+    def on_frame(frame):
+        proc = holder["proc"]
+        if frame.get("type") == "user" and frame.get("uuid"):
+            proc.feed({**frame, "isReplay": True})
+            proc.feed({
+                "type": "assistant",
+                "uuid": "frame-uuid-1",
+                "message": {"content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": "second"},
+                ]},
+            })
+            proc.feed({"type": "result", "subtype": "success", "usage": {}})
+
+    proc = _FakeProcess(on_frame)
+    holder["proc"] = proc
+    proc.feed({
+        "type": "system", "subtype": "init",
+        "session_id": "claude-1", "slash_commands": [],
+    })
+    return proc, ClaudeCodeCliDriver(lambda _args, _spec: proc, replay_timeout=1)
+
+
+def _two_message_codex_driver():
+    """A Codex turn with two agent messages that carry no ``itemId``."""
+    holder = {}
+
+    def on_frame(frame):
+        proc = holder["proc"]
+        method = frame.get("method")
+        if method == "initialize":
+            proc.feed({"id": frame["id"], "result": {"server": "fake"}})
+        elif method == "thread/start":
+            proc.feed({"id": frame["id"], "result": {"thread": {"id": "th_1"}}})
+        elif method == "turn/start":
+            proc.feed({
+                "id": frame["id"], "result": {"turn": {"id": "native-1"}},
+            })
+            proc.feed({
+                "method": "turn/started", "params": {"turn": {"id": "native-1"}},
+            })
+            for text in ("first", "second"):
+                proc.feed({
+                    "method": "item/agentMessage/delta",
+                    "params": {"delta": text},
+                })
+                proc.feed({
+                    "method": "item/agentMessage/completed", "params": {},
+                })
+            proc.feed({
+                "method": "turn/completed",
+                "params": {"turn": {"status": "completed"}},
+            })
+
+    proc = _FakeProcess(on_frame)
+    holder["proc"] = proc
+    return proc, CodexAppServerDriver(lambda _spec: proc)
+
+
+async def _collect_until_turn_end(stream):
+    collected = []
+    async for value in stream:
+        if value.turn_ref is not None:
+            collected.append(value)
+        kind = getattr(value.type, "value", value.type)
+        if kind in {"turn.completed", "turn.abandoned"}:
+            return collected
+    raise AssertionError("event stream ended before the turn finished")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude-code", "codex"])
+async def test_two_output_blocks_in_one_turn_keep_distinct_block_ids(provider):
+    """Reproduced bug: a frame-scoped block id aborts a two-block turn.
+
+    Anthropic ``text`` blocks carry no ``id`` and Codex agent-message deltas may
+    omit ``itemId``, so both drivers used to fall back to a value that is
+    constant across the turn.  Two blocks then shared one public id, the
+    projector suppressed the second ``start``, and the validator rejected the
+    resulting ``end -> delta`` transition -- which the Runtime Manager turns
+    into ``runtime_event_processing_failed`` and abandons the whole turn.
+    """
+    if provider == "claude-code":
+        proc, driver = _two_block_claude_driver()
+        await driver.open(RuntimeSpec("/workspace"))
+    else:
+        proc, driver = _two_message_codex_driver()
+        await driver.open(RuntimeSpec("/workspace", model="gpt"))
+    stream = driver.events()
+    started = await driver.start_turn(
+        TurnInput("hello", client_correlation_id="client-1")
+    )
+    assert started.turn_ref.value
+    collected = await _collect_until_turn_end(stream)
+    await driver.close()
+
+    deltas = [
+        value for value in collected
+        if getattr(value.type, "value", value.type) == "turn.assistant_delta"
+    ]
+    block_ids = [value.data["block_id"] for value in deltas]
+    assert [value.data["text"] for value in deltas] == ["first", "second"]
+    assert len(set(block_ids)) == 2, block_ids
+
+    # The identity only matters because of what it does downstream: replaying
+    # the driver's own events must not trip the lifecycle validator.
+    projector = RuntimeEventProjector(agent_id="agent_1", session_ref="s_1")
+    validator = LifecycleValidator()
+    phases = []
+    for value in collected:
+        for projected in projector.project_all(value):
+            validator.accept(projected)
+            if projected.type == "output.updated":
+                phases.append(projected.payload["phase"])
+    assert phases == ["start", "delta", "end"] * 2
+    assert validator.active_turn_ref is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude-code", "codex"])
+async def test_start_turn_write_failure_leaves_no_turn_or_request_pending(
+    provider,
+):
+    """A provider write that fails must not strand per-turn bookkeeping.
+
+    When the child dies between ``open()`` and the turn write, ``drain()``
+    raises.  Claude used to write outside the ``try`` that clears its replay
+    state, so ``_active`` stayed set and the next turn was refused as "one turn
+    is already active"; Codex registered the pending future before the write,
+    so a failed write leaked an entry that ``_fail_pending_requests`` later
+    resolved with an exception no coroutine was left to retrieve.
+    """
+    if provider == "claude-code":
+        proc, driver = _two_block_claude_driver()
+        await driver.open(RuntimeSpec("/workspace"))
+    else:
+        proc, driver = _two_message_codex_driver()
+        await driver.open(RuntimeSpec("/workspace", model="gpt"))
+
+    working_drain = proc.stdin.drain
+
+    async def broken_drain():
+        raise ConnectionResetError("child died")
+
+    proc.stdin.drain = broken_drain
+    with pytest.raises(ConnectionResetError):
+        await driver.start_turn(
+            TurnInput("hello", client_correlation_id="client-1")
+        )
+
+    assert driver._active.value == ""
+    assert driver._active_native_turn_id == ""
+    if provider == "claude-code":
+        assert driver._pending_replay is None
+        assert driver._pending_content == ""
+        assert driver._pending_uuid == ""
+    else:
+        assert driver._pending == {}
+
+    # The failed turn never reached the provider, so the next one is admitted.
+    proc.stdin.drain = working_drain
+    retried = await driver.start_turn(
+        TurnInput("hello", client_correlation_id="client-1")
+    )
+    assert retried.turn_ref.value
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_child_environment_merges_over_process_environment(
+    monkeypatch,
+):
+    """``RuntimeSpec.environment`` is a delta, not the child's whole env.
+
+    ``ClaudeCodeCliDriver`` merges it over ``os.environ``; Codex replaced the
+    environment outright, so any spec carrying only overrides would launch
+    ``codex app-server`` without PATH or HOME.
+    """
+    holder = {}
+
+    def on_frame(frame):
+        proc = holder["proc"]
+        if frame.get("method") == "initialize":
+            proc.feed({"id": frame["id"], "result": {"server": "fake"}})
+        elif frame.get("method") == "thread/start":
+            proc.feed({"id": frame["id"], "result": {"thread": {"id": "th_1"}}})
+
+    proc = _FakeProcess(on_frame)
+    holder["proc"] = proc
+    captured = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured.update(kwargs)
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setenv("PUFFO_HARNESS_MARKER", "inherited")
+    driver = CodexAppServerDriver()
+    await driver.open(
+        RuntimeSpec("/workspace", environment={"CODEX_HOME": "/tmp/codex"})
+    )
+    await driver.close()
+
+    assert captured["env"]["CODEX_HOME"] == "/tmp/codex"
+    assert captured["env"]["PUFFO_HARNESS_MARKER"] == "inherited"
+    assert captured["env"]["PATH"] == os.environ["PATH"]

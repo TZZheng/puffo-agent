@@ -179,8 +179,13 @@ class ClaudeCodeCliDriver(Driver):
                 "content": [{"type": "text", "text": input.content}],
             },
         }
-        await self._write(frame)
+        replay = self._pending_replay
         try:
+            # The write belongs inside the try: a child that died between
+            # open() and the turn write makes drain() raise, and leaving that
+            # path outside the cleanup strands `_active` plus an orphaned
+            # replay future whose exception nobody retrieves.
+            await self._write(frame)
             observed_uuid = await asyncio.wait_for(
                 asyncio.shield(self._pending_replay), self.replay_timeout
             )
@@ -190,6 +195,16 @@ class ClaudeCodeCliDriver(Driver):
             return TurnStarted(
                 local, accepted=False, delivery="ambiguous_at_least_once"
             )
+        except BaseException:
+            # A turn that never reached the provider is not in flight; clear it
+            # so the next start_turn is not refused as "already active".
+            self._active = TurnRef("")
+            self._active_native_turn_id = ""
+            if not replay.done():
+                replay.cancel()
+            elif not replay.cancelled():
+                replay.exception()
+            raise
         finally:
             self._pending_replay = None
             self._pending_content = ""
@@ -372,22 +387,34 @@ class ClaudeCodeCliDriver(Driver):
                 native_payload=frame,
             )
             return
-        for block in (frame.get("message") or {}).get("content") or ():
+        for index, block in enumerate(
+            (frame.get("message") or {}).get("content") or ()
+        ):
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "text":
-                await self._emit_assistant_text(frame, block)
+                await self._emit_assistant_text(frame, block, index)
             elif block.get("type") == "tool_use":
                 await self._emit_tool_started(frame, block)
 
     async def _emit_assistant_text(
-        self, frame: dict[str, Any], block: dict[str, Any]
+        self, frame: dict[str, Any], block: dict[str, Any], index: int
     ) -> None:
         self._output_block_counter += 1
+        # Block identity must be per content block, not per frame: Anthropic
+        # `text` blocks carry no `id`, so falling back to the frame `uuid`
+        # alone gives every text block in a multi-block frame the same public
+        # id.  The projector then suppresses the second block's `start` and the
+        # validator rejects the resulting `end -> delta` transition, aborting
+        # the whole turn as `runtime_event_processing_failed`.
+        frame_uuid = frame.get("uuid")
         block_id = str(
             block.get("id")
-            or frame.get("uuid")
-            or f"result_{self._output_block_counter}"
+            or (
+                f"{frame_uuid}:{index}"
+                if frame_uuid
+                else f"result_{self._output_block_counter}"
+            )
         )
         await self._emit(
             HarnessEventType.ASSISTANT_DELTA,

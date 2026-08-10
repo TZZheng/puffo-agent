@@ -188,9 +188,17 @@ def _thaw_json(value: Any) -> Any:
 class LifecycleValidator:
     """Stateful validator; call before persisting each event."""
 
+    # A worker's validator lives as long as the daemon, so finished-turn
+    # memory has to be bounded.  The cost of eviction is that a duplicate
+    # `turn.started` for a turn older than this many turns is re-admitted
+    # instead of rejected as terminal; every other late event for it still
+    # fails the "event does not belong to active turn" check.
+    _FINISHED_CAPACITY = 1024
+
     def __init__(self) -> None:
         self._active: str | None = None
-        self._finished: set[str] = set()
+        # Ordered set: keys are finished turn refs, in eviction order.
+        self._finished: dict[str, None] = {}
         self._blocks: dict[tuple[str, str], str] = {}
 
     @property
@@ -226,7 +234,14 @@ class LifecycleValidator:
                 for key, phase in self._blocks.items()
             ):
                 raise ValueError("turn cannot finish with an open output block")
-            self._finished.add(turn)
+            # The turn is terminal, so its per-block rows can never be
+            # consulted again; dropping them also keeps the scan above O(open
+            # blocks) instead of O(blocks ever seen by this process).
+            for key in [key for key in self._blocks if key[0] == turn]:
+                del self._blocks[key]
+            self._finished[turn] = None
+            while len(self._finished) > self._FINISHED_CAPACITY:
+                self._finished.pop(next(iter(self._finished)))
             self._active = None
 
 
@@ -258,6 +273,7 @@ class RuntimeEventProjector:
         self.id_factory = id_factory or (lambda: f"evt_{uuid.uuid4().hex}")
         self._block_refs: dict[tuple[str, str], str] = {}
         self._tool_refs: dict[tuple[str, str], str] = {}
+        self._started_blocks: set[tuple[str, str]] = set()
 
     def _make(
         self, event: HarnessEvent, type_: str, payload: Mapping[str, Any]
@@ -365,6 +381,15 @@ class RuntimeEventProjector:
             key, f"out_{uuid.uuid4().hex}"
         )
 
+    def _prune_turn(self, turn_ref: str) -> None:
+        """Drop the per-turn ref tables once the turn is terminal."""
+        for refs in (self._block_refs, self._tool_refs):
+            for key in [key for key in refs if key[0] == turn_ref]:
+                del refs[key]
+        self._started_blocks -= {
+            key for key in self._started_blocks if key[0] == turn_ref
+        }
+
     def project_all(self, event: HarnessEvent) -> tuple[RuntimeEvent, ...]:
         """Project an event while materializing output block boundaries.
 
@@ -394,11 +419,14 @@ class RuntimeEventProjector:
                 occurred_at=projected.occurred_at,
             )
             return (projected, activity)
+        if kind in {"turn.completed", "turn.abandoned"}:
+            # Terminal boundary: no later event can reference this turn, so its
+            # ref tables are dead weight for the rest of the daemon's life.
+            self._prune_turn(projected.turn_ref)
+            return (projected,)
         if kind == "turn.assistant_delta":
             key = (projected.turn_ref, str(projected.payload["block_id"]))
-            started = getattr(self, "_started_blocks", None)
-            if started is None:
-                started = self._started_blocks = set()
+            started = self._started_blocks
             if key not in started:
                 started.add(key)
                 start = RuntimeEvent(

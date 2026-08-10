@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -151,6 +152,10 @@ class CodexAppServerDriver(Driver):
         self._context = ContextStatus(stale=True)
         self._permission_requests: dict[PermissionRef, int | str] = {}
         self._open_output_blocks: set[str] = set()
+        # Synthetic id for the currently open id-less agent message, plus the
+        # counter that keeps successive ones distinct.
+        self._fallback_block_id: str | None = None
+        self._fallback_block_counter = 0
         self._closed = False
 
     async def open(
@@ -162,6 +167,11 @@ class CodexAppServerDriver(Driver):
             self._prepare_reopen()
         if self.process_factory is None:
             executable = spec.executable or "codex"
+            # Merge, matching ClaudeCodeCliDriver.open: `RuntimeSpec.environment`
+            # is a Mapping that invites a delta, and replacing the child's whole
+            # environment would strip PATH/HOME from `codex app-server`.
+            env = os.environ.copy()
+            env.update(spec.environment)
             self._proc = await asyncio.create_subprocess_exec(
                 executable,
                 *spec.launch_args,
@@ -170,7 +180,7 @@ class CodexAppServerDriver(Driver):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=spec.workspace_dir or None,
-                env=dict(spec.environment) or None,
+                env=env,
                 # One provider frame can carry a large tool result; the default
                 # 64 KiB stream limit would terminate the reader mid-session.
                 limit=16 * 1024 * 1024,
@@ -363,6 +373,7 @@ class CodexAppServerDriver(Driver):
         self._active_native_turn_id = ""
         self._permission_requests.clear()
         self._open_output_blocks.clear()
+        self._fallback_block_id = None
         self._context = ContextStatus(stale=True)
         await self._events.put(None)
 
@@ -375,6 +386,7 @@ class CodexAppServerDriver(Driver):
         self._active_native_turn_id = ""
         self._permission_requests.clear()
         self._open_output_blocks.clear()
+        self._fallback_block_id = None
         self._context = ContextStatus(stale=True)
 
     def _fail_pending_requests(self, message: str) -> None:
@@ -388,8 +400,13 @@ class CodexAppServerDriver(Driver):
         request_id = self._request_id
         future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
-        await self._write({"id": request_id, "method": method, "params": params})
         try:
+            # Inside the try: a write that raises must not leak the registered
+            # entry, which `_fail_pending_requests` would later resolve with an
+            # exception no coroutine is left to retrieve.
+            await self._write(
+                {"id": request_id, "method": method, "params": params}
+            )
             return await asyncio.wait_for(future, self.request_timeout_seconds)
         except asyncio.TimeoutError:
             # Provider silence must surface as a bounded, retryable failure so
@@ -520,7 +537,7 @@ class CodexAppServerDriver(Driver):
                 native_payload=frame,
             )
         elif method == "item/agentMessage/delta":
-            block_id = str(params.get("itemId") or "result")
+            block_id = self._delta_block_id(params.get("itemId"))
             self._open_output_blocks.add(block_id)
             await self._emit(
                 HarnessEventType.ASSISTANT_DELTA,
@@ -560,6 +577,22 @@ class CodexAppServerDriver(Driver):
                 native_payload=frame,
             )
 
+    def _delta_block_id(self, item_id: Any) -> str:
+        """Public id for an agent-message delta.
+
+        A constant fallback would give two successive id-less messages in one
+        turn the same public id, so the second one's `start` is suppressed and
+        the validator rejects an `end -> delta` transition.  Reuse the open
+        synthetic id while a block is in flight; mint a fresh one after it
+        closes.
+        """
+        if item_id:
+            return str(item_id)
+        if self._fallback_block_id is None:
+            self._fallback_block_counter += 1
+            self._fallback_block_id = f"result_{self._fallback_block_counter}"
+        return self._fallback_block_id
+
     def _log_tool_shape(self, method: str, params: dict[str, Any]) -> None:
         item = params.get("item")
         if not isinstance(item, dict) or not (
@@ -590,13 +623,15 @@ class CodexAppServerDriver(Driver):
             "toolCall",
         }:
             await self._emit_completed_tool(frame, item, params)
-        block_id = str(
-            (item.get("id") if isinstance(item, dict) else None)
-            or params.get("itemId")
-            or "result"
-        )
+        native_id = (
+            item.get("id") if isinstance(item, dict) else None
+        ) or params.get("itemId")
+        # An id-less completion closes whichever synthetic block is open.
+        block_id = str(native_id or self._fallback_block_id or "result")
         if block_id in self._open_output_blocks:
             self._open_output_blocks.discard(block_id)
+            if block_id == self._fallback_block_id:
+                self._fallback_block_id = None
             await self._emit(
                 HarnessEventType.ASSISTANT_COMPLETED,
                 turn_ref=self._active,
@@ -659,6 +694,7 @@ class CodexAppServerDriver(Driver):
                 native_payload=frame,
             )
         self._open_output_blocks.clear()
+        self._fallback_block_id = None
         outcome = (
             "cancelled"
             if "interrupt" in status

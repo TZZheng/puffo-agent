@@ -377,3 +377,50 @@ def test_log_command_normalization_and_projection_boundaries_are_closed(caplog):
     assert secret not in "\n".join(
         record.getMessage() for record in caplog.records
     )
+
+
+def test_second_output_block_is_accepted_and_terminal_state_is_pruned():
+    """Two output blocks in one turn, then no per-turn state survives it.
+
+    A provider frame carrying two content blocks opens a second block after the
+    first has ended.  The validator must admit that (the drivers emit it), and
+    once the turn is terminal neither the validator nor the projector may keep
+    rows for it -- both live for the whole daemon lifetime, so an un-pruned
+    table grows without bound and makes the validator's open-block scan cost
+    grow with process age.
+    """
+    projector = RuntimeEventProjector(agent_id="agent_1", session_ref="s_1")
+    validator = LifecycleValidator()
+
+    def normalized(type_, **data):
+        return HarnessEvent.normalized(
+            type=type_, driver="claude-code", session_ref=SessionRef("s_1"),
+            turn_ref=TurnRef("turn_1"), data=data,
+        )
+
+    source = [normalized("turn.started")]
+    for block in ("block-a", "block-b"):
+        source.append(normalized(
+            "turn.assistant_delta", text="hi", block_id=block
+        ))
+        source.append(normalized("turn.assistant_completed", block_id=block))
+        source.append(normalized("turn.tool_started", tool_call_ref=block))
+    source.append(normalized("turn.completed", outcome="succeeded"))
+
+    phases = []
+    for item in source:
+        for projected in projector.project_all(item):
+            validator.accept(projected)
+            if projected.type == "output.updated":
+                phases.append(projected.payload["phase"])
+
+    # Both blocks materialize a full start -> delta -> end, so the second one
+    # was not suppressed as a duplicate of the first.
+    assert phases == ["start", "delta", "end"] * 2
+    assert validator.active_turn_ref is None
+    assert validator._blocks == {}
+    assert projector._block_refs == {}
+    assert projector._tool_refs == {}
+    assert projector._started_blocks == set()
+    # The turn is still remembered as terminal, so a late event is rejected.
+    assert "turn_1" in validator._finished

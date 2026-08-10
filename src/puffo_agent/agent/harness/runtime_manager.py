@@ -655,7 +655,8 @@ class RuntimeManagerAdapter(Adapter):
         self.spec_reloader = spec_reloader
         self.assistant_text_parts: list[str] = []
 
-    async def run_turn(self, ctx: TurnContext) -> TurnResult:
+    @staticmethod
+    def _current_user_input(ctx: TurnContext) -> str:
         if not ctx.messages:
             raise RuntimeStateError("turn context requires a current user input")
         current = ctx.messages[-1]
@@ -666,6 +667,94 @@ class RuntimeManagerAdapter(Adapter):
         message = current.get("content")
         if not isinstance(message, str) or not message.strip():
             raise RuntimeStateError("current user input must be non-empty text")
+        return message
+
+    async def _announce_admission(self, started) -> None:
+        callback = getattr(self, "_context_admission_callback", None)
+        if callback is None:
+            return
+        await self._fire_admission_callback(ProviderAdmissionEvent(
+            planning_cycle_key=getattr(
+                self, "_context_admission_planning_cycle_key", ""
+            ),
+            provider_session_id=self.get_provider_session_id(),
+            provider_turn_id=started.native_turn_id or None,
+            admitted_at=datetime.now(timezone.utc),
+        ))
+
+    async def _consume_turn_events(
+        self,
+        ctx: TurnContext,
+        stream,
+        turn: TurnRef,
+        metadata: dict[str, Any],
+    ) -> TurnResult | None:
+        """Drain the turn's events; None means the runtime stream ended."""
+        async for event in stream:
+            if event.turn_ref != turn:
+                continue
+            event_type = (
+                event.type.value
+                if isinstance(event.type, HarnessEventType) else event.type
+            )
+            if event_type == "turn.assistant_delta":
+                text = event.data.get("text")
+                if isinstance(text, str):
+                    self.assistant_text_parts.append(text)
+                    if ctx.on_progress is not None:
+                        await ctx.on_progress(text)
+            if event_type in {"turn.completed", "turn.abandoned"}:
+                outcome = str(event.data.get("outcome") or "succeeded")
+                if event_type == "turn.abandoned" or outcome != "succeeded":
+                    raise RuntimeStateError(
+                        f"provider turn ended with outcome {outcome}"
+                    )
+                metadata.update({
+                    key: value for key, value in event.data.items()
+                    if key in {
+                        "input_tokens", "output_tokens", "tool_calls",
+                        "provider_session_id", "send_message_targets",
+                    }
+                })
+                return TurnResult(
+                    reply="".join(self.assistant_text_parts),
+                    input_tokens=int(metadata.get("input_tokens", 0)),
+                    output_tokens=int(metadata.get("output_tokens", 0)),
+                    tool_calls=int(metadata.get("tool_calls", 0)),
+                    metadata=metadata,
+                )
+        return None
+
+    async def _timed_out_turn_result(
+        self,
+        turn: TurnRef | None,
+        timeout_seconds: float,
+        metadata: dict[str, Any],
+    ) -> TurnResult:
+        logger.warning(
+            "provider turn %s exceeded %.3fs timeout",
+            turn,
+            timeout_seconds,
+        )
+        if turn is not None:
+            # A start_turn that timed out already released its own
+            # bookkeeping through the manager's BaseException path.
+            await self.manager.timeout_turn(turn)
+        label = (
+            f"{timeout_seconds / 60:g} minute"
+            if timeout_seconds >= 60 and timeout_seconds % 60 == 0
+            else f"{timeout_seconds:g} second"
+        )
+        return TurnResult(
+            reply=f"Task exceeded the {label} timeout.",
+            metadata={
+                **metadata,
+                "runtime_turn_timeout": True,
+            },
+        )
+
+    async def run_turn(self, ctx: TurnContext) -> TurnResult:
+        message = self._current_user_input(ctx)
         self.assistant_text_parts = []
         metadata: dict[str, Any] = {}
         timeout_seconds = float(
@@ -691,72 +780,17 @@ class RuntimeManagerAdapter(Adapter):
                     return TurnResult(reply="", metadata={"accepted": False})
                 turn = started.turn_ref
                 metadata["turn_ref"] = str(turn)
-                callback = getattr(self, "_context_admission_callback", None)
-                if callback is not None:
-                    await self._fire_admission_callback(ProviderAdmissionEvent(
-                        planning_cycle_key=getattr(
-                            self, "_context_admission_planning_cycle_key", ""
-                        ),
-                        provider_session_id=self.get_provider_session_id(),
-                        provider_turn_id=started.native_turn_id or None,
-                        admitted_at=datetime.now(timezone.utc),
-                    ))
-                async for event in stream:
-                    if event.turn_ref != turn:
-                        continue
-                    event_type = (
-                        event.type.value
-                        if isinstance(event.type, HarnessEventType) else event.type
-                    )
-                    if event_type == "turn.assistant_delta":
-                        text = event.data.get("text")
-                        if isinstance(text, str):
-                            self.assistant_text_parts.append(text)
-                            if ctx.on_progress is not None:
-                                await ctx.on_progress(text)
-                    if event_type in {"turn.completed", "turn.abandoned"}:
-                        outcome = str(event.data.get("outcome") or "succeeded")
-                        if event_type == "turn.abandoned" or outcome != "succeeded":
-                            raise RuntimeStateError(
-                                f"provider turn ended with outcome {outcome}"
-                            )
-                        metadata.update({
-                            key: value for key, value in event.data.items()
-                            if key in {
-                                "input_tokens", "output_tokens", "tool_calls",
-                                "provider_session_id", "send_message_targets",
-                            }
-                        })
-                        return TurnResult(
-                            reply="".join(self.assistant_text_parts),
-                            input_tokens=int(metadata.get("input_tokens", 0)),
-                            output_tokens=int(metadata.get("output_tokens", 0)),
-                            tool_calls=int(metadata.get("tool_calls", 0)),
-                            metadata=metadata,
-                        )
+                await self._announce_admission(started)
+                completed = await self._consume_turn_events(
+                    ctx, stream, turn, metadata
+                )
+                if completed is not None:
+                    return completed
         except TimeoutError:
             if not timeout.expired():
                 raise
-            logger.warning(
-                "provider turn %s exceeded %.3fs timeout",
-                turn,
-                timeout_seconds,
-            )
-            if turn is not None:
-                # A start_turn that timed out already released its own
-                # bookkeeping through the manager's BaseException path.
-                await self.manager.timeout_turn(turn)
-            label = (
-                f"{timeout_seconds / 60:g} minute"
-                if timeout_seconds >= 60 and timeout_seconds % 60 == 0
-                else f"{timeout_seconds:g} second"
-            )
-            return TurnResult(
-                reply=f"Task exceeded the {label} timeout.",
-                metadata={
-                    **metadata,
-                    "runtime_turn_timeout": True,
-                },
+            return await self._timed_out_turn_result(
+                turn, timeout_seconds, metadata
             )
         finally:
             close_stream = getattr(stream, "aclose", None)
