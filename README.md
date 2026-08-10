@@ -425,7 +425,7 @@ puffo-agent ws-local /path/to/agent.puffoagent --passcode <code>
 ```
 
 The client prints a `SESSION_DIR=…` line — the AI tail-follows `events.ndjson`
-for inbound bundles and appends `tool_call` / `ack` / `end` commands to
+for inbound bundles and appends `tool_call` / `ack` / `admitted` / `end` commands to
 `commands.ndjson`. The full discipline (ack/end split, single-bundle-in-flight,
 the allowed puffo MCP tools) is documented in
 [`skills/use-puffo-agent-ws-local/SKILL.md`](skills/use-puffo-agent-ws-local/SKILL.md).

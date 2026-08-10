@@ -91,8 +91,7 @@ class ClaudeCodeCliDriver(Driver):
         if self._proc is not None:
             raise RuntimeError("driver is already open")
         if self._closed:
-            self._closed = False
-            self._events = asyncio.Queue()
+            self._prepare_reopen()
         args = [
             spec.executable or "claude",
             *spec.launch_args,
@@ -262,7 +261,35 @@ class ClaudeCodeCliDriver(Driver):
         if self._stderr_reader is not None:
             self._stderr_reader.cancel()
             await asyncio.gather(self._stderr_reader, return_exceptions=True)
+        self._reader = None
+        self._stderr_reader = None
+        self._fail_pending_futures("Claude Code CLI closed")
+        self._active = TurnRef("")
+        self._active_native_turn_id = ""
+        self._pending_content = ""
+        self._pending_uuid = ""
+        self._tool_calls.clear()
         await self._events.put(None)
+
+    def _prepare_reopen(self) -> None:
+        """Discard transient state tied to the process that was closed."""
+        self._closed = False
+        self._events = asyncio.Queue()
+        self._init = None
+        self._pending_replay = None
+        self._pending_content = ""
+        self._pending_uuid = ""
+        self._active = TurnRef("")
+        self._active_native_turn_id = ""
+        self._tool_calls.clear()
+        self._compact_advertised = False
+
+    def _fail_pending_futures(self, message: str) -> None:
+        for future in (self._init, self._pending_replay):
+            if future is not None and not future.done():
+                future.set_exception(RuntimeError(message))
+        self._init = None
+        self._pending_replay = None
 
     async def _write(self, frame: dict[str, Any]) -> None:
         encoded = (

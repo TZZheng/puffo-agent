@@ -560,6 +560,14 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                     quarantine=self.store.quarantine_pending,
                 )
                 if changed:
+                    log_runtime_event(
+                        logger,
+                        "inbox.row_quarantined",
+                        agent_id=self.agent_id,
+                        message_id=batch.unfit_head_id,
+                        error_category="context_oversize",
+                        outcome="terminal",
+                    )
                     pending_universe = await self.store.get_pending()
                     pending = pending_universe
                     if max_items is not None:

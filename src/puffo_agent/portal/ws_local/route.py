@@ -299,6 +299,7 @@ def _make_owned_runtime(point: AttachPoint, bridge, holder: dict[str, WsLocalSes
         adapter=adapter,
         run_turn=run_turn,
         workspace=workspace,
+        held_catchup=client.recover_pending_delivery,
         send_mode_keys=(point.agent_id, client.slug),
         agent_id=point.agent_id,
     )

@@ -44,6 +44,7 @@ RUNTIME_EVENT_NAMES = frozenset({
     "inbox.row_in_turn",
     "inbox.row_processed",
     "inbox.row_requeued",
+    "inbox.row_quarantined",
     "batch.planned",
     "turn.admitted",
     "history.read_staged",

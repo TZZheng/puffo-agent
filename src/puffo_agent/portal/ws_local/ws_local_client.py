@@ -31,6 +31,7 @@ from typing import Any, Callable, Optional
 import aiohttp
 
 POLL_INTERVAL_SECONDS = 0.1
+V2_CAPABILITIES = ("multi-target-v2", "explicit-admission-v2")
 
 
 async def run_attach(
@@ -98,7 +99,14 @@ async def _run_attach_connection(
             write_status({"state": "error", "reason": str(exc)})
             return 1
         await ws.send_str(
-            json.dumps({"type": "connect", "bundle": bundle, "password": passcode})
+            json.dumps(
+                {
+                    "type": "connect",
+                    "bundle": bundle,
+                    "password": passcode,
+                    "capabilities": list(V2_CAPABILITIES),
+                }
+            )
         )
         stop = asyncio.Event()
         try:
@@ -215,6 +223,18 @@ async def _send_attach_command(
         await ws.send_str(
             json.dumps({"type": kind, "bundle_id": str(command.get("bundle_id", ""))})
         )
+        return False
+    if kind == "admitted":
+        admitted = {
+            "type": "admitted",
+            "version": 2,
+            "bundle_id": str(command.get("bundle_id", "")),
+            "turn_id": str(command.get("turn_id", "")),
+        }
+        correlation_key = command.get("correlation_key")
+        if correlation_key is not None:
+            admitted["correlation_key"] = str(correlation_key)
+        await ws.send_str(json.dumps(admitted))
         return False
     if kind == "tool_call":
         params = command.get("params") or {}

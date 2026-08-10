@@ -322,6 +322,48 @@ async def test_malformed_head_is_discarded_so_later_sequence_can_progress(tmp_pa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403, 404, 405])
+async def test_channel_level_http_failures_preserve_fifo_and_degrade(tmp_path, status):
+    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    await outbox.enqueue(event(1))
+    await outbox.enqueue(event(2))
+    attempted = []
+
+    async def unavailable(_path, body):
+        attempted.append([item["event_id"] for item in json.loads(body)["events"]])
+        return status, {}
+
+    result = await RuntimeEventUploader(outbox, unavailable).upload_once()
+
+    assert result.state == "degraded"
+    assert result.error_code == f"http_{status}"
+    assert attempted == [["evt_1_turn.started", "evt_2_turn.started"]]
+    assert [row.event_id for row in outbox.prefix()] == [
+        "evt_1_turn.started", "evt_2_turn.started",
+    ]
+    assert [row.retry_count for row in outbox.prefix()] == [0, 0]
+    outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_row_level_http_rejection_still_isolates_then_discards_head(tmp_path):
+    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    await outbox.enqueue(event(1))
+    await outbox.enqueue(event(2))
+
+    async def rejected(_path, _body):
+        return 422, {}
+
+    uploader = RuntimeEventUploader(outbox, rejected)
+    assert (await uploader.upload_once()).state == "retry"
+    assert (await uploader.upload_once()).state == "discarded"
+    assert [row.event_id for row in outbox.prefix()] == [
+        "evt_2_turn.started",
+    ]
+    outbox.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_event_transport_enforces_complete_body_limits_and_progress(tmp_path):
     """The actual bytes handed to transport, rather than a row estimate,
     are bounded; bad heads cannot strand valid followers."""

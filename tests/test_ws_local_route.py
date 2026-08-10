@@ -381,6 +381,7 @@ class _V2Client:
         self.global_runtime = None
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+        self.recovered: list[str] = []
 
     async def listen(self, _on_message):
         from puffo_agent.agent.message_store import ReceiptDisposition
@@ -400,6 +401,10 @@ class _V2Client:
 
     def set_profile(self, *_args, **_kwargs):
         return None
+
+    async def recover_pending_delivery(self, envelope_id: str) -> bool:
+        self.recovered.append(envelope_id)
+        return True
 
 
 async def _start_v2_attached(monkeypatch, tmp_path, store):
@@ -488,6 +493,8 @@ async def test_v2_receipt_to_global_bundle_admitted_end_and_owned_runtime_cleanu
     store = MessageStore(tmp_path / "messages.db")
     await store.open()
     client, transport, served = await _start_v2_attached(monkeypatch, tmp_path, store)
+    assert await client.global_runtime.held_recovery_source.catchup_pending("late-one")
+    assert client.recovered == ["late-one"]
     bundle = await _wait_for_v2_bundle(transport)
     await _admit_and_end_v2_bundle(transport, store, bundle)
     transport._inbound.put_nowait(None)

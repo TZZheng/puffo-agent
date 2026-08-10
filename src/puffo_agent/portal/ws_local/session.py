@@ -29,6 +29,7 @@ from .protocol import (
     Ack,
     Admitted,
     End,
+    Error,
     Ping,
     Pong,
     ProtocolError,
@@ -304,6 +305,10 @@ class WsLocalSession:
             and inflight.turn_id
             and not self._inflight_admitted
         ):
+            reason = "v2 bundle ended before explicit admission"
+            logger.warning("ws-local %s: %s", self.slug, reason)
+            await self._transport.send(encode(Error(reason)))
+            await self._die(reason)
             return
         bundle = self._queue.ack(bundle_id)
         if bundle is None:

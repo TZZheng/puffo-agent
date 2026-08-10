@@ -34,12 +34,20 @@ def _quoted(value: Any) -> str:
         .replace("\\", "\\\\")
         .replace('"', '\\"')
         .replace("\n", "\\n")
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
     )
     return f'"{escaped}"'
 
 
 def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return (
+        json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
 
 
 def _annotation(label: str, value: Any) -> str:
@@ -51,6 +59,12 @@ def message_text(message: Any) -> str:
     if isinstance(content, Mapping):
         return str(content.get("text") or content.get("caption") or "")
     return str(content or "")
+
+
+def _content_field(value: Any) -> str:
+    """Keep untrusted prose inside one JSON value, outside row grammar."""
+    text = "" if value is None else str(value)
+    return f"content={_json(text)}"
 
 
 def _dm_peer(message: Any, current_agent_aliases: Sequence[str] = ()) -> str:
@@ -204,7 +218,7 @@ def format_reminder_event(message: Any) -> str:
         f"intended_at={_quoted(event.get('intended_at', ''))}",
         f"actual_fire_at={_quoted(event.get('actual_fire_at', ''))}",
     ]
-    return f"[event {' '.join(fields)}]\n{str(event.get('content', ''))}"
+    return f"[event {' '.join(fields)}]\n{_content_field(event.get('content', ''))}"
 
 
 def format_membership_event(message: Any) -> str:
@@ -225,7 +239,7 @@ def format_membership_event(message: Any) -> str:
         value = str(event.get(key) or "")
         if value:
             fields.append(f"{label}={_quoted(prefix + value.lstrip('@'))}")
-    return f"[event {' '.join(fields)}]\n{message_text(message)}"
+    return f"[event {' '.join(fields)}]\n{_content_field(message_text(message))}"
 
 
 def _event_type(message: Any) -> str:
@@ -293,7 +307,7 @@ def format_message_row(
         fields.append(f"mentions={_json(mentions)}")
     if reply_count is not None:
         fields.append(f"reply_count={reply_count}")
-    return f"[message {' '.join(fields)}]\n{message_text(message)}"
+    return f"[message {' '.join(fields)}]\n{_content_field(message_text(message))}"
 
 
 def target_ref(

@@ -157,8 +157,7 @@ class CodexAppServerDriver(Driver):
         if self._proc is not None:
             raise RuntimeError("driver is already open")
         if self._closed:
-            self._closed = False
-            self._events = asyncio.Queue()
+            self._prepare_reopen()
         if self.process_factory is None:
             executable = spec.executable or "codex"
             self._proc = await asyncio.create_subprocess_exec(
@@ -352,7 +351,32 @@ class CodexAppServerDriver(Driver):
         if self._stderr_reader is not None:
             self._stderr_reader.cancel()
             await asyncio.gather(self._stderr_reader, return_exceptions=True)
+        self._reader = None
+        self._stderr_reader = None
+        self._fail_pending_requests("Codex app-server closed")
+        self._active = TurnRef("")
+        self._active_native_turn_id = ""
+        self._permission_requests.clear()
+        self._open_output_blocks.clear()
+        self._context = ContextStatus(stale=True)
         await self._events.put(None)
+
+    def _prepare_reopen(self) -> None:
+        """Discard transient state tied to the process that was closed."""
+        self._closed = False
+        self._events = asyncio.Queue()
+        self._pending.clear()
+        self._active = TurnRef("")
+        self._active_native_turn_id = ""
+        self._permission_requests.clear()
+        self._open_output_blocks.clear()
+        self._context = ContextStatus(stale=True)
+
+    def _fail_pending_requests(self, message: str) -> None:
+        for future in self._pending.values():
+            if not future.done():
+                future.set_exception(RuntimeError(message))
+        self._pending.clear()
 
     async def _request(self, method: str, params: dict[str, Any]) -> Any:
         self._request_id += 1
@@ -403,9 +427,7 @@ class CodexAppServerDriver(Driver):
                     continue
                 await self._notification(frame)
         finally:
-            for future in self._pending.values():
-                if not future.done():
-                    future.set_exception(RuntimeError("Codex app-server exited"))
+            self._fail_pending_requests("Codex app-server exited")
             if not self._closed:
                 await self._emit(HarnessEventType.RUNTIME_EXITED)
 

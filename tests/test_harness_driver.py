@@ -984,6 +984,89 @@ async def test_codex_driver_resumes_with_native_session_id_after_handshake():
 
 
 @pytest.mark.asyncio
+async def test_codex_driver_reopens_cleanly_after_closing_an_active_turn():
+    processes = []
+
+    def factory(_spec):
+        holder = {}
+
+        def on_frame(frame):
+            proc = holder["proc"]
+            if frame.get("method") == "initialize":
+                proc.feed({"id": frame["id"], "result": {}})
+            elif frame.get("method") == "thread/start":
+                proc.feed({
+                    "id": frame["id"],
+                    "result": {"thread": {"id": f"thread-{len(processes)}"}},
+                })
+            elif frame.get("method") == "turn/start":
+                proc.feed({
+                    "id": frame["id"],
+                    "result": {"turn": {"id": f"turn-{len(processes)}"}},
+                })
+
+        proc = _FakeProcess(on_frame)
+        holder["proc"] = proc
+        processes.append(proc)
+        return proc
+
+    driver = CodexAppServerDriver(factory)
+    await driver.open(RuntimeSpec("/workspace"))
+    first = await driver.start_turn(TurnInput("first"))
+    assert first.accepted
+
+    await driver.close()
+    assert not driver._pending
+    assert not driver._active.value
+    assert not driver._active_native_turn_id
+    await driver.open(RuntimeSpec("/workspace"))
+    second = await driver.start_turn(TurnInput("second"))
+
+    assert second.accepted
+    assert len(processes) == 2
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_driver_reopens_cleanly_after_closing_an_active_turn():
+    processes = []
+
+    def factory(_args, _spec):
+        holder = {}
+
+        def on_frame(frame):
+            if frame.get("type") == "user" and frame.get("uuid"):
+                holder["proc"].feed({**frame, "isReplay": True})
+
+        proc = _FakeProcess(on_frame)
+        holder["proc"] = proc
+        processes.append(proc)
+        proc.feed({
+            "type": "system",
+            "subtype": "init",
+            "session_id": f"claude-{len(processes)}",
+            "slash_commands": [],
+        })
+        return proc
+
+    driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
+    await driver.open(RuntimeSpec("/workspace"))
+    first = await driver.start_turn(TurnInput("first"))
+    assert first.accepted
+
+    await driver.close()
+    assert driver._pending_replay is None
+    assert not driver._active.value
+    assert not driver._active_native_turn_id
+    await driver.open(RuntimeSpec("/workspace"))
+    second = await driver.start_turn(TurnInput("second"))
+
+    assert second.accepted
+    assert len(processes) == 2
+    await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_writes():
     captured_args = []
     holder = {}

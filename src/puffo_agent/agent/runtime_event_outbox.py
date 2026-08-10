@@ -21,6 +21,11 @@ from .runtime_events import (
 )
 
 APPEND_PATH = "/v2/agent-runtime/events:append"
+# These responses describe the upload channel, not a specific event row.  In
+# particular, a rolling Server deployment can briefly expose an authenticated
+# Agent to a Server without the append endpoint.  Retain FIFO evidence until
+# the operator repairs that boundary rather than treating the head as bad.
+_DEGRADED_CHANNEL_HTTP_STATUSES = frozenset({401, 403, 404, 405})
 
 
 def runtime_event_outbox_path(agent_state_dir: str | Path) -> Path:
@@ -331,6 +336,14 @@ class RuntimeEventUploader:
                     error_code=f"http_{status}",
                 )
                 return UploadResult("retry", error_code=f"http_{status}")
+            if status in _DEGRADED_CHANNEL_HTTP_STATUSES:
+                self.degraded_error = f"http_{status}"
+                self.outbox._log(
+                    "runtime.retry", outbox_sequence=rows[0].sequence,
+                    retry_count=rows[0].retry_count,
+                    state="degraded", error_code=self.degraded_error,
+                )
+                return UploadResult("degraded", error_code=self.degraded_error)
             if status < 200 or status >= 300:
                 # A batch rejection does not identify its bad member.  Retry
                 # its head alone before discarding anything, preserving FIFO
