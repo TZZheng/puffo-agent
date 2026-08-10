@@ -363,7 +363,7 @@ def _stub_side_effects(client, inbox_root: Path):
         saved.append(envelope_id)
         return []
 
-    async def _send_dm(recipient, text, root_id=""):
+    async def _send_dm(recipient, text, root_id="", require_encryption=False):
         sent_dms.append((recipient, text))
         return {"envelope_id": "env_prompt"}
 

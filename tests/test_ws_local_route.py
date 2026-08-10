@@ -416,24 +416,10 @@ async def test_full_attach_flow_v1_peer_receives_single_root_bundle_and_can_send
     """
     import puffo_agent.agent.send_coordinator as coordinator_mod
 
-    from puffo_agent.agent.message_store import (
-        MessageStore,
-        ProcessingState,
-        ReceiptDisposition,
-    )
+    from puffo_agent.agent.message_store import ProcessingState
 
     monkeypatch.setattr(coordinator_mod, "SendCoordinator", _RecordingCoordinator)
-    store = MessageStore(tmp_path / "messages.db")
-    await store.open()
-    await store.store_receipt(
-        {
-            "envelope_id": "v1-one", "envelope_kind": "channel",
-            "sender_slug": "alice", "space_id": "sp", "channel_id": "ch",
-            "content": {"text": "hello v1", "sender_display_name": "Alice"},
-            "content_type": "puffo/message+attachments/v1", "sent_at": 1,
-        },
-        server_seq=1, disposition=ReceiptDisposition.ELIGIBLE, reason="test receipt",
-    )
+    store = await _seed_v1_store(tmp_path)
     client = V1Client(store, tmp_path)
     reporter = FakeReporter()
     hub = _v1_hub(client, tmp_path, reporter)
@@ -517,6 +503,23 @@ async def _processed(store, envelope_id):
 
     row = await store.get_message_by_envelope(envelope_id)
     return row if row.processing_state == ProcessingState.PROCESSED.value else None
+
+
+async def _seed_v1_store(tmp_path):
+    from puffo_agent.agent.message_store import MessageStore, ReceiptDisposition
+
+    store = MessageStore(tmp_path / "messages.db")
+    await store.open()
+    await store.store_receipt(
+        {
+            "envelope_id": "v1-one", "envelope_kind": "channel",
+            "sender_slug": "alice", "space_id": "sp", "channel_id": "ch",
+            "content": {"text": "hello v1", "sender_display_name": "Alice"},
+            "content_type": "puffo/message+attachments/v1", "sent_at": 1,
+        },
+        server_seq=1, disposition=ReceiptDisposition.ELIGIBLE, reason="test receipt",
+    )
+    return store
 
 
 @pytest.mark.asyncio
