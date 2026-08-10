@@ -87,28 +87,34 @@ async def test_scheduler_without_authorizer_ignores_remote_prepared_work(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_scheduler_notifies_committed_deliveries_once_per_batch(tmp_path):
+async def test_scheduler_notifies_every_lifecycle_commit_once(tmp_path):
     store = MessageStore(tmp_path / "batch.db", now_ms=lambda: 2_000)
     commits: list[str] = []
     scheduler = ReminderScheduler(
         store=store,
         notify=lambda: None,
         now_ms=lambda: 2_000,
-        on_deliveries_committed=lambda: commits.append("committed"),
+        on_lifecycle_committed=lambda: commits.append("committed"),
     )
-    for reminder_id in ("reminder-one", "reminder-two"):
-        await store.create_reminder(
-            reminder_id=reminder_id,
-            occurrence_id=f"occurrence-{reminder_id}",
-            content="due",
+    for content in ("reminder one", "reminder two"):
+        await scheduler.create_reminder(
+            content=content,
             target="dm:peer",
-            intended_at_ms=1_000,
+            intended_at="1970-01-01T00:00:01Z",
         )
 
+    assert commits == ["committed", "committed"]
     assert len(await scheduler.process_due_once()) == 2
-    assert commits == ["committed"]
+    assert commits == ["committed", "committed", "committed"]
     assert await scheduler.process_due_once() == ()
-    assert commits == ["committed"]
+    assert commits == ["committed", "committed", "committed"]
+
+    future = await scheduler.create_reminder(
+        content="cancel", target="dm:peer", intended_at="1970-01-01T00:00:03Z",
+    )
+    assert len(commits) == 4
+    await scheduler.cancel_reminder(reminder_id=str(future["reminder_id"]))
+    assert len(commits) == 5
     await store.close()
 
 

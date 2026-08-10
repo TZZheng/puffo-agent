@@ -497,8 +497,8 @@ class StandardWorkerRun:
         runtime.reminder_scheduler.set_delivery_authorizer(
             reminder_sync.authorize_due_delivery
         )
-        runtime.reminder_scheduler.set_deliveries_committed_callback(
-            reminder_sync.signal_delivery_committed
+        runtime.reminder_scheduler.set_lifecycle_committed_callback(
+            reminder_sync.signal_lifecycle_committed
         )
         client.add_connected_callback(reminder_sync.on_transport_connected)
         try:

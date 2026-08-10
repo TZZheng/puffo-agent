@@ -72,14 +72,14 @@ class ReminderScheduler:
         now_ms: Callable[[], int] = _now_ms,
         wait_for_change: Callable[[asyncio.Event, float | None], Awaitable[None]] | None = None,
         delivery_authorizer: ReminderDeliveryAuthorizer | None = None,
-        on_deliveries_committed: Callable[[], None] | None = None,
+        on_lifecycle_committed: Callable[[], None] | None = None,
     ) -> None:
         self.store = store
         self._notify = notify
         self._now_ms = now_ms
         self._wait_for_change = wait_for_change
         self._delivery_authorizer = delivery_authorizer
-        self._on_deliveries_committed = on_deliveries_committed
+        self._on_lifecycle_committed = on_lifecycle_committed
         self._authorization_retry_after_ms: int | None = None
         self._wakeup = asyncio.Event()
         self._stopping = False
@@ -101,11 +101,11 @@ class ReminderScheduler:
         self._authorization_retry_after_ms = None
         self.signal()
 
-    def set_deliveries_committed_callback(
+    def set_lifecycle_committed_callback(
         self, callback: Callable[[], None] | None,
     ) -> None:
-        """Set a provider-neutral notification for a committed delivery batch."""
-        self._on_deliveries_committed = callback
+        """Wake a provider-neutral outbox after any local lifecycle commit."""
+        self._on_lifecycle_committed = callback
 
     async def create_reminder(
         self, *, content: str, target: str, intended_at: str,
@@ -117,6 +117,8 @@ class ReminderScheduler:
             intended_at_ms=intended_at_ms,
         )
         self.signal()
+        if self._on_lifecycle_committed is not None:
+            self._on_lifecycle_committed()
         return reminder.as_dict()
 
     async def list_reminders(
@@ -134,6 +136,8 @@ class ReminderScheduler:
     async def cancel_reminder(self, *, reminder_id: str) -> dict[str, object]:
         reminder = await self.store.cancel_reminder(reminder_id)
         self.signal()
+        if self._on_lifecycle_committed is not None:
+            self._on_lifecycle_committed()
         return reminder.as_dict()
 
     async def process_due_once(self) -> tuple[ReminderOccurrence, ...]:
@@ -154,8 +158,8 @@ class ReminderScheduler:
             )
         for _occurrence in delivered:
             self._notify()
-        if delivered and self._on_deliveries_committed is not None:
-            self._on_deliveries_committed()
+        if delivered and self._on_lifecycle_committed is not None:
+            self._on_lifecycle_committed()
         return delivered
 
     async def _wait_until_changed_or_due(self, deadline_ms: int | None) -> None:

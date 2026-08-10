@@ -321,8 +321,8 @@ class ReminderSync:
         self._snapshot_requested = True
         self._wakeup.set()
 
-    def signal_delivery_committed(self) -> None:
-        """Wake the outbox cadence after the scheduler commits delivery."""
+    def signal_lifecycle_committed(self) -> None:
+        """Wake the outbox after create, cancel, or delivery commits locally."""
         self._wakeup.set()
 
     async def on_transport_connected(self) -> None:

@@ -196,6 +196,7 @@ def _sync(
     keys: KeyStore | None = None,
     now: list[int] | None = None,
     wakes: list[str] | None = None,
+    idle_seconds: float = 30.0,
 ) -> tuple[ReminderSync, MessageStore, ReminderScheduler, KeyStore]:
     now = now if now is not None else [2_000]
     keys = keys or KeyStore(tmp_path / "agent-state" / "keys")
@@ -213,11 +214,48 @@ def _sync(
             http_client=transport,
             scheduler=scheduler,
             now_ms=lambda: now[0],
+            idle_seconds=idle_seconds,
         ),
         store,
         scheduler,
         keys,
     )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_commits_wake_a_sleeping_sync_outbox(tmp_path):
+    transport = _RecordingTransport()
+    sync, store, scheduler, _keys = _sync(
+        tmp_path, transport, idle_seconds=3_600,
+    )
+    scheduler.set_lifecycle_committed_callback(sync.signal_lifecycle_committed)
+    task = asyncio.create_task(sync.run(request_snapshot_on_start=False))
+    await asyncio.sleep(0.05)
+
+    async def wait_for_put_count(count: int) -> None:
+        while sum(call[0] == "put" for call in transport.calls) < count:
+            await asyncio.sleep(0)
+
+    created = await scheduler.create_reminder(
+        content="sync now",
+        target="dm:peer",
+        intended_at="1970-01-01T00:00:05Z",
+    )
+    await asyncio.wait_for(wait_for_put_count(1), timeout=1)
+    record = await store.get_reminder_sync_record(str(created["occurrence_id"]))
+    assert record is not None and record.server_ack_revision == 1
+
+    await scheduler.cancel_reminder(reminder_id=str(created["reminder_id"]))
+    await asyncio.wait_for(wait_for_put_count(2), timeout=1)
+    record = await store.get_reminder_sync_record(str(created["occurrence_id"]))
+    assert record is not None
+    assert (record.state, record.revision, record.server_ack_revision) == (
+        "cancelled", 2, 2,
+    )
+
+    sync.stop()
+    await task
+    await store.close()
 
 
 @pytest.mark.asyncio
@@ -393,7 +431,7 @@ async def test_acquired_claim_delivers_and_terminal_put_carries_same_claim_id(tm
     assert await sync.upload_pending_once() == 1
     assert await sync.reconcile_snapshot() == 0
     scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
-    scheduler.set_deliveries_committed_callback(sync.signal_delivery_committed)
+    scheduler.set_lifecycle_committed_callback(sync.signal_lifecycle_committed)
     sync._wakeup.clear()
 
     assert [item.occurrence_id for item in await scheduler.process_due_once()] == [
@@ -446,7 +484,7 @@ async def test_held_or_terminal_claim_never_creates_a_local_inbox_event(tmp_path
     assert await sync.reconcile_snapshot() == 0
     scheduler.set_delivery_authorizer(sync.authorize_due_delivery)
     commits: list[str] = []
-    scheduler.set_deliveries_committed_callback(lambda: commits.append("committed"))
+    scheduler.set_lifecycle_committed_callback(lambda: commits.append("committed"))
     transport.claim_status = "held"
     assert await scheduler.process_due_once() == ()
     assert commits == []
