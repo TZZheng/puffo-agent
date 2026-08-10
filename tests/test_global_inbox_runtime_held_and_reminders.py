@@ -76,9 +76,10 @@ async def test_held_sync_fails_closed_when_bounded_semantic_context_overflows(tm
         "sp-1", "ch-1", 52, "held-52", "provider-1",
     )
     assert rows == ()
-    assert runtime.held.synchronized is False
-    assert runtime.held.message_ids == ()
-    assert "exceeds" in runtime.held.diagnostic
+    staged = runtime.held[("sp-1", "ch-1")]
+    assert staged.synchronized is False
+    assert staged.message_ids == ()
+    assert "exceeds" in staged.diagnostic
     assert [row.envelope_id for row in await store.get_pending()] == [
         f"held-{seq}" for seq in range(2, 53)
     ]
@@ -132,9 +133,10 @@ async def test_held_sync_overflow_is_independent_of_formatter_and_context_budget
     )
 
     assert rows == ()
-    assert runtime.held.message_ids == ()
-    assert runtime.held.synchronized is False
-    assert "exceeds" in runtime.held.diagnostic
+    staged = runtime.held[("sp-1", "ch-1")]
+    assert staged.message_ids == ()
+    assert staged.synchronized is False
+    assert "exceeds" in staged.diagnostic
     await store.close()
 
 
@@ -168,7 +170,7 @@ async def test_repeated_held_sync_proof_returns_stable_local_semantic_context(
     )
     assert first == second
     assert first[0]["content"] == "text-held"
-    assert runtime.held.message_ids == ("held",)
+    assert runtime.held[("sp-1", "ch-1")].message_ids == ("held",)
 
     in_turn = await store.get_in_turn_messages("turn", "provider-1")
     assert [row.envelope_id for row in in_turn] == ["initial"]
@@ -1848,4 +1850,68 @@ async def test_failed_recovery_requeues_grown_membership_not_activation_snapshot
         "page-1", "page-2",
     ]
     assert not recovered.current_turn_path.exists()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrently_held_channels_project_only_their_own_recovery(tmp_path):
+    """Held staging is per target, so one channel cannot answer for another.
+
+    ``_send_request`` serializes per ``(space_id, channel_id)``, so two
+    channels of one turn can be held and recovered concurrently.  A shared
+    staging slot let the later recovery decide what the earlier send reported
+    as its own ``synchronized`` / ``recovered_through_seq``.
+    """
+    store = await make_store(tmp_path)
+    await receipt(store, "initial", 1, channel="ch-a")
+    await store.admit_messages(
+        ["initial"], turn_id="turn", provider_session_id="provider-1",
+    )
+    await receipt(store, "held-a", 5, channel="ch-a")
+    await receipt(store, "held-b", 6, channel="ch-b")
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=ToolReturnAdapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.active.turn_id = "turn"
+    runtime.active.message_ids[:] = ["initial"]
+    runtime.active.provider_session_id = "provider-1"
+    runtime.active.routes[:] = [
+        MessageRoute("held-a", "channel", "sp-1", "ch-a"),
+        MessageRoute("held-b", "channel", "sp-1", "ch-b"),
+    ]
+    source = runtime.held_recovery_source
+    recovered = {"ch-a": asyncio.Event(), "ch-b": asyncio.Event()}
+    watermark = {"ch-a": (5, "held-a"), "ch-b": (6, "held-b")}
+
+    class Interleaved:
+        held_recovery_source = source
+
+        async def send(self, request=None, **_kwargs):
+            channel = str(request["channel"])
+            if channel == "ch-b":
+                await asyncio.wait_for(recovered["ch-a"].wait(), timeout=1)
+            seq, envelope_id = watermark[channel]
+            await source.query_held_messages(
+                "sp-1", channel, seq, envelope_id, "provider-1",
+            )
+            recovered[channel].set()
+            if channel == "ch-a":
+                # ch-b recovers before this held result is staged.
+                await asyncio.wait_for(recovered["ch-b"].wait(), timeout=1)
+            return {
+                "state": "held", "latest_seq": seq,
+                "latest_envelope_id": envelope_id,
+            }
+
+    delegate = TrackingSendDelegate(Interleaved(), runtime.attempts, runtime)
+    first = asyncio.create_task(delegate.send({"channel": "ch-a", "text": "a"}))
+    second = await delegate.send({"channel": "ch-b", "text": "b"})
+    result = await asyncio.wait_for(first, timeout=1)
+
+    assert (result["latest_seq"], result["recovered_through_seq"]) == (5, 5)
+    assert (second["latest_seq"], second["recovered_through_seq"]) == (6, 6)
+    assert result["synchronized"] is True and second["synchronized"] is True
     await store.close()

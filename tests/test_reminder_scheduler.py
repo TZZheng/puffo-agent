@@ -5,7 +5,10 @@ import asyncio
 import pytest
 
 from puffo_agent.agent.message_store import MessageStore
-from puffo_agent.agent.reminder_scheduler import ReminderScheduler
+from puffo_agent.agent.reminder_scheduler import (
+    ReminderDeliveryAuthorization,
+    ReminderScheduler,
+)
 
 
 @pytest.mark.asyncio
@@ -160,4 +163,57 @@ async def test_scheduler_earlier_create_replans_wait_and_stop_has_no_leaked_task
     scheduler.stop()
     await task
     assert task.done() and not task.cancelled()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_blocked_delivery_claim_never_postpones_a_nearer_reminder(tmp_path):
+    """A blocked claim owns only its own retry, not everyone else's deadline.
+
+    The blocked occurrence stays ``scheduled`` with a past ``intended_at_ms``,
+    so the durable "next deadline" answer is that past row.  Folding the claim
+    retry over it must not hide an independent occurrence that is due before
+    the retry, while a blocked-only run must still wait out the retry instead
+    of hot-spinning on the past deadline.
+    """
+    now = [1_000]
+    waits: list[float | None] = []
+    entered = asyncio.Event()
+
+    async def wait_for_change(event: asyncio.Event, timeout: float | None) -> None:
+        waits.append(timeout)
+        entered.set()
+        await event.wait()
+
+    store = MessageStore(tmp_path / "blocked.db", now_ms=lambda: now[0])
+    blocked = await store.create_reminder(
+        content="due but blocked", target="channel:sp:ch", intended_at_ms=500,
+    )
+    nearer = await store.create_reminder(
+        content="independent", target="channel:sp:ch", intended_at_ms=3_000,
+    )
+
+    async def authorizer(_candidates):
+        return ReminderDeliveryAuthorization(retry_after_ms=now[0] + 5_000)
+
+    scheduler = ReminderScheduler(
+        store=store,
+        notify=lambda: None,
+        now_ms=lambda: now[0],
+        wait_for_change=wait_for_change,
+        delivery_authorizer=authorizer,
+    )
+    task = asyncio.create_task(scheduler.run())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    assert waits == [pytest.approx(2.0)]
+    assert (await store.get_reminder(blocked.reminder_id)).state == "scheduled"
+
+    await store.cancel_reminder(nearer.reminder_id)
+    entered.clear()
+    scheduler.signal()
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    assert waits[-1] == pytest.approx(5.0)
+
+    scheduler.stop()
+    await task
     await store.close()

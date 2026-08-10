@@ -206,7 +206,16 @@ class TrackingSendDelegate:
     ) -> Any:
         source = getattr(self.coordinator, "held_recovery_source", None)
         runtime = getattr(source, "runtime", None)
-        staging = getattr(runtime, "held", None)
+        by_target = getattr(runtime, "held", None)
+        route = trace.route
+        # Only this target's own recovery may describe this result; without a
+        # resolved route or a staged entry the coordinator's own per-key
+        # verdict stands unchanged.
+        staging = (
+            by_target.get((route.space_id, route.channel_id))
+            if isinstance(by_target, dict) and route is not None
+            else None
+        )
         if staging is not None:
             result["synchronized"] = bool(staging.synchronized)
             if staging.recovered_through_seq is not None:

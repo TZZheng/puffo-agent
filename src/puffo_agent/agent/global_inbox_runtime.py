@@ -148,7 +148,10 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         self.active = ActiveExactUnion()
         self.attempts = SendAttemptState()
         self.health = RuntimeHealth()
-        self.held = HeldStaging()
+        # Per ``(space_id, channel_id)``: sends serialize per target, so two
+        # channels of one turn can be held and recovered concurrently and must
+        # never project each other's synchronization status.
+        self.held: dict[tuple[str, str], HeldStaging] = {}
         self._held_admission_evidence: dict[
             tuple[str, str, str, str, int, str], HeldAdmissionEvidence
         ] = {}
@@ -1016,6 +1019,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             )
         if terminal or not was_active:
             self._discard_held_admission_evidence(planned.turn_id)
+            self.held.clear()
             self.active.clear()
         if self.coordinator is not None:
             self._discard_coordinator_held_evidence()
@@ -1128,6 +1132,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
     def _clear_terminal_turn(self) -> None:
         self.adapter.register_admission_callback(None, "")
         self._discard_held_admission_evidence(self.active.turn_id)
+        self.held.clear()
         self.active.clear()
         if self.coordinator is not None:
             self._discard_coordinator_held_evidence()

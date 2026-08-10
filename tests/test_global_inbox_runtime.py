@@ -1827,8 +1827,9 @@ async def test_held_watermark_sync_proof_returns_local_semantic_rows_without_adm
     assert rows[0]["content"] == "text-watermark"
     assert rows[0]["thread_root_id"] == ""
     assert [row.envelope_id for row in await store.get_pending()] == ["watermark"]
-    assert runtime.held.synchronized
-    assert runtime.held.message_ids == ("watermark",)
+    staged = runtime.held[("sp-1", "ch-1")]
+    assert staged.synchronized
+    assert staged.message_ids == ("watermark",)
     assert await ActiveBoundaryAdapter(
         store, runtime.active
     ).get_active_turn_through_seq("sp-1", "ch-1") == 1
@@ -1896,15 +1897,16 @@ async def test_held_timeout_mismatch_and_context_pressure_stage_nothing(
     assert await source.query_held_messages(
         "sp", "ch", 9, "missing", None,
     ) == ()
-    assert runtime.held.message_ids == ()
+    assert runtime.held[("sp", "ch")].message_ids == ()
     await receipt(store, "rejected", 10)
     runtime.active.provider_session_id = "provider-1"
     metadata = await source.query_held_messages(
         "sp-1", "ch-1", 10, "rejected", "provider-1",
     )
     assert metadata
-    assert runtime.held.synchronized is True
-    assert runtime.held.message_ids == ("rejected",)
+    staged = runtime.held[("sp-1", "ch-1")]
+    assert staged.synchronized is True
+    assert staged.message_ids == ("rejected",)
     assert [row.envelope_id for row in await store.get_pending()] == ["rejected"]
     await store.close()
 
@@ -1933,7 +1935,7 @@ async def test_held_timeout_uses_signed_pending_catchup_before_failing(tmp_path)
     assert await source.wait_for_held_delivery(
         "sp-1", "ch-1", 9, "late-watermark",
     )
-    assert runtime.held.diagnostic == ""
+    assert runtime.held == {}
     await store.close()
 
 

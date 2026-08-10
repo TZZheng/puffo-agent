@@ -823,28 +823,41 @@ class ReminderStoreMixin:
         *,
         now_ms: int | None = None,
         local_only: bool = False,
+        after_ms: int | None = None,
     ) -> int | None:
-        """Return the next eligible deadline, or now for claimed recovery."""
+        """Return the next eligible deadline, or now for claimed recovery.
+
+        ``after_ms`` restricts the answer to work that is not yet due.  A
+        caller that already owns a wake for the due window — a delivery-claim
+        retry — asks that way so a blocked due row cannot mask an independent
+        occurrence scheduled before that retry.  Claimed recovery is due work
+        by definition, so it is skipped for that question rather than
+        reported as ``now``.
+        """
         now = int(self._now_ms()) if now_ms is None else now_ms
         if not self._valid_reminder_time(now):
             raise ValueError("now_ms must be an integer epoch milliseconds")
+        if after_ms is not None and not self._valid_reminder_time(after_ms):
+            raise ValueError("after_ms must be an integer epoch milliseconds")
         async with self._inbox_lock:
             db = await self._ensure_db()
-            async with db.execute(
-                f"""SELECT 1 FROM reminder_occurrences
-                    WHERE state = 'claimed'
-                      AND (? = 0 OR {_REMINDER_LOCAL_DELIVERY_SQL})
-                    LIMIT 1""",
-                (1 if local_only else 0,),
-            ) as cursor:
-                if await cursor.fetchone() is not None:
-                    return now
+            if after_ms is None:
+                async with db.execute(
+                    f"""SELECT 1 FROM reminder_occurrences
+                        WHERE state = 'claimed'
+                          AND (? = 0 OR {_REMINDER_LOCAL_DELIVERY_SQL})
+                        LIMIT 1""",
+                    (1 if local_only else 0,),
+                ) as cursor:
+                    if await cursor.fetchone() is not None:
+                        return now
             async with db.execute(
                 f"""SELECT intended_at_ms FROM reminder_occurrences
                     WHERE state = 'scheduled'
                       AND (? = 0 OR {_REMINDER_LOCAL_DELIVERY_SQL})
+                      AND (? IS NULL OR intended_at_ms > ?)
                     ORDER BY intended_at_ms, occurrence_id LIMIT 1""",
-                (1 if local_only else 0,),
+                (1 if local_only else 0, after_ms, after_ms),
             ) as cursor:
                 row = await cursor.fetchone()
             return int(row["intended_at_ms"]) if row is not None else None

@@ -189,13 +189,20 @@ class ReminderScheduler:
             await self.process_due_once()
             if self._stopping:
                 break
+            now = int(self._now_ms())
+            local_only = self._delivery_authorizer is None
             deadline = await self.store.next_reminder_deadline(
-                now_ms=int(self._now_ms()),
-                local_only=self._delivery_authorizer is None,
+                now_ms=now, local_only=local_only,
             )
-            if self._authorization_retry_after_ms is not None:
-                deadline = max(
-                    self._authorization_retry_after_ms,
-                    deadline if deadline is not None else self._authorization_retry_after_ms,
-                )
+            retry = self._authorization_retry_after_ms
+            if retry is not None:
+                if deadline is None or deadline <= now:
+                    # The earliest durable deadline belongs to due work whose
+                    # claim was blocked; waiting on it would hot-spin, and the
+                    # retry is that work's earliest useful wake. Independent
+                    # work scheduled before the retry must still fire on time.
+                    deadline = await self.store.next_reminder_deadline(
+                        now_ms=now, local_only=local_only, after_ms=now,
+                    )
+                deadline = retry if deadline is None else min(deadline, retry)
             await self._wait_until_changed_or_due(deadline)

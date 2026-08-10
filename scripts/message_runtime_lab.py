@@ -700,7 +700,10 @@ class CountingTurnRunner:
             # Local held synchronization is not a content read. The in-process
             # lab must perform the content-bearing read that admits the row.
             await self.holder["agent"].runtime.read_inbox(limit=50)
-            if not self.holder["agent"].runtime.held.synchronized:
+            staged = self.holder["agent"].runtime.held.get(
+                ("space-lab", "channel-lab"),
+            )
+            if staged is None or not staged.synchronized:
                 raise RuntimeError("held continuation did not synchronize")
             await self.results.put(result)
 

@@ -75,7 +75,7 @@ class HeldRecoverySource:
                 pass
             if await proven():
                 return True
-        self.runtime.held = HeldStaging(
+        self.runtime.held[(space_id, channel_id)] = HeldStaging(
             latest_seq=latest_seq,
             latest_envelope_id=latest_envelope_id,
             diagnostic=(
@@ -99,7 +99,7 @@ class HeldRecoverySource:
             or not provider_session_id
             or active.provider_session_id != provider_session_id
         ):
-            self.runtime.held = HeldStaging(
+            self.runtime.held[(space_id, channel_id)] = HeldStaging(
                 latest_seq=latest_seq,
                 latest_envelope_id=latest_envelope_id,
                 diagnostic="stateful active provider session unavailable",
@@ -113,13 +113,13 @@ class HeldRecoverySource:
             or watermark.channel_id != channel_id
             or watermark.processing_state is not ProcessingState.PENDING
         ):
-            self.runtime.held = HeldStaging(
+            self.runtime.held[(space_id, channel_id)] = HeldStaging(
                 latest_seq=latest_seq,
                 latest_envelope_id=latest_envelope_id,
                 diagnostic="exact held watermark mismatch",
             )
             return ()
-        self.runtime.held = HeldStaging(
+        staging = self.runtime.held[(space_id, channel_id)] = HeldStaging(
             latest_seq=latest_seq,
             latest_envelope_id=latest_envelope_id,
             recovered_through_seq=latest_seq,
@@ -138,7 +138,7 @@ class HeldRecoverySource:
             limit=51,
         )
         if len(rows) > 50:
-            self.runtime.held = HeldStaging(
+            self.runtime.held[(space_id, channel_id)] = HeldStaging(
                 latest_seq=latest_seq,
                 latest_envelope_id=latest_envelope_id,
                 diagnostic="held context exceeds the bounded recovery limit",
@@ -183,5 +183,5 @@ class HeldRecoverySource:
                 latest_envelope_id,
             )
         ] = evidence
-        self.runtime.held.message_ids = evidence.displayed_ids
+        staging.message_ids = evidence.displayed_ids
         return tuple(projected)

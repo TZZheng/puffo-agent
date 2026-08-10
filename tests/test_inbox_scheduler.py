@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sys
 from dataclasses import FrozenInstanceError
@@ -239,6 +240,46 @@ async def test_coalescer_preserves_notification_for_next_expired_window():
     await coalescer.wait_for_burst()
     await coalescer.wait_for_burst()
     assert sleeps == [pytest.approx(3.0), pytest.approx(3.0)]
+
+
+@pytest.mark.asyncio
+async def test_coalescer_pulls_a_pending_long_deadline_into_the_normal_window():
+    """A degraded backoff must not swallow work that arrives while it waits.
+
+    ``_degrade`` arms a deadline up to 300 s out. ``notify()`` clears the
+    degraded state, so the runtime is no longer backed off and the newly
+    stored message must be planned in the normal window instead of waiting
+    out the abandoned backoff.
+    """
+    now = 40.0
+    sleeps = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    def monotonic():
+        return now
+
+    async def sleep(delay):
+        nonlocal now
+        sleeps.append(delay)
+        entered.set()
+        await release.wait()
+        now += delay
+
+    coalescer = InboxCoalescer(sleep=sleep, monotonic=monotonic)
+    coalescer.notify(delay_seconds=300.0)
+    waiter = asyncio.create_task(coalescer.wait_for_burst())
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    entered.clear()
+
+    now += 1.0
+    coalescer.notify()
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    assert sleeps == [pytest.approx(300.0), pytest.approx(3.0)]
+
+    release.set()
+    await asyncio.wait_for(waiter, timeout=1)
+    assert not coalescer._deadlines
 
 
 @pytest.mark.asyncio

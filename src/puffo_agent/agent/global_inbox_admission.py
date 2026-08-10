@@ -315,7 +315,8 @@ class InboxAdmissionMixin:
                 correlation_receipt=receipt,
             )
         result["tool_result_admission"] = marker
-        self.held.correlation_key = correlation_key
+        if (staging := self.held.get((space_id, channel_id))) is not None:
+            staging.correlation_key = correlation_key
         return result
 
     def _write_active_current_turn(self) -> None:

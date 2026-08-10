@@ -216,6 +216,7 @@ class _ChannelSendBoundary:
     held_key: tuple[str, str, str, str]
     attempt_fingerprint: str
     reconsideration: _ReconsiderationDecision | None
+    held_generation: int = 0  # discard generation seen before the transport
     # Bytes read once, before the reconsideration decision, and reused for the
     # actual upload — so the approved payload is the transmitted payload.
     materialized: tuple[tuple[str, bytes], ...] = ()
@@ -315,6 +316,7 @@ class SendCoordinator:
         self._channel_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._held_lock = asyncio.Lock()
         self._held_evidence: dict[tuple[str, str, str, str], _HeldEvidence] = {}
+        self._held_generation = 0  # bumped by every teardown discard
 
     def _turn_identity(self) -> tuple[str, str]:
         active = getattr(self.active_turn_source, "active", None)
@@ -749,6 +751,7 @@ class SendCoordinator:
                     thread_root_id=root_id,
                     visible_draft_basis=visible_draft_basis,
                     content_digest=boundary.content_digest,
+                    held_generation=boundary.held_generation,
                 )
             result.note = (
                 "No channel message was committed; inspect newer Inbox context."
@@ -849,6 +852,7 @@ class SendCoordinator:
         *,
         combined_error: bool,
     ) -> _ChannelSendBoundary | dict[str, Any]:
+        held_generation = self._held_generation  # read before any await
         baseline = await self._baseline(space_id, channel_id)
         if baseline is None:
             baseline = 0
@@ -902,6 +906,7 @@ class SendCoordinator:
             held_key=(session_id, turn_id, space_id, channel_id),
             attempt_fingerprint=fingerprint,
             reconsideration=reconsideration,
+            held_generation=held_generation,
             materialized=materialized,
             content_digest=content_digest,
         )
@@ -1102,6 +1107,7 @@ class SendCoordinator:
                 thread_root_id=str(resolved.get("root_id") or request.root_id or ""),
                 visible_draft_basis=visible_draft_basis,
                 content_digest=boundary.content_digest,
+                held_generation=boundary.held_generation,
             )
         result.note = (
             "No message was sent because the channel advanced beyond this "
@@ -1485,8 +1491,11 @@ class SendCoordinator:
         thread_root_id: str = "",
         visible_draft_basis: Sequence[Mapping[str, Any]] = (),
         content_digest: str = "",
+        held_generation: int = 0,
     ) -> None:
         async with self._held_lock:
+            if held_generation != self._held_generation:
+                return  # the owning turn tore down while this send was in flight
             old = self._held_evidence.get(key)
             # The key is per turn/channel, so two different drafts can be held
             # against one Server head. The newest attempt owns the record; the
@@ -1588,11 +1597,13 @@ class SendCoordinator:
     def discard_held_evidence(self) -> None:
         """Drop every held record when the owning turn tears down.
 
-        Called from the runtime's terminal paths, which are synchronous and
-        run after the turn's sends have finished, so this deliberately skips
-        ``_held_lock`` — ``dict.clear()`` needs no await and there is no
-        concurrent in-turn writer left to serialize against.
+        The terminal paths are synchronous but do not wait for the turn's
+        sends: ``send_message`` runs in the RPC/ws-local handler task, which
+        cancelling the turn task does not reach, so one can still be awaiting
+        its transport.  Bumping the generation makes its later ``_record_held``
+        drop that record instead of repopulating the map behind this clear.
         """
+        self._held_generation += 1
         self._held_evidence.clear()
 
     async def _consume_held(self, key: tuple[str, str, str, str]) -> None:

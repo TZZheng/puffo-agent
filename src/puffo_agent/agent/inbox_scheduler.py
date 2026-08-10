@@ -228,24 +228,59 @@ class InboxCoalescer:
         self._monotonic = monotonic
         self._window_seconds = window_seconds
         self._wake = asyncio.Event()
+        self._pulled = asyncio.Event()
         self._deadlines: deque[float] = deque()
         self._wait_lock = asyncio.Lock()
 
     def notify(self, *, delay_seconds: float | None = None) -> None:
         now = self._monotonic()
+        delay = self._window_seconds if delay_seconds is None else max(
+            0.0, delay_seconds
+        )
+        candidate = now + delay
         if not self._deadlines or now >= self._deadlines[-1]:
-            delay = self._window_seconds if delay_seconds is None else max(
-                0.0, delay_seconds
-            )
-            self._deadlines.append(now + delay)
+            self._deadlines.append(candidate)
+        elif candidate < self._deadlines[0]:
+            # A pending deadline may only move earlier, never later, so the
+            # fixed non-resetting window still swallows a second notify inside
+            # its own window.  Without this, a long degraded-backoff deadline
+            # would hold newly arrived work for up to its whole backoff even
+            # though the same notify already cleared the degraded state.
+            self._deadlines[0] = candidate
+            self._pulled.set()
         self._wake.set()
+
+    async def _sleep_or_pull(self, remaining: float) -> bool:
+        """Sleep ``remaining``; report whether a pulled deadline cut it short."""
+        sleeper = asyncio.ensure_future(self._sleep(remaining))
+        pull = asyncio.ensure_future(self._pulled.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {sleeper, pull}, return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (sleeper, pull):
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+        return sleeper not in done
 
     async def wait_for_burst(self) -> None:
         async with self._wait_lock:
             await self._wake.wait()
-            deadline = self._deadlines[0]
-            remaining = max(0.0, deadline - self._monotonic())
-            await self._sleep(remaining)
+            while True:
+                self._pulled.clear()
+                # Re-read after clearing so a pull between the read and the
+                # clear cannot be lost.
+                deadline = self._deadlines[0]
+                remaining = max(0.0, deadline - self._monotonic())
+                if not await self._sleep_or_pull(remaining):
+                    break
+                if self._deadlines[0] >= deadline:
+                    break
             self._deadlines.popleft()
             if self._deadlines:
                 self._wake.set()

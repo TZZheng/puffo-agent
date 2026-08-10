@@ -1241,6 +1241,44 @@ async def test_held_override_is_bound_to_the_transmitted_attachment_bytes(tmp_pa
     await case.store.close()
 
 
+async def _assert_cancelled_turn_drops_a_late_held_record(runtime):
+    """Teardown can overlap a send the turn's cancellation never reaches.
+
+    ``send_message`` is serviced by the RPC/ws-local handler task, not the
+    turn task, so a cancelled turn runs ``_clear_terminal_turn`` while that
+    handler is still awaiting its transport.  The record it writes afterwards
+    must not repopulate the map behind teardown's back.
+    """
+    coordinator, freshness, http = await coordinator_fixture(baseline=2, active=2)
+    bind_turn(coordinator, freshness)
+    runtime.coordinator = coordinator
+    posted, release = asyncio.Event(), asyncio.Event()
+
+    async def post(_path, body):
+        posted.set()
+        await release.wait()
+        return held_response(body)
+
+    http.post = post
+    send_task = asyncio.create_task(coordinator.send(
+        SemanticSendRequest(destination="ch_a", text="secret draft"),
+    ))
+    await asyncio.wait_for(posted.wait(), timeout=1)
+    runtime._clear_terminal_turn()
+    release.set()
+    assert (await asyncio.wait_for(send_task, timeout=1))["state"] == "held"
+    assert coordinator._held_evidence == {}
+
+    # A later turn reusing the same identity must not inherit the late record.
+    bind_turn(coordinator, freshness)
+    probe = await coordinator.send(SemanticSendRequest(
+        destination="ch_a", text="secret draft", send_anyway=True,
+    ))
+    assert probe["_reconsideration_audit"]["decision_reason"] == (
+        "missing_held_evidence"
+    )
+
+
 @pytest.mark.asyncio
 async def test_turn_teardown_discards_decrypted_held_evidence(tmp_path):
     """Terminal turns drop held plaintext instead of leaking it forward."""
@@ -1280,5 +1318,7 @@ async def test_turn_teardown_discards_decrypted_held_evidence(tmp_path):
     stage()
     runtime._clear_terminal_turn()
     assert coordinator._held_evidence == {}
+
+    await _assert_cancelled_turn_drops_a_late_held_record(runtime)
     await store.close()
     await unused.close()
