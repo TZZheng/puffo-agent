@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
+from puffo_agent.agent.message_store_models import LifecycleConflict
 from puffo_agent.mcp._host_mcp import PuffoRpcClient
 from puffo_agent.portal import rpc_service
 from puffo_agent.portal.host_mcp_handler import HostMcpContext
@@ -351,6 +352,27 @@ async def test_reminder_routes_are_strict_and_return_structured_objects(
         ("list", {"state": "scheduled", "limit": 3}),
         ("cancel", {"reminder_id": "reminder-1"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_cancel_reminder_maps_lifecycle_conflict_to_http_409(
+    app_client_factory, monkeypatch,
+):
+    async def cancel(_ctx, **_kwargs):
+        raise LifecycleConflict("reminder cancellation conflicts with delivery claim")
+
+    monkeypatch.setattr(rpc_service.host_mcp_handler, "cancel_reminder", cancel)
+    rpc_service.set_rpc_resolver(lambda aid: _stub_ctx(aid))
+    client = await app_client_factory()
+
+    response = await client.post(
+        "/v1/rpc/agent_a/cancel-reminder",
+        json={"reminder_id": "reminder-1"},
+    )
+    assert response.status == 409
+    assert await response.json() == {
+        "error": "reminder cancellation conflicts with delivery claim",
+    }
 
 
 @pytest.mark.asyncio

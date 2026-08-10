@@ -13,6 +13,7 @@ from typing import Awaitable, Callable, Optional
 from aiohttp import web
 
 from ..agent.message_store import MAX_REMINDER_LIST_LIMIT, REMINDER_STATES, parse_reminder_target
+from ..agent.message_store_models import LifecycleConflict
 from ..agent.reminder_scheduler import normalize_reminder_timestamp
 from . import host_mcp_handler
 from ._port import bind_tcp_with_fallback
@@ -454,6 +455,8 @@ async def cancel_reminder_route(request: web.Request) -> web.Response:
         return web.json_response(
             await host_mcp_handler.cancel_reminder(ctx, reminder_id=reminder_id)
         )
+    except LifecycleConflict as exc:
+        return web.json_response({"error": str(exc)}, status=409)
     except (RuntimeError, ValueError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:

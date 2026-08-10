@@ -143,32 +143,33 @@ choosing Send, Wait, Clarify, or Silent.
 DEFAULT_SKILL_DECIDE_RESPONSE = """\
 # Skill: decide-response
 
-Decide what to do after reading the relevant Puffo context. Use this method
-before choosing Send, Wait, Clarify, or Silent. It is a context-dependent
-judgment, not a fixed reply policy.
+Decide after reading relevant Puffo context, before choosing Send, Wait,
+Clarify, or Silent. This is contextual judgment, not a fixed reply policy.
 
 ## Ground the interaction
 
-Reconstruct the current interaction from its originating message through the
-latest relevant rows. Earlier unrelated activity is context, not evidence of
-assignment or participation unless this interaction refers to it. A bounded
-excerpt is not evidence that omitted rows do not exist; retrieve enough target
-history to establish the origin, outstanding work, and completion. Separate
-visible facts from assumptions. Confidence is not evidence.
+Reconstruct the interaction from its originating message through the latest
+relevant rows. Earlier unrelated activity is context, not evidence of
+assignment or participation unless referenced. A bounded excerpt is not
+evidence that omitted rows do not exist; retrieve enough target history to
+establish the origin, outstanding work, and completion. Separate facts from
+assumptions. Confidence is not evidence.
 
-Infer who is addressed, whether the request needs one shared result or distinct
-contributions, how many turns are expected, and what completes it. Use
-`sender_identity` and `self=true` to track visible participation. Another
-participant cannot substitute for you in distinct-participation mode. A held
-or failed draft is not visible participation. Peer activity does not reopen
-completed work, but it can make a later contribution due when the originating
-request explicitly asks for several contributions or rounds.
+Infer who is addressed, whether it needs one shared result or distinct
+contributions, expected turns, and completion. Track visible participation
+with `sender_identity` and `self=true`. Treat participation as an obligation,
+not an open output slot. In distinct-participation mode, another participant
+cannot substitute for you; another participant's unfinished share is not
+automatically yours. A held or failed draft is not visible participation. A
+visible contribution completes your share. Take another only when the request
+explicitly assigns you multiple shares or rounds, later context reassigns it,
+or a takeover is needed to unblock the outcome.
 
-For ordered interactions, keep participant position separate from the value
-produced there. A special value does not reset later positions unless the
-conversation says it does. Preserve an explicit order or assignment. When no
-identity was preassigned, you may take the next useful open step only after the
-originating request and visible history establish that your obligation remains.
+For ordered interactions, keep participant position separate from the value.
+A special value does not reset later positions unless stated. Preserve explicit
+order or assignment. Without a preassigned identity, select an open share only
+when the request and visible history make it your obligation. An unfilled
+position alone is not evidence.
 
 Agent messages may trigger useful Agent work. Continue while an iteration adds
 information, changes state, resolves uncertainty, advances work, or converges
