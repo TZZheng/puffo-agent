@@ -113,6 +113,74 @@ def test_unchanged_fingerprint_does_not_reset(tmp_path, monkeypatch):
     assert r._consecutive_failed == 1
 
 
+def test_every_refresh_success_site_also_notes_recovery():
+    """The sweep I owed the first commit (Solution caught the miss).
+
+    There are three places that declare "we have a working credential
+    again". Two of them going through _note_recovery is not the fix —
+    the whole point is that no path can declare recovery without
+    resetting the state that recovery invalidates. Source-level because
+    the third site (KeychainBackend poll) is macOS-only and never
+    executes on CI or on the operator's host, so a behavioural test
+    would pass here while the path stayed broken.
+    """
+    import inspect
+
+    src = inspect.getsource(credential_refresh.CredentialRefresher)
+    fire = [
+        line for line in src.splitlines()
+        if "self._fire_refresh_success()" in line
+    ]
+    assert len(fire) == 3, (
+        f"call-site count changed ({len(fire)}); re-check the sweep"
+    )
+    notes = src.count("self._note_recovery(")
+    assert notes >= 3, (
+        "a _fire_refresh_success() site is not paired with _note_recovery()"
+    )
+
+
+def test_keychain_rotation_loop_resets_state(tmp_path, monkeypatch):
+    # The macOS path, driven directly: one poll reporting a rotation has
+    # to leave the same clean state the file-fingerprint path leaves.
+    import asyncio
+    from puffo_agent.portal.state import RuntimeState
+
+    r, aid = _refresher(tmp_path, monkeypatch, expires_in_seconds=3600)
+    _break_it(r)
+    assert RuntimeState.load(aid).health == "refresh_broken"
+
+    monkeypatch.setattr(
+        credential_refresh, "REFRESH_POLL_SECONDS", 0, raising=False,
+    )
+    polls = {"n": 0}
+
+    async def fake_poll():
+        polls["n"] += 1
+        return True
+
+    monkeypatch.setattr(
+        r.backend, "poll_external_rotation", fake_poll, raising=False,
+    )
+
+    async def drive():
+        stop = asyncio.Event()
+        task = asyncio.create_task(r._external_rotation_loop(stop))
+        await asyncio.sleep(0.05)
+        stop.set()
+        await asyncio.wait_for(task, timeout=2)
+
+    monkeypatch.setattr(
+        "puffo_agent.macos.keychain.KEYCHAIN_POLL_INTERVAL_SECONDS",
+        0.01, raising=False,
+    )
+    asyncio.run(drive())
+
+    assert polls["n"] >= 1, "the loop never polled; test drove nothing"
+    assert r._consecutive_failed == 0
+    assert RuntimeState.load(aid).health == "ok"
+
+
 # ── gap 2: UNCHANGED is only trouble when the token is not fresh ───
 
 

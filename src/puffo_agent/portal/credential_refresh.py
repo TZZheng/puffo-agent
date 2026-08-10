@@ -1015,6 +1015,7 @@ class CredentialRefresher:
                 continue
             if rotated:
                 self._sync_views()
+                self._note_recovery("keychain poll")
                 self._fire_refresh_success()
 
     async def _sleep_until_next_tick(self, stop_event: asyncio.Event) -> None:
