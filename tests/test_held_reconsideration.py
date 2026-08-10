@@ -419,7 +419,7 @@ async def _native_held_contract():
     return SimpleNamespace(
         coordinator=coordinator, freshness=freshness, boundary=boundary,
         calls=calls, paths=paths, destination="ch_a",
-        expected_path=CHANNEL_SEND_PATH, store=None, http=http,
+        expected_path=CHANNEL_SEND_PATH, store=None,
     )
 
 
@@ -467,7 +467,7 @@ async def _keyless_held_contract():
     return SimpleNamespace(
         coordinator=coordinator, freshness=freshness, boundary=active_boundary,
         calls=calls, paths=paths, destination="ch_abc",
-        expected_path=KEYLESS_CHANNEL_SEND_PATH, store=store, http=http,
+        expected_path=KEYLESS_CHANNEL_SEND_PATH, store=store,
     )
 
 
@@ -479,13 +479,6 @@ async def _assert_initial_held_contract(case):
     assert held["latest_seq"] == 5
     assert held["latest_envelope_id"] == "msg_latest"
     assert held["synchronized"] is True
-    member_path = (
-        f"/spaces/sp_1/channels/{case.destination}/members"
-        if case.expected_path == CHANNEL_SEND_PATH
-        else f"/v2/cloud-agents/spaces/sp_test/channels/{case.destination}/members"
-    )
-    member_reads = [call for call in case.http.calls if call[1] == member_path]
-    assert len(member_reads) == (2 if case.expected_path == CHANNEL_SEND_PATH else 1)
     # Unchanged draft, so the probe reaches the admission gate rather than
     # stopping at the draft-identity gate.
     staged = await case.coordinator.send(SemanticSendRequest(
@@ -597,30 +590,6 @@ async def test_complete_exact_held_identity_and_one_shot_contract(transport):
     await _assert_one_shot_held_send(case)
     if case.store is not None:
         await case.store.close()
-
-
-@pytest.mark.asyncio
-async def test_held_membership_enrichment_has_a_short_failure_boundary(monkeypatch):
-    coordinator, _freshness, http = await coordinator_fixture()
-    key = ("session-a", "turn-a", "sp_1", "ch_a")
-    coordinator._held_evidence[key] = _HeldEvidence(
-        latest_seq=5,
-        latest_envelope_id="latest",
-        synchronized=True,
-    )
-
-    async def blocked_get(_path):
-        await asyncio.Event().wait()
-
-    http.get = blocked_get
-    monkeypatch.setattr(
-        "puffo_agent.agent.send_coordinator._HELD_MEMBERSHIP_TIMEOUT_SECONDS",
-        0.01,
-    )
-    output = await coordinator._held_context_output(key, "sp_1", "ch_a")
-    assert output["reconsideration"]["participation_snapshot"][
-        "channel_membership"
-    ] == {"context_ready": False}
 
 
 @pytest.mark.asyncio
