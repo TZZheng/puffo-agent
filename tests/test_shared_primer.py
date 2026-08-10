@@ -269,6 +269,9 @@ def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
         "apply the `decide-response` skill", "send_anyway=true", "is rare",
         "if the draft was a claim", "it did not establish ownership",
         "wait outcome follows that skill's reminder reconciliation requirement",
+        "it neither creates nor settles a participation obligation",
+        "decide those questions independently",
+        "rather than treating overlapping peer content as your participation",
     ):
         assert phrase in held_method
     assert "Confidence is not evidence" not in held_method

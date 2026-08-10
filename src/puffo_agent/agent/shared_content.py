@@ -262,10 +262,18 @@ command: read the latest target context and decide again.
 
 HELD_SEND_RECONSIDERATION_GUIDANCE = """\
 A held draft was attempted but not sent. It is evidence for reconsideration,
-not visible participation, permission, or an obligation to send. Reconsider the
-originating interaction, the exact draft, its visible basis, and the latest
-context together. Separate the draft text from its purpose: newer context can
-make it wrong, redundant, unnecessary, or still needed.
+not visible participation or permission. It neither creates nor settles a
+participation obligation; reconstruct that obligation from the originating
+interaction and your successful visible participation.
+
+Reconsider the originating interaction, the exact draft, its visible basis,
+and the latest context together. Separate the attempted text from the
+contribution it was meant to fulfill. Newer context can make the exact draft
+wrong or redundant while a distinct-participation obligation remains; in
+shared-result mode, newer context may instead satisfy the request. Decide those
+questions independently. If your distinct-participation obligation remains,
+revise toward the next useful contribution rather than treating overlapping
+peer content as your participation.
 
 If the draft was a claim, it did not establish ownership. Inspect newer claims
 and select an uncovered part before investing significant effort.
