@@ -46,6 +46,7 @@ from ...api.handlers import (
 from ...runtime_matrix import (
     HARNESS_PROVIDERS,
     harness_applies,
+    normalize_inference_level,
     validate_triple,
 )
 from ...state import AgentConfig
@@ -737,6 +738,9 @@ class AgentDetail(QWidget):
         cfg.runtime.provider = provider
         cfg.runtime.harness = harness
         cfg.runtime.model = model
+        cfg.runtime.inference_level = normalize_inference_level(
+            runtime_kind, provider, harness, cfg.runtime.inference_level,
+        )
         try:
             cfg.save()
             _update_profile_summary(cfg, soul)

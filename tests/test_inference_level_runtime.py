@@ -154,6 +154,49 @@ def test_runtime_writers_save_a_loadable_config_on_harness_swap(
 
 
 
+def test_desktop_save_harness_swap_clears_incompatible_inference_level(
+    tmp_path, monkeypatch,
+):
+    """The Agent Detail save path is a runtime writer too: swapping a
+    Codex agent to claude-code must not persist Codex-only ``minimal``,
+    or the saved yaml is rejected by ``AgentConfig.load`` and by daemon
+    reconciliation (which loads through the same gate)."""
+    pytest.importorskip("PySide6")
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    cfg = _save_codex_agent(tmp_path, monkeypatch)
+
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    from puffo_agent.agent.model_catalog import ModelOption
+    from puffo_agent.portal.ui.widgets import agent_detail as detail_module
+
+    # The real prefetch/provider_models reach the live /v1/models list and
+    # the real warning() opens a modal dialog that would hang headless.
+    warnings: list[str] = []
+    monkeypatch.setattr(detail_module, "prefetch", lambda: None)
+    monkeypatch.setattr(
+        detail_module, "provider_models",
+        lambda harness: [ModelOption("claude-sonnet-4-6", "claude-sonnet-4-6")],
+    )
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        lambda *a, **kw: warnings.append(a[2] if len(a) > 2 else ""),
+    )
+
+    QApplication.instance() or QApplication([])
+    widget = detail_module.AgentDetail()
+    widget.bind(cfg.id)
+    widget._harness.setCurrentText("claude-code")
+    widget._model.setCurrentIndex(0)
+    widget._on_save()
+
+    assert warnings == []
+    loaded = AgentConfig.load(cfg.id)
+    assert loaded.runtime.provider == "anthropic"
+    assert loaded.runtime.harness == "claude-code"
+    assert loaded.runtime.inference_level == ""
+
+
 def test_cli_switch_to_harness_without_inference_support_clears_level(
     tmp_path, monkeypatch,
 ):
