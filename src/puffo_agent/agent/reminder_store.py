@@ -10,6 +10,7 @@ import aiosqlite
 
 from .message_store_models import (
     _REMINDER_DELIVERY_CUSTODY_SQL,
+    _REMINDER_LOCAL_DELIVERY_SQL,
     MAX_REMINDER_LIST_LIMIT,
     REMINDER_STATES,
     LifecycleConflict,
@@ -821,22 +822,29 @@ class ReminderStoreMixin:
         self,
         *,
         now_ms: int | None = None,
+        local_only: bool = False,
     ) -> int | None:
-        """Return the next scheduled deadline, or now when recovery is claimed."""
+        """Return the next eligible deadline, or now for claimed recovery."""
         now = int(self._now_ms()) if now_ms is None else now_ms
         if not self._valid_reminder_time(now):
             raise ValueError("now_ms must be an integer epoch milliseconds")
         async with self._inbox_lock:
             db = await self._ensure_db()
             async with db.execute(
-                "SELECT 1 FROM reminder_occurrences WHERE state = 'claimed' LIMIT 1"
+                f"""SELECT 1 FROM reminder_occurrences
+                    WHERE state = 'claimed'
+                      AND (? = 0 OR {_REMINDER_LOCAL_DELIVERY_SQL})
+                    LIMIT 1""",
+                (1 if local_only else 0,),
             ) as cursor:
                 if await cursor.fetchone() is not None:
                     return now
             async with db.execute(
-                """SELECT intended_at_ms FROM reminder_occurrences
-                   WHERE state = 'scheduled'
-                   ORDER BY intended_at_ms, occurrence_id LIMIT 1"""
+                f"""SELECT intended_at_ms FROM reminder_occurrences
+                    WHERE state = 'scheduled'
+                      AND (? = 0 OR {_REMINDER_LOCAL_DELIVERY_SQL})
+                    ORDER BY intended_at_ms, occurrence_id LIMIT 1""",
+                (1 if local_only else 0,),
             ) as cursor:
                 row = await cursor.fetchone()
             return int(row["intended_at_ms"]) if row is not None else None
@@ -994,9 +1002,10 @@ class ReminderStoreMixin:
         await db.execute("BEGIN IMMEDIATE")
         try:
             async with db.execute(
-                """SELECT reminder_id FROM reminder_occurrences
-                   WHERE state = 'scheduled' AND intended_at_ms <= ?
-                   ORDER BY intended_at_ms, occurrence_id""",
+                f"""SELECT reminder_id FROM reminder_occurrences
+                    WHERE state = 'scheduled' AND intended_at_ms <= ?
+                      AND {_REMINDER_LOCAL_DELIVERY_SQL}
+                    ORDER BY intended_at_ms, occurrence_id""",
                 (now_ms,),
             ) as cursor:
                 rows = await cursor.fetchall()
@@ -1004,9 +1013,10 @@ class ReminderStoreMixin:
             for row in rows:
                 reminder_id = str(row["reminder_id"])
                 cursor = await db.execute(
-                    """UPDATE reminder_occurrences
-                       SET state = 'claimed', claimed_at_ms = ?, actual_fire_at_ms = ?
-                       WHERE reminder_id = ? AND state = 'scheduled'""",
+                    f"""UPDATE reminder_occurrences
+                        SET state = 'claimed', claimed_at_ms = ?, actual_fire_at_ms = ?
+                        WHERE reminder_id = ? AND state = 'scheduled'
+                          AND {_REMINDER_LOCAL_DELIVERY_SQL}""",
                     (now_ms, now_ms, reminder_id),
                 )
                 if cursor.rowcount == 1:
@@ -1152,8 +1162,9 @@ class ReminderStoreMixin:
             await self._claim_due_reminders_unlocked(now)
             db = await self._ensure_db()
             async with db.execute(
-                """SELECT reminder_id FROM reminder_occurrences WHERE state = 'claimed'
-                   ORDER BY intended_at_ms, occurrence_id"""
+                f"""SELECT reminder_id FROM reminder_occurrences
+                    WHERE state = 'claimed' AND {_REMINDER_LOCAL_DELIVERY_SQL}
+                    ORDER BY intended_at_ms, occurrence_id"""
             ) as cursor:
                 rows = await cursor.fetchall()
             delivered: list[ReminderOccurrence] = []

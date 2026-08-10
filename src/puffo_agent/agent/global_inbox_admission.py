@@ -106,7 +106,7 @@ class InboxAdmissionMixin:
             or event.provider_session_id != provider_session_id
             or event.provider_turn_id != evidence.provider_turn_id
         ):
-            return
+            raise RuntimeError("held admission crossed the active provider turn")
         rows = [
             await self.store.get_message_by_envelope(item) for item in displayed_ids
         ]
@@ -118,7 +118,7 @@ class InboxAdmissionMixin:
             or row.server_seq > latest_seq
             for row in rows
         ):
-            return
+            raise RuntimeError("held admission evidence no longer matches local rows")
         if any(
             row is not None
             and row.processing_state is not ProcessingState.PENDING
@@ -128,12 +128,13 @@ class InboxAdmissionMixin:
             )
             for row in rows
         ):
-            return
+            raise RuntimeError("held admission rows crossed another turn boundary")
         pending_ids = [
             row.envelope_id
             for row in rows
             if row is not None and row.processing_state is ProcessingState.PENDING
         ]
+        fired[0] = True
         try:
             if pending_ids:
                 await self.store.admit_messages(
@@ -168,9 +169,38 @@ class InboxAdmissionMixin:
                 latest_seq,
             )
         except Exception:
-            return
-        fired[0] = True
+            self._log_held_admission_failure(
+                event=event,
+                active_turn_id=active_turn_id,
+                provider_session_id=provider_session_id,
+                evidence=evidence,
+            )
+            raise
         self._held_admission_evidence.pop(evidence_key, None)
+
+    def _log_held_admission_failure(
+        self,
+        *,
+        event: ProviderAdmissionEvent,
+        active_turn_id: str,
+        provider_session_id: str,
+        evidence: Any,
+    ) -> None:
+        log_runtime_event(
+            logger,
+            "held.admission_failed",
+            level=logging.WARNING,
+            agent_id=self.agent_id,
+            turn_id=active_turn_id,
+            provider_session_id=provider_session_id,
+            provider_turn_id=event.provider_turn_id,
+            tool_call_id=event.tool_call_id,
+            envelope_id=evidence.latest_envelope_id,
+            space_id=evidence.space_id,
+            channel_id=evidence.channel_id,
+            latest_seq=evidence.latest_seq,
+            state="admission_failed",
+        )
 
     async def stage_held_send_result(
         self,

@@ -486,13 +486,6 @@ class StandardWorkerRun:
         from ..agent.reminder_sync import ReminderSync
 
         client = context.client
-        if not (
-            callable(getattr(client, "add_connected_callback", None))
-            and callable(
-                getattr(client.keystore, "load_or_create_message_backup_dek", None)
-            )
-        ):
-            return None
         reminder_sync = ReminderSync(
             store=client.store,
             keystore=client.keystore,

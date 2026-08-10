@@ -66,6 +66,27 @@ async def test_scheduler_recovers_claimed_work_after_reopen(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_scheduler_without_authorizer_ignores_remote_prepared_work(tmp_path):
+    store = MessageStore(tmp_path / "remote.db", now_ms=lambda: 2_000)
+    reminder = await store.create_reminder(
+        content="remote", target="dm:peer", intended_at_ms=1_000,
+    )
+    await store.persist_reminder_envelope(
+        occurrence_id=reminder.occurrence_id,
+        payload_format="opaque-v1",
+        opaque_payload=b"encrypted",
+    )
+    scheduler = ReminderScheduler(
+        store=store, notify=lambda: None, now_ms=lambda: 2_000,
+    )
+
+    assert await scheduler.process_due_once() == ()
+    assert (await store.get_reminder(reminder.reminder_id)).state == "scheduled"
+    assert await store.next_reminder_deadline(now_ms=2_000, local_only=True) is None
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_notifies_committed_deliveries_once_per_batch(tmp_path):
     store = MessageStore(tmp_path / "batch.db", now_ms=lambda: 2_000)
     commits: list[str] = []

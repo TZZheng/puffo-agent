@@ -148,11 +148,11 @@ Loss of both the Agent state and this `MessageBackupDEK` remains outside v1;
 the Server does not decrypt reminders or retain a plaintext recovery copy.
 
 The Server delivery claim provides cross-runtime election for acknowledged
-occurrences. Claims are durable and do not expire: if the winning runtime loses
-its local state after acquiring a claim but before committing delivery, v1
-prefers preventing duplicate execution over automatic takeover. Copying an
-already-claimed local state is likewise not an automatic transfer protocol.
-Both cases require a future explicit recovery policy.
+occurrences. A claim is a renewable lease. Every delivery attempt revalidates
+the persisted claim ID immediately before entering the local Inbox transaction;
+retrying the same live claim renews it, another live claim is held, and an
+expired claim may be acquired by a replacement runtime. The local acquired bit
+is therefore crash-recovery metadata, never permanent delivery authority.
 
 ## Non-goals
 

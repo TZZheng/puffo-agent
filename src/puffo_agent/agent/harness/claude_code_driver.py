@@ -32,6 +32,7 @@ from .driver import (
     TurnStarted,
     UnsupportedCapability,
 )
+from .subprocess_io import drain_subprocess_stream
 
 
 class AmbiguousDeliveryError(RuntimeError):
@@ -67,6 +68,7 @@ class ClaudeCodeCliDriver(Driver):
         self.replay_timeout = replay_timeout
         self._proc: Any = None
         self._reader: asyncio.Task | None = None
+        self._stderr_reader: asyncio.Task | None = None
         self._write_lock = asyncio.Lock()
         self._events: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
         self._init: asyncio.Future[dict[str, Any]] | None = None
@@ -127,6 +129,9 @@ class ClaudeCodeCliDriver(Driver):
                 self._proc = await self._proc
         self._init = asyncio.get_running_loop().create_future()
         self._reader = asyncio.create_task(self._read_loop())
+        self._stderr_reader = asyncio.create_task(
+            drain_subprocess_stream(getattr(self._proc, "stderr", None))
+        )
         init = await asyncio.wait_for(self._init, timeout=self.replay_timeout)
         native = str(init.get("session_id") or "")
         if not native:
@@ -254,6 +259,9 @@ class ClaudeCodeCliDriver(Driver):
         if self._reader is not None:
             self._reader.cancel()
             await asyncio.gather(self._reader, return_exceptions=True)
+        if self._stderr_reader is not None:
+            self._stderr_reader.cancel()
+            await asyncio.gather(self._stderr_reader, return_exceptions=True)
         await self._events.put(None)
 
     async def _write(self, frame: dict[str, Any]) -> None:

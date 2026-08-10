@@ -18,6 +18,7 @@ RUNTIME_EVENT_FIELDS = frozenset({
     "context_baseline_seq", "seen_seq", "latest_seq",
     "latest_seq_before_send", "seq",
     "mode", "attempt_phase", "transport", "attempt", "state",
+    "requires_encryption",
     "duration_ms", "message_count",
     "formatted_bytes", "projected_tokens", "used_tokens_before",
     "used_tokens_after", "context_window", "decision_reason", "error_category",
@@ -27,7 +28,7 @@ RUNTIME_EVENT_FIELDS = frozenset({
     "send_attempt_id", "outcome", "remaining_count", "snapshot_generation",
     "runtime_ref", "session_ref", "turn_ref", "permission_ref",
     "event_id", "event_type", "outbox_sequence", "retry_count",
-    "capability", "capability_decision", "error_code",
+    "capability", "capability_decision", "error_code", "error_type",
     "first_sequence", "last_sequence", "event_count",
 })
 RUNTIME_EVENT_NAMES = frozenset({
@@ -49,6 +50,7 @@ RUNTIME_EVENT_NAMES = frozenset({
     "history.read_admitted",
     "send.attempted",
     "send.held",
+    "held.admission_failed",
     "held.synchronized",
     "reconsideration.eligible",
     "reconsideration.blocked",
@@ -59,6 +61,7 @@ RUNTIME_EVENT_NAMES = frozenset({
     "context.rollover",
     "turn.processed",
     "turn.requeued",
+    "turn.failed",
     "turn.finalized",
     "runtime.command",
     "runtime.normalized_event",

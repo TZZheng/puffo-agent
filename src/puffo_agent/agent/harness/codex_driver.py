@@ -37,6 +37,7 @@ from .driver import (
     TurnRef,
     TurnStarted,
 )
+from .subprocess_io import drain_subprocess_stream
 
 CODEX_CAPABILITIES = DriverCapabilities(
     session_resume=True,
@@ -135,6 +136,7 @@ class CodexAppServerDriver(Driver):
         self.executable_version = executable_version
         self._proc: Any = None
         self._reader: asyncio.Task | None = None
+        self._stderr_reader: asyncio.Task | None = None
         self._write_lock = asyncio.Lock()
         self._pending: dict[int, asyncio.Future[Any]] = {}
         self._request_id = 0
@@ -174,6 +176,9 @@ class CodexAppServerDriver(Driver):
             if asyncio.iscoroutine(self._proc):
                 self._proc = await self._proc
         self._reader = asyncio.create_task(self._read_loop())
+        self._stderr_reader = asyncio.create_task(
+            drain_subprocess_stream(getattr(self._proc, "stderr", None))
+        )
         await self._request(
             "initialize",
             {
@@ -344,6 +349,9 @@ class CodexAppServerDriver(Driver):
         if self._reader is not None:
             self._reader.cancel()
             await asyncio.gather(self._reader, return_exceptions=True)
+        if self._stderr_reader is not None:
+            self._stderr_reader.cancel()
+            await asyncio.gather(self._stderr_reader, return_exceptions=True)
         await self._events.put(None)
 
     async def _request(self, method: str, params: dict[str, Any]) -> Any:

@@ -14,16 +14,20 @@ from typing import Any, Optional
 PRIOR_CONTEXT_MAX_ITEMS = 20
 PRIOR_CONTEXT_MAX_BYTES = 48_000
 
-# Persisting an envelope is the write-ahead fence for remote delivery.  Only
-# an entirely unprepared row can use the local-only delivery path.
-_REMINDER_DELIVERY_CUSTODY_SQL = """
+# Persisting an envelope is the write-ahead fence for remote delivery. Only an
+# entirely unprepared row can use the local-only path. A remotely coordinated
+# row additionally needs a freshly validated Server lease before delivery.
+_REMINDER_LOCAL_DELIVERY_SQL = """
+(
+    server_ack_revision = 0
+    AND payload_format IS NULL
+    AND opaque_payload IS NULL
+)
+"""
+_REMINDER_DELIVERY_CUSTODY_SQL = f"""
 (
     delivery_claim_acquired = 1
-    OR (
-        server_ack_revision = 0
-        AND payload_format IS NULL
-        AND opaque_payload IS NULL
-    )
+    OR {_REMINDER_LOCAL_DELIVERY_SQL}
 )
 """
 

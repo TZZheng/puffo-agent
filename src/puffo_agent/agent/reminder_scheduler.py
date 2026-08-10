@@ -186,7 +186,8 @@ class ReminderScheduler:
             if self._stopping:
                 break
             deadline = await self.store.next_reminder_deadline(
-                now_ms=int(self._now_ms())
+                now_ms=int(self._now_ms()),
+                local_only=self._delivery_authorizer is None,
             )
             if self._authorization_retry_after_ms is not None:
                 deadline = max(

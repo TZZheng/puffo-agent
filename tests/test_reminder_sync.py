@@ -411,6 +411,31 @@ async def test_acquired_claim_delivers_and_terminal_put_carries_same_claim_id(tm
 
 
 @pytest.mark.asyncio
+async def test_persisted_acquired_claim_is_revalidated_before_delivery(tmp_path):
+    transport = _RecordingTransport()
+    sync, store, _scheduler, _keys = _sync(tmp_path, transport)
+    reminder = await store.create_reminder(
+        content="due", target="dm:peer", intended_at_ms=1_000,
+    )
+    assert await sync.upload_pending_once() == 1
+    assert await sync.reconcile_snapshot() == 0
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None
+
+    first = await sync.authorize_due_delivery((record,))
+    assert first.occurrence_ids == (reminder.occurrence_id,)
+    acquired = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert acquired is not None and acquired.delivery_claim_acquired
+
+    transport.claim_status = "held"
+    second = await sync.authorize_due_delivery((acquired,))
+    assert second.occurrence_ids == ()
+    assert len(transport.claims) == 2
+    assert transport.claims[0][1]["claim_id"] == transport.claims[1][1]["claim_id"]
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_held_or_terminal_claim_never_creates_a_local_inbox_event(tmp_path):
     transport = _RecordingTransport()
     sync, store, scheduler, _keys = _sync(tmp_path, transport)
@@ -905,7 +930,7 @@ async def test_envelope_fence_blocks_upload_race_from_local_delivery(tmp_path):
     record = await store.get_reminder_sync_record("occurrence-delivery-race")
     assert record is not None
     assert (record.state, record.revision, record.server_ack_revision) == (
-        "claimed", 1, 1,
+        "scheduled", 1, 1,
     )
     assert await store.get_pending() == ()
     await store.close()

@@ -26,6 +26,7 @@ from puffo_agent.agent.global_inbox_runtime import (
     HeldRecoverySource,
     MessageRoute,
     PlannedTurn,
+    RuntimeHealth,
     SendAttemptState,
     TrackingSendDelegate,
     await_listener_with_runtime,
@@ -969,21 +970,39 @@ async def test_global_notice_turns_are_ephemeral_to_the_agent_log(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pre_admission_failure_leaves_pending_and_crash_join_exists(tmp_path):
+async def test_pre_admission_failure_leaves_pending_without_self_retry(
+    tmp_path, caplog,
+):
+    caplog.set_level(logging.INFO)
     store = await make_store(tmp_path)
     await receipt(store, "m1", 1)
     adapter = Adapter()
+    calls = 0
 
     async def fail(_planned):
+        nonlocal calls
+        calls += 1
         assert (tmp_path / ".puffo-agent/current_turn.json").exists()
         raise RuntimeError("provider failed before admission")
 
     runtime = GlobalInboxRuntime(
         store=store, adapter=adapter, run_turn=fail, workspace=tmp_path,
     )
-    await runtime.process_once()
+    assert await runtime.process_once()
+    assert not await runtime.process_once()
+    assert calls == 1
+    assert runtime.health == RuntimeHealth(
+        "degraded", "turn failed before durable admission"
+    )
+    assert runtime._degraded is True
     assert [m.envelope_id for m in await store.get_pending()] == ["m1"]
     assert not (tmp_path / ".puffo-agent/current_turn.json").exists()
+    failures = [
+        event for event in runtime_events(caplog) if event["event"] == "turn.failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0]["error_type"] == "RuntimeError"
+    assert failures[0]["outcome"] == "degraded"
     await store.close()
 
 

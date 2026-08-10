@@ -959,6 +959,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 ),
             )
         if terminal or not was_active:
+            self._discard_held_admission_evidence(planned.turn_id)
             self.active.clear()
         if self.coordinator is not None:
             self.coordinator.provider_session_id = None
@@ -1018,11 +1019,30 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 await self._requeue_active_turn(planned, process_started, "cancelled")
                 terminal = True
                 raise
-            except Exception:
+            except Exception as exc:
                 terminal = await self._requeue_active_turn(
                     planned, process_started, "provider_error"
                 )
-                self.health = RuntimeHealth("degraded", "turn failed and was requeued")
+                diagnostic = (
+                    "turn failed and was requeued"
+                    if terminal
+                    else "turn failed before durable admission"
+                )
+                self._degrade(diagnostic)
+                log_runtime_event(
+                    logger,
+                    "turn.failed",
+                    level=logging.ERROR,
+                    agent_id=self.agent_id,
+                    turn_id=planned.turn_id,
+                    provider_session_id=self.active.provider_session_id,
+                    provider_turn_id=self.active.provider_turn_id,
+                    notice_generation=planned.notice_generation,
+                    target_count=len(planned.targets),
+                    error_category="provider_error",
+                    error_type=type(exc).__name__,
+                    outcome="requeued" if terminal else "degraded",
+                )
             finally:
                 self._finalize_process(planned, terminal)
             await self._wake_remaining_pending()
@@ -1050,6 +1070,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
 
     def _clear_terminal_turn(self) -> None:
         self.adapter.register_admission_callback(None, "")
+        self._discard_held_admission_evidence(self.active.turn_id)
         self.active.clear()
         if self.coordinator is not None:
             self.coordinator.provider_session_id = None
@@ -1057,6 +1078,14 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             self.current_turn_path.unlink()
         except OSError:
             pass
+
+    def _discard_held_admission_evidence(self, turn_id: str) -> None:
+        """Release transient held projections when their owning turn ends."""
+        if not turn_id:
+            return
+        for key in tuple(self._held_admission_evidence):
+            if key[0] == turn_id:
+                self._held_admission_evidence.pop(key, None)
 
     def _reconstruct_exact_turn(
         self,

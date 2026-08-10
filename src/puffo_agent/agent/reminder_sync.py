@@ -469,12 +469,13 @@ class ReminderSync:
             if not self._delivery_ready:
                 blocked = True
                 continue
-            if candidate.delivery_claim_acquired:
-                authorized.append(candidate.occurrence_id)
-                continue
             if candidate.state not in {"scheduled", "claimed"}:
                 blocked = True
                 continue
+            # Server claims are renewable leases. The persisted flag records a
+            # prior response but is never sufficient authorization after a
+            # restart or suspend; retrying the same claim ID renews and fences
+            # this concrete delivery attempt.
             claim_id = candidate.delivery_claim_id or str(uuid.uuid4())
             try:
                 persisted = await self.store.persist_reminder_delivery_claim_id(
