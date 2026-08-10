@@ -35,6 +35,7 @@ from ...portal.state import (
     home_dir,
     read_host_codex_mcp_servers,
     seed_claude_home,
+    strip_claude_api_key_from_settings,
     sync_host_codex_auth_view,
     sync_host_claude_code_auth_view,
     sync_host_enabled_plugins,
@@ -171,6 +172,7 @@ class LocalCLIAdapter(Adapter):
         puffo_core_server_url: str = "",
         puffo_core_slug: str = "",
         puffo_core_keys_dir: str = "",
+        claude_api_key: str = "",
     ):
         self.agent_id = agent_id
         # Adapter-owned variables below take precedence over these overrides.
@@ -195,6 +197,7 @@ class LocalCLIAdapter(Adapter):
         self.puffo_core_server_url = puffo_core_server_url
         self.puffo_core_slug = puffo_core_slug
         self.puffo_core_keys_dir = puffo_core_keys_dir
+        self.claude_api_key = claude_api_key
         self._desired_codex_extras: dict[str, dict] = {}
         self._desired_installed = False
         if harness is None:
@@ -790,6 +793,7 @@ class LocalCLIAdapter(Adapter):
         if self._session is not None:
             return self._session
         extra = self._prepare_mcp_args()
+        self._strip_claude_api_key_settings()
         # Register the PreToolUse permission hook before spawning;
         # settings.json is read fresh every spawn so this is
         # idempotent on every worker restart.
@@ -812,7 +816,10 @@ class LocalCLIAdapter(Adapter):
             },
             **adapter_owned_env,
         }
+        env.pop("ANTHROPIC_API_KEY", None)
         env.pop("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", None)
+        if self.claude_api_key:
+            env["ANTHROPIC_API_KEY"] = self.claude_api_key
         self._session = ClaudeSession(
             agent_id=self.agent_id,
             session_file=self.session_file,
@@ -828,6 +835,23 @@ class LocalCLIAdapter(Adapter):
             env_overrides=self.env_overrides,
         )
         return self._session
+
+    def _strip_claude_api_key_settings(self) -> None:
+        paths: list[Path] = []
+        agent_home_dir = getattr(self, "agent_home_dir", None)
+        if agent_home_dir is not None:
+            paths.extend([
+                Path(agent_home_dir) / ".claude" / "settings.json",
+                Path(agent_home_dir) / ".claude" / "settings.local.json",
+            ])
+        claude_dir = getattr(self, "claude_dir", None)
+        if claude_dir is not None:
+            paths.extend([
+                Path(claude_dir) / "settings.json",
+                Path(claude_dir) / "settings.local.json",
+            ])
+        for settings_path in paths:
+            strip_claude_api_key_from_settings(settings_path)
 
     def _macos_credential_env(self) -> dict[str, str]:
         """macOS-only env hardening:
@@ -945,6 +969,7 @@ class LocalCLIAdapter(Adapter):
         extra_args: list[str],
         env_overrides: dict[str, str] | None = None,
     ) -> list[str]:
+        self._strip_claude_api_key_settings()
         # ``env_overrides`` is merged into the subprocess env on the
         # host by ClaudeSession._spawn; the kwarg here is just for
         # symmetry with the docker adapter.

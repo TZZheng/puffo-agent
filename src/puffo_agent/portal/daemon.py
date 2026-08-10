@@ -46,6 +46,7 @@ from .state import (
     agents_dir,
     archive_flag_path,
     archived_dir,
+    claude_cli_api_key,
     clear_daemon_pid,
     clear_refresh_token_request,
     clear_stop_request,
@@ -65,6 +66,15 @@ from .state import (
 from .worker import Worker
 
 logger = logging.getLogger(__name__)
+
+
+def _uses_claude_api_key(daemon_cfg: DaemonConfig | None, agent_cfg: AgentConfig) -> bool:
+    return (
+        getattr(agent_cfg.runtime, "kind", "cli-local")
+        in {"cli-local", "cli-docker"}
+        and (agent_cfg.runtime.harness or "claude-code") == "claude-code"
+        and bool(claude_cli_api_key(daemon_cfg))
+    )
 
 
 class Daemon:
@@ -349,9 +359,14 @@ class Daemon:
             return self.codex_refresher
         return self.refresher
 
+    def _uses_claude_api_key(self, agent_cfg: AgentConfig) -> bool:
+        return _uses_claude_api_key(self.daemon_cfg, agent_cfg)
+
     def _register_with_refresher(
         self, agent_cfg: AgentConfig, worker: Worker,
     ) -> None:
+        if _uses_claude_api_key(getattr(self, "daemon_cfg", None), agent_cfg):
+            return
         refresher = self._refresher_for(agent_cfg)
         refresher.register_agent(agent_home_dir(agent_cfg.id))
         agent_id = agent_cfg.id
@@ -387,9 +402,13 @@ class Daemon:
         worker._refresh_success_callback = on_refresh_success
 
     def _notify_refresh_for(self, agent_cfg: AgentConfig):
+        if self._uses_claude_api_key(agent_cfg):
+            return None
         return self._refresher_for(agent_cfg).notify_refresh_needed
 
     def _ensure_fresh_for(self, agent_cfg: AgentConfig):
+        if self._uses_claude_api_key(agent_cfg):
+            return None
         return self._refresher_for(agent_cfg).ensure_fresh
 
     def _set_worker_profile_cache(

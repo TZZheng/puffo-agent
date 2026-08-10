@@ -40,6 +40,7 @@ from ...portal.state import (
     filter_container_mcp_servers,
     read_host_codex_mcp_servers,
     seed_claude_home,
+    strip_claude_api_key_from_settings,
     sync_host_claude_code_auth_view,
     sync_host_codex_auth_view,
     sync_host_codex_skills,
@@ -159,6 +160,7 @@ class DockerCLIAdapter(Adapter):
         puffo_core_server_url: str = "",
         puffo_core_slug: str = "",
         puffo_core_keys_dir: str = "",
+        claude_api_key: str = "",
     ):
         self.agent_id = agent_id
         self.model = model
@@ -206,6 +208,7 @@ class DockerCLIAdapter(Adapter):
         self.puffo_core_server_url = puffo_core_server_url
         self.puffo_core_slug = puffo_core_slug
         self.puffo_core_keys_dir = puffo_core_keys_dir
+        self.claude_api_key = claude_api_key
         self._desired_codex_extras: dict[str, dict] = {}
         self._codex_bearer_env_names: tuple[str, ...] = ()
         self._desired_installed = False
@@ -370,6 +373,7 @@ class DockerCLIAdapter(Adapter):
             build_command=self._build_command,
             # cwd is WORKDIR /workspace inside the container.
             cwd=None,
+            env=self._claude_docker_env(),
             # Host-side write; the workspace bind-mount delivers it
             # to the container's tail loop and ``docker logs``.
             audit=AuditLog(
@@ -387,14 +391,25 @@ class DockerCLIAdapter(Adapter):
         extra_args: list[str],
         env_overrides: dict[str, str] | None = None,
     ) -> list[str]:
+        self._strip_claude_api_key_settings()
         cmd: list[str] = [getattr(self, "_docker_bin", "docker"), "exec", "-i"]
+        if getattr(self, "claude_api_key", ""):
+            cmd.extend(["-e", "ANTHROPIC_API_KEY"])
+        else:
+            # docker exec cannot unset a variable. An explicit empty value
+            # prevents the container image from supplying an ambient key;
+            # Claude Code treats the empty value as subscription mode.
+            cmd.extend(["-e", "ANTHROPIC_API_KEY="])
         # ``env_overrides`` flows in before the container name so
         # docker treats each ``-e KEY=VALUE`` as an exec flag.
         # SECURITY: values are visible in the process list and in command
         # errors. Never pass secrets here; use Docker's name-only ``-e NAME``
         # passthrough, as the Codex bearer-token path does.
         for key, value in (env_overrides or {}).items():
-            if key == "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE":
+            if key in {
+                "ANTHROPIC_API_KEY",
+                "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+            }:
                 continue
             cmd.extend(["-e", f"{key}={value}"])
         cmd.extend([
@@ -424,6 +439,31 @@ class DockerCLIAdapter(Adapter):
                 )
         cmd.extend(extra_args)
         return cmd
+
+    def _claude_docker_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        env.pop("ANTHROPIC_API_KEY", None)
+        api_key = getattr(self, "claude_api_key", "")
+        if api_key:
+            env["ANTHROPIC_API_KEY"] = api_key
+        return env
+
+    def _strip_claude_api_key_settings(self) -> None:
+        paths: list[Path] = []
+        claude_home_src = getattr(self, "claude_home_src", None)
+        if claude_home_src is not None:
+            paths.extend([
+                Path(claude_home_src) / "settings.json",
+                Path(claude_home_src) / "settings.local.json",
+            ])
+        claude_dir = getattr(self, "claude_dir", None)
+        if claude_dir is not None:
+            paths.extend([
+                Path(claude_dir) / "settings.json",
+                Path(claude_dir) / "settings.local.json",
+            ])
+        for settings_path in paths:
+            strip_claude_api_key_from_settings(settings_path)
 
     def _prepare_mcp_args(self) -> list[str]:
         """Write the per-agent MCP config into the workspace and
@@ -621,6 +661,7 @@ class DockerCLIAdapter(Adapter):
                     "agent %s: seeded per-agent virtual $HOME at %s from %s",
                     self.agent_id, self.agent_home_dir, host_home,
                 )
+            self._strip_claude_api_key_settings()
             claude_auth_mode = sync_host_claude_code_auth_view(
                 host_home, self.agent_home_dir,
             )
@@ -682,6 +723,7 @@ class DockerCLIAdapter(Adapter):
 
             if (
                 self.harness.name() == "claude-code"
+                and not self.claude_api_key
                 and not (self.agent_home_dir / ".claude" / ".credentials.json").exists()
             ):
                 logger.warning(

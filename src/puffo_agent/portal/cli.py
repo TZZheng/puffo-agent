@@ -203,12 +203,26 @@ def cmd_config(args: argparse.Namespace) -> int:
     home_dir().mkdir(parents=True, exist_ok=True)
     cfg = DaemonConfig.load()
 
+    anthropic_api_key = getattr(args, "anthropic_api_key", None)
+    anthropic_cli_use_api_key = getattr(
+        args, "anthropic_cli_use_api_key", None,
+    )
+    if anthropic_api_key is not None or anthropic_cli_use_api_key is not None:
+        if anthropic_api_key is not None:
+            cfg.anthropic.api_key = anthropic_api_key
+        if anthropic_cli_use_api_key is not None:
+            cfg.anthropic.cli_use_api_key = (
+                anthropic_cli_use_api_key == "true"
+            )
+        cfg.save()
+        print(f"wrote {daemon_yml_path()}")
+        return 0
+
     if daemon_yml_path().exists():
         print(f"updating daemon.yml at {daemon_yml_path()}")
     else:
         print("creating daemon.yml (optional — defaults only)")
 
-    env_anthropic = os.environ.get("ANTHROPIC_API_KEY", "")
     env_openai = os.environ.get("OPENAI_API_KEY", "")
     env_google = (
         os.environ.get("GEMINI_API_KEY")
@@ -226,10 +240,19 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     cfg.default_provider = prompt("Default AI provider (anthropic|openai|google)", cfg.default_provider or "anthropic")
 
-    anth_key = cfg.anthropic.api_key or env_anthropic
+    anth_key = cfg.anthropic.api_key
     anth_key = prompt("Default Anthropic API key (blank to skip)", anth_key)
     if anth_key:
-        cfg.anthropic = ProviderConfig(api_key=anth_key, model=cfg.anthropic.model or "claude-sonnet-4-6")
+        cfg.anthropic.api_key = anth_key
+        cfg.anthropic.model = cfg.anthropic.model or "claude-sonnet-4-6"
+    cli_use_api_key = prompt(
+        "Use the Anthropic API key for Claude Code (true|false)",
+        "true" if cfg.anthropic.cli_use_api_key else "false",
+    ).lower()
+    if cli_use_api_key not in {"true", "false"}:
+        print("error: Claude Code API-key mode must be true or false")
+        return 2
+    cfg.anthropic.cli_use_api_key = cli_use_api_key == "true"
 
     oai_key = cfg.openai.api_key or env_openai
     oai_key = prompt("Default OpenAI API key (blank to skip)", oai_key)
@@ -1464,13 +1487,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser(
+    config = sub.add_parser(
         "config",
         help=(
             "Optional: set daemon-wide defaults (provider, models, API keys). "
             "The daemon runs fine without this — agents can carry their own keys."
         ),
-    ).set_defaults(func=cmd_config)
+    )
+    config.add_argument(
+        "--anthropic-api-key",
+        metavar="KEY",
+        help=(
+            "Set daemon.yml anthropic.api_key without reading "
+            "ANTHROPIC_API_KEY from the environment; pass an empty value "
+            "to clear it"
+        ),
+    )
+    config.add_argument(
+        "--anthropic-cli-use-api-key",
+        choices=("true", "false"),
+        help=(
+            "Enable or disable passing daemon.yml anthropic.api_key to "
+            "Claude Code"
+        ),
+    )
+    config.set_defaults(func=cmd_config)
     start = sub.add_parser(
         "start",
         help=(

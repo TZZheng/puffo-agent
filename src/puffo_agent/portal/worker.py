@@ -48,6 +48,7 @@ from .state import (
     agent_codex_user_dir,
     agent_dir,
     agent_home_dir,
+    claude_cli_api_key,
     cli_session_json_path,
     docker_shared_dir,
     shared_fs_dir,
@@ -89,6 +90,12 @@ def _rebuild_managed_system_prompt(
 logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
+
+
+def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
+    if harness_name != "claude-code":
+        return ""
+    return claude_cli_api_key(daemon_cfg)
 
 
 def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
@@ -176,6 +183,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             puffo_core_server_url=agent_cfg.puffo_core.server_url,
             puffo_core_slug=agent_cfg.puffo_core.slug,
             puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
+            claude_api_key=_claude_cli_api_key(daemon_cfg, harness.name()),
         )
         # Env for spawning the puffo_core MCP server; path-typed values are
         # rewritten to container bind-mount paths at config-write time.
@@ -237,6 +245,7 @@ def build_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
             puffo_core_server_url=agent_cfg.puffo_core.server_url,
             puffo_core_slug=agent_cfg.puffo_core.slug,
             puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
+            claude_api_key=_claude_cli_api_key(daemon_cfg, harness.name()),
         )
         if agent_cfg.puffo_core.is_configured():
             from ..mcp.config import puffo_core_mcp_env
@@ -496,6 +505,7 @@ def _handle_suppressed_reply(
     scope: str,
     on_auth_failure: Optional[Callable[[], None]] = None,
     on_auth_failed_enter: Optional[Callable[[], None]] = None,
+    auth_error_message: str | None = None,
 ) -> tuple[bool, float]:
     """Shared landing for a suppressed worker-error leak. Returns
     ``(suppressed, backoff_seconds)``:
@@ -546,7 +556,9 @@ def _handle_suppressed_reply(
                     "agent %s: on_auth_failed_enter callback raised: %s",
                     agent_id, exc,
                 )
-    if scope == "api-error-retry":
+    if is_auth and auth_error_message:
+        runtime.error = auth_error_message
+    elif scope == "api-error-retry":
         if is_auth:
             runtime.error = (
                 "Claude Code sign-in expired. On the computer running "
@@ -651,7 +663,10 @@ class Worker:
             probe_ok = False
         if not probe_ok:
             Worker._reassert_auth_failed_after_failed_probe(
-                self.runtime, agent_id, logger,
+                self.runtime,
+                agent_id,
+                logger,
+                api_key_mode=getattr(self, "_claude_api_key_mode", False),
             )
         self._warm_done.set()
 
@@ -660,6 +675,8 @@ class Worker:
         runtime: "RuntimeState",
         agent_id: str,
         log: logging.Logger,
+        *,
+        api_key_mode: bool = False,
     ) -> None:
         """``on_refresh_success`` eagerly clears ``auth_failed`` before
         the respawn, so a still-broken provider warms up looking healthy.
@@ -669,11 +686,7 @@ class Worker:
         if runtime.health != "ok":
             return
         runtime.health = "auth_failed"
-        runtime.error = (
-            "Claude Code sign-in expired. On the computer running "
-            "puffo-agent, open a terminal and run `claude auth "
-            "login`, then send this agent a message."
-        )
+        runtime.error = Worker._auth_failed_error(api_key_mode)
         runtime.save(agent_id)
         log.warning(
             "agent %s: post-warm health probe failed; reasserted "
@@ -688,10 +701,8 @@ class Worker:
         rt = self.runtime
         was_ok = rt.health != "auth_failed"
         rt.health = "auth_failed"
-        rt.error = (
-            "Claude Code sign-in expired. On the computer running "
-            "puffo-agent, open a terminal and run `claude auth "
-            "login`, then send this agent a message."
+        rt.error = Worker._auth_failed_error(
+            getattr(self, "_claude_api_key_mode", False),
         )
         rt.save(agent_id)
         if self._notify_refresh_needed is not None:
@@ -706,10 +717,12 @@ class Worker:
 
     def _on_auth_failed_enter(self) -> None:
         """Fire the operator DM once per auth_failed episode. The flag
-        re-arms on auth_failed CLEAR (daemon ``on_refresh_success``) and
-        on a failed send, so a later genuine failure re-notifies."""
+        re-arms on OAuth refresh, successful API-key recovery, or a failed
+        send, so a later genuine failure re-notifies."""
         if self._auth_failed_notification_sent:
             return
+        if getattr(self, "_claude_api_key_mode", False):
+            self._api_key_auth_recovery_pending = True
         self._auth_failed_notification_sent = True
         try:
             asyncio.create_task(self._notify_operator_of_auth_failed_oauth())
@@ -722,7 +735,7 @@ class Worker:
             )
 
     async def _notify_operator_of_auth_failed_oauth(self) -> None:
-        """DM the operator the bilingual OAuth-expired recovery copy.
+        """DM the operator the matching bilingual auth recovery copy.
         Re-arms the dedup flag on a transient failure (client not warm,
         or send raised) so the next ENTER retries instead of staying
         silently gated."""
@@ -745,6 +758,7 @@ class Worker:
             )
             return
         from ..agent._invite_strings import (
+            format_anthropic_api_key_rejected,
             format_codex_oauth_expired,
             format_oauth_expired,
         )
@@ -756,7 +770,11 @@ class Worker:
         # the alert is broken. Harness is the cheapest signal we have.
         runtime = getattr(self.agent_cfg, "runtime", None)
         harness = getattr(runtime, "harness", "") if runtime is not None else ""
-        if harness == "codex":
+        if getattr(self, "_claude_api_key_mode", False):
+            text = format_anthropic_api_key_rejected(
+                self.agent_cfg.id, display_name,
+            )
+        elif harness == "codex":
             text = format_codex_oauth_expired(self.agent_cfg.id, display_name)
         else:
             text = format_oauth_expired(self.agent_cfg.id, display_name)
@@ -771,8 +789,22 @@ class Worker:
             )
             return
         logger.info(
-            "agent %s: notified operator @%s of OAuth-expired",
+            "agent %s: notified operator @%s of auth failure",
             self.agent_cfg.id, operator_slug,
+        )
+
+    @staticmethod
+    def _auth_failed_error(api_key_mode: bool) -> str:
+        if api_key_mode:
+            return (
+                "Claude Code API key was rejected. Update anthropic.api_key "
+                "in daemon.yml, keep anthropic.cli_use_api_key enabled, "
+                "restart puffo-agent, then send this agent a message."
+            )
+        return (
+            "Claude Code sign-in expired. On the computer running "
+            "puffo-agent, open a terminal and run `claude auth "
+            "login`, then send this agent a message."
         )
 
     @staticmethod
@@ -794,14 +826,37 @@ class Worker:
         runtime: "RuntimeState",
         agent_id: str,
         log: logging.Logger,
+        *,
+        recover_auth_failed: bool = False,
     ) -> None:
-        """Transition ``in_progress`` → ``ok``; skip any in-turn red."""
-        if runtime.health != "in_progress":
+        """Resolve a successful turn without masking unrelated red states."""
+        recoverable = {"in_progress"}
+        if recover_auth_failed:
+            recoverable.add("auth_failed")
+        if runtime.health not in recoverable:
             return
+        previous_health = runtime.health
         runtime.health = "ok"
         runtime.error = ""
         runtime.save(agent_id)
-        log.info("agent %s: runtime.health in_progress → ok", agent_id)
+        log.info(
+            "agent %s: runtime.health %s → ok", agent_id, previous_health,
+        )
+
+    def _resolve_health_after_success(self, agent_id: str) -> None:
+        recovering_api_key = (
+            getattr(self, "_claude_api_key_mode", False)
+            and getattr(self, "_api_key_auth_recovery_pending", False)
+        )
+        Worker._resolve_health_on_success(
+            self.runtime,
+            agent_id,
+            logger,
+            recover_auth_failed=recovering_api_key,
+        )
+        if recovering_api_key:
+            self._api_key_auth_recovery_pending = False
+            self._auth_failed_notification_sent = False
 
     @staticmethod
     def _fallback_unhandled_error_if_stuck_in_progress(
@@ -847,6 +902,14 @@ class Worker:
         # re-armed on credential refresh-success (daemon
         # on_refresh_success) and on a failed send.
         self._auth_failed_notification_sent = False
+        self._claude_api_key_mode = (
+            agent_cfg.runtime.kind in {RUNTIME_CLI_LOCAL, RUNTIME_CLI_DOCKER}
+            and bool(_claude_cli_api_key(
+                daemon_cfg,
+                agent_cfg.runtime.harness or "claude-code",
+            ))
+        )
+        self._api_key_auth_recovery_pending = False
         self.runtime = RuntimeState(
             status="running",
             started_at=int(time.time()),
@@ -1372,9 +1435,7 @@ class Worker:
                 # AgentAPIError leaves in_progress for next batch's flip.
                 if turn_succeeded:
                     try:
-                        Worker._resolve_health_on_success(
-                            self.runtime, agent_id, logger,
-                        )
+                        self._resolve_health_after_success(agent_id)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "agent %s: _resolve_health_on_success failed: %s",
@@ -1409,6 +1470,9 @@ class Worker:
                     scope="fallback",
                     on_auth_failure=self._notify_refresh_needed,
                     on_auth_failed_enter=self._on_auth_failed_enter,
+                    auth_error_message=self._auth_failed_error(
+                        self._claude_api_key_mode,
+                    ),
                 )
                 if suppressed:
                     await asyncio.sleep(backoff)
@@ -1452,6 +1516,9 @@ class Worker:
                     scope="api-error-retry",
                     on_auth_failure=self._notify_refresh_needed,
                     on_auth_failed_enter=self._on_auth_failed_enter,
+                    auth_error_message=self._auth_failed_error(
+                        self._claude_api_key_mode,
+                    ),
                 )
                 if suppressed:
                     # Hottest leak site (FB-88 / FB-159 case-studies).
@@ -1511,9 +1578,7 @@ class Worker:
                 self.runtime, agent_id, root_id, logger,
             )
             # retry-success path bypasses on_message_batch's finally.
-            Worker._resolve_health_on_success(
-                self.runtime, agent_id, logger,
-            )
+            self._resolve_health_after_success(agent_id)
 
         async def heartbeat():
             interval = max(1.0, self.daemon_cfg.runtime_heartbeat_seconds)
