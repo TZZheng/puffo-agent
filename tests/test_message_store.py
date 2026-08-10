@@ -1504,3 +1504,86 @@ async def test_successful_empty_notice_turn_keeps_same_session_suppressed(
     assert state.is_due_for("provider-2")
     assert await store.get_active_turn_runs() == ()
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_held_dm_bodies_stay_unreadable_and_odd_anchors_page_empty(tmp_path):
+    """Store reads never surface a held DM, and never crash on a routeless one.
+
+    The foreign-DM gate suppresses *push* delivery — the pending queue and
+    prior context. No *pull* path filtered on disposition, so the same
+    plaintext came straight back out of ``get_dm_history``, and
+    ``get_thread_messages`` had the same hole. Retention compounded it:
+    ``cleanup()`` deliberately never expires a gated row, which is right
+    while the hold is open and wrong once the operator has said no, so a
+    refused body was kept forever and stayed readable.
+
+    The last case is the same read layer's other sharp edge: a DM row with
+    neither a sender nor a recipient slug has no route, and
+    ``get_prior_context_page`` answered that with a bare ``()`` instead of a
+    page — crashing every caller that reads ``.has_more``.
+    """
+    marker = "held-body-the-operator-never-approved"
+    store = MessageStore(tmp_path / "held-dm-containment.db")
+    await store.store_receipt(
+        {
+            "envelope_id": "env_held",
+            "envelope_kind": "dm",
+            "sender_slug": "mallory-9f21",
+            "recipient_slug": "bot-0001",
+            "content": marker,
+            "sent_at": _now_ms(),
+            "thread_root_id": "env_thread_root",
+        },
+        server_seq=1,
+        disposition=ReceiptDisposition.FOREIGN_DM_GATED,
+        reason="foreign dm awaiting approval",
+    )
+    await store.store_receipt(
+        {
+            "envelope_id": "env_thread_root",
+            "envelope_kind": "dm",
+            "sender_slug": "mallory-9f21",
+            "recipient_slug": "bot-0001",
+            "content": "ordinary earlier dm",
+            "sent_at": _now_ms() - 1000,
+        },
+        server_seq=2,
+        disposition=ReceiptDisposition.TERMINAL,
+        reason="test",
+    )
+
+    history = await store.get_dm_history("mallory-9f21")
+    assert marker not in str([m.content for m in history])
+    assert "env_held" not in [m.envelope_id for m in history]
+
+    thread = await store.get_thread_messages("env_thread_root")
+    assert "env_held" not in [m.envelope_id for m in thread]
+
+    # The operator answers "n": the refused body goes, the row stays so
+    # redelivery dedupe and envelope accounting still work.
+    assert await store.tombstone_gated_dms_from("mallory-9f21") == 1
+    row = await store.get_message_by_envelope("env_held")
+    assert row is not None
+    assert marker not in str(row.content)
+    assert row.receipt_disposition == ReceiptDisposition.TERMINAL
+    assert marker not in str(
+        [m.content for m in await store.get_dm_history("mallory-9f21")]
+    )
+
+    # A routeless DM anchor pages empty rather than returning the wrong type.
+    routeless = await store.store_local_event(
+        {
+            "envelope_id": "env_routeless",
+            "envelope_kind": "dm",
+            "sender_slug": "",
+            "recipient_slug": "",
+            "content": "no route at all",
+            "sent_at": _now_ms(),
+        },
+        reason="routeless anchor",
+    )
+    page = await store.get_prior_context_page(routeless)
+    assert page.items == ()
+    assert page.has_more is False
+    await store.close()

@@ -45,6 +45,18 @@ _SCHEMA_INIT_LOCKS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
 ] = weakref.WeakKeyDictionary()
 
+# Stored in place of a denied stranger's body once the operator answers "n".
+# The row stays so envelope accounting and redelivery dedupe still work; the
+# plaintext the operator refused does not.
+DENIED_DM_PLACEHOLDER = "[message from a denied sender was discarded]"
+
+# A held foreign DM is withheld from the model on the push path, so every
+# pull-side read must withhold it too. Applied to the DM and thread reads —
+# the channel reads cannot reach a gated row, which is always a DM.
+_NOT_GATED = (
+    "(receipt_disposition IS NULL OR receipt_disposition != 'foreign_dm_gated')"
+)
+
 
 def _schema_init_lock(db_path: Path) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
@@ -459,13 +471,50 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             received_at=received_at,
         )
 
+    async def store_local_receipt(
+        self,
+        payload: Any,
+        *,
+        disposition: ReceiptDisposition,
+        reason: str,
+        received_at: int | None = None,
+    ) -> ReceiptResult:
+        """Persist one gate verdict for a delivery that carries no ``server_seq``.
+
+        The cloud-bridge ``Message`` frame has no delivery sequence, so the
+        keyless transport cannot use ``store_receipt``. It still has to persist
+        the *verdict*: a plain ``store()`` writes a NULL disposition, which
+        makes a held foreign DM unpromotable and indistinguishable from an
+        un-classified row. This is ``store_receipt``'s sequence-less sibling —
+        same dispositions, same ack rule, local ordering instead of a server
+        frontier.
+        """
+        async with self._inbox_lock:
+            from .receipt_persistence import store_local_receipt_unlocked
+
+            return await store_local_receipt_unlocked(
+                self,
+                payload,
+                disposition=disposition,
+                reason=reason,
+                received_at=received_at,
+            )
+
     async def promote_gated_receipt(
         self,
         envelope_id: str,
-        server_seq: int,
+        server_seq: int | None,
         *,
         reason: str,
     ) -> ReceiptResult:
+        """Release one approval-gated receipt into the pending queue.
+
+        ``server_seq`` is the sequence the gated row was written with, or
+        ``None`` for the sequence-less keyless lane. Both lanes run the same
+        state machine; only the terminal shape differs, because a row without
+        a server sequence is only visible to ``get_pending`` as a local
+        runtime event with an allocated ordinal.
+        """
         async with self._inbox_lock:
             return await self._promote_gated_receipt_unlocked(
                 envelope_id, server_seq, reason=reason
@@ -474,7 +523,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
     async def _promote_gated_receipt_unlocked(
         self,
         envelope_id: str,
-        server_seq: int,
+        server_seq: int | None,
         *,
         reason: str,
     ) -> ReceiptResult:
@@ -482,11 +531,15 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         await db.execute("BEGIN IMMEDIATE")
         try:
             async with db.execute(
-                "SELECT server_seq, receipt_disposition, processing_state "
-                "FROM messages WHERE envelope_id = ?",
+                "SELECT server_seq, receipt_disposition, processing_state, "
+                "received_at FROM messages WHERE envelope_id = ?",
                 (envelope_id,),
             ) as cursor:
                 row = await cursor.fetchone()
+            if server_seq is None:
+                return await self._promote_local_gated_row(
+                    db, row, envelope_id=envelope_id, reason=reason
+                )
             if row is None or row["server_seq"] != server_seq:
                 await db.rollback()
                 return ReceiptResult(
@@ -542,6 +595,78 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         except Exception:
             await db.rollback()
             raise
+
+    async def _promote_local_gated_row(
+        self,
+        db: aiosqlite.Connection,
+        row: aiosqlite.Row | None,
+        *,
+        envelope_id: str,
+        reason: str,
+    ) -> ReceiptResult:
+        """Release a gated row that was written without a server sequence.
+
+        Its released shape is the keyless *eligible* shape — ``local_runtime``
+        pending with an allocated ordinal — because that is the only pending
+        shape ``_get_pending_unlocked`` recognises for a row with no
+        ``server_seq``. Promoting it to ``eligible`` instead would leave the
+        approved DM durably invisible, which is the failure this replaces.
+        """
+        if row is None or row["server_seq"] is not None:
+            await db.rollback()
+            return ReceiptResult(
+                ReceiptWriteStatus.CONFLICT,
+                ReceiptDisposition.FOREIGN_DM_GATED,
+                "gated receipt association mismatch",
+                False,
+            )
+        if (
+            row["receipt_disposition"] == ReceiptDisposition.LOCAL_RUNTIME.value
+            and row["processing_state"] == ProcessingState.PENDING.value
+        ):
+            await db.rollback()
+            return ReceiptResult(
+                ReceiptWriteStatus.IDEMPOTENT,
+                ReceiptDisposition.LOCAL_RUNTIME,
+                reason,
+                True,
+            )
+        if (
+            row["receipt_disposition"] != ReceiptDisposition.FOREIGN_DM_GATED.value
+            or row["processing_state"] is not None
+        ):
+            await db.rollback()
+            return ReceiptResult(
+                ReceiptWriteStatus.CONFLICT,
+                ReceiptDisposition.FOREIGN_DM_GATED,
+                "receipt is not approval-gated",
+                False,
+            )
+        ordinal, frontier = await self._allocate_local_position(db)
+        await db.execute(
+            """UPDATE messages
+               SET receipt_disposition = ?, receipt_reason = ?,
+                   processing_state = ?, local_ordinal = ?, after_server_seq = ?
+               WHERE envelope_id = ? AND server_seq IS NULL
+                 AND receipt_disposition = ? AND processing_state IS NULL""",
+            (
+                ReceiptDisposition.LOCAL_RUNTIME.value,
+                reason,
+                ProcessingState.PENDING.value,
+                ordinal,
+                frontier,
+                envelope_id,
+                ReceiptDisposition.FOREIGN_DM_GATED.value,
+            ),
+        )
+        await self._refresh_notice_state(db, activated_at=int(row["received_at"]))
+        await db.commit()
+        return ReceiptResult(
+            ReceiptWriteStatus.COMMITTED,
+            ReceiptDisposition.LOCAL_RUNTIME,
+            reason,
+            True,
+        )
 
     async def store_local_event(
         self,
@@ -629,23 +754,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         local frontier, ordinal, and notice-generation semantics for every
         local event type.
         """
-        async with db.execute(
-            """SELECT MAX(server_seq) FROM messages
-               WHERE receipt_disposition = ? AND processing_state = ?
-                 AND server_seq IS NOT NULL""",
-            (ReceiptDisposition.ELIGIBLE.value, ProcessingState.PENDING.value),
-        ) as cursor:
-            frontier_row = await cursor.fetchone()
-        frontier = int(frontier_row[0]) if frontier_row[0] is not None else None
-        async with db.execute(
-            "SELECT next_ordinal FROM local_ordinal_allocator WHERE singleton = 1"
-        ) as cursor:
-            ordinal_row = await cursor.fetchone()
-        ordinal = int(ordinal_row[0])
-        await db.execute(
-            "UPDATE local_ordinal_allocator SET next_ordinal = ? WHERE singleton = 1",
-            (ordinal + 1,),
-        )
+        ordinal, frontier = await self._allocate_local_position(db)
         await db.execute(
             """INSERT INTO messages
                (envelope_id, envelope_kind, sender_slug, channel_id, space_id,
@@ -663,6 +772,35 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             ),
         )
         await self._refresh_notice_state(db, activated_at=int(values[9]))
+
+    async def _allocate_local_position(
+        self, db: aiosqlite.Connection
+    ) -> tuple[int, int | None]:
+        """Claim the next local ordinal and the current pending frontier.
+
+        Every row that has no ``server_seq`` but must still take a definite
+        place in Inbox and prior-context ordering allocates through here, so
+        local events, sequence-less gate verdicts, and released gated DMs all
+        share one monotonic sequence. The caller owns ``BEGIN IMMEDIATE``.
+        """
+        async with db.execute(
+            """SELECT MAX(server_seq) FROM messages
+               WHERE receipt_disposition = ? AND processing_state = ?
+                 AND server_seq IS NOT NULL""",
+            (ReceiptDisposition.ELIGIBLE.value, ProcessingState.PENDING.value),
+        ) as cursor:
+            frontier_row = await cursor.fetchone()
+        frontier = int(frontier_row[0]) if frontier_row[0] is not None else None
+        async with db.execute(
+            "SELECT next_ordinal FROM local_ordinal_allocator WHERE singleton = 1"
+        ) as cursor:
+            ordinal_row = await cursor.fetchone()
+        ordinal = int(ordinal_row[0])
+        await db.execute(
+            "UPDATE local_ordinal_allocator SET next_ordinal = ? WHERE singleton = 1",
+            (ordinal + 1,),
+        )
+        return ordinal, frontier
 
     async def has_known_channel_rows_above_baseline(
         self,
@@ -858,16 +996,17 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
     ) -> list[StoredMessage]:
         db = await self._ensure_db()
         if before is not None:
-            sql = """SELECT * FROM messages
+            sql = f"""SELECT * FROM messages
                      WHERE envelope_kind = 'dm'
                        AND (sender_slug = ? OR recipient_slug = ?)
-                       AND sent_at < ?
+                       AND sent_at < ? AND {_NOT_GATED}
                      ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"""
             params: tuple = (peer_slug, peer_slug, before, limit)
         else:
-            sql = """SELECT * FROM messages
+            sql = f"""SELECT * FROM messages
                      WHERE envelope_kind = 'dm'
                        AND (sender_slug = ? OR recipient_slug = ?)
+                       AND {_NOT_GATED}
                      ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"""
             params = (peer_slug, peer_slug, limit)
 
@@ -916,9 +1055,9 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             return []
         db = await self._ensure_db()
         async with db.execute(
-            """SELECT * FROM messages
+            f"""SELECT * FROM messages
                WHERE (envelope_id = ? OR thread_root_id = ?)
-                 AND sent_at > ?
+                 AND sent_at > ? AND {_NOT_GATED}
                ORDER BY sent_at ASC, envelope_id ASC""",
             (root_id, root_id, since_sent_at),
         ) as cursor:
@@ -1052,7 +1191,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         since_resolved = await self._resolve_since_sent_at(since_envelope_id)
         before_resolved = await self._resolve_since_sent_at(before_envelope_id)
 
-        clauses = ["(envelope_id = ? OR thread_root_id = ?)"]
+        clauses = ["(envelope_id = ? OR thread_root_id = ?)", _NOT_GATED]
         params: list = [root_id, root_id]
         if since_resolved is not None:
             clauses.append("(sent_at > ? OR (sent_at = ? AND envelope_id > ?))")
@@ -1148,6 +1287,38 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
                 (channel_id, _now_ms()),
             )
             await db.commit()
+
+    async def tombstone_gated_dms_from(self, sender_slug: str) -> int:
+        """Discard the plaintext of every DM still gated from ``sender_slug``.
+
+        Called when the operator denies a foreign-DM approval. ``cleanup()``
+        deliberately never expires a gated row — right for a hold that is
+        still open, wrong once the answer is "no", which would otherwise
+        retain the refused body indefinitely. The row itself survives as a
+        terminal tombstone so redelivery dedupe and envelope accounting keep
+        working; only the body the operator refused is gone.
+        """
+        if not sender_slug:
+            return 0
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            async with db.execute(
+                """UPDATE messages
+                   SET content = ?, content_type = 'text/plain',
+                       receipt_disposition = ?, receipt_reason = ?
+                   WHERE envelope_kind = 'dm' AND sender_slug = ?
+                     AND receipt_disposition = ?""",
+                (
+                    DENIED_DM_PLACEHOLDER,
+                    ReceiptDisposition.TERMINAL.value,
+                    "foreign dm denied by operator",
+                    sender_slug,
+                    ReceiptDisposition.FOREIGN_DM_GATED.value,
+                ),
+            ) as cursor:
+                count = cursor.rowcount
+            await db.commit()
+            return count
 
     async def cleanup(self, retention_days: int = 90) -> int:
         async with self._inbox_lock:

@@ -14,6 +14,14 @@ DM_GATE_SENDER_ACK = (
     "approve our conversation, and I'll reply as soon as they do."
 )
 
+# Stored in place of the agent's own foreign-DM approval prompt when the
+# server echoes it back. The prompt quotes the held stranger's message for
+# the operator's benefit; storing that echo verbatim would put the withheld
+# body into the model's prior context, defeating the gate that withheld it.
+DM_GATE_PROMPT_PLACEHOLDER = (
+    "[foreign-DM approval prompt — held message withheld from context]"
+)
+
 
 class AgentLogger(logging.LoggerAdapter):
     """Prefix daemon logs with the active agent slug."""

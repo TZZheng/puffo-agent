@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -983,3 +984,51 @@ async def test_unexpected_or_hold_callback_result_emits_no_ack(returned):
     })
     assert isinstance(result, DeliveryResult)
     assert result.outcome is TransportOutcome.HOLD
+
+
+@pytest.mark.asyncio
+async def test_catchup_holds_one_delivery_without_wedging_the_rest(caplog):
+    """One unownable envelope must not wedge every message behind it.
+
+    ``_run_catchup`` used to break at the first non-ACK/non-DEFER outcome
+    and report failure, and ``_catchup`` turned that into a
+    ``ConnectionError`` — raised *before* ``_listen_loop``. So a single
+    permanently unopenable envelope (an undecryptable payload, an
+    unreadable blocklist) reconnected, failed the same way, and never
+    reached live listen again: not one message lost, all of them.
+
+    Acks on this path carry explicit envelope ids, so leaving one unacked
+    proves nothing about the ones after it — the server simply redelivers
+    it. What the hold must not do is disappear silently, hence the record.
+    """
+    ks, _ = _make_keystore()
+    http = FakeHttpClient()
+    http.pending_messages = [
+        {"seq": 1, "envelope": {"envelope_id": "unopenable", "sender_slug": "bob"}},
+        {"seq": 2, "envelope": {"envelope_id": "later", "sender_slug": "carol"}},
+    ]
+    received = []
+
+    async def on_msg(delivery):
+        envelope_id = delivery["envelope"]["envelope_id"]
+        received.append(envelope_id)
+        return (
+            TransportOutcome.HOLD
+            if envelope_id == "unopenable"
+            else TransportOutcome.ACK
+        )
+
+    client = PuffoCoreWsClient("http://localhost", ks, "alice-0001", http)
+    client.on_message = on_msg
+
+    with caplog.at_level(logging.WARNING):
+        # The connection-drain entry point: it must not raise, or the
+        # listen loop it guards is never reached.
+        await client._catchup()
+
+    assert received == ["unopenable", "later"]
+    # The held envelope is not acked; the one behind it is.
+    assert http.ack_posts == [["later"]]
+    assert any(
+        "unopenable" in record.getMessage() for record in caplog.records
+    ), "the hold must leave an auditable record"

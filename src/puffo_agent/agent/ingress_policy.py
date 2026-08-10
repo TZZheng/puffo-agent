@@ -86,6 +86,12 @@ async def blocked_gate(client: Any, payload: Any) -> GateVerdict | None:
     account and the model. A tombstone row is stored in place of the
     body: the message is accounted for without its plaintext ever
     reaching the database.
+
+    Propagates ``BlocklistUnavailable`` when the list cannot be read at
+    all (see ``ContactCache.is_blocked``). Each transport turns that into
+    a hold — an unacked delivery the server will send again — because
+    neither admitting nor tombstoning is a decision this gate has the
+    facts to make.
     """
     sender = payload.sender_slug
     if sender == client.slug:

@@ -757,7 +757,19 @@ class PuffoCoreMessageClient:
         return name
 
     async def _fetch_owner_slug(self, slug: str) -> str:
-        """Return the cached or refreshed operator slug for an agent."""
+        """Return the cached or refreshed operator slug for an agent.
+
+        ``/identities/profiles`` is subkey-signed, so the keyless transport
+        cannot answer this at all and does not try. It returns the same empty
+        answer the doomed request would have produced, but leaves the cache
+        alone — a cached blank reads back as the attested fact "this sender
+        has no owner" for the whole TTL, which misclassifies a co-owned
+        sibling agent as a stranger the moment a keyless profile route exists.
+        """
+        from .ingress_policy import signed_http_available
+
+        if not signed_http_available(self):
+            return self._owner_slug_cache.get(slug, ("", 0.0))[0]
         return await fetch_owner_slug(
             slug=slug,
             owner_cache=self._owner_slug_cache,

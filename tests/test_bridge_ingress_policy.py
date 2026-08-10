@@ -88,6 +88,20 @@ def _dm_frame(sender: str, content: str, *, seq: int, **extra) -> dict:
     return frame
 
 
+def _wire_dm_frame(sender: str, content: str, *, envelope_id: str, **extra) -> dict:
+    """A ``message`` frame in the shape the Server actually sends.
+
+    ``AgentServerMsg::Message`` declares no ``seq`` member, so the live wire
+    never carries one — every fixture above supplies a sequence the bridge
+    only ever sees in tests, which is how the sequence-less lane shipped
+    unexercised.
+    """
+    frame = _dm_frame(sender, content, seq=0, **extra)
+    del frame["seq"]
+    frame["envelope_id"] = envelope_id
+    return frame
+
+
 @pytest.mark.asyncio
 async def test_blocked_sender_bridge_dm_tombstones_without_persisting_plaintext(
     tmp_path,
@@ -156,4 +170,87 @@ async def test_foreign_dm_over_bridge_is_gated_not_eligible(tmp_path):
     # Never acked — the DM stays queued server-side until the operator
     # answers, so a lost gate cannot silently drop the message.
     assert client._bridge.acked == []
+    await client.store.close()
+
+
+@pytest.mark.asyncio
+async def test_seqless_bridge_frames_carry_their_verdict_into_storage(tmp_path):
+    """The real wire shape persists its gate verdict, both dispositions.
+
+    Every case here rides one ``message`` frame with no ``seq`` key — the
+    only shape production sends — through ``_dispatch_bridge_frame``. That
+    lane used to write through ``MessageStore.store``, which records no
+    disposition at all, so all three symptoms below shared one root:
+
+      * a held foreign DM landed with a NULL disposition, which
+        ``promote_gated_receipt`` can never release, and the Server's first
+        redelivery was acked away — the message then existed nowhere;
+      * a terminal verdict (here a blocked sender's tombstone) was likewise
+        undistinguished, so prior context, which selects on
+        ``receipt_disposition = 'terminal'``, silently skipped it and the
+        two transports built different histories;
+      * and the same frame's owner pre-seed cached an empty owner as if the
+        Server had attested it, though the frame carries no owner field.
+    """
+    marker = "seqless-body-that-must-stay-held"
+    client = _client(tmp_path, operator_slug=OPERATOR)
+    await client.store.open()
+
+    # ── held foreign DM ───────────────────────────────────────────────
+    gated_frame = _wire_dm_frame(
+        STRANGER, marker, envelope_id="env_wire_dm",
+        sender_display_name="Mallory",
+    )
+    await client._dispatch_bridge_frame(gated_frame)
+
+    held = await client.store.get_message_by_envelope("env_wire_dm")
+    assert held is not None
+    assert held.receipt_disposition == "foreign_dm_gated"
+    assert client._bridge.acked == []
+
+    # Redelivery: the Server resends anything unacked. Acking it here is
+    # what used to drop the only remaining copy of a message the agent
+    # could not release either.
+    await client._dispatch_bridge_frame(gated_frame)
+    assert client._bridge.acked == []
+
+    # And the row is releasable, which a NULL-disposition row never was.
+    promoted = await client.store.promote_gated_receipt(
+        "env_wire_dm", None, reason="operator approved",
+    )
+    assert promoted.status.value == "committed"
+    assert [m.envelope_id for m in await client.store.get_pending()] == [
+        "env_wire_dm"
+    ]
+
+    # ── terminal verdict on the same lane ─────────────────────────────
+    client._contacts.note_blocked("blocked-0002", True)
+    await client._dispatch_bridge_frame(
+        _wire_dm_frame("blocked-0002", "blocked body", envelope_id="env_wire_tomb")
+    )
+    tombstone = await client.store.get_message_by_envelope("env_wire_tomb")
+    assert tombstone is not None
+    assert tombstone.receipt_disposition == "terminal"
+
+    # Prior context selects terminal rows; before the verdict was persisted
+    # this row was invisible to the keyless agent and visible to a native
+    # one receiving the same backlog.
+    anchor = await client.store.store_local_event(
+        {
+            "envelope_id": "env_wire_anchor",
+            "envelope_kind": "dm",
+            "sender_slug": "blocked-0002",
+            "recipient_slug": SELF,
+            "content": "later anchor",
+            "sent_at": 1_700_000_100_000,
+        },
+        reason="anchor",
+    )
+    page = await client.store.get_prior_context_page(anchor)
+    assert "env_wire_tomb" in [item.envelope_id for item in page.items]
+
+    # ── owner pre-seed ────────────────────────────────────────────────
+    # The frame carried a display name and no owner field, so the display
+    # name is cached and the owner is not claimed either way.
+    assert STRANGER not in client._owner_slug_cache
     await client.store.close()

@@ -29,6 +29,10 @@ class _FakeHttp:
         self.keyless = False
         self._delete_error = delete_error
 
+    async def get(self, path, *a, **k):
+        self.calls.append(("GET", path, None))
+        return {"entries": [], "blocks": []}
+
     async def post(self, path, body=None):
         self.calls.append(("POST", path, body))
         return {"ok": True}
@@ -121,3 +125,33 @@ async def test_keyless_agent_gets_an_explicit_unsupported_error():
 
     assert http.calls == []
     assert TARGET in contacts.blocked
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool, args",
+    [
+        ("get_dm_allowlists", {}),
+        ("get_dm_blocklists", {}),
+        ("add_dm_allowlist", {"slug": TARGET}),
+        ("update_dm_blocklist", {"slug": TARGET, "on": True}),
+    ],
+)
+async def test_every_dm_preference_tool_names_the_keyless_gap(tool, args):
+    """All four tools fail the same explicit way, not just the one.
+
+    ``/allowlists`` and ``/blocklists`` are subkey-signed server-side with
+    no keyless counterpart, so none of these can work on a keyless agent.
+    Only ``update_dm_blocklist`` said so; the other three sent the request
+    anyway and surfaced whatever opaque auth error came back — the same
+    dead end, described as a transport failure the operator could plausibly
+    read as transient.
+    """
+    http = _FakeHttp()
+    http.keyless = True
+    mcp, _ = _tools(http)
+
+    with pytest.raises(Exception, match="keyless"):
+        await mcp.call_tool(tool, args)
+
+    assert http.calls == []

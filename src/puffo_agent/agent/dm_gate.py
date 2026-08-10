@@ -221,6 +221,25 @@ async def drop_pending_from_sender(client, sender_slug: str) -> None:
     # Ack-discard a blocked sender's pending DMs; never seen by the agent.
     if not sender_slug:
         return
+    # Acking the server's copy leaves the locally stored gated rows behind.
+    # ``cleanup()`` never expires a gated row — correct while the hold is
+    # open, but the operator has now said no, so the refused body would be
+    # retained forever and stay readable. Discard it here.
+    try:
+        discarded = await client.store.tombstone_gated_dms_from(sender_slug)
+    except Exception:  # noqa: BLE001 — never block the block itself
+        client._log.exception(
+            "auto_accept_dm: could not discard held DMs from denied %s",
+            sender_slug,
+        )
+    else:
+        if discarded:
+            client._log.info(
+                "auto_accept_dm: discarded %d held DM body/bodies from "
+                "denied %s",
+                discarded,
+                sender_slug,
+            )
     try:
         data = await client.http.get(f"/messages/pending?kind=dm&sender={sender_slug}")
     except Exception as exc:

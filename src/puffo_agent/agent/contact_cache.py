@@ -10,6 +10,19 @@ import time
 from typing import Any
 
 
+class BlocklistUnavailable(RuntimeError):
+    """The blocklist has no answer to give, so no admit decision is safe.
+
+    Raised only by the one case where silence is indistinguishable from
+    "nobody is blocked": a signed agent that has never hydrated and whose
+    refresh just failed. The caller holds the delivery instead of admitting
+    it — the server redelivers, so a hold costs a retry, whereas answering
+    "not blocked" from an empty cache puts a blocked account in front of the
+    model. Keyless never raises this: its empty list is a real, explicit
+    local-state answer, not a missing one.
+    """
+
+
 class ContactCache:
     def __init__(
         self,
@@ -27,6 +40,13 @@ class ContactCache:
         self._block: set[str] = set()
         self._fetched_at: float = 0.0
         self._degrade_logged = False
+        # True once a server read has actually landed. Distinguishes "the
+        # server says these are blocked" from "we have never been told".
+        self._hydrated = False
+
+    @property
+    def _keyless(self) -> bool:
+        return bool(getattr(self._http, "keyless", False))
 
     async def refresh(self) -> None:
         """Replace both sets, preserving stale data when refresh fails.
@@ -38,7 +58,7 @@ class ContactCache:
         visible. Either way a refresh failure is non-fatal: every
         allow/block decision still answers from what is known.
         """
-        if getattr(self._http, "keyless", False):
+        if self._keyless:
             if not self._degrade_logged:
                 self._degrade_logged = True
                 self._log.info(
@@ -62,6 +82,7 @@ class ContactCache:
             if entry.get("target") == "user"
         } - {""}
         self._fetched_at = time.monotonic()
+        self._hydrated = True
 
     def _age(self) -> float:
         if not self._fetched_at:
@@ -82,9 +103,23 @@ class ContactCache:
         return slug in self._allow
 
     async def is_blocked(self, slug: str) -> bool:
+        """Whether ``slug`` is blocked, or ``BlocklistUnavailable`` if unknown.
+
+        ``refresh`` preserves stale data when a fetch fails, which is the
+        right call once there *is* stale data. At cold start there is none:
+        the sets are in-memory only, so a process that restarts during a
+        server incident would otherwise report every blocked account as
+        unblocked — and this gate is the only thing filtering a blocked
+        sender's channel traffic. So a signed agent that has never hydrated
+        says "unavailable" rather than "not blocked".
+        """
         if not slug:
             return False
         await self._maybe_refresh(on_miss=False)
+        if not self._hydrated and not self._keyless:
+            raise BlocklistUnavailable(
+                "blocklist has never been read from the server"
+            )
         return slug in self._block
 
     def note_allowed(self, slug: str) -> None:

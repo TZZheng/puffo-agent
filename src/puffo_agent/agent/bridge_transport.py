@@ -37,6 +37,7 @@ from ..crypto.message import MessagePayload
 from ..crypto.ws_client import INITIAL_BACKOFF, MAX_BACKOFF
 from . import disk_cache
 from .inbound_attachments import downscale_oversized_image
+from .contact_cache import BlocklistUnavailable
 from .ingress_policy import (
     GateVerdict,
     blocked_gate,
@@ -354,7 +355,13 @@ def preseed_frame_display_name(
         client.set_profile(slug, name, avatar_url)
         owner_slug = frame.get("sender_owner_slug") or frame.get("owner_slug") or ""
         owner_slug = owner_slug.strip() if isinstance(owner_slug, str) else ""
-        client._owner_slug_cache[slug] = (owner_slug, time.monotonic())
+        if owner_slug:
+            # Same guard as the display name above, for the same reason: the
+            # Message frame carries no owner field today, so seeding the blank
+            # would cache "this sender has no owner" as an attested fact and
+            # ``fetch_owner_slug`` would serve that false miss for the whole
+            # TTL — misclassifying a co-owned sibling agent as a stranger.
+            client._owner_slug_cache[slug] = (owner_slug, time.monotonic())
     except Exception:  # noqa: BLE001 - optional frame metadata is fail-soft
         client._log.debug(
             "bridge display-name pre-seed skipped (envelope_id=%s)",
@@ -379,16 +386,41 @@ async def store_bridge_payload(
     Every shared policy gate runs before persistence, in the native
     order — see the module's ingress policy contract.
     """
-    if server_seq is None and await client.store.get_message_by_envelope(
-        payload.envelope_id
-    ):
-        return True
+    if server_seq is None:
+        stored = await client.store.get_message_by_envelope(payload.envelope_id)
+        if stored is not None:
+            return _redelivery_ack(stored)
     row = await _bridge_storage_row(client, payload)
-    verdict = await _bridge_gate_verdict(client, payload, row)
+    try:
+        verdict = await _bridge_gate_verdict(client, payload, row)
+    except BlocklistUnavailable as exc:
+        # No blocklist answer means no safe admit decision. Leave the
+        # envelope unacked and unstored; the server redelivers it once the
+        # blocklist can be read.
+        client._log.warning(
+            "bridge delivery held: %s (envelope_id=%s sender=%s)",
+            exc,
+            payload.envelope_id,
+            payload.sender_slug,
+        )
+        return False
     if verdict is not None:
         return await _commit_bridge_verdict(client, payload, row, server_seq, verdict)
     await _populate_bridge_prompt_content(client, payload, row)
     return await _persist_eligible_bridge_payload(client, payload, row, server_seq)
+
+
+def _redelivery_ack(stored) -> bool:
+    """Whether a redelivered envelope we already hold may be acked.
+
+    The server redelivers anything unacked, so this answer has to come from
+    what the first delivery decided. Acking unconditionally is how a held
+    foreign DM used to be dropped server-side while still unreleasable
+    locally — the message would then exist nowhere it could be read.
+    """
+    if stored.receipt_disposition is ReceiptDisposition.FOREIGN_DM_GATED:
+        return False
+    return True
 
 
 async def _bridge_storage_row(client, payload: MessagePayload) -> dict[str, Any]:
@@ -467,8 +499,16 @@ async def _commit_bridge_verdict(
         row["content"] = verdict.content
         row["content_type"] = "text/plain"
     if server_seq is None:
-        await client.store.store(row)
-        return verdict.disposition is not ReceiptDisposition.FOREIGN_DM_GATED
+        # The live bridge wire carries no delivery sequence, so this is the
+        # lane every real keyless message takes. It must persist the verdict:
+        # a plain ``store()`` drops it, leaving a gated DM unpromotable and
+        # a terminal row invisible to prior context.
+        local = await client.store.store_local_receipt(
+            row,
+            disposition=verdict.disposition,
+            reason=verdict.reason,
+        )
+        return local.acknowledge
     result = await client.store.store_receipt(
         row,
         server_seq=server_seq,

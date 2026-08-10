@@ -122,7 +122,11 @@ async def get_prior_context_page(
     limit, max_bytes = _bounded_limits(limit, max_bytes)
     route = _prior_context_route(store, anchor)
     if route is None:
-        return ()
+        # An unrouteable anchor has no prior context, not a different return
+        # type: callers read ``.items`` / ``.has_more``, and a bare tuple
+        # crashes them on the one row shape that reaches here — a DM with
+        # neither a sender nor a recipient slug.
+        return PriorContextPage((), False)
     clauses, params, order_sql = route
     async with store._inbox_lock:
         rows = await _query_context_rows(

@@ -11,12 +11,29 @@ from ..crypto.http_client import HttpError
 from .puffo_core_tools import _note_contact
 
 
+def _require_signed(cfg: Any, tool: str, route: str) -> None:
+    """Fail with the real reason when the route needs signed auth.
+
+    ``/allowlists`` and ``/blocklists`` are subkey-signed on the server and
+    have no keyless (``/v2/cloud-agents/*``) counterpart, so a keyless agent
+    cannot use any of them. Every tool here says so the same way, instead of
+    one saying it and the rest surfacing an opaque transport auth error that
+    reads like something transient.
+    """
+    if cfg.keyless:
+        raise RuntimeError(
+            f"{tool} is unsupported for keyless agents: the {route} "
+            "route requires signed auth this agent does not have"
+        )
+
+
 def register_dm_preference_tools(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def get_dm_allowlists() -> dict[str, Any]:
         """List your DM allowlist (peers whose DMs skip the approval
         gate). Per-agent — every identity keeps its own list; this
         reads yours only."""
+        _require_signed(cfg, "get_dm_allowlists", "/allowlists")
         data = await cfg.http_client.get("/allowlists")
         slugs = sorted(
             e.get("peer_slug", "")
@@ -34,6 +51,7 @@ def register_dm_preference_tools(mcp: FastMCP, cfg: Any) -> None:
         """List your DM blocklist (senders whose messages are silently
         dropped). Per-agent — every identity keeps its own list; this
         reads yours only."""
+        _require_signed(cfg, "get_dm_blocklists", "/blocklists")
         data = await cfg.http_client.get("/blocklists")
         slugs = sorted(
             b.get("id", "")
@@ -58,6 +76,7 @@ def register_dm_preference_tools(mcp: FastMCP, cfg: Any) -> None:
         target = (slug or "").strip()
         if not target:
             raise RuntimeError("slug is required")
+        _require_signed(cfg, "add_dm_allowlist", "/allowlists")
         await cfg.http_client.post("/allowlists", {"slugs": [target]})
         _note_contact(cfg, target, allowed=True)
         return f"allowlisted {target}"
@@ -76,16 +95,7 @@ def register_dm_preference_tools(mcp: FastMCP, cfg: Any) -> None:
         target = (slug or "").strip()
         if not target:
             raise RuntimeError("slug is required")
-        if cfg.keyless:
-            # ``/blocklists`` is subkey-signed on the server and has no
-            # keyless (``/v2/cloud-agents/*``) counterpart, so a keyless
-            # agent cannot maintain a server-side blocklist at all.
-            # Fail with the real reason instead of an opaque auth error.
-            raise RuntimeError(
-                "update_dm_blocklist is unsupported for keyless agents: "
-                "the /blocklists route requires signed auth this agent "
-                "does not have"
-            )
+        _require_signed(cfg, "update_dm_blocklist", "/blocklists")
         if on:
             await cfg.http_client.post(
                 "/blocklists",

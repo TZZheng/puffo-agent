@@ -123,10 +123,20 @@ class PuffoCoreWsClient:
         """Drain `/messages/pending` — rows the server held while we
         were offline. MUST run after ``_handshake`` (it registers the
         session); ordering is register → pending fetch → live listen.
+
+        An incomplete drain does not abort the connection. Raising here
+        aborts before ``_listen_loop``, so one envelope this receiver can
+        never own — or one transient failure on ``/messages/pending`` —
+        would reconnect, fail the same way, and never reach live listen
+        again: every later message wedged behind one. Unacked envelopes are
+        redelivered on the next drain, so continuing costs a retry and
+        losing the connection costs everything after it.
         """
         if not await self._run_catchup():
-            raise ConnectionError(
-                "catch-up stopped at an unacknowledged delivery"
+            logger.warning(
+                "Catch-up incomplete (session=%s) — continuing to live "
+                "listen; unacked envelopes are redelivered on the next drain",
+                self.session_id or "<pre-handshake>",
             )
 
     async def recover_pending_until(self, envelope_id: str) -> bool:
@@ -153,6 +163,7 @@ class PuffoCoreWsClient:
                 # HTTP, not WS-frame (no pong until the listen loop → WS dies
                 # mid-catch-up); chunked so progress survives a death.
                 envelope_ids = []
+                held = 0
                 blocked = False
                 for item in messages:
                     result = await self.dispatch_delivery(item)
@@ -163,11 +174,28 @@ class PuffoCoreWsClient:
                         # later deliveries.
                         continue
                     if result.outcome is not TransportOutcome.ACK:
-                        # Do not prove an exact later watermark by skipping an
-                        # earlier delivery the receiver could not durably own.
-                        # The local model-visible boundary is contiguous.
-                        blocked = True
-                        break
+                        # This one envelope is not ours to own — an
+                        # undecryptable payload, an unreadable blocklist, a
+                        # lifecycle conflict.
+                        held += 1
+                        logger.warning(
+                            "Catch-up held one delivery (envelope_id=%s "
+                            "reason=%s) — left unacked",
+                            result.envelope_id or "<unknown>",
+                            result.reason,
+                        )
+                        if required_envelope_id is not None:
+                            # Held recovery answers "is everything through
+                            # this exact envelope durably mine?", so a gap
+                            # makes the answer no. It must stop, not skip.
+                            blocked = True
+                            break
+                        # A plain drain has no watermark to protect: acks
+                        # here are per envelope id, so leaving this one
+                        # unacked proves nothing about the ones after it.
+                        # Stopping would let a single permanently unopenable
+                        # envelope wedge every message behind it, forever.
+                        continue
                     if result.envelope_id:
                         envelope_ids.append(result.envelope_id)
                         if result.envelope_id == required_envelope_id:
@@ -179,6 +207,13 @@ class PuffoCoreWsClient:
                         break
                 if envelope_ids:
                     await self._ack_http(envelope_ids)
+                if held:
+                    logger.warning(
+                        "Catch-up finished with %d held delivery/deliveries "
+                        "(session=%s); the server redelivers them",
+                        held,
+                        self.session_id or "<pre-handshake>",
+                    )
                 if blocked:
                     return False
         except Exception:

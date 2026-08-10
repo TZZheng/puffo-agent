@@ -10,6 +10,8 @@ from ..crypto.message import MessagePayload, decrypt_message, read_plaintext_mes
 from ..crypto.primitives import KemKeyPair
 from ..crypto.ws_client import ServerDelivery, TransportOutcome
 from ._logging import log_runtime_event
+from .client_support import DM_GATE_PROMPT_PLACEHOLDER
+from .contact_cache import BlocklistUnavailable
 from .ingress_policy import (
     BLOCKED_MESSAGE_PLACEHOLDER,
     GateVerdict,
@@ -186,10 +188,15 @@ class InboundReceiptHandler:
         if outcome is not None:
             return outcome
 
-        raw_text, attachment_paths = await self._extract_content(payload)
+        # The gate decides on the text alone. Materializing attachments first
+        # would hand an unapproved stranger a file write into the workspace
+        # the model reads, which no later approval outcome undoes — the same
+        # split the bridge lane already makes.
+        raw_text = self._raw_text(payload)
         outcome = await self._foreign_dm_outcome(committer, raw_text)
         if outcome is not None:
             return outcome
+        attachment_paths = await self._save_attachments(payload)
         self._cache_channel_space(payload)
         committer.stored_payload["content"] = await self._prompt_content(
             payload,
@@ -325,10 +332,21 @@ class InboundReceiptHandler:
         self,
         committer: _ReceiptCommitter,
     ) -> TransportOutcome | None:
-        return await self._commit_verdict(
-            committer,
-            await blocked_gate(self.client, committer.payload),
-        )
+        try:
+            verdict = await blocked_gate(self.client, committer.payload)
+        except BlocklistUnavailable as exc:
+            # Hold rather than guess. The delivery stays unacked and the
+            # server sends it again; admitting it would put a possibly
+            # blocked sender in front of the model on the strength of an
+            # empty cache.
+            self.client._log.warning(
+                "delivery held: %s (envelope_id=%s sender=%s)",
+                exc,
+                committer.payload.envelope_id,
+                committer.payload.sender_slug,
+            )
+            return TransportOutcome.HOLD
+        return await self._commit_verdict(committer, verdict)
 
     async def _self_echo_outcome(
         self,
@@ -339,7 +357,26 @@ class InboundReceiptHandler:
             return None
         if payload.envelope_kind == "dm":
             await self.client._maybe_allowlist_outbound_dm(payload.recipient_slug)
-        return await committer.commit(ReceiptDisposition.TERMINAL, "self echo")
+        return await committer.commit(
+            ReceiptDisposition.TERMINAL,
+            "self echo",
+            content=self._echo_redaction(payload),
+        )
+
+    def _echo_redaction(self, payload: MessagePayload) -> str | None:
+        """Replacement body for a self-echo that must not be stored verbatim.
+
+        The foreign-DM approval prompt quotes up to 280 characters of the
+        stranger's message so the operator can judge it. The server echoes
+        that DM back and the echo is stored terminal — and prior context
+        selects terminal rows, so the operator's next ordinary DM would
+        carry the withheld body into the model's context, gate approved or
+        not. The prompt's own envelope id identifies it.
+        """
+        pending = getattr(self.client, "_pending_dm_approvals", None) or {}
+        if payload.envelope_id in pending:
+            return DM_GATE_PROMPT_PLACEHOLDER
+        return None
 
     async def _operator_control_outcome(
         self,
@@ -378,23 +415,33 @@ class InboundReceiptHandler:
             "stale catch-up",
         )
 
-    async def _extract_content(
-        self,
-        payload: MessagePayload,
-    ) -> tuple[str, list[str]]:
+    @staticmethod
+    def _raw_text(payload: MessagePayload) -> str:
+        """The message body as plain text, with no side effects."""
         if payload.content_type == "puffo/message+attachments/v1" and isinstance(
             payload.content, dict
         ):
-            raw_text = str(payload.content.get("text") or "")
-            raw_attachments = payload.content.get("attachments") or []
-            if isinstance(raw_attachments, list):
-                paths = await self.client._save_inbound_attachments(
-                    envelope_id=payload.envelope_id,
-                    metas_raw=raw_attachments,
-                )
-                return raw_text, paths
-            return raw_text, []
-        return str(payload.content) if payload.content else "", []
+            return str(payload.content.get("text") or "")
+        return str(payload.content) if payload.content else ""
+
+    async def _save_attachments(self, payload: MessagePayload) -> list[str]:
+        """Download and decrypt this message's attachments to the workspace.
+
+        Only ever called for an admitted message: the files land under
+        ``<workspace>/.puffo/inbox/<envelope_id>/``, which the harness's
+        ordinary file tools can read.
+        """
+        if payload.content_type != "puffo/message+attachments/v1" or not isinstance(
+            payload.content, dict
+        ):
+            return []
+        raw_attachments = payload.content.get("attachments") or []
+        if not isinstance(raw_attachments, list):
+            return []
+        return await self.client._save_inbound_attachments(
+            envelope_id=payload.envelope_id,
+            metas_raw=raw_attachments,
+        )
 
     async def _foreign_dm_outcome(
         self,
