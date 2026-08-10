@@ -854,7 +854,12 @@ class CredentialRefresher:
         self._agent_homes: set[Path] = set()
         self._on_refresh_success: list[Callable[[], None]] = []
         self._lock = asyncio.Lock()
-        self._consecutive_non_success = 0
+        # Split deliberately: only the failure streak may flip
+        # refresh_broken. A benign UNCHANGED (token still fresh) is not
+        # evidence of breakage, and counting it as such re-flagged agents
+        # moments after a recovery.
+        self._consecutive_failed = 0
+        self._consecutive_unchanged = 0
         self._rate_limit_retry_task: asyncio.Task | None = None
         # Last host-credential fingerprint, for spotting an external
         # rotation (operator re-login) on copy-mode hosts with no symlink
@@ -1034,6 +1039,7 @@ class CredentialRefresher:
                 "— syncing agents + firing refresh-success",
             )
             self._sync_views()
+            self._note_recovery("external rotation")
             self._fire_refresh_success()
 
     def _record_cred_fingerprint(self) -> None:
@@ -1099,21 +1105,51 @@ class CredentialRefresher:
         if outcome is RefreshOutcome.REFRESHED:
             self._fire_refresh_success()
 
+    def _note_recovery(self, source: str) -> None:
+        """Single definition of "we now have a working credential", so
+        every recovery path resets the same state. Both callers reach it:
+        a probe-driven REFRESHED and an externally-detected rotation.
+        Keeping this in one place is the fix for the two paths having
+        drifted apart."""
+        if self._consecutive_failed > 0:
+            logger.info(
+                "credential refresh recovered via %s after %d failed "
+                "tick(s) — clearing refresh_broken health on "
+                "registered agents",
+                source, self._consecutive_failed,
+            )
+        # Always clear: a daemon restart resets the in-memory counter
+        # to 0 while leaving on-disk ``refresh_broken`` from the
+        # previous instance — without the unconditional call those
+        # agents stay stuck. _clear_refresh_broken is idempotent.
+        self._clear_refresh_broken()
+        self._consecutive_failed = 0
+        self._consecutive_unchanged = 0
+
+    def _credential_is_fresh(self) -> bool:
+        """Whether the credential we hold right now is comfortably valid.
+
+        This is what separates a benign UNCHANGED from a concerning one.
+        The poll only refreshes at or below the safety margin, so an
+        UNCHANGED with plenty of life left means the refresh was
+        redundant (agent-triggered, or a rotation that just landed). An
+        UNCHANGED at or below the margin means we asked for a rotation we
+        genuinely needed and did not get one.
+        """
+        expires_in = self.expires_in_seconds()
+        return expires_in is not None and expires_in > REFRESH_SAFETY_MARGIN_SECONDS
+
     def _propagate_outcome(self, outcome: RefreshOutcome) -> None:
         if outcome is RefreshOutcome.REFRESHED:
-            if self._consecutive_non_success > 0:
-                logger.info(
-                    "credential refresh recovered after %d non-success "
-                    "tick(s) — clearing refresh_broken health on "
-                    "registered agents",
-                    self._consecutive_non_success,
-                )
-            # Always clear: a daemon restart resets the in-memory counter
-            # to 0 while leaving on-disk ``refresh_broken`` from the
-            # previous instance — without the unconditional call those
-            # agents stay stuck. _clear_refresh_broken is idempotent.
-            self._clear_refresh_broken()
-            self._consecutive_non_success = 0
+            self._note_recovery("refresh probe")
+            return
+        if outcome is RefreshOutcome.UNCHANGED and self._credential_is_fresh():
+            self._consecutive_unchanged += 1
+            logger.debug(
+                "credential refresh unchanged with a fresh token "
+                "(%d in a row) — not counted toward refresh_broken",
+                self._consecutive_unchanged,
+            )
             return
         if outcome is RefreshOutcome.AUTH_FAILED:
             # Skip the 2-tick refresh_broken streak: Anthropic revoked
@@ -1123,8 +1159,8 @@ class CredentialRefresher:
             # operator.
             self._flip_auth_failed()
             return
-        self._consecutive_non_success += 1
-        if self._consecutive_non_success >= REFRESH_BROKEN_THRESHOLD:
+        self._consecutive_failed += 1
+        if self._consecutive_failed >= REFRESH_BROKEN_THRESHOLD:
             self._flip_refresh_broken(outcome)
         if outcome is RefreshOutcome.RATE_LIMITED:
             self._schedule_rate_limit_retry()
@@ -1163,7 +1199,7 @@ class CredentialRefresher:
         from .state import RuntimeState
         logger.warning(
             "flipping refresh_broken after %d consecutive %s outcome(s)",
-            self._consecutive_non_success, outcome.value,
+            self._consecutive_failed, outcome.value,
         )
         msg = (
             "Claude Code sign-in couldn't be refreshed. On the computer "
