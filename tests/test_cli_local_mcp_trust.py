@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -77,7 +78,11 @@ def test_command_shape_matches_cli_docker_for_bypass():
     # is irrelevant here).
     adapter = _make_adapter("bypassPermissions")
     cmd = adapter._build_command(extra_args=["--verbose"])
-    assert cmd[0] == "claude"
+    # PUF-420: argv[0] is now the resolver's absolute path rather than the
+    # bare name — bare names don't resolve under Windows CreateProcess. The
+    # shape assertions below are what this test is actually for; the old
+    # ``== "claude"`` pinned the defect by accident.
+    assert Path(cmd[0]).name.startswith("claude")
     assert cmd[1] == "--dangerously-skip-permissions"
     # --model + value sit right after the bypass flag.
     assert cmd[2] == "--model"

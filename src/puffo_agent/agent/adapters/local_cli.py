@@ -43,7 +43,13 @@ from ...portal.state import (
     sync_host_plugins,
     sync_host_skills,
 )
-from ..cli_bin import resolve_claude_bin, resolve_codex_bin, resolve_hermes_bin
+from ..cli_bin import (
+    CLAUDE_BIN_MISSING,
+    resolve_claude_bin,
+    resolve_codex_bin,
+    resolve_hermes_bin,
+    spawn_argv,
+)
 from .base import Adapter, TurnContext, TurnResult
 from .cli_session import AuditLog, ClaudeSession
 from .codex_session import CodexSession
@@ -974,7 +980,15 @@ class LocalCLIAdapter(Adapter):
         # host by ClaudeSession._spawn; the kwarg here is just for
         # symmetry with the docker adapter.
         del env_overrides
-        cmd = ["claude"]
+        # PUF-420. Bare ``["claude"]`` relies on the OS resolving the name at
+        # spawn time. execvp does; CreateProcess does not, so on Windows an
+        # npm-installed CLI died with WinError 2 even though the shell could
+        # find it. The resolver was already being called in _verify and its
+        # answer thrown away — this uses it, the way the codex adapter does.
+        claude_bin = resolve_claude_bin()
+        if claude_bin is None:
+            raise RuntimeError(CLAUDE_BIN_MISSING)
+        cmd = spawn_argv(claude_bin)
         # --dangerously-skip-permissions bypasses BOTH the per-tool prompt AND
         # the per-project trust dialog; stream-json has no UI for the dialog,
         # and an untrusted cwd silently drops --mcp-config servers. Non-bypass
@@ -1044,12 +1058,7 @@ class LocalCLIAdapter(Adapter):
             self._verified = True
             return
         if resolve_claude_bin() is None:
-            raise RuntimeError(
-                "claude binary not found. Tried $PUFFO_CLAUDE_BIN, "
-                "$PATH, and known bundle paths. Install the Claude "
-                "Code CLI (`npm install -g @anthropic-ai/claude-code`) "
-                "or set ``PUFFO_CLAUDE_BIN=/abs/path/to/claude``."
-            )
+            raise RuntimeError(CLAUDE_BIN_MISSING)
         # Seed the per-agent virtual $HOME on first use (settings,
         # .claude.json). Credentials handled separately below.
         host_home = Path.home()

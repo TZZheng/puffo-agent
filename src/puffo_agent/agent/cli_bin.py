@@ -113,6 +113,66 @@ def _is_executable_file(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
 
 
+# PUF-420. Windows spawn, in preference order: a real .exe costs nothing to
+# launch, .cmd/.bat need cmd.exe, .ps1 needs powershell and is the slowest
+# and the most likely to be blocked by execution policy.
+_WINDOWS_SPAWN_EXTS = (".exe", ".cmd", ".bat", ".ps1")
+
+
+def windows_runnable(binary: str) -> str:
+    """Map a resolved path to one Windows can actually start.
+
+    ``npm install -g`` drops three files next to each other: ``claude.cmd``,
+    ``claude.ps1``, and an extensionless ``claude`` shell script. Only the
+    first two can be started on Windows, but ``shutil.which`` can hand back
+    the extensionless one, and ``CreateProcess`` fails on it with
+    ``WinError 2`` — the same error as "not found at all", which is what
+    made this hard to read from the traceback.
+
+    Non-Windows, or an already-runnable suffix, is returned untouched.
+    """
+    if sys.platform != "win32":
+        return binary
+    p = Path(binary)
+    if p.suffix.lower() in _WINDOWS_SPAWN_EXTS:
+        return binary
+    for ext in _WINDOWS_SPAWN_EXTS:
+        sibling = p.with_name(p.name + ext)
+        if sibling.is_file():
+            return str(sibling)
+    return binary
+
+
+def spawn_argv(binary: str) -> list[str]:
+    """argv head for launching ``binary`` via ``create_subprocess_exec``.
+
+    POSIX passes through. On Windows a script shim can't be argv[0] — it
+    isn't a PE image — so it goes to its interpreter instead. Callers append
+    their own arguments to the returned list; everything after the shim path
+    is forwarded by both interpreters unchanged.
+    """
+    resolved = windows_runnable(binary)
+    if sys.platform != "win32":
+        return [resolved]
+    ext = Path(resolved).suffix.lower()
+    if ext in (".cmd", ".bat"):
+        return ["cmd.exe", "/c", resolved]
+    if ext == ".ps1":
+        return ["powershell.exe", "-NoProfile", "-NonInteractive", "-File", resolved]
+    return [resolved]
+
+
+CLAUDE_BIN_MISSING = (
+    "claude binary not found. Tried $PUFFO_CLAUDE_BIN, $PATH, and known "
+    "bundle paths. Install the Claude Code CLI "
+    "(`npm install -g @anthropic-ai/claude-code`) or set "
+    "``PUFFO_CLAUDE_BIN=/abs/path/to/claude``. On Windows the npm install "
+    "writes claude.cmd and claude.ps1 (no .exe) into %APPDATA%\\npm — point "
+    "PUFFO_CLAUDE_BIN at the .cmd if PATH lookup is failing under the "
+    "daemon's narrower environment."
+)
+
+
 def _first_executable(paths: list[Path]) -> str | None:
     for cand in paths:
         if _is_executable_file(cand):
@@ -253,10 +313,17 @@ def _claude_bundle_paths() -> list[Path]:
             "~/Applications/Claude.app/Contents/Resources/claude",
         )
     if sys.platform == "win32":
+        # npm-global shims last, and .exe before .cmd before .ps1 — see
+        # _WINDOWS_SPAWN_EXTS. These matter when the daemon starts with a
+        # narrower PATH than the operator's interactive shell, which is the
+        # case PUF-420 was reported from.
         return _expand(
             r"%LOCALAPPDATA%\Programs\claude\claude.exe",
             r"%LOCALAPPDATA%\Programs\Claude\claude.exe",
             r"%PROGRAMFILES%\Claude\claude.exe",
+            r"%APPDATA%\npm\claude.exe",
+            r"%APPDATA%\npm\claude.cmd",
+            r"%APPDATA%\npm\claude.ps1",
         )
     return _expand(
         "/opt/Claude/claude",
