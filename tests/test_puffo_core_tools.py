@@ -1969,3 +1969,46 @@ async def test_send_message_with_attachments_cross_channel_root_rejected(tmp_pat
             "root_id": "msg_elsewhere",
         })
     assert "ch_OTHER" in str(excinfo.value)
+
+
+class _StubRpc:
+    """Records the kwargs the tool wrapper forwards. ``sync_mcp`` is
+    keyword-only ``template_id`` — same as the real ``PuffoRpcClient``
+    — so a forward that names the argument anything else raises
+    TypeError here exactly as it does in production."""
+
+    def __init__(self):
+        self.template_ids = []
+
+    async def sync_mcp(self, *, template_id: str) -> str:
+        self.template_ids.append(template_id)
+        return f"mirrored {template_id} into your config"
+
+
+@pytest.mark.asyncio
+async def test_sync_host_mcp_forwards_to_keyword_only_template_id():
+    # PUF-402. main forwards correctly today; this pins it, because the
+    # bug it guards against is not hypothetical — #200 renamed the
+    # agent-facing param and left the forward naming the old one, and
+    # every call raised TypeError. Whatever the agent-facing param ends
+    # up called, the RPC kwarg is `template_id`.
+    cfg, _, _ = _setup()
+    stub = _StubRpc()
+    cfg.rpc_client = stub
+    mcp = _build_tools(cfg)
+    tool = mcp._tool_manager._tools["sync_host_mcp"]
+    result = await tool.fn(template_id="linear")
+    assert stub.template_ids == ["linear"]
+    assert "linear" in result
+
+
+@pytest.mark.asyncio
+async def test_sync_host_mcp_raises_when_rpc_unavailable():
+    # Non-regression: the no-rpc guard fires with the guidance string
+    # instead of an AttributeError on None.
+    cfg, _, _ = _setup()
+    cfg.rpc_client = None
+    mcp = _build_tools(cfg)
+    tool = mcp._tool_manager._tools["sync_host_mcp"]
+    with pytest.raises(RuntimeError, match="PUFFO_RPC_URL"):
+        await tool.fn(template_id="linear")
