@@ -434,7 +434,16 @@ async def _apply_local_transition(
     applied (``COMMITTED`` or ``IDEMPOTENT``). ``CONFLICT``, an exception,
     or any other result retains the record and never ACKs it."""
     if approved:
-        client._contacts.note_allowed(record.sender_slug)
+        try:
+            client._contacts.note_allowed(record.sender_slug)
+        except OSError as exc:
+            client._log.warning(
+                "keyless_dm_approval: contact allow persistence for %s "
+                "failed (%s); retained resumable",
+                record.sender_slug,
+                exc,
+            )
+            return False
         try:
             result = await client.store.promote_gated_receipt(
                 record.envelope_id,
@@ -449,7 +458,16 @@ async def _apply_local_transition(
             )
             return False
     else:
-        client._contacts.note_blocked(record.sender_slug, True)
+        try:
+            client._contacts.note_blocked(record.sender_slug, True)
+        except OSError as exc:
+            client._log.warning(
+                "keyless_dm_approval: contact block persistence for %s "
+                "failed (%s); retained resumable",
+                record.sender_slug,
+                exc,
+            )
+            return False
         try:
             result = await client.store.tombstone_gated_dm(
                 record.envelope_id,
