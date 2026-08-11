@@ -43,6 +43,7 @@ from ..limits import (
     MAX_INBOUND_ATTACHMENT_TOTAL_BYTES,
 )
 from . import disk_cache
+from .client_support import DM_GATE_PROMPT_PLACEHOLDER
 from .inbound_attachments import (
     downscale_oversized_image,
     is_safe_path_component,
@@ -54,6 +55,13 @@ from .ingress_policy import (
     blocked_gate,
     foreign_dm_gate,
     operator_control_gate,
+)
+from .keyless_dm_approval_flow import (
+    is_keyless_operator_approval_reply,
+    is_keyless_prompt_envelope,
+    maybe_handle_operator_reply,
+    record_gated_dm,
+    resume_pending_approvals,
 )
 from .message_context import MENTION_RE, maybe_redact_long_text
 from .message_store import ReceiptDisposition, ReceiptWriteStatus
@@ -124,6 +132,14 @@ async def dispatch_bridge_frame(
         client._log.info(
             "bridge backfill complete: pending_delivered (count=%s)",
             frame.get("count"),
+        )
+        # Reconnect replay: resend missing approval prompts, resume local
+        # receipt transitions, and ACK completed envelopes. It is
+        # response-waiting, so it runs as a tracked task now that the frame
+        # pump is live — never from ``connect()`` or a connected callback.
+        _track_bridge_task(
+            client,
+            asyncio.create_task(resume_pending_approvals(client)),
         )
         # Seed the channel→space map for every channel we're already a
         # member of, so a proactive post to a pre-existing channel works
@@ -414,6 +430,7 @@ async def store_bridge_payload(
     if server_seq is None:
         stored = await client.store.get_message_by_envelope(payload.envelope_id)
         if stored is not None:
+            _reschedule_keyless_gated_record(client, payload, stored)
             return _redelivery_ack(stored)
     row = await _bridge_storage_row(client, payload)
     try:
@@ -430,6 +447,11 @@ async def store_bridge_payload(
         )
         return False
     if verdict is not None:
+        if verdict.disposition is ReceiptDisposition.FOREIGN_DM_GATED:
+            # A held receipt must already contain the same model-facing
+            # context an admitted DM would expose. Approval may happen after
+            # a restart, when the original bridge frame is no longer present.
+            await _populate_bridge_prompt_content(client, payload, row)
         return await _commit_bridge_verdict(client, payload, row, server_seq, verdict)
     await _populate_bridge_prompt_content(client, payload, row)
     return await _persist_eligible_bridge_payload(client, payload, row, server_seq)
@@ -446,6 +468,30 @@ def _redelivery_ack(stored) -> bool:
     if stored.receipt_disposition is ReceiptDisposition.FOREIGN_DM_GATED:
         return False
     return True
+
+
+def _reschedule_keyless_gated_record(client, payload, stored) -> None:
+    """Re-schedule durable recording for a redelivered gated envelope.
+
+    The compatibility lane answers a redelivery before any gate runs, so the
+    durable record must be re-scheduled here when it is missing — the first
+    attempt may have crashed or failed to persist. Without it the held
+    receipt would look ACKable to ``_redelivery_ack`` while carrying no
+    resumable approval state. Idempotent when the record already exists.
+    """
+    if stored.receipt_disposition is not ReceiptDisposition.FOREIGN_DM_GATED:
+        return
+    _track_bridge_task(
+        client,
+        asyncio.create_task(
+            record_gated_dm(
+                client,
+                envelope_id=payload.envelope_id,
+                sender_slug=payload.sender_slug,
+                server_seq=None,
+            )
+        ),
+    )
 
 
 async def _bridge_storage_row(client, payload: MessagePayload) -> dict[str, Any]:
@@ -498,10 +544,21 @@ async def _bridge_gate_verdict(client, payload, row) -> GateVerdict | None:
     if verdict is not None:
         return verdict
     if payload.sender_slug == client.slug:
+        content = None
+        if is_keyless_prompt_envelope(
+            getattr(client, "_pending_dm_approvals", None) or {},
+            envelope_id=payload.envelope_id,
+        ):
+            # The echo of the agent's own keyless approval prompt quotes the
+            # withheld stranger's body; storing it verbatim would leak the
+            # plaintext the gate is holding. Same redaction the native lane
+            # applies, keyed on the durable prompt envelope id here.
+            content = DM_GATE_PROMPT_PLACEHOLDER
         return GateVerdict(
             gate="self_echo",
             disposition=ReceiptDisposition.TERMINAL,
             reason="keyless bridge client echo",
+            content=content,
         )
     verdict = await operator_control_gate(
         client,
@@ -509,6 +566,9 @@ async def _bridge_gate_verdict(client, payload, row) -> GateVerdict | None:
         thread_root_id=row["thread_root_id"] or "",
         text=str(payload.content) if payload.content else "",
     )
+    if verdict is not None:
+        return verdict
+    verdict = await _keyless_operator_reply_gate(client, payload, row)
     if verdict is not None:
         return verdict
     verdict = await foreign_dm_gate(client, payload, _bridge_raw_text(payload))
@@ -521,6 +581,51 @@ async def _bridge_gate_verdict(client, payload, row) -> GateVerdict | None:
             reason="keyless bridge stale history",
         )
     return None
+
+
+async def _keyless_operator_reply_gate(client, payload, row) -> GateVerdict | None:
+    """Consume a keyless operator's exact threaded approval reply.
+
+    Recognition is synchronous against validated durable records only, so it
+    runs on the frame-pump stack without awaiting anything response-waiting;
+    ``maybe_handle_operator_reply`` — which calls bridge ``send_ack`` and can
+    block — is scheduled as a tracked task the pump keeps feeding. Any other
+    operator control (invite / leave / permission / signed DM approval) has
+    already been decided by ``operator_control_gate`` before this runs.
+    """
+    if not (
+        payload.envelope_kind == "dm"
+        and payload.sender_slug == client.operator_slug
+    ):
+        return None
+    # A fast operator reply can arrive before the prompt self-echo has been
+    # persisted locally. The operator identity plus a durable prompt-id match
+    # is sufficient to authenticate this control reference, so retain the raw
+    # wire root as a fallback instead of silently losing the reply.
+    thread_root_id = row["thread_root_id"] or payload.thread_root_id or ""
+    text = str(payload.content) if payload.content else ""
+    pending = getattr(client, "_pending_dm_approvals", None) or {}
+    if not is_keyless_operator_approval_reply(
+        pending,
+        thread_root_id=thread_root_id,
+        text=text,
+    ):
+        return None
+    _track_bridge_task(
+        client,
+        asyncio.create_task(
+            maybe_handle_operator_reply(
+                client,
+                thread_root_id=thread_root_id,
+                text=text,
+            )
+        ),
+    )
+    return GateVerdict(
+        gate="operator_control",
+        disposition=ReceiptDisposition.TERMINAL,
+        reason="handled keyless dm approval reply",
+    )
 
 
 async def _commit_bridge_verdict(
@@ -543,18 +648,34 @@ async def _commit_bridge_verdict(
         # lane must still persist the verdict: a plain ``store()`` drops it,
         # leaving a gated DM unpromotable and a terminal row invisible to prior
         # context.
-        local = await client.store.store_local_receipt(
+        result = await client.store.store_local_receipt(
             row,
             disposition=verdict.disposition,
             reason=verdict.reason,
         )
-        return local.acknowledge
-    result = await client.store.store_receipt(
-        row,
-        server_seq=server_seq,
-        disposition=verdict.disposition,
-        reason=verdict.reason,
-    )
+    else:
+        result = await client.store.store_receipt(
+            row,
+            server_seq=server_seq,
+            disposition=verdict.disposition,
+            reason=verdict.reason,
+        )
+    if (
+        verdict.disposition is ReceiptDisposition.FOREIGN_DM_GATED
+        and result.status
+        in {ReceiptWriteStatus.COMMITTED, ReceiptWriteStatus.IDEMPOTENT}
+    ):
+        _track_bridge_task(
+            client,
+            asyncio.create_task(
+                record_gated_dm(
+                    client,
+                    envelope_id=payload.envelope_id,
+                    sender_slug=payload.sender_slug,
+                    server_seq=server_seq,
+                )
+            ),
+        )
     runtime = getattr(client, "global_runtime", None)
     if (
         runtime is not None

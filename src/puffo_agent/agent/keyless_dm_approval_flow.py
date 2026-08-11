@@ -66,6 +66,49 @@ def _keyless_records(
     ]
 
 
+def is_keyless_operator_approval_reply(
+    pending: dict[str, dict[str, Any]],
+    *,
+    thread_root_id: str,
+    text: str,
+) -> bool:
+    """Whether ``text`` is an exact threaded operator decision for a durable
+    keyless approval prompt.
+
+    Pure and synchronous: bridge ingress runs this on the frame-pump stack to
+    recognise the reply before scheduling the response-waiting
+    :func:`maybe_handle_operator_reply` as a tracked task. It mirrors the
+    handler's exact ``y``/``yes``/``n``/``no`` vocabulary and thread match but
+    never mutates or persists anything.
+    """
+    if not thread_root_id:
+        return False
+    if text.strip().lower() not in _YES | _NO:
+        return False
+    return any(
+        record.prompt_envelope_id == thread_root_id
+        or record.prompt_thread_id == thread_root_id
+        for record in _keyless_records(pending)
+    )
+
+
+def is_keyless_prompt_envelope(
+    pending: dict[str, dict[str, Any]],
+    *,
+    envelope_id: str,
+) -> bool:
+    """Whether ``envelope_id`` is a durable keyless approval-prompt envelope.
+
+    The server echoes the agent's own approval prompt back; that self-echo
+    must be stored with ``DM_GATE_PROMPT_PLACEHOLDER`` rather than as the
+    operator-visible prompt text, which quotes the withheld stranger's body.
+    """
+    return any(
+        record.prompt_envelope_id == envelope_id
+        for record in _keyless_records(pending)
+    )
+
+
 def _persist(client, pending: dict[str, dict[str, Any]]) -> bool:
     """Save the whole pending dict; legacy native entries pass through
     unchanged. Returns whether the write landed."""
