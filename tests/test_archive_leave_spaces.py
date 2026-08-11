@@ -46,6 +46,10 @@ def _make_mock_app(state):
                 {"error": "owner must transfer ownership before leaving"},
                 status=403,
             )
+        if space_id in state["reject_status"]:
+            return web.json_response(
+                {"error": "rejected"}, status=state["reject_status"][space_id]
+            )
         if space_id in state["fail"]:
             return web.json_response({"error": "induced failure"}, status=500)
         return web.json_response({"ok": True, "applied": 1})
@@ -69,6 +73,7 @@ async def mock_server():
         "spaces": [],
         "fail": set(),
         "reject_owner": set(),
+        "reject_status": {},
         "spaces_status": 0,
     }
     server = TestServer(_make_mock_app(state))
@@ -179,6 +184,57 @@ async def test_server_owner_rejection_is_skipped_not_failed(mock_server):
     assert result.skipped_owner == ["sp_stale"]
     assert result.left == ["sp_ok"]
     assert result.failed == []
+
+
+@pytest.mark.parametrize("status", [400, 404, 422])
+async def test_non_403_4xx_is_permanent_and_never_deferred(mock_server, status):
+    """AC #4 — the server repeating an identical rejection can't be fixed
+    by retrying, so it must not park the revoke forever."""
+    from puffo_agent.portal import import_agents as imp
+
+    server, state = mock_server
+    adir, _ = _seed(server, spaces=[])
+    state["spaces"] = [_member("sp_rejected"), _member("sp_ok")]
+    state["reject_status"] = {"sp_rejected": status}
+
+    result = await imp.leave_all_spaces(adir, slug=SLUG)
+
+    assert result.skipped_permanent == ["sp_rejected"]
+    assert result.failed == []
+    assert result.left == ["sp_ok"]
+
+
+@pytest.mark.parametrize("status", [403, 429])
+async def test_403_and_429_stay_retryable(mock_server, status):
+    """A non-owner 403 can be an auth blip and 429 is explicitly a
+    rate-limit — both are worth another pass."""
+    from puffo_agent.portal import import_agents as imp
+
+    server, state = mock_server
+    adir, _ = _seed(server, spaces=[])
+    state["spaces"] = [_member("sp_blipped")]
+    state["reject_status"] = {"sp_blipped": status}
+
+    result = await imp.leave_all_spaces(adir, slug=SLUG)
+
+    assert result.failed == ["sp_blipped"]
+    assert result.skipped_permanent == []
+
+
+async def test_permanent_rejection_does_not_defer_the_revoke(mock_server):
+    from puffo_agent.portal import daemon as dmn
+    from puffo_agent.portal import import_agents as imp
+
+    server, state = mock_server
+    adir, _ = _seed(server, spaces=[])
+    state["spaces"] = [_member("sp_rejected")]
+    state["reject_status"] = {"sp_rejected": 400}
+
+    proceed = await dmn._leave_spaces_before_revoke(AGENT_ID, adir, slug=SLUG)
+
+    assert proceed is True
+    assert not imp.archived_pending_leave_path(adir).exists()
+    assert not imp.archived_pending_revoke_path(adir).exists()
 
 
 async def test_one_failing_space_does_not_abort_the_others(mock_server):

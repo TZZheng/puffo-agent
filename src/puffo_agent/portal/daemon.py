@@ -747,6 +747,13 @@ async def _leave_spaces_before_revoke(
                 agent_id,
                 ", ".join(result.skipped_owner),
             )
+        if result.skipped_permanent:
+            logger.warning(
+                "agent %s: space(s) %s permanently rejected the leave; "
+                "archiving anyway (a retry would never converge)",
+                agent_id,
+                ", ".join(result.skipped_permanent),
+            )
         if not result.failed:
             logger.info(
                 "agent %s: left %d space(s) before revoke",

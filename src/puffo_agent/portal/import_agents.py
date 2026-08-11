@@ -26,7 +26,7 @@ import json
 import logging
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiohttp
@@ -63,6 +63,15 @@ def _remote_http_session(server_url: str) -> aiohttp.ClientSession:
 
 class ImportError(Exception):
     pass
+
+
+class HttpStatusError(ImportError):
+    """Carries the response status so callers can tell a retryable blip
+    from a permanent rejection."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass
@@ -394,7 +403,7 @@ async def _signed_post(
     ) as resp:
         if resp.status >= 400:
             text = await resp.text()
-            raise ImportError(f"{path} {resp.status}: {text}")
+            raise HttpStatusError(f"{path} {resp.status}: {text}", resp.status)
 
 
 async def _signed_get(
@@ -417,7 +426,7 @@ async def _signed_get(
     async with session.get(f"{server_url.rstrip('/')}{path}", headers=headers) as resp:
         if resp.status >= 400:
             text = await resp.text()
-            raise ImportError(f"{path} {resp.status}: {text}")
+            raise HttpStatusError(f"{path} {resp.status}: {text}", resp.status)
         return await resp.json()
 
 
@@ -734,17 +743,31 @@ OWNER_LEAVE_REJECTION = "owner must transfer ownership before leaving"
 @dataclass
 class LeaveSpacesResult:
     """Outcome of the on-archive space-leave fanout. ``failed`` is the
-    only retryable bucket — ``skipped_owner`` is permanent until a human
-    transfers the space, so it must never hold up the archive."""
+    only retryable bucket; both skip buckets are permanent and must never
+    hold up the revoke, since retrying them would never converge.
+
+    ``skipped_owner`` needs a human to transfer the space first.
+    ``skipped_permanent`` is a non-403 4xx — a rejection the server will
+    repeat identically on every retry."""
 
     left: list[str]
     skipped_owner: list[str]
     failed: list[str]
+    skipped_permanent: list[str] = field(default_factory=list)
     last_error: str = ""
 
 
+def _is_permanent_leave_rejection(exc: Exception) -> bool:
+    """Per AC #4: a 4xx other than 403 is the server telling us this
+    request is wrong, not that it's busy — retrying can't fix it. 403 is
+    excluded because a non-owner 403 can be a transient auth blip, and
+    429 is a rate-limit, i.e. explicitly retryable."""
+    status = getattr(exc, "status", 0)
+    return 400 <= status < 500 and status not in (403, 429)
+
+
 def archived_pending_leave_path(archived_agent_dir: Path) -> Path:
-    return archived_agent_dir / ".puffo-agent" / "pending_leave.json"
+    return archived_agent_dir / ".puffo-agent" / "pending_leave_memberships.json"
 
 
 def write_archived_pending_leave(
@@ -850,6 +873,14 @@ async def leave_all_spaces(archived_dir: Path, *, slug: str) -> LeaveSpacesResul
             except Exception as exc:  # noqa: BLE001
                 if OWNER_LEAVE_REJECTION in str(exc):
                     result.skipped_owner.append(space_id)
+                    continue
+                if _is_permanent_leave_rejection(exc):
+                    result.skipped_permanent.append(space_id)
+                    logger.warning(
+                        "archive leave: space %s permanently rejected for %s "
+                        "(%s); not retrying",
+                        space_id, slug, exc,
+                    )
                     continue
                 result.failed.append(space_id)
                 result.last_error = f"{type(exc).__name__}: {exc}"
