@@ -388,6 +388,45 @@ async def test_delete_on_flag_leaves_spaces_before_revoking(monkeypatch, mock_se
     assert [b["space_id"] for b in state["posted"]] == ["sp_one"]
 
 
+async def test_cli_archive_leaves_spaces_before_revoking(monkeypatch, mock_server):
+    """`puffo-agent agent archive <id>` reaches the same end state as the
+    archive flag — an operator archiving from the CLI would otherwise
+    reproduce the original bug through a different trigger."""
+    import argparse
+    import asyncio
+
+    from puffo_agent.portal import cli
+    from puffo_agent.portal import import_agents as imp
+
+    server, state = mock_server
+    _seed(server, spaces=[])
+    state["spaces"] = [_member("sp_one")]
+
+    order: list[str] = []
+    real_leave = imp.leave_all_spaces
+
+    async def spy_leave(archived_dir, *, slug):
+        order.append("leave")
+        return await real_leave(archived_dir, slug=slug)
+
+    async def spy_revoke(archived_dir, *, slug):
+        order.append("revoke")
+
+    monkeypatch.setattr(imp, "leave_all_spaces", spy_leave)
+    monkeypatch.setattr(imp, "revoke_archived_device", spy_revoke)
+
+    # cmd_agent_archive is sync and owns its own asyncio.run, so it has to
+    # run off-loop — otherwise it can't nest inside the test's loop, and
+    # that loop is what serves the mock server.
+    rc = await asyncio.get_running_loop().run_in_executor(
+        None, cli.cmd_agent_archive, argparse.Namespace(id=AGENT_ID)
+    )
+
+    assert rc == 0
+    assert order == ["leave", "revoke"]
+    assert [b["space_id"] for b in state["posted"]] == ["sp_one"]
+
+
 # ────────────────────────────────────────────────────────────────────
 # Retry sweep
 # ────────────────────────────────────────────────────────────────────
