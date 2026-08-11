@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from ..cli_bin import normalize_launch_argv
 from .driver import (
     CancelCapability,
     CompactCapability,
@@ -108,7 +109,7 @@ class ClaudeCodeCliDriver(Driver):
         if self._closed:
             self._prepare_reopen()
         args = [
-            spec.executable or "claude",
+            *normalize_launch_argv(spec.executable or "claude"),
             *spec.launch_args,
             "-p",
             "--input-format",

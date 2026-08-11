@@ -120,6 +120,54 @@ def _first_executable(paths: list[Path]) -> str | None:
     return None
 
 
+# ── Windows shim launch normalization ────────────────────────────────
+
+
+def normalize_launch_argv(executable: str) -> list[str]:
+    """Return the argv prefix that launches ``executable`` on this host.
+
+    POSIX passes the executable through unchanged. Windows maps an
+    extensionless path to an existing ``.exe`` / ``.cmd`` / ``.bat`` /
+    ``.ps1`` sibling and wraps the interpreter-backed shims so a direct
+    ``asyncio.create_subprocess_exec`` can run them: ``.cmd`` / ``.bat``
+    through ``cmd.exe /c``, ``.ps1`` through ``powershell.exe``. Every
+    returned element is a single argv entry, so paths containing spaces
+    survive intact.
+    """
+    if sys.platform != "win32":
+        return [executable]
+    resolved = _windows_launch_path(executable)
+    lower = resolved.lower()
+    if lower.endswith((".cmd", ".bat")):
+        return ["cmd.exe", "/c", resolved]
+    if lower.endswith(".ps1"):
+        return [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            resolved,
+        ]
+    return [resolved]
+
+
+def _windows_launch_path(executable: str) -> str:
+    """Prefer an existing sibling for an extensionless Windows executable.
+
+    Order: ``.exe``, ``.cmd``, ``.bat``, ``.ps1``. A path that already
+    carries an extension — or whose sibling set has no match — is used
+    as-is (the resolver-miss fallback launches the bare name directly).
+    """
+    path = Path(executable).expanduser()
+    if path.suffix:
+        return str(path)
+    for suffix in (".exe", ".cmd", ".bat", ".ps1"):
+        candidate = path.with_suffix(suffix)
+        if candidate.is_file():
+            return str(candidate)
+    return str(path)
+
+
 # ── Real-PATH reconstruction (broader than the daemon's process PATH) ──
 
 
@@ -244,9 +292,10 @@ def _codex_bundle_paths() -> list[Path]:
 
 
 def _claude_bundle_paths() -> list[Path]:
-    # Anthropic doesn't currently ship a desktop app that bundles the
-    # ``claude`` CLI the way Codex.app does; defensive paths cover
-    # the case where they start to.
+    # The standard Windows install is the npm-global shim set under
+    # ``%APPDATA%\npm``; Anthropic doesn't currently ship a desktop app
+    # that bundles the ``claude`` CLI the way Codex.app does, so the
+    # app-root paths are defensive coverage.
     if sys.platform == "darwin":
         return _expand(
             "/Applications/Claude.app/Contents/Resources/claude",
@@ -254,6 +303,9 @@ def _claude_bundle_paths() -> list[Path]:
         )
     if sys.platform == "win32":
         return _expand(
+            r"%APPDATA%\npm\claude.exe",
+            r"%APPDATA%\npm\claude.cmd",
+            r"%APPDATA%\npm\claude.ps1",
             r"%LOCALAPPDATA%\Programs\claude\claude.exe",
             r"%LOCALAPPDATA%\Programs\Claude\claude.exe",
             r"%PROGRAMFILES%\Claude\claude.exe",
