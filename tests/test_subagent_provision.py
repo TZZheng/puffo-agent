@@ -1,5 +1,5 @@
 """PUF-395: create-time sub-agent provisioning — inline .md validation +
-write, plus the write path through ``_write_agent_from_context``.
+write, plus the write path through ``write_agent_from_context``.
 """
 from __future__ import annotations
 
@@ -214,7 +214,7 @@ def test_sha256_hex_matches_stdlib():
     assert sha256_hex("hello") == hashlib.sha256(b"hello").hexdigest()
 
 
-# ── write path through _write_agent_from_context ─────────────────────
+# ── write path through write_agent_from_context ──────────────────────
 
 def _ctx(agent_id: str, subagents: list[dict]) -> dict:
     from puffo_agent.portal.state import RuntimeConfig
@@ -248,11 +248,11 @@ def test_write_agent_from_context_lands_subagents(tmp_path, monkeypatch):
     # AC #3 + #5 — .md written under <workspace>/.claude/agents, response
     # carries {name, sha256}.
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
-    from puffo_agent.portal.api.handlers import _write_agent_from_context
+    from puffo_agent.portal.control.provision import write_agent_from_context
     from puffo_agent.portal.state import agent_dir
 
     content = _md("code-reviewer")
-    result = _write_agent_from_context(
+    result = write_agent_from_context(
         _ctx("rev-bot", [{"name": "code-reviewer", "content": content}]),
     )
     md = agent_dir("rev-bot") / "workspace" / ".claude" / "agents" / "code-reviewer.md"
@@ -267,16 +267,19 @@ def test_write_agent_from_context_prunes_on_subagent_write_failure(tmp_path, mon
     # the half-built agent dir (shutil.rmtree) rather than leaving it for the
     # reconcile loop. The new subagent write is a fresh IO surface; pin it.
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
-    from puffo_agent.portal import subagent_provision
-    from puffo_agent.portal.api.handlers import _write_agent_from_context
+    from puffo_agent.portal.control import provision as provision_mod
+    from puffo_agent.portal.control.provision import write_agent_from_context
     from puffo_agent.portal.state import agent_dir
 
     def _boom(claude_dir, subagents):
         raise OSError("disk full")
 
-    monkeypatch.setattr(subagent_provision, "write_subagents", _boom)
+    # Patch where it's used, not where it's defined: provision.py binds the
+    # symbol at import (``from ..subagent_provision import write_subagents``),
+    # so patching the source module leaves the bound reference untouched.
+    monkeypatch.setattr(provision_mod, "write_subagents", _boom)
     with pytest.raises(OSError):
-        _write_agent_from_context(
+        write_agent_from_context(
             _ctx("doomed-bot", [{"name": "code-reviewer", "content": _md("code-reviewer")}]),
         )
     assert not agent_dir("doomed-bot").exists()  # half-built dir pruned
@@ -285,9 +288,9 @@ def test_write_agent_from_context_prunes_on_subagent_write_failure(tmp_path, mon
 def test_write_agent_from_context_no_subagents(tmp_path, monkeypatch):
     # AC #8 — no desired_subagents → no .claude/agents dir, empty response list.
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
-    from puffo_agent.portal.api.handlers import _write_agent_from_context
+    from puffo_agent.portal.control.provision import write_agent_from_context
     from puffo_agent.portal.state import agent_dir
 
-    result = _write_agent_from_context(_ctx("plain-bot", []))
+    result = write_agent_from_context(_ctx("plain-bot", []))
     assert result["subagents"] == []
     assert not (agent_dir("plain-bot") / "workspace" / ".claude" / "agents").exists()
