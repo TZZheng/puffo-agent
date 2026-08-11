@@ -507,6 +507,7 @@ class CloudBridgeClient:
         reply_to_id: Optional[str] = None,
         thread_root_id: Optional[str] = None,
         attachments: Optional[list[dict]] = None,
+        client_ref: Optional[str] = None,
         timeout: float = 30.0,
     ) -> dict:
         # Pass EITHER recipient_slug (DM) OR space_id+channel_id
@@ -520,8 +521,18 @@ class CloudBridgeClient:
         # size_bytes? }); blobs were already uploaded keyless via
         # ``upload_blob``. Added only when non-empty so a plain send
         # stays byte-shape-identical to the pre-attachment frame.
+        # ``client_ref`` is the correlation id: a caller-supplied
+        # non-empty string is used verbatim for both the outbound frame
+        # and the waiter (the resumable approval flow sends a stable
+        # prompt ref), otherwise the existing ``r_<random>`` is generated.
+        # An empty / whitespace-only / non-string caller value fails before
+        # a frame is sent.
+        if client_ref is not None:
+            if not isinstance(client_ref, str) or not client_ref.strip():
+                raise ValueError(f"invalid client_ref: {client_ref!r}")
         ws = await self._require_ws()
-        client_ref = f"r_{uuid.uuid4().hex[:12]}"
+        if client_ref is None:
+            client_ref = f"r_{uuid.uuid4().hex[:12]}"
         frame: dict[str, Any] = {
             "type": "send",
             "plaintext": plaintext,
