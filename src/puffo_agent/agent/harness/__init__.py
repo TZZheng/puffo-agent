@@ -1,45 +1,71 @@
-"""Harness abstraction — which agent engine runs inside a runtime.
+"""Execution engines used by Puffo runtimes.
 
-Runtime answers WHERE the agent executes; harness answers WHAT.
-Only meaningful for the CLI runtimes; ``chat-local`` / ``sdk-local``
-ignore the field. Four harnesses ship: ``claude-code`` (Anthropic),
-``hermes`` (Anthropic + OpenAI), ``gemini-cli`` (Google),
-``codex`` (OpenAI — opt-in, default for openai is still hermes).
-Each declares ``supported_providers`` so the runtime matrix can
-reject mismatched triples at load time.
+Docker executes Claude Code only. Host-local execution uses the long-lived
+Claude Code and Codex Driver implementations.
 """
 
-from .base import Harness, HarnessTurn
+from dataclasses import dataclass
+from typing import Any
+
+from .base import DockerHarness
 from .claude_code import ClaudeCodeHarness
-from .codex import CodexHarness
-from .gemini_cli import GeminiCLIHarness
-from .hermes import HermesHarness
+from .driver import (
+    Driver,
+    RuntimeRef,
+    SessionRef,
+    TurnRef,
+    PermissionRef,
+    UnsupportedCapability,
+)
+from .codex_driver import CodexAppServerDriver, CodexDriver
+from .claude_code_driver import ClaudeCodeCliDriver, ClaudeDriver
 
 
-def build_harness(name: str) -> Harness:
-    """Resolve a harness name from agent.yml. Default Claude Code so
-    agents without the field keep existing behaviour.
+def build_docker_harness(name: str) -> DockerHarness:
+    """Resolve the sole executable Docker harness from ``agent.yml``.
+
+    Claude Code is the compatibility default for configs without a harness.
     """
     if not name or name == "claude-code":
         return ClaudeCodeHarness()
-    if name == "hermes":
-        return HermesHarness()
-    if name == "gemini-cli":
-        return GeminiCLIHarness()
-    if name == "codex":
-        return CodexHarness()
     raise ValueError(
-        f"unknown harness {name!r}: expected one of "
-        "'claude-code', 'hermes', 'gemini-cli', 'codex'"
+        f"Docker harness {name!r} is not executable; "
+        "the supported Docker harness is 'claude-code'"
     )
 
 
+@dataclass(frozen=True)
+class UnsupportedDriver:
+    harness: str
+    diagnostic: str = "no local Driver implementation for this harness"
+
+
+def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
+    """Construct only the two ratified Driver implementations.
+
+    This factory is deliberately separate from :func:`build_docker_harness`.
+    """
+    if name == "codex":
+        return CodexAppServerDriver(**kwargs)
+    if not name or name == "claude-code":
+        return ClaudeCodeCliDriver(**kwargs)
+    return UnsupportedDriver(name)
+
+
 __all__ = [
-    "Harness",
-    "HarnessTurn",
+    "DockerHarness",
     "ClaudeCodeHarness",
-    "CodexHarness",
-    "GeminiCLIHarness",
-    "HermesHarness",
-    "build_harness",
+    "build_docker_harness",
+    "Driver",
+    "RuntimeRef",
+    "SessionRef",
+    "TurnRef",
+    "PermissionRef",
+    "UnsupportedCapability",
+    "UnsupportedDriver",
+    "CodexAppServerDriver",
+    "CodexDriver",
+    "ClaudeCodeCliDriver",
+    "ClaudeDriver",
+    "build_driver",
 ]

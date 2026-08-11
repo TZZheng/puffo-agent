@@ -7,8 +7,8 @@ processed server-side, but skip the LLM pipeline.
 """
 from __future__ import annotations
 
-import inspect
 import logging
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,26 +58,34 @@ def test_now_ms_defaults_to_wall_clock():
     assert _client(_48H_MS)._is_stale_for_catchup(0) is True
 
 
-def test_gate_wired_into_listen_before_admit():
-    """handle_envelope is a nested closure — pin the gate's ordering
-    at source level."""
-    src = inspect.getsource(PuffoCoreMessageClient.listen)
-    assert "_is_stale_for_catchup(payload.sent_at)" in src
-    assert "staleness-gate-skipped" in src
-    gate = src.index("_is_stale_for_catchup(payload.sent_at)")
-    admit = src.index("_admit_thread_message(")
-    assert gate < admit, "staleness gate must precede _admit_thread_message"
-    # A skipped envelope is still persisted — the store precedes the gate.
-    store = src.index("self.store.store(")
-    assert store < gate, "store.store must precede the staleness gate"
-    # Self-echo + operator intercepts run regardless of age.
-    self_echo = src.index("payload.sender_slug == self.slug")
-    leave = src.index("_maybe_handle_leave_reply")
-    permission = src.index("_maybe_handle_permission_reply")
-    assert self_echo < gate and leave < gate and permission < gate
-    # A skipped envelope is still reported processed server-side.
-    report = src.index("_report_stale_processed(payload.envelope_id)")
-    assert gate < report < admit
+@pytest.mark.asyncio
+async def test_stale_receipt_is_reported_and_committed_terminal():
+    from puffo_agent.agent.inbound_receipts import InboundReceiptHandler
+    from puffo_agent.agent.message_store import ReceiptDisposition
+
+    client = _client(_48H_MS)
+    client._log = logging.getLogger("staleness-test")
+    reported: list[str] = []
+    client._report_stale_processed = reported.append
+    commits: list[tuple] = []
+
+    async def _commit(disposition, reason):
+        commits.append((disposition, reason))
+        return "ack"
+
+    committer = SimpleNamespace(
+        payload=SimpleNamespace(
+            envelope_id="msg_old", sent_at=_NOW - 49 * 3600 * 1000,
+        ),
+        stored_payload={"thread_root_id": ""},
+        commit=_commit,
+    )
+    handler = InboundReceiptHandler.__new__(InboundReceiptHandler)
+    handler.client = client
+
+    assert await handler._stale_outcome(committer) == "ack"
+    assert reported == ["msg_old"]
+    assert commits == [(ReceiptDisposition.TERMINAL, "stale catch-up")]
 
 
 def _init_client(catchup_stale_hours: float) -> PuffoCoreMessageClient:
@@ -189,8 +197,6 @@ class _StubHttp:
 
 
 def _report_client(fail: bool = False):
-    import asyncio as _a
-
     c = _client(_48H_MS)
     c.http = _StubHttp(fail=fail)
     c._log = logging.getLogger("staleness-test")
@@ -230,8 +236,6 @@ async def test_reports_chunk_at_200():
 
 @pytest.mark.asyncio
 async def test_report_during_flush_is_not_stranded():
-    import asyncio
-
     c = _report_client()
     orig_post = c.http.post
     late: dict = {}

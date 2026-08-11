@@ -6,6 +6,54 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.0a1] — 2026-08-11
+
+> Pre-release published to TestPyPI for staging validation only. It is not the
+> stable `1.3.0` release.
+
+### Added
+
+- **A durable Global Inbox now coordinates work across spaces and targets.**
+  Inbound messages are persisted before acknowledgement, batched into
+  metadata-only wake notices, admitted into turns through explicit reads, and
+  recovered safely after restarts.
+
+- **Native and keyless cloud Agents now share coordinated channel sends.**
+  Freshness checks can hold stale drafts, recover the blocking context, and let
+  the model revise, wait, remain silent, or explicitly send anyway without
+  exposing sequence ownership to the model.
+
+- **Keyless cloud Agents now use a scoped Server bridge.** The bridge supports
+  backfill, acknowledgements, authoritative channel sequences, attachments,
+  runtime commands, status, and the same model-facing Inbox and MCP behavior as
+  native Agents.
+
+- **One-shot reminders survive offline periods.** Local scheduling is backed by
+  encrypted Server snapshots, renewable delivery claims, reconstruction,
+  cancellation, and replacement semantics.
+
+- **Agent memory now has bounded briefing, notes, recollection, and import
+  areas.** Semantic MCP tools provide controlled reads, writes, search,
+  refresh, reload, and Git-backed history.
+
+- **Runtime lifecycle metadata is durable and replayable.** Codex app-server and
+  Claude Code stream-json events are normalized behind one Driver contract.
+  Only fixed-vocabulary lifecycle, tool, permission, and terminal metadata is
+  uploaded in bounded idempotent batches; assistant output remains local unless
+  a future end-to-end encrypted content contract is introduced.
+
+### Changed
+
+- **The runtime foundation now has two long-lived local Drivers and one Docker
+  compatibility runtime.** Local Claude Code uses stream-json, local Codex uses
+  app-server, and Docker supports Claude Code only. Docker Codex and the
+  Hermes/Gemini execution paths are no longer admitted; their names remain
+  design-only so stale configs fail with an explicit diagnostic.
+
+- **Port 63387 is now exclusively the loopback ws-local service.** The retired
+  browser-facing Local Bridge, its pairing/API commands, and the
+  `--with-local-bridge` startup flag have been removed.
+
 ## [1.2.0] — 2026-08-10
 
 ### Added
@@ -4348,7 +4396,9 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v0.10.0a2...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v1.3.0a1...HEAD
+[1.3.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v1.3.0a1
+[1.2.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v1.2.0
 [0.10.0a2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.10.0a2
 [0.10.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.10.0a1
 [0.8.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.8.3

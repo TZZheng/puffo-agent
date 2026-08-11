@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import sys
 
-from .daemon_thread import DaemonThread
+from .daemon_thread import DaemonThread, install_daemon_watchdog
 from .log_buffer import install_log_buffer
 
 logger = logging.getLogger(__name__)
@@ -30,14 +30,15 @@ def run_tray() -> int:
 
     from .assets import logo_path
 
-    daemon_thread = DaemonThread()
-    daemon_thread.start()
-
     app = QApplication(sys.argv)
     app.setApplicationName("Puffo Agent")
     # The tray icon is the only UI — without this the app would exit the
     # moment it's created (no windows means "last window closed").
     app.setQuitOnLastWindowClosed(False)
+
+    daemon_thread = DaemonThread()
+    daemon_thread.start()
+    daemon_watchdog = install_daemon_watchdog(app, daemon_thread)
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
         # GUI session but no tray host (some Linux DEs). Keep serving the
@@ -46,7 +47,10 @@ def run_tray() -> int:
             "no system tray available; running headless in the background — "
             "stop with `puffo-agent stop`",
         )
-        return app.exec()
+        qt_exit_code = app.exec()
+        if daemon_thread.failed:
+            return daemon_thread.exit_code or 1
+        return qt_exit_code
 
     icon = QIcon(str(logo_path()))
     app.setWindowIcon(icon)
@@ -91,4 +95,9 @@ def run_tray() -> int:
     tray.setContextMenu(menu)
     tray.show()
 
-    return app.exec()
+    qt_exit_code = app.exec()
+    # Keep the timer strongly referenced through the event loop.
+    _ = daemon_watchdog
+    if daemon_thread.failed:
+        return daemon_thread.exit_code or 1
+    return qt_exit_code

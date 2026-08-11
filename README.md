@@ -5,44 +5,52 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/puffo-agent.svg)](https://pypi.org/project/puffo-agent/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow.svg)](LICENSE)
 
-Local daemon that runs AI bots (Claude / GPT / Gemini) on
+Local daemon that runs AI bots (Claude / GPT) on
 [Puffo](https://puffo.ai). One process supervises many bot accounts;
 each account has its own profile, memory, per-channel triggers, file
 inbox, and a paired web operator.
 
-Speaks the puffo-server wire protocol: HPKE-wrapped per-recipient
-message keys, ed25519-signed events, structured AAD, and
-`/blobs/upload` + `/blobs/<id>` for encrypted file attachments.
+Supports two Puffo transports behind one Agent runtime. Native mode uses
+HPKE-wrapped per-recipient message keys, ed25519-signed requests, structured
+AAD, and locally encrypted attachments. Keyless cloud mode uses a scoped
+sandbox token and delegates Puffo message crypto to the Server. Both feed the
+same durable Global Inbox, Driver, MCP, memory, reminder, and coordinated-send
+layers.
 
 The CLI follows a `puffo-agent <resource> <verb>` shape — daemon-level
 commands at the root (`start`, `status`, …), `machine` for portal
 linking, and `agent` for the bots themselves.
 
+For `cli-local`, Codex app-server and Claude Code stream-json also expose the
+provider-neutral Driver boundary. Their safe five-type execution
+lifecycle is durably staged in the daemon-owned per-Agent state directory at
+`runtime_events.db`, beside `messages.db` and never in the user workspace; raw
+provider frames, reasoning, tool payloads, credentials, and Inbox contents are
+never written to that public outbox.
+Docker Claude continues through the compatibility Adapter; `ws-local` attaches
+an external engine directly to the daemon's loopback WebSocket endpoint. Direct
+`chat-local` and `sdk-local` runtimes are retired; existing agent configs are
+loaded as `cli-local` and keep their persisted profile and state.
+
 ## 1. Prerequisites
 
 - **Python 3.11+**.
-- **An LLM provider key** for whichever provider your agents use:
-  `ANTHROPIC_API_KEY` (Claude), `OPENAI_API_KEY` (GPT), or
-  `GEMINI_API_KEY` (Gemini). Keys travel **per agent**, so you can
-  also set them with `puffo-agent agent create --api-key …` instead
-  of exporting them globally.
+- **A model runtime login.** For the default `cli-local` runtime, install
+  Claude Code and run `claude login`, or install Codex and run `codex login`.
+  Cloud/gateway deployments may instead configure a per-agent `api_key` with
+  `llm_base_url`.
 - **A [Puffo](https://puffo.ai) account.** The daemon defaults to
   `https://chat.puffo.ai/relay`; point at a self-hosted server via each
   agent's `puffo_core.server_url`.
 - **Per runtime kind** (see [Runtime kinds](#61-runtime-kinds) below):
-  - `chat-local` — none beyond the provider key.
-  - `sdk-local` — `pip install puffo-agent[sdk]`.
   - `cli-local` — by default, `claude` CLI on `$PATH` + `claude login`
     on the host. With `runtime.harness=codex`, instead requires the
     `codex` CLI on `$PATH` + `codex login` (ChatGPT-account OAuth).
     Gives the agent shell-level tools on your machine — only enable
     for agents you trust.
   - `cli-docker` — Docker installed and the daemon user able to talk
-    to the daemon socket. Puffo resolves Docker from
-    `PUFFO_DOCKER_BIN`, the current or persistent user `PATH`, and
-    known Docker Desktop locations. Supports `claude-code` and
-    `codex`; authenticate once on the host with `claude login` or
-    `codex login`.
+    to the daemon socket. Supports the `claude-code` harness only;
+    codex inside Docker is not yet supported.
 
 ## 2. Install
 
@@ -54,7 +62,7 @@ Python:
 ```bash
 uv tool install puffo-agent
 # pin to a specific version:
-uv tool install puffo-agent==0.12.4
+uv tool install puffo-agent==1.2.0
 ```
 
 Otherwise use pip:
@@ -62,12 +70,25 @@ Otherwise use pip:
 ```bash
 pip install puffo-agent
 # pin to a specific version:
-pip install puffo-agent==0.12.4
+pip install puffo-agent==1.2.0
 ```
+
+The Agent Foundation `1.3.0a1` candidate is for staging validation and is
+published to TestPyPI only. See
+[`docs/RELEASE-CANDIDATE-1.3.0a1.md`](docs/RELEASE-CANDIDATE-1.3.0a1.md) for
+the install command, test scope, and stable-release TODOs.
 
 Both paths install the `puffo-agent` console script. The CLI's
 `check-update` command detects which way you installed and prints
 the matching upgrade command, so you don't have to remember.
+
+The base install runs the headless foreground daemon. Install the GUI extra
+before using the desktop window, tray, or detached background mode:
+
+```bash
+uv tool install --force 'puffo-agent[gui]'
+# or: pip install 'puffo-agent[gui]'
+```
 
 For contributors working from a source checkout:
 
@@ -85,12 +106,12 @@ lazy-creates `~/.puffo-agent/` on first run with sensible defaults (server
 
 | Command | What it does |
 | --- | --- |
-| `puffo-agent start` | Run the daemon (foreground). `--ui` adds the PySide6 desktop window; `--background` detaches with a tray icon |
+| `puffo-agent start` | Run the daemon (foreground). `--ui` and `--background` require the `[gui]` extra; background mode detaches with a tray icon. |
 | `puffo-agent status` | Is it alive? which agents are running? |
 | `puffo-agent stop` | Graceful shutdown from any terminal (`--timeout`, default 60s) |
 | `puffo-agent version` | Print the installed `puffo-agent` version |
 | `puffo-agent check-update` | Compare against the latest GitHub release + print the matching upgrade command |
-| `puffo-agent config` | Optional daemon-wide defaults (provider, models, keys). Rarely needed — agents carry their own keys |
+| `puffo-agent config` | Optional daemon-wide model defaults. Claude/Codex use CLI login or per-agent gateway credentials. |
 
 The daemon watches `~/.puffo-agent/agents/<agent-id>/` and reconciles on-disk
 state every couple of seconds — you don't restart it after config changes.
@@ -102,10 +123,9 @@ containers `docker stop`'d (not removed). On the next `start`, each cli-docker
 worker reuses its existing container and resumes the persisted session via
 `--resume`, so a restart costs no image pull, container boot, or working memory.
 
-API keys travel **per agent**, not per daemon — `puffo-agent agent create`
-prompts for one if you didn't pass `--api-key` and no `ANTHROPIC_API_KEY` /
-`OPENAI_API_KEY` / `GEMINI_API_KEY` is set. Use `config` only if you want one
-key shared across many agents.
+Gateway API keys travel **per agent**, not per daemon. Pass `--api-key` only
+when the runtime is configured with an `llm_base_url`; ordinary local Claude
+Code and Codex runtimes reuse their CLI login.
 
 ### 3.1 Config files
 
@@ -119,10 +139,11 @@ entirely on disk:
 ├── control/                     # machine identity + operator pairings (portal)
 └── agents/<agent-id>/
     ├── agent.yml                # puffo_core identity, runtime, triggers
-    ├── profile.md               # system prompt + Soul (long-form persona)
-    ├── memory/                  # rolling notes the agent writes itself
-    ├── keys/                    # per-agent puffo-core keystore
-    ├── messages.db              # encrypted message store (sqlite)
+    ├── profile.md               # operator-editable Soul source
+    ├── memory/                  # briefing, notes, recollection, imports
+    ├── keys/                    # native transport only
+    ├── messages.db              # message, Inbox, turn, reminder state
+    ├── runtime_events.db        # bounded Runtime event outbox
     ├── runtime.json             # heartbeat / status (daemon-managed)
     └── workspace/.puffo/inbox/  # decrypted incoming attachments
 ```
@@ -180,12 +201,15 @@ approve it in the web app (My Agents → Link machine). It **auto-starts the
 daemon** if it isn't already running, so it's a
 one-step onboard. The default server is `chat.puffo.ai/relay`.
 
-### 4.1 Agent Portal architecture (v0.4)
+### 4.1 Agent Portal control plane
 
 The machine and operator never talk directly — puffo-server relays
 end-to-end-encrypted control frames between them.
 
-![Agent Portal v0.4 architecture](docs/agent-portal-architecture.svg)
+See the current [system architecture](docs/ARCHITECTURE.md) and
+[codebase map](docs/puffo-agent-architecture.md). The architecture document
+separates the machine control plane from native and keyless Agent message
+transports.
 
 **Control plane.** Each operator command arrives as an HPKE envelope, signed by
 the operator's root key over a canonical form and bound to `(machine_id,
@@ -198,15 +222,14 @@ to the first pairing's server; multiple operators on that server are all served.
 this machine's `machine_id` onto the operator's owned agents, so agents created
 locally before linking become remotely manageable without re-creating them.
 
-**Loopback services.** Three daemon-owned services are available locally:
+**Loopback services.** The daemon owns three loopback-only services:
 
 - `127.0.0.1:63386` — **data service**: in-process MCP tooling reads agent
   identities + message DBs from the host.
 - `127.0.0.1:63385` — **rpc service**: daemon-mediated MCP ops (host-MCP
   install / sync).
-- `127.0.0.1:63387/v1/ws-local` — **ws-local WebSocket**: passes messages and
-  tool calls between a `ws-local` worker and an attached local AI tool. This
-  port exposes no agent-management or browser API.
+- `127.0.0.1:63387` — **ws-local service**: authenticated external Agent
+  attachment at `GET /v1/ws-local`. It exposes no browser management API.
 
 ## 5. Agent commands
 
@@ -251,9 +274,10 @@ long-form persona in `profile.md`:
 - **`display_name`** — the human-readable label shown next to the
   avatar in member lists and message bubbles. Falls back to the
   `agent-id` when unset.
-- **`avatar_url`** — uploaded blob URL. The web client and desktop
-  profile editor handle the upload + verify pipeline and persist the
-  resolved URL to `agent.yml`.
+- **`avatar_url`** — uploaded blob URL (the web client handles the
+  upload + verify pipeline; the bridge's `PATCH /v1/agents/{id}`
+  accepts raw bytes via `avatar_bytes_b64` and writes the resolved
+  URL back to `agent.yml`).
 - **`role`** — free-text "what does this agent do" string (≤140
   chars). Recommended shape `<short>: <description>`, e.g.
   `"coder: main puffo-core coder"`. Stored as a single line in
@@ -319,10 +343,10 @@ A few constraints worth knowing:
   web) to force a worker respawn if you need the change to land
   mid-conversation.
 - The server-side `identities.role` / `role_short` fields are kept in
-  sync best-effort. CLI, desktop, and control-plane profile edits update
-  local state before syncing through `PATCH /identities/self`; if that
-  sync fails (e.g. server unreachable), the next successful sync catches
-  up.
+  sync best-effort. A `PATCH /v1/agents/{id}/profile` write fans out to
+  `PATCH /identities/self` automatically; if that sync fails (e.g.
+  server unreachable) the local change still lands and the next
+  successful sync will catch up.
 
 ### 5.2 Server-side status reporting
 
@@ -365,12 +389,17 @@ orphan run row.
 
 ### 5.3 Auto-accept invites + DM intercept
 
-Agents auto-accept space and channel invites whose inviter root pubkey
-matches the agent's `declared_operator_public_key` (set at agent
-creation, baked into the identity cert). Invites from anyone else are
-surfaced as a DM thread the LLM answers `y` / `n` on; the daemon
-intercepts the reply, accepts/declines on the agent's behalf, and
-swallows the message so the LLM never has to think about RPC.
+Native Agents auto-accept space and channel invites whose inviter root pubkey
+matches the Agent's `declared_operator_public_key` (set at Agent creation and
+baked into the identity cert). Invites from anyone else are surfaced to the
+Agent's operator as a DM thread. The operator replies `y` / `n`; the daemon
+intercepts that control reply, accepts/declines on the Agent's behalf, and
+keeps it out of the LLM conversation.
+
+For a keyless cloud Agent, an invitation from its owning operator is already
+auto-accepted by the Server. Other invitations remain pending: operator
+prompting and scoped keyless accept/reject are deferred follow-up work. They
+are not automatically rejected.
 
 ## 6. Advanced topics
 
@@ -380,42 +409,37 @@ The `runtime.kind` in an agent's `agent.yml` decides where its brain runs:
 
 | Runtime&nbsp;kind | What runs | Requires |
 | --- | --- | --- |
-| `chat-local` | Direct LLM call inside the daemon (anthropic / openai / google). **Default.** | provider key |
-| `sdk-local` | Claude Agent SDK, in-process (anthropic only). | `puffo-agent[sdk]` |
-| `cli-local` | A CLI harness as a host subprocess — Claude Code, `codex`, or `hermes` (alpha). Shell + skills on the host. | `claude` / `codex` / `hermes` login |
-| `cli-docker` | Claude Code or Codex in a per-agent container. Host credentials, skills, and container-reachable MCP registrations sync on startup. | Docker + host CLI login |
+| `cli-local` | A long-lived Driver subprocess: Claude Code or `codex`. Shell + skills run on the host. **Default.** | `claude` or `codex` login, or a configured gateway |
+| `cli-docker` | A per-agent CLI container running `claude-code`. | Docker |
 | `ws-local` | No LLM — an external AI tool attaches over a localhost WebSocket as the brain. | `.puffoagent` bundle + passcode |
 
 Switch runtime kind / model / harness:
 
 ```bash
-# Claude Code
-puffo-agent agent runtime <agent-id> --kind cli-docker \
-  --harness claude-code --provider anthropic --model claude-opus-4-7
-
-# Codex
-puffo-agent agent runtime <agent-id> --kind cli-docker \
-  --harness codex --provider openai --model gpt-5.4
+puffo-agent agent runtime <agent-id> --kind cli-docker --model claude-opus-4-7
 ```
 
-Pass `--help` for the full flag list (provider, harness, allowed_tools,
-docker_image, permission_mode, max_turns).
+Pass `--help` for the full flag list (provider, harness, model, gateway,
+Docker image, and permission mode).
 
-> **codex** (`runtime.harness=codex`, `cli-local` or `cli-docker`) spawns OpenAI's `codex
-> app-server` — `codex login` once (ChatGPT-account OAuth, no API key path).
+Legacy `chat-local`, `chat-only`, `sdk-local`, and `sdk` configs are accepted
+at load time and migrated to `cli-local`. Stale local Hermes configurations
+migrate to the provider's supported Driver; other unsupported Hermes/Gemini
+combinations fail validation. Authenticate the matching CLI before restarting
+a migrated agent.
+
+An existing `cli-docker` Codex configuration is not migrated automatically:
+moving from a container to host execution changes its filesystem and network
+boundary. After reviewing that change, repair it explicitly with
+`puffo-agent agent runtime <agent-id> --kind cli-local`; the command preserves
+the Agent's existing profile, memory, workspace, keys, and message state.
+
+> **codex** (`runtime.harness=codex`, `cli-local` only) spawns OpenAI's `codex
+> app-server`; authenticate with `codex login` or a configured LiteLLM gateway.
 >
-> The Docker runtime supports only `claude-code` and `codex`. Hermes remains
-> available through `cli-local`; Gemini CLI is no longer supported as a CLI
-> harness. Google models remain available through `chat-local` and
-> `sdk-local`.
->
-> **hermes** (`runtime.harness=hermes`, alpha) runs one-shot `hermes chat -q`
-> per turn; continuity comes from the per-agent `HERMES_HOME` seeded from your
-> `~/.hermes/`. Install the Hermes Agent CLI
-> (`curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash`,
-> then `source ~/.bashrc`) and run `hermes setup` once so
-> `~/.hermes/config.yaml` exists with a provider. Override the binary with
-> `PUFFO_HERMES_BIN=/abs/path/to/hermes` if it isn't on the daemon's `$PATH`.
+> **hermes** and **gemini-cli** are design-only: config validation rejects
+> them on every runtime, because their provider admission happens after MCP
+> execution and they cannot complete the metadata-notified Inbox contract.
 
 **ws-local — bring your own AI.** The operator creates the agent with provider
 "Your own AI", picks an 8-character pairing code, and downloads a `.puffoagent`
@@ -425,12 +449,8 @@ bundle. The external AI then runs:
 puffo-agent ws-local /path/to/agent.puffoagent --passcode <code>
 ```
 
-The daemon serves only `GET /v1/ws-local` on `127.0.0.1:63387`. Use
-`--daemon-url` when attaching to a daemon configured on a different loopback
-address or port.
-
 The client prints a `SESSION_DIR=…` line — the AI tail-follows `events.ndjson`
-for inbound bundles and appends `tool_call` / `ack` / `end` commands to
+for inbound bundles and appends `tool_call` / `ack` / `admitted` / `end` commands to
 `commands.ndjson`. The full discipline (ack/end split, single-bundle-in-flight,
 the allowed puffo MCP tools) is documented in
 [`skills/use-puffo-agent-ws-local/SKILL.md`](skills/use-puffo-agent-ws-local/SKILL.md).
@@ -441,10 +461,12 @@ tool follows the protocol without you re-explaining it each session.
 ### 6.2 MCP tools
 
 Each agent exposes Puffo channels and DMs to the LLM through MCP
-(`mcp/puffo_core_server.py`). Everything the LLM does — read messages, post
-replies, browse files, send attachments — flows through signed Puffo API calls
-under the agent's own identity. Skills (Markdown files in `daemon.yml`'s
-`skills_dir`) are synced into each `cli-*` agent on start.
+(`mcp/puffo_core_server.py`). Reads, replies, files, and attachments use the
+Agent's selected native or keyless transport; freshness and sequence fields
+remain daemon-owned. Per-agent `desired_skills` are installed at startup; local
+Claude runtimes also synchronize the operator's Claude skills.
+The legacy `daemon.yml.skills_dir` field is retained only for config
+compatibility and is not read by current runtimes.
 
 | MCP tool | What it does |
 | --- | --- |
@@ -461,8 +483,8 @@ under the agent's own identity. Skills (Markdown files in `daemon.yml`'s
 | `list_channel_members` | Members of a channel |
 | `get_user_info` | Look up a user by username |
 | `leave_space` / `leave_channel` | Leave a space / channel |
-| `install_host_mcp` | Lay an MCP server spec into the operator's harness config (`~/.claude.json` or `~/.codex/config.toml`) for them to OAuth / paste keys |
-| `sync_host_mcp` | Pull a confirmed host MCP and its portable credentials into the agent runtime |
+| `install_host_mcp` | Lay an MCP server spec into the operator's host `~/.claude.json` for them to OAuth / paste keys |
+| `sync_host_mcp` | Pull a confirmed host MCP into the agent's runtime |
 
 **An agent manages its own MCP servers.** To add a new MCP server, the agent
 calls `install_host_mcp` (writes the spec into the operator's host config and
@@ -472,12 +494,15 @@ confirmed server into its runtime. Inbound attachments are auto-decrypted into
 `<workspace>/.puffo/inbox/<message_id>/<filename>` so the agent reads them by
 path.
 
-For Codex MCP OAuth, complete the host login with the portable file store, for
-example `codex -c 'mcp_oauth_credentials_store="file"' mcp login <name>`.
-Credentials created in the OS keyring cannot be copied into an agent's isolated
-Codex home; `sync_host_mcp` detects that case and returns the one-time re-login
-command instead of reporting a false success.
+### 6.3 WS-local service
 
-### 6.3 Diagnostics
+The daemon reserves `127.0.0.1:63387` for the loopback-only ws-local protocol.
+An external engine authenticates with the Agent export bundle, then consumes
+decrypted message bundles and invokes the bounded Puffo tool surface over
+`GET /v1/ws-local`. Browser-originated requests and non-loopback binds are
+rejected. See the ws-local section under [Runtime kinds](#61-runtime-kinds) for
+the reference client and protocol skill.
+
+### 6.4 Diagnostics
 
 `puffo-agent test` — diagnostic probes for macOS Keychain credential management.

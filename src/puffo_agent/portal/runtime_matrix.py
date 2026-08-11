@@ -1,8 +1,18 @@
 """(runtime, provider, harness) validity matrix.
 
 Single source of truth for which combinations are supported, used
-both at agent-load time and at CLI flag-parse time. Harness/provider
-compatibility and runtime-specific availability are validated together.
+both at agent-load time and at CLI flag-parse time. Some harnesses
+are bound to one provider (``claude-code`` → anthropic, ``gemini-cli``
+→ google); ``hermes`` is multi-provider.
+
+Supported today: ``cli-local`` with ``claude-code`` or ``codex``,
+``cli-docker`` with ``claude-code``, and ``ws-local`` (external tool,
+no internal engine). ``hermes`` and ``gemini-cli`` remain design-only —
+no runtime accepts them, because their provider admission happens after
+MCP execution and they cannot correlate a concrete ``read_inbox`` tool
+result, so they cannot complete the metadata-notified Inbox contract.
+They stay enumerated here so a persisted agent.yml carrying one fails
+with that explicit diagnostic instead of a misleading "unknown harness".
 """
 
 from __future__ import annotations
@@ -16,16 +26,12 @@ logger = logging.getLogger(__name__)
 
 # ── Enumerations ──────────────────────────────────────────────────────────────
 
-RUNTIME_CHAT_LOCAL  = "chat-local"
-RUNTIME_SDK_LOCAL   = "sdk-local"
 RUNTIME_CLI_LOCAL   = "cli-local"
 RUNTIME_CLI_DOCKER  = "cli-docker"
 RUNTIME_WS_LOCAL    = "ws-local"  # external tool consumes over localhost WS
 RUNTIME_CLI_SANDBOX = "cli-sandbox"  # reserved; not yet implemented
 
 VALID_RUNTIMES: frozenset[str] = frozenset({
-    RUNTIME_CHAT_LOCAL,
-    RUNTIME_SDK_LOCAL,
     RUNTIME_CLI_LOCAL,
     RUNTIME_CLI_DOCKER,
     RUNTIME_WS_LOCAL,
@@ -62,9 +68,10 @@ VALID_HARNESSES: frozenset[str] = frozenset({
 
 # ── Constraints ───────────────────────────────────────────────────────────────
 
-# Harness → providers it supports. ``codex`` is OpenAI-only but is
-# NOT the default for openai (see DEFAULT_HARNESS_FOR_PROVIDER below);
-# operators opt in via ``runtime.harness: codex`` in agent.yml.
+# Harness → providers it supports. ``resolve_effective_harness`` selects Codex
+# for OpenAI on ``cli-local``. The design-only Hermes/Gemini entries are kept
+# so provider defaults still resolve to a named harness and ``validate_triple``
+# can reject it with the design-only diagnostic; no runtime admits them.
 HARNESS_PROVIDERS: dict[str, frozenset[str]] = {
     HARNESS_CLAUDE_CODE: frozenset({PROVIDER_ANTHROPIC}),
     HARNESS_HERMES:      frozenset({PROVIDER_ANTHROPIC, PROVIDER_OPENAI}),
@@ -72,21 +79,8 @@ HARNESS_PROVIDERS: dict[str, frozenset[str]] = {
     HARNESS_CODEX:       frozenset({PROVIDER_OPENAI}),
 }
 
-HARNESSES_FOR_RUNTIME: dict[str, frozenset[str]] = {
-    RUNTIME_CLI_LOCAL: frozenset({
-        HARNESS_CLAUDE_CODE,
-        HARNESS_HERMES,
-        HARNESS_CODEX,
-    }),
-    RUNTIME_CLI_DOCKER: frozenset({
-        HARNESS_CLAUDE_CODE,
-        HARNESS_CODEX,
-    }),
-}
 
-
-# Runtimes where ``harness`` is meaningful. For chat-local and
-# sdk-local the agent engine is implicit and the field is ignored.
+# Runtimes where ``harness`` is meaningful.
 _HARNESS_BEARING_RUNTIMES: frozenset[str] = frozenset({
     RUNTIME_CLI_LOCAL,
     RUNTIME_CLI_DOCKER,
@@ -106,8 +100,6 @@ def harness_applies(runtime: str) -> bool:
 # model — so provider/harness are inert; the entry keeps the map
 # exhaustive over VALID_RUNTIMES.
 DEFAULT_PROVIDER_FOR_RUNTIME: dict[str, str] = {
-    RUNTIME_CHAT_LOCAL: PROVIDER_ANTHROPIC,
-    RUNTIME_SDK_LOCAL:  PROVIDER_ANTHROPIC,
     RUNTIME_CLI_LOCAL:  PROVIDER_ANTHROPIC,
     RUNTIME_CLI_DOCKER: PROVIDER_ANTHROPIC,
     RUNTIME_WS_LOCAL:   PROVIDER_ANTHROPIC,
@@ -115,22 +107,21 @@ DEFAULT_PROVIDER_FOR_RUNTIME: dict[str, str] = {
 
 DEFAULT_HARNESS_FOR_PROVIDER: dict[str, str] = {
     PROVIDER_ANTHROPIC: HARNESS_CLAUDE_CODE,
-    PROVIDER_OPENAI:    HARNESS_HERMES,
+    PROVIDER_OPENAI:    HARNESS_CODEX,
     PROVIDER_GOOGLE:    HARNESS_GEMINI_CLI,
-}
-
-DEFAULT_DOCKER_HARNESS_FOR_PROVIDER: dict[str, str] = {
-    PROVIDER_ANTHROPIC: HARNESS_CLAUDE_CODE,
-    PROVIDER_OPENAI: HARNESS_CODEX,
 }
 
 
 # ── Legacy-name migration ─────────────────────────────────────────────────────
 
-# Old ``runtime.kind`` values kept working with a one-time WARNING.
+# Direct-provider runtimes were retired in favour of the host-local Driver
+# runtime. Existing agent.yml files still load; AgentConfig normalizes their
+# previously-inert harness field from the provider before validation.
 _LEGACY_KIND_MIGRATIONS: dict[str, str] = {
-    "chat-only": RUNTIME_CHAT_LOCAL,
-    "sdk":       RUNTIME_SDK_LOCAL,
+    "chat-only": RUNTIME_CLI_LOCAL,
+    "chat-local": RUNTIME_CLI_LOCAL,
+    "sdk": RUNTIME_CLI_LOCAL,
+    "sdk-local": RUNTIME_CLI_LOCAL,
 }
 
 
@@ -144,7 +135,9 @@ def migrate_legacy_kind(raw_kind: str, agent_id: str = "") -> str:
         new = _LEGACY_KIND_MIGRATIONS[raw_kind]
         logger.warning(
             "agent %s: runtime.kind %r is deprecated, use %r. "
-            "auto-migrated for this run; please update agent.yml.",
+            "auto-migrated to the CLI Driver runtime for this run; "
+            "authenticate with `claude login` or `codex login`, then update "
+            "agent.yml.",
             agent_id or "(?)", raw_kind, new,
         )
         return new
@@ -164,8 +157,9 @@ def validate_triple(
 ) -> ValidationResult:
     """Check a (runtime, provider, harness) triple.
 
-    Empty ``provider`` / ``harness`` mean "use the default" and are
-    accepted; callers resolve defaults separately.
+    Empty ``provider`` / ``harness`` mean "use the default". Validation
+    resolves those defaults so an unsupported inferred combination cannot
+    pass here and fail later during Worker startup.
     """
     if runtime in RESERVED_RUNTIMES:
         return ValidationResult(False, (
@@ -189,8 +183,7 @@ def validate_triple(
         return ValidationResult(True, "")
 
     if not harness:
-        # Empty means "use default" — resolved by caller.
-        return ValidationResult(True, "")
+        harness = resolve_effective_harness(runtime, provider, harness)
 
     if harness not in VALID_HARNESSES:
         return ValidationResult(False, (
@@ -198,11 +191,31 @@ def validate_triple(
             f"(valid: {', '.join(sorted(VALID_HARNESSES))})"
         ))
 
-    runtime_harnesses = HARNESSES_FOR_RUNTIME.get(runtime, frozenset())
-    if harness not in runtime_harnesses:
+    if runtime == RUNTIME_CLI_LOCAL and harness not in {
+        HARNESS_CLAUDE_CODE,
+        HARNESS_CODEX,
+    }:
         return ValidationResult(False, (
-            f"harness {harness!r} is not supported with runtime {runtime!r} "
-            f"(supported: {', '.join(sorted(runtime_harnesses)) or '(none)'})"
+            f"runtime {RUNTIME_CLI_LOCAL!r} supports only "
+            f"{HARNESS_CLAUDE_CODE!r} and {HARNESS_CODEX!r}; "
+            f"harness {harness!r} is not implemented by the Driver runtime"
+        ))
+
+    if runtime == RUNTIME_CLI_DOCKER and harness != HARNESS_CLAUDE_CODE:
+        if harness == HARNESS_CODEX:
+            return ValidationResult(False, (
+                f"runtime {RUNTIME_CLI_DOCKER!r} supports only "
+                f"{HARNESS_CLAUDE_CODE!r}; harness {HARNESS_CODEX!r} "
+                "requires the host-local Driver runtime — set runtime.kind "
+                f"to {RUNTIME_CLI_LOCAL!r}"
+            ))
+        return ValidationResult(False, (
+            f"runtime {RUNTIME_CLI_DOCKER!r} supports only "
+            f"{HARNESS_CLAUDE_CODE!r}; harness {harness!r} is design-only in "
+            "this release — it cannot complete the metadata-notified Inbox "
+            f"contract. Set runtime.kind {RUNTIME_CLI_LOCAL!r} with harness "
+            f"{HARNESS_CLAUDE_CODE!r} or {HARNESS_CODEX!r}, or keep "
+            f"{RUNTIME_CLI_DOCKER!r} with harness {HARNESS_CLAUDE_CODE!r}"
         ))
 
     if provider:
@@ -234,16 +247,36 @@ def resolve_effective_harness(runtime: str, provider: str, harness: str) -> str:
     if harness:
         return harness
     provider = resolve_effective_provider(runtime, provider)
-    if runtime == RUNTIME_CLI_DOCKER:
-        return DEFAULT_DOCKER_HARNESS_FOR_PROVIDER.get(
-            provider, HARNESS_CLAUDE_CODE,
-        )
+    if runtime == RUNTIME_CLI_LOCAL and provider == PROVIDER_OPENAI:
+        return HARNESS_CODEX
     return DEFAULT_HARNESS_FOR_PROVIDER.get(provider, HARNESS_CLAUDE_CODE)
+
+
+def normalize_inference_level(
+    runtime: str, provider: str, harness: str, inference_level: str,
+) -> str:
+    """Return ``inference_level`` if the effective harness supports it, else "".
+
+    The single source of truth for the harness↔inference_level rule. Every
+    writer of a runtime config calls this after applying its fields, so no
+    writer can persist a level that ``AgentConfig.load`` then rejects.
+    Value-based (rather than taking a ``RuntimeConfig``) to keep this module
+    free of a ``state`` import cycle.
+    """
+    if not inference_level:
+        return ""
+    from ..mcp.config import supported_inference_levels
+
+    effective = resolve_effective_harness(
+        runtime, resolve_effective_provider(runtime, provider), harness
+    )
+    if inference_level in supported_inference_levels(effective):
+        return inference_level
+    return ""
 
 
 __all__ = [
     # runtime constants
-    "RUNTIME_CHAT_LOCAL", "RUNTIME_SDK_LOCAL",
     "RUNTIME_CLI_LOCAL", "RUNTIME_CLI_DOCKER", "RUNTIME_WS_LOCAL",
     "RUNTIME_CLI_SANDBOX",
     # provider constants
@@ -255,7 +288,6 @@ __all__ = [
     "VALID_RUNTIMES", "RESERVED_RUNTIMES",
     "VALID_PROVIDERS", "VALID_HARNESSES",
     "HARNESS_PROVIDERS",
-    "HARNESSES_FOR_RUNTIME",
     # helpers
     "harness_applies",
     "migrate_legacy_kind",
@@ -263,4 +295,5 @@ __all__ = [
     "ValidationResult",
     "resolve_effective_provider",
     "resolve_effective_harness",
+    "normalize_inference_level",
 ]

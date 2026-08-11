@@ -1,7 +1,4 @@
-"""Per-agent pending DM-approval persistence. Entries are keyed by the
-prompt DM's envelope_id (in-thread y/n routes via thread_root_id) and
-survive daemon restarts.
-"""
+"""Persistence for pending per-agent DM approval prompts."""
 
 from __future__ import annotations
 
@@ -33,16 +30,22 @@ def load_pending_dm_approvals(slug: str) -> dict[str, dict[str, Any]]:
     except (OSError, ValueError) as exc:
         logger.warning(
             "pending_dm_approvals: %s unreadable (%s); starting empty",
-            path, exc,
+            path,
+            exc,
         )
         return {}
     if not isinstance(raw, dict):
         return {}
-    return {k: v for k, v in raw.items() if isinstance(v, dict)}
+    return {
+        key: value
+        for key, value in raw.items()
+        if isinstance(value, dict)
+    }
 
 
 def save_pending_dm_approvals(
-    slug: str, pending: dict[str, dict[str, Any]],
+    slug: str,
+    pending: dict[str, dict[str, Any]],
 ) -> None:
     path = pending_dm_approvals_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
