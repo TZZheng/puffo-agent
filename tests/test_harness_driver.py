@@ -1416,6 +1416,42 @@ async def test_claude_driver_accepts_init_after_first_stream_input():
 
 
 @pytest.mark.asyncio
+async def test_claude_driver_prepends_normalized_launch_argv(monkeypatch):
+    """Regression-pin for the A1 gap: the launch argv must be the
+    normalized executable prefix (the Windows wrapper block) followed by
+    the untouched flags. On this host the real boundary passes the
+    executable through, so the wiring + ordering both stay pinned."""
+    import puffo_agent.agent.harness.claude_code_driver as driver_mod
+
+    def make_factory(captured):
+        def factory(args, _spec):
+            captured.extend(args)
+            proc = _FakeProcess()
+            proc.feed({
+                "type": "system", "subtype": "init",
+                "session_id": f"claude-{len(captured)}", "slash_commands": [],
+            })
+            return proc
+        return factory
+
+    posix = []
+    driver = ClaudeCodeCliDriver(make_factory(posix), replay_timeout=1)
+    await driver.open(RuntimeSpec("/workspace", executable="claude"))
+    await driver.close()
+    assert posix[:2] == ["claude", "-p"]
+
+    monkeypatch.setattr(
+        driver_mod, "normalize_launch_argv",
+        lambda executable: ["cmd.exe", "/c", executable + ".cmd"],
+    )
+    windows = []
+    driver = ClaudeCodeCliDriver(make_factory(windows), replay_timeout=1)
+    await driver.open(RuntimeSpec("/workspace", executable="claude"))
+    await driver.close()
+    assert windows[:4] == ["cmd.exe", "/c", "claude.cmd", "-p"]
+
+
+@pytest.mark.asyncio
 async def test_claude_driver_resume_flag_maps_to_resumed_system_init():
     captured = []
 
