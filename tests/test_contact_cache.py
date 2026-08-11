@@ -201,3 +201,28 @@ async def test_keyless_local_allow_block_state(tmp_path, with_path):
     assert await again.is_allowed("bob-2") is True
     assert await again.is_blocked("bob-2") is False
     assert again._allow & again._block == set()
+
+    # A failed durable write must roll the in-memory sets back, in both the
+    # allow and block directions, so a later note retries the full mutation
+    # and the decision actually lands on disk. Without the rollback the
+    # memory stays ahead of disk and the retry skips persistence entirely.
+    write = again._persist_local_state
+
+    def _disk_full():
+        raise OSError("disk full")
+
+    again._persist_local_state = _disk_full
+    with pytest.raises(OSError):
+        again.note_allowed("dave-4")
+    with pytest.raises(OSError):
+        again.note_blocked("carol-3", True)
+    again._persist_local_state = write
+    assert "dave-4" not in again._allow
+    assert "carol-3" not in again._allow
+    assert "carol-3" not in again._block
+    again.note_blocked("carol-3", True)
+    assert "carol-3" in again._block
+    assert "carol-3" not in again._allow
+    disk = ContactCache(_KeylessHttp(), log, local_state_path=path)
+    assert await disk.is_blocked("carol-3") is True
+    assert disk._allow & disk._block == set()

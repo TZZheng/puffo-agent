@@ -14,6 +14,7 @@ from puffo_agent.agent.contact_cache import ContactCache
 from puffo_agent.agent.dm_approvals import (
     load_pending_dm_approvals,
     parse_keyless_approval,
+    save_pending_dm_approvals,
 )
 from puffo_agent.agent.keyless_dm_approval_flow import (
     maybe_handle_operator_reply,
@@ -310,6 +311,40 @@ async def test_denial_conflict_missing_operator_and_persist_failure_fail_closed(
     )
     assert "held-p" not in failed._pending_dm_approvals
     assert failed._bridge.send_calls == []
+
+    # A keyless contact write failure fails closed in both directions: the
+    # decided record stays pending, nothing transitions or ACKs, and replay
+    # retries the durable contact mutation before applying and ACKing the
+    # exact held envelope.
+    monkeypatch.setattr(flow, "save_pending_dm_approvals", save_pending_dm_approvals)
+
+    def _disk_full():
+        raise OSError("disk full")
+
+    for approve, word, seq, sender in ((True, "y", 51, "frank-1"), (False, "n", 61, "grace-1")):
+        slug = "approve-fail" if approve else "deny-fail"
+        fail = _client(slug)
+        await record_gated_dm(fail, envelope_id="held-f", sender_slug=sender, server_seq=seq)
+        write = fail._contacts._persist_local_state
+        fail._contacts._persist_local_state = _disk_full
+        assert await maybe_handle_operator_reply(fail, thread_root_id="prompt-1", text=word) is True
+        fail._contacts._persist_local_state = write
+        assert _record(fail, "held-f").phase == "pending"
+        assert _record(fail, "held-f").decision == ("approved" if approve else "denied")
+        assert fail._bridge.ack_calls == []
+        assert fail.store.promote_calls == []
+        assert fail.store.tombstone_calls == []
+        if approve:
+            assert fail.global_runtime.notifications == 0
+        retry = _client(slug)
+        await resume_pending_approvals(retry)
+        if approve:
+            assert retry.store.promote_calls == [("held-f", seq, flow.APPROVED_REASON)]
+        else:
+            assert retry.store.tombstone_calls == [("held-f", seq)]
+        assert retry._bridge.ack_calls == [["held-f"]]
+        assert (await retry._contacts.is_allowed(sender)) == approve
+        assert (await retry._contacts.is_blocked(sender)) == (not approve)
 
 
 def test_contact_construction_seam():
