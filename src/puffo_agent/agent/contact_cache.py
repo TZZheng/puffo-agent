@@ -157,6 +157,21 @@ class ContactCache:
         )
         os.replace(tmp, path)
 
+    def _persist_or_rollback(self, allow_before: set[str], block_before: set[str]) -> None:
+        """Persist keyless state, restoring the pre-mutation sets on failure.
+
+        The mutation has already been applied in memory; if the durable write
+        raises, the sets are rolled back and the error re-raised so the caller
+        can retry as a full mutation. Memory must never run ahead of disk, or
+        a retry would see "no change" and skip persistence entirely.
+        """
+        try:
+            self._persist_local_state()
+        except OSError:
+            self._allow = allow_before
+            self._block = block_before
+            raise
+
     async def _maybe_refresh(self, *, on_miss: bool) -> None:
         age = self._age()
         if age >= self._ttl:
@@ -196,8 +211,12 @@ class ContactCache:
         if not slug:
             return
         self._ensure_local_state()
+        keyless = self._keyless
+        if keyless:
+            allow_before = set(self._allow)
+            block_before = set(self._block)
         changed = False
-        if self._keyless and slug in self._block:
+        if keyless and slug in self._block:
             # The allow/block sets stay mutually exclusive; an explicit allow
             # cancels a block the operator is reversing.
             self._block.discard(slug)
@@ -205,24 +224,29 @@ class ContactCache:
         if slug not in self._allow:
             self._allow.add(slug)
             changed = True
-        if changed:
-            self._persist_local_state()
+        if changed and keyless:
+            self._persist_or_rollback(allow_before, block_before)
 
     def note_blocked(self, slug: str, blocked: bool) -> None:
         if not slug:
             return
         self._ensure_local_state()
+        keyless = self._keyless
+        if keyless:
+            allow_before = set(self._allow)
+            block_before = set(self._block)
         if blocked:
             changed = False
-            if self._keyless and slug in self._allow:
+            if keyless and slug in self._allow:
                 # Mutual exclusion, mirrored from ``note_allowed``.
                 self._allow.discard(slug)
                 changed = True
             if slug not in self._block:
                 self._block.add(slug)
                 changed = True
-            if changed:
-                self._persist_local_state()
+            if changed and keyless:
+                self._persist_or_rollback(allow_before, block_before)
         elif slug in self._block:
             self._block.discard(slug)
-            self._persist_local_state()
+            if keyless:
+                self._persist_or_rollback(allow_before, block_before)

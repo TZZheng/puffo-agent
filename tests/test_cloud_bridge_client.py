@@ -141,7 +141,9 @@ async def test_send_send_correlates_ack_via_client_ref():
         consumer = asyncio.create_task(_drain(c))
         try:
             ack = await c.send_send(
-                plaintext="hi alice", recipient_slug="alice",
+                plaintext="hi alice",
+                recipient_slug="alice",
+                client_ref="stable-ref",
             )
         finally:
             await c.close()
@@ -152,7 +154,7 @@ async def test_send_send_correlates_ack_via_client_ref():
     sent = bridge_app.recv_send[0]
     assert sent["type"] == "send"
     assert sent["plaintext"] == "hi alice"
-    assert sent["client_ref"] == ack["client_ref"]
+    assert sent["client_ref"] == ack["client_ref"] == "stable-ref"
 
 
 @pytest.mark.asyncio

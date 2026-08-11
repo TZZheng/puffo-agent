@@ -11,6 +11,7 @@ from ..limits import (
     MAX_INLINE_MESSAGE_CHARS,
     MESSAGE_SEGMENT_CHARS,
 )
+from ..portal.state import agent_dir
 from .client_support import AgentLogger, DeviceKeyCache
 from .contact_cache import ContactCache
 from .dm_approvals import load_pending_dm_approvals
@@ -80,6 +81,7 @@ def _membership_state(slug: str) -> dict[str, Any]:
         "_pending_leave_dms": {},
         "_gate_left_spaces": set(),
         "_pending_dm_approvals": load_pending_dm_approvals(slug),
+        "_keyless_dm_approval_lock": asyncio.Lock(),
         "_pending_command_permissions": {},
         "_timed_out_command_permissions": {},
     }
@@ -97,6 +99,31 @@ def _cache_state() -> dict[str, Any]:
         "_channel_name_cache": {},
         "_space_members": {},
     }
+
+
+def _keyless_contact_state_path(slug: str) -> Any:
+    """Per-Agent local contact state for a keyless transport.
+
+    A keyless agent can never hydrate the signed ``/allowlists`` and
+    ``/blocklists`` routes, so its ``ContactCache`` answers (and persists)
+    a small per-Agent JSON allow/block set instead. Signed clients never
+    pass a path and keep today's server-hydration / in-memory behavior.
+    """
+    return agent_dir(slug) / ".puffo-agent" / "keyless_contacts.json"
+
+
+def _contacts(
+    http_client: Any,
+    log: Any,
+    *,
+    slug: str,
+) -> ContactCache:
+    keyless = bool(getattr(http_client, "keyless", False))
+    return ContactCache(
+        http_client,
+        log,
+        local_state_path=_keyless_contact_state_path(slug) if keyless else None,
+    )
 
 
 def initial_client_state(
@@ -143,5 +170,5 @@ def initial_client_state(
     state["_log"] = AgentLogger(
         logging.getLogger("puffo_agent.agent.puffo_core_client"), {"agent": slug}
     )
-    state["_contacts"] = ContactCache(http_client, state["_log"])
+    state["_contacts"] = _contacts(http_client, state["_log"], slug=slug)
     return state
