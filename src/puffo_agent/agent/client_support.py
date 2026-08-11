@@ -22,6 +22,12 @@ DM_GATE_PROMPT_PLACEHOLDER = (
     "[foreign-DM approval prompt — held message withheld from context]"
 )
 
+# Stored in place of the agent's own keyless invitation prompt when the
+# server echoes it back. The echo is an operator-control artifact, not
+# model context; storing the operator-visible prompt verbatim would let the
+# agent "hear itself" ask to accept an invite it is waiting to decide.
+INVITE_PROMPT_PLACEHOLDER = "[invitation prompt — operator decision pending]"
+
 
 class AgentLogger(logging.LoggerAdapter):
     """Prefix daemon logs with the active agent slug."""

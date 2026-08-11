@@ -3,8 +3,8 @@
 One durable :class:`~puffo_agent.agent.keyless_invitation_state.KeylessInvitation`
 per authoritative ``invitation_event_id``. The three async entry points
 (``reconcile``, ``handle_operator_reply``, ``resume``) are scheduled by the
-later integration layer; nothing here is wired into ``bridge_transport`` or
-the bridge frame pump.
+bridge ingress integration in ``bridge_transport``, which owns the
+connection-scoped invitation poller that feeds this flow.
 
 Reconcile: merge the Server's authoritative pending list by exact event id
 without duplicating a prompt, retire/log active records that vanished from
@@ -103,8 +103,9 @@ class KeylessInvitationFlow:
         self, *, thread_root_id: str, text: str,
     ) -> bool:
         """Consume an exact threaded ``y``/``yes``/``n``/``no`` operator
-        reply for one prompted invite; other text or an unknown thread is
-        returned unconsumed."""
+        reply for one prompted invite. ``True`` means its decision is durable
+        and the reply may be acknowledged; unknown replies and failed decision
+        persistence return ``False``."""
         async with self._lock:
             return await self._handle_reply_locked(thread_root_id, text)
 
@@ -115,6 +116,39 @@ class KeylessInvitationFlow:
         known prompt awaiting its exact reply."""
         async with self._lock:
             await self._resume_locked()
+
+    def is_prompt_envelope(self, envelope_id: str) -> bool:
+        """Whether ``envelope_id`` is a durable invitation-prompt envelope.
+
+        Pure and synchronous: bridge ingress runs this on the frame-pump
+        stack so the echo of the agent's own operator prompt is stored as a
+        short control placeholder rather than delivered to model context.
+        Terminal records still count — a late echo of an already-decided
+        prompt must not resurface as operator-visible prompt text.
+        """
+        if not envelope_id:
+            return False
+        return any(
+            (record := parse_keyless_invitation(value)) is not None
+            and record.prompt_envelope_id == envelope_id
+            for value in self._pending.values()
+        )
+
+    def is_operator_reply(self, *, thread_root_id: str, text: str) -> bool:
+        """Whether ``text`` is an exact threaded operator decision for a
+        durable invitation prompt.
+
+        Pure and synchronous: bridge ingress recognizes the reply on the
+        frame-pump stack before scheduling the response-waiting
+        :meth:`handle_operator_reply` as a tracked task. It mirrors the
+        handler's exact ``y``/``yes``/``n``/``no`` vocabulary and thread
+        match but never mutates or persists anything.
+        """
+        if not thread_root_id:
+            return False
+        if text.strip().lower() not in _YES | _NO:
+            return False
+        return self._matching_record(thread_root_id) is not None
 
     async def _reconcile_locked(self, invites: Any) -> None:
         if isinstance(invites, dict) and isinstance(invites.get("invites"), list):
@@ -182,6 +216,15 @@ class KeylessInvitationFlow:
                     event_id,
                 )
                 continue
+            if scope == "channel":
+                channel_id = invite.get("channel_id")
+                if not isinstance(channel_id, str) or not channel_id:
+                    self._log.warning(
+                        "keyless_invitation: skipping channel invite %s "
+                        "without channel_id",
+                        event_id,
+                    )
+                    continue
             valid.append(invite)
         return valid
 
@@ -300,7 +343,7 @@ class KeylessInvitationFlow:
             phase="decided",
         ).to_dict()
         if not self._persist_or_restore(before):
-            return True
+            return False
         await self._send_decision_locked(record.invitation_event_id)
         return True
 
