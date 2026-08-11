@@ -1689,3 +1689,95 @@ async def test_gated_dm_is_withheld_from_the_model_visible_envelope_read():
     assert released is not None
     assert secret in str(released.content)
     await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "row_seq, call_seq",
+    [
+        (None, None),
+        (7, 7),
+        (7, None),
+    ],
+)
+async def test_exact_gated_dm_denial_tombstones_only_the_correlated_receipt(
+    row_seq, call_seq,
+):
+    """The envelope-and-sequence-scoped denial tombstones exactly one gated
+    receipt, is idempotent on replay, and leaves siblings alone.
+
+    The keyless bridge correlates a denial to a single held envelope; the
+    sender-wide ``tombstone_gated_dms_from`` bulk path cannot, because a
+    denied sender may still have approved siblings pending. This guards that
+    the wrong row is never tombstoned, that the refused plaintext is gone,
+    and that an exact replay reports ``IDEMPOTENT`` instead of counting a
+    second tombstone. A sequence-less correlation to a sequenced row must be
+    a ``CONFLICT``: answering ``COMMITTED`` there would let the caller ACK a
+    frame whose refused plaintext was never removed.
+    """
+    store = _temp_store()
+    secret = "refused-plaintext-never-seen-again"
+    sibling = "approved-sibling-stays-readable"
+    if row_seq is None:
+        await store.store_local_receipt(
+            _dm_payload("env_denied", "mallory-9f21", "bot-0001", content=secret),
+            disposition=ReceiptDisposition.FOREIGN_DM_GATED,
+            reason="foreign dm awaiting approval",
+        )
+        await store.store_local_receipt(
+            _dm_payload("env_sibling", "mallory-9f21", "bot-0001", content=sibling),
+            disposition=ReceiptDisposition.FOREIGN_DM_GATED,
+            reason="foreign dm awaiting approval",
+        )
+    else:
+        await store.store_receipt(
+            _dm_payload("env_denied", "mallory-9f21", "bot-0001", content=secret),
+            server_seq=row_seq,
+            disposition=ReceiptDisposition.FOREIGN_DM_GATED,
+            reason="foreign dm awaiting approval",
+        )
+        await store.store_receipt(
+            _dm_payload("env_sibling", "mallory-9f21", "bot-0001", content=sibling),
+            server_seq=row_seq + 100,
+            disposition=ReceiptDisposition.FOREIGN_DM_GATED,
+            reason="foreign dm awaiting approval",
+        )
+
+    if call_seq != row_seq:
+        # A sequence-less correlation to a sequenced row is a mismatch: the
+        # refused plaintext must survive, never be silently tombstoned.
+        mismatch = await store.tombstone_gated_dm("env_denied", call_seq)
+        assert mismatch.status is ReceiptWriteStatus.CONFLICT
+        kept = await store.get_message_by_envelope("env_denied")
+        assert secret in str(kept.content)
+        assert kept.receipt_disposition == ReceiptDisposition.FOREIGN_DM_GATED
+        sibling_row = await store.get_message_by_envelope("env_sibling")
+        assert sibling in str(sibling_row.content)
+        await store.close()
+        return
+
+    if row_seq is not None:
+        wrong = await store.tombstone_gated_dm("env_denied", row_seq + 1)
+        assert wrong.status is ReceiptWriteStatus.CONFLICT
+
+    result = await store.tombstone_gated_dm("env_denied", call_seq)
+    assert result.status is ReceiptWriteStatus.COMMITTED
+    assert result.disposition is ReceiptDisposition.TERMINAL
+
+    row = await store.get_message_by_envelope("env_denied")
+    assert row is not None
+    assert secret not in str(row.content)
+    assert row.receipt_disposition == ReceiptDisposition.TERMINAL
+
+    # Exact replay is idempotent; a missing envelope is a conflict.
+    replay = await store.tombstone_gated_dm("env_denied", call_seq)
+    assert replay.status is ReceiptWriteStatus.IDEMPOTENT
+    missing = await store.tombstone_gated_dm("env_never_seen", call_seq)
+    assert missing.status is ReceiptWriteStatus.CONFLICT
+
+    # The sibling stays gated and its plaintext intact.
+    sibling_row = await store.get_message_by_envelope("env_sibling")
+    assert sibling_row is not None
+    assert sibling in str(sibling_row.content)
+    assert sibling_row.receipt_disposition == ReceiptDisposition.FOREIGN_DM_GATED
+    await store.close()

@@ -2,11 +2,19 @@
 from puffo-server. Per-agent - the server scopes both lists to the
 authenticated identity. Single read/write point for every allow/block
 decision - never hit /allowlists + /blocklists ad hoc.
+
+A keyless transport can never hydrate those signed lists, so a cache given
+an optional per-agent local-state path serves (and atomically persists) a
+small JSON allow/block set instead. Signed caches and keyless caches without
+a path keep today's server/in-memory behavior unchanged.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 
@@ -31,6 +39,7 @@ class ContactCache:
         *,
         ttl: float = 300.0,
         miss_refresh_interval: float = 15.0,
+        local_state_path: str | os.PathLike[str] | None = None,
     ):
         self._http = http_client
         self._log = log
@@ -43,6 +52,12 @@ class ContactCache:
         # True once a server read has actually landed. Distinguishes "the
         # server says these are blocked" from "we have never been told".
         self._hydrated = False
+        # Keyless-only per-Agent local persistence. ``None`` (the default)
+        # keeps every caller's behavior exactly as it was.
+        self._local_state_path = (
+            Path(local_state_path) if local_state_path is not None else None
+        )
+        self._local_state_loaded = False
 
     @property
     def _keyless(self) -> bool:
@@ -89,6 +104,59 @@ class ContactCache:
             return float("inf")
         return time.monotonic() - self._fetched_at
 
+    def _ensure_local_state(self) -> None:
+        """Load the keyless local allow/block set once, if this cache owns it.
+
+        A keyless transport cannot hydrate from the signed server lists, so a
+        cache handed a per-agent path answers from the small JSON set that
+        ``note_allowed`` / ``note_blocked`` persist. Signed caches and keyless
+        caches without a path never read the file and never write one.
+        """
+        if self._local_state_loaded or self._local_state_path is None:
+            return
+        self._local_state_loaded = True
+        if not self._keyless:
+            return
+        path = self._local_state_path
+        if not path.exists():
+            return
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            self._log.warning(
+                "contact_cache: keyless local state %s unreadable (%s); "
+                "starting empty",
+                path,
+                exc,
+            )
+            return
+        if isinstance(raw, dict):
+            allow = raw.get("allow")
+            block = raw.get("block")
+            if isinstance(allow, list):
+                self._allow = {str(entry) for entry in allow if entry} - {""}
+            if isinstance(block, list):
+                self._block = {str(entry) for entry in block if entry} - {""}
+        # The sets stay mutually exclusive even if a hand-edited file breaks
+        # the invariant; an explicit block wins over an allow.
+        self._allow -= self._block
+
+    def _persist_local_state(self) -> None:
+        """Atomically write the keyless local allow/block sets, if owned."""
+        if self._local_state_path is None or not self._keyless:
+            return
+        path = self._local_state_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(
+                {"allow": sorted(self._allow), "block": sorted(self._block)},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        os.replace(tmp, path)
+
     async def _maybe_refresh(self, *, on_miss: bool) -> None:
         age = self._age()
         if age >= self._ttl:
@@ -99,6 +167,7 @@ class ContactCache:
     async def is_allowed(self, slug: str) -> bool:
         if not slug:
             return False
+        self._ensure_local_state()
         await self._maybe_refresh(on_miss=slug not in self._allow)
         return slug in self._allow
 
@@ -115,6 +184,7 @@ class ContactCache:
         """
         if not slug:
             return False
+        self._ensure_local_state()
         await self._maybe_refresh(on_miss=False)
         if not self._hydrated and not self._keyless:
             raise BlocklistUnavailable(
@@ -123,13 +193,36 @@ class ContactCache:
         return slug in self._block
 
     def note_allowed(self, slug: str) -> None:
-        if slug:
+        if not slug:
+            return
+        self._ensure_local_state()
+        changed = False
+        if self._keyless and slug in self._block:
+            # The allow/block sets stay mutually exclusive; an explicit allow
+            # cancels a block the operator is reversing.
+            self._block.discard(slug)
+            changed = True
+        if slug not in self._allow:
             self._allow.add(slug)
+            changed = True
+        if changed:
+            self._persist_local_state()
 
     def note_blocked(self, slug: str, blocked: bool) -> None:
         if not slug:
             return
+        self._ensure_local_state()
         if blocked:
-            self._block.add(slug)
-        else:
+            changed = False
+            if self._keyless and slug in self._allow:
+                # Mutual exclusion, mirrored from ``note_allowed``.
+                self._allow.discard(slug)
+                changed = True
+            if slug not in self._block:
+                self._block.add(slug)
+                changed = True
+            if changed:
+                self._persist_local_state()
+        elif slug in self._block:
             self._block.discard(slug)
+            self._persist_local_state()

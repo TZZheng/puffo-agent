@@ -175,6 +175,95 @@ def test_pending_dm_approvals_non_dict_json_returns_empty(tmp_path):
 
 
 # ─────────────────────────────────────────────────────────────────────
+# Keyless resumable approval record (backward compatible)
+# ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "server_seq, prompt_envelope_id, prompt_thread_id",
+    [
+        (None, None, None),
+        (41, "prompt_env_1", "prompt_thread_1"),
+    ],
+)
+def test_keyless_approval_record_round_trip_and_rejects_malformed(
+    tmp_path, server_seq, prompt_envelope_id, prompt_thread_id,
+):
+    """A validated keyless approval record round-trips through the shared
+    pending file, malformed keyless records are rejected, and legacy native
+    records keep loading unchanged.
+
+    The bridge orchestrator later keys a resumable approval by held envelope,
+    so a restart must reproduce every field exactly (including an absent
+    server sequence) or the reply cannot be correlated. The malformed cases
+    guard silent corruption: a hand-edited or half-written keyless record
+    must never resurface as approval state. The legacy row pins that the
+    same file keeps loading native records untouched.
+    """
+    isolated_home()
+    from puffo_agent.portal.state import agent_dir
+    from puffo_agent.agent.dm_approvals import (
+        KEYLESS_APPROVAL_KIND,
+        KeylessDmApproval,
+        load_pending_dm_approvals,
+        parse_keyless_approval,
+        save_pending_dm_approvals,
+    )
+
+    agent_dir("alpha").mkdir(parents=True, exist_ok=True)
+    record = KeylessDmApproval(
+        envelope_id="held_env_1",
+        sender_slug="mallory-9",
+        operator_slug="op-1",
+        server_seq=server_seq,
+        prompt_client_ref="prompt-ref-abc",
+        prompt_envelope_id=prompt_envelope_id,
+        prompt_thread_id=prompt_thread_id,
+        decision="pending",
+        phase="pending",
+    )
+    pending = {
+        record.envelope_id: record.to_dict(),
+        # One legacy native prompt record must keep loading unchanged.
+        "native_prompt_env_1": {
+            "sender_slug": "alice-1234",
+            "sender_display_name": "Alice",
+        },
+        # Malformed keyless records must be rejected, not resurfaced.
+        "bad_env_1": {
+            "kind": KEYLESS_APPROVAL_KIND,
+            "envelope_id": "bad_env_1",
+            "sender_slug": "mallory-9",
+            "operator_slug": "op-1",
+            "server_seq": "not-an-int",
+            "prompt_client_ref": "prompt-ref",
+            "decision": "pending",
+            "phase": "pending",
+        },
+        "bad_env_2": {
+            "kind": KEYLESS_APPROVAL_KIND,
+            "envelope_id": "wrong-key",
+            "sender_slug": "mallory-9",
+            "operator_slug": "op-1",
+            "server_seq": None,
+            "prompt_client_ref": "prompt-ref",
+            "decision": "maybe",  # not in the exact decision vocabulary
+            "phase": "pending",
+        },
+    }
+    save_pending_dm_approvals("alpha", pending)
+    loaded = load_pending_dm_approvals("alpha")
+
+    assert parse_keyless_approval(loaded[record.envelope_id]) == record
+    assert loaded["native_prompt_env_1"] == {
+        "sender_slug": "alice-1234",
+        "sender_display_name": "Alice",
+    }
+    assert "bad_env_1" not in loaded
+    assert "bad_env_2" not in loaded
+
+
+# ─────────────────────────────────────────────────────────────────────
 # Gate logic — manual client surgery, no WS / HTTP
 # ─────────────────────────────────────────────────────────────────────
 
