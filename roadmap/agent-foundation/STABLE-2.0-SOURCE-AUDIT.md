@@ -3,6 +3,24 @@
 Reviewed, source-grounded inventory for Agent Foundation 2.0 stable readiness.
 This is a documentation audit, not an implementation pass.
 
+## Post-audit implementation status (2026-08-11)
+
+This section records work completed after the frozen audit base. It does not
+rewrite the source evidence or classifications below.
+
+- **A1 local implementation complete:** Agent merge commit `8a56124` routes
+  the Claude Driver executable through `normalize_launch_argv`, including npm
+  `.cmd`/`.bat`, PowerShell `.ps1`, direct `.exe`, and `%APPDATA%\npm`
+  discovery. Focused construction tests pass. One real Windows Claude turn is
+  still external and `not locally verified`.
+- **K1 local implementation complete:** Agent merge commit `ea83bc2` provides
+  resumable keyless foreign-DM and invitation operator authorization, bridge
+  polling/control routing, fail-closed persistence, and durable ACK ordering.
+  The companion Server feature branch is at `393a1af` and provides self-scoped
+  invitation listing and serialized decisions. Agent focused checks and the
+  full Python suite pass; a real Agent-to-Server bridge scenario remains
+  external and `not locally verified`.
+
 ## Method and provenance
 
 - **Frozen source base (immutable):** `b3669377d0978f3b4cdf02647f170522a32ed05e`
