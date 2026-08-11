@@ -21,11 +21,20 @@ runs them in the native order (blocked → self echo → operator control →
 foreign DM → stale → eligible) and only maps each verdict onto the bridge's
 own storage lane.
 
-Known keyless DM gaps: outbound allowlisting on self-echo needs a signed
-``POST /allowlists`` this transport cannot make, and the foreign-DM operator
-approval flow also depends on signed prompt/allowlist/blocklist operations.
-With ``auto_accept_dm=false`` and an operator configured, an untrusted inbound
-DM therefore remains safely gated until a keyless approval control plane exists.
+Known keyless DM gaps: outbound allowlisting on self-echo still needs a
+signed ``POST /allowlists`` this transport cannot make, so an approved
+foreign DM is admitted via local ``ContactCache`` state only. The foreign-DM
+operator approval prompt itself is a plain bridge ``send_send`` DM, and the
+same local contact state records the decision; there is no signed approval
+control plane involved.
+
+Keyless invitations: each real keyless bridge client constructs exactly one
+durable ``KeylessInvitationFlow``. ``listen_bridge`` owns one
+connection-scoped poller that reads the Server's authoritative pending list
+with ``send_list_invites``, reconciles it into the durable flow, and resumes
+any persisted prompt/decision work. The configured operator is prompted only
+through ``send_send``; exact threaded ``y``/``yes``/``n``/``no`` replies are
+consumed as tracked work, and no signed HTTP invitation route is used.
 """
 
 from __future__ import annotations
@@ -43,7 +52,10 @@ from ..limits import (
     MAX_INBOUND_ATTACHMENT_TOTAL_BYTES,
 )
 from . import disk_cache
-from .client_support import DM_GATE_PROMPT_PLACEHOLDER
+from .client_support import (
+    DM_GATE_PROMPT_PLACEHOLDER,
+    INVITE_PROMPT_PLACEHOLDER,
+)
 from .inbound_attachments import (
     downscale_oversized_image,
     is_safe_path_component,
@@ -63,8 +75,12 @@ from .keyless_dm_approval_flow import (
     record_gated_dm,
     resume_pending_approvals,
 )
+from .membership_events import invite_poll_loop
 from .message_context import MENTION_RE, maybe_redact_long_text
 from .message_store import ReceiptDisposition, ReceiptWriteStatus
+
+KEYLESS_DM_REPLY_REASON = "handled keyless dm approval reply"
+KEYLESS_INVITATION_REPLY_REASON = "handled keyless invitation reply"
 
 
 async def listen_bridge(client) -> None:
@@ -78,7 +94,13 @@ async def listen_bridge(client) -> None:
     is scheduled. A fresh ``connect()`` drives ``send_fetch_pending()``
     once so a cold sandbox drains its server-side queue.
 
-    Deliberately does NOT start ``_invite_poll_loop`` /
+    Owns exactly one keyless invitation poller per connection: armed when
+    the first ``pending_delivered`` marker proves the frame pump is live
+    enough to resolve correlated replies, and cancelled and awaited in the
+    connection's ``finally`` so a reconnect creates one fresh poller and
+    never leaks or duplicates background work.
+
+    Deliberately does NOT start the native ``_invite_poll_loop`` /
     ``_warm_member_caches`` — they drive signed HTTP endpoints that
     can't work keyless. Current Server message frames pre-seed sender identity;
     other uncached directory entries degrade to their stable slugs.
@@ -94,9 +116,13 @@ async def listen_bridge(client) -> None:
                 await bridge.connect()
                 backoff = INITIAL_BACKOFF
                 await bridge.send_fetch_pending()
+                client._keyless_invite_poll_task = None
                 async for frame in bridge.frames():
+                    if frame.get("type") == "pending_delivered":
+                        _arm_keyless_invite_poller(client)
                     await client._dispatch_bridge_frame(frame)
             finally:
+                await _stop_keyless_invite_poller(client)
                 await bridge.close()
         except asyncio.CancelledError:
             raise
@@ -110,6 +136,77 @@ async def listen_bridge(client) -> None:
             )
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
+
+
+def _arm_keyless_invite_poller(client) -> None:
+    """Start the connection-owned keyless invitation poller exactly once.
+
+    Called when a ``pending_delivered`` marker establishes that ``frames()``
+    is actively dispatching and can resolve correlated replies. Repeated
+    markers (or a poller that already finished) never spawn a duplicate; the
+    per-connection ``finally`` cancels and awaits it before reconnect.
+    """
+    if getattr(client, "_keyless_invitation_flow", None) is None:
+        return
+    task = getattr(client, "_keyless_invite_poll_task", None)
+    if task is not None and not task.done():
+        return
+    client._keyless_invite_poll_task = asyncio.create_task(
+        keyless_invite_poll_loop(client)
+    )
+
+
+async def _stop_keyless_invite_poller(client) -> None:
+    """Cancel and await the current connection's invitation poller, then
+    clear its ownership slot so the next connect creates one fresh task."""
+    task = getattr(client, "_keyless_invite_poll_task", None)
+    if task is None:
+        return
+    client._keyless_invite_poll_task = None
+    if task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001 - cleanup only
+        pass
+
+
+async def keyless_invite_poll_loop(client) -> None:
+    """The connection-owned keyless invitation poller (fast-then-steady).
+
+    Reuses the native cadence helper: a 2-second initial delay, then 10
+    seconds during the first five minutes and 30 seconds after. Every poll
+    reads the Server's authoritative pending invites, reconciles them into
+    the durable flow, and resumes any persisted prompt/decision work.
+    """
+    flow = getattr(client, "_keyless_invitation_flow", None)
+    if flow is None:
+        return
+    await invite_poll_loop(
+        poll_invites=lambda: poll_keyless_invites(client, flow),
+        next_interval=client._next_invite_poll_interval,
+        sleep=asyncio.sleep,
+    )
+
+
+async def poll_keyless_invites(client, flow) -> None:
+    """One authoritative keyless invitation poll round.
+
+    Fail-soft: a poll failure is logged and retried on the next cadence; it
+    must never escape the poller and kill bridge delivery.
+    """
+    try:
+        invites = await client._bridge.send_list_invites()
+        await flow.reconcile(invites)
+        await flow.resume()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - a poll failure must not stop delivery
+        client._log.warning(
+            "keyless_invitation: poll failed (%s); retrying on next cadence",
+            exc,
+        )
 
 
 async def dispatch_bridge_frame(
@@ -431,6 +528,8 @@ async def store_bridge_payload(
         stored = await client.store.get_message_by_envelope(payload.envelope_id)
         if stored is not None:
             _reschedule_keyless_gated_record(client, payload, stored)
+            if _reschedule_sequence_less_control_reply(client, payload, stored):
+                return False
             return _redelivery_ack(stored)
     row = await _bridge_storage_row(client, payload)
     try:
@@ -468,6 +567,61 @@ def _redelivery_ack(stored) -> bool:
     if stored.receipt_disposition is ReceiptDisposition.FOREIGN_DM_GATED:
         return False
     return True
+
+
+def _reschedule_sequence_less_control_reply(client, payload, stored) -> bool:
+    """Resume a deferred keyless control reply from its terminal receipt.
+
+    Sequence-less compatibility deliveries bypass receipt classification on
+    redelivery. Re-run only the matching durable control handler while its
+    decision is still pending; otherwise the terminal receipt may be ACKed.
+    """
+    row = {"thread_root_id": stored.thread_root_id or payload.thread_root_id or ""}
+    if stored.receipt_reason == KEYLESS_DM_REPLY_REASON:
+        pending = getattr(client, "_pending_dm_approvals", None) or {}
+        thread_root_id = row["thread_root_id"]
+        text = str(payload.content) if payload.content else ""
+        if not is_keyless_operator_approval_reply(
+            pending,
+            thread_root_id=thread_root_id,
+            text=text,
+        ):
+            return False
+        _track_bridge_task(
+            client,
+            asyncio.create_task(
+                _finish_keyless_dm_operator_reply(
+                    client,
+                    thread_root_id=thread_root_id,
+                    text=text,
+                    envelope_id=payload.envelope_id,
+                )
+            ),
+        )
+        return True
+    if stored.receipt_reason == KEYLESS_INVITATION_REPLY_REASON:
+        flow = getattr(client, "_keyless_invitation_flow", None)
+        thread_root_id = row["thread_root_id"]
+        text = str(payload.content) if payload.content else ""
+        if flow is None or not flow.is_operator_reply(
+            thread_root_id=thread_root_id,
+            text=text,
+        ):
+            return False
+        _track_bridge_task(
+            client,
+            asyncio.create_task(
+                _finish_keyless_invitation_reply(
+                    client,
+                    flow,
+                    thread_root_id=thread_root_id,
+                    text=text,
+                    envelope_id=payload.envelope_id,
+                )
+            ),
+        )
+        return True
+    return False
 
 
 def _reschedule_keyless_gated_record(client, payload, stored) -> None:
@@ -554,6 +708,11 @@ async def _bridge_gate_verdict(client, payload, row) -> GateVerdict | None:
             # plaintext the gate is holding. Same redaction the native lane
             # applies, keyed on the durable prompt envelope id here.
             content = DM_GATE_PROMPT_PLACEHOLDER
+        elif _is_keyless_invite_prompt_echo(client, payload.envelope_id):
+            # The echo of the agent's own invitation prompt is operator
+            # control, not model context; store a short placeholder instead
+            # of the operator-visible invitation wording.
+            content = INVITE_PROMPT_PLACEHOLDER
         return GateVerdict(
             gate="self_echo",
             disposition=ReceiptDisposition.TERMINAL,
@@ -569,6 +728,9 @@ async def _bridge_gate_verdict(client, payload, row) -> GateVerdict | None:
     if verdict is not None:
         return verdict
     verdict = await _keyless_operator_reply_gate(client, payload, row)
+    if verdict is not None:
+        return verdict
+    verdict = await _keyless_invitation_reply_gate(client, payload, row)
     if verdict is not None:
         return verdict
     verdict = await foreign_dm_gate(client, payload, _bridge_raw_text(payload))
@@ -614,18 +776,105 @@ async def _keyless_operator_reply_gate(client, payload, row) -> GateVerdict | No
     _track_bridge_task(
         client,
         asyncio.create_task(
-            maybe_handle_operator_reply(
+            _finish_keyless_dm_operator_reply(
                 client,
                 thread_root_id=thread_root_id,
                 text=text,
+                envelope_id=payload.envelope_id,
             )
         ),
     )
     return GateVerdict(
         gate="operator_control",
         disposition=ReceiptDisposition.TERMINAL,
-        reason="handled keyless dm approval reply",
+        reason=KEYLESS_DM_REPLY_REASON,
+        defer_ack=True,
     )
+
+
+async def _finish_keyless_dm_operator_reply(
+    client, *, thread_root_id: str, text: str, envelope_id: str,
+) -> None:
+    """ACK an operator reply only after its approval decision is durable."""
+    durable = await maybe_handle_operator_reply(
+        client,
+        thread_root_id=thread_root_id,
+        text=text,
+    )
+    if durable:
+        await ack_bridge_envelope(client, [envelope_id])
+
+
+def _is_keyless_invite_prompt_echo(client, envelope_id: str) -> bool:
+    """Whether ``envelope_id`` is the agent's own durable invitation prompt.
+
+    The server echoes the prompt back to its sender; that self-echo is
+    operator control and must be stored as a short placeholder, not
+    delivered to model context.
+    """
+    flow = getattr(client, "_keyless_invitation_flow", None)
+    if flow is None:
+        return False
+    return flow.is_prompt_envelope(envelope_id)
+
+
+async def _keyless_invitation_reply_gate(client, payload, row) -> GateVerdict | None:
+    """Consume an exact threaded keyless invitation decision reply.
+
+    Recognition is synchronous against the durable flow's in-memory mirror,
+    so it runs on the frame-pump stack without awaiting anything
+    response-waiting; the locked ``handle_operator_reply`` — which can call
+    ``send_decide_invitation`` and block on correlation — is scheduled as a
+    tracked task the pump keeps feeding. Any other operator control (invite /
+    leave / permission / signed DM approval) has already been decided by
+    ``operator_control_gate`` before this runs.
+    """
+    flow = getattr(client, "_keyless_invitation_flow", None)
+    if flow is None:
+        return None
+    if not (
+        payload.envelope_kind == "dm"
+        and payload.sender_slug == client.operator_slug
+    ):
+        return None
+    # A fast operator reply can arrive before the prompt self-echo has been
+    # persisted locally. The operator identity plus a durable prompt-id match
+    # is sufficient to authenticate this control reference, so retain the raw
+    # wire root as a fallback instead of silently losing the reply.
+    thread_root_id = row["thread_root_id"] or payload.thread_root_id or ""
+    text = str(payload.content) if payload.content else ""
+    if not flow.is_operator_reply(thread_root_id=thread_root_id, text=text):
+        return None
+    _track_bridge_task(
+        client,
+        asyncio.create_task(
+            _finish_keyless_invitation_reply(
+                client,
+                flow,
+                thread_root_id=thread_root_id,
+                text=text,
+                envelope_id=payload.envelope_id,
+            )
+        ),
+    )
+    return GateVerdict(
+        gate="operator_control",
+        disposition=ReceiptDisposition.TERMINAL,
+        reason=KEYLESS_INVITATION_REPLY_REASON,
+        defer_ack=True,
+    )
+
+
+async def _finish_keyless_invitation_reply(
+    client, flow, *, thread_root_id: str, text: str, envelope_id: str,
+) -> None:
+    """ACK an operator reply only after its invitation decision is durable."""
+    durable = await flow.handle_operator_reply(
+        thread_root_id=thread_root_id,
+        text=text,
+    )
+    if durable:
+        await ack_bridge_envelope(client, [envelope_id])
 
 
 async def _commit_bridge_verdict(
@@ -687,7 +936,7 @@ async def _commit_bridge_verdict(
         }
     ):
         runtime.notify_delivery()
-    return result.acknowledge
+    return result.acknowledge and not verdict.defer_ack
 
 
 def _bridge_raw_text(payload) -> str:

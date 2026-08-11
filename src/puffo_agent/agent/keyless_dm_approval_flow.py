@@ -3,8 +3,9 @@
 One durable :class:`~puffo_agent.agent.dm_approvals.KeylessDmApproval` per
 held foreign-DM envelope, one operator prompt per ``(operator_slug,
 sender_slug)`` group. The three async entry points are scheduled by the
-later integration layer; nothing here is wired into ``bridge_transport`` or
-``dm_gate`` yet.
+bridge ingress integration in ``bridge_transport``: ``record_gated_dm`` on a
+held DM, ``maybe_handle_operator_reply`` as tracked reply work, and
+``resume_pending_approvals`` on each reconnect's ``pending_delivered``.
 
 Grouping: every held envelope from one sender against one operator shares a
 single stable ``prompt_client_ref``, prompt thread, and decision. The local
@@ -316,8 +317,9 @@ async def maybe_handle_operator_reply(
     """Consume an exact threaded ``y``/``yes``/``n``/``no`` operator reply.
 
     Persists the decision across every record in the matched prompt group
-    before any local transition, then finalizes each member. Unknown text or
-    an unknown thread returns ``False`` without any save or mutation.
+    before any local transition, then finalizes each member. ``True`` means
+    the reply is represented by a durable decision and may be acknowledged;
+    unknown replies and failed decision persistence return ``False``.
     """
     async with _approval_lock(client):
         return await _maybe_handle_operator_reply_locked(
@@ -369,7 +371,7 @@ async def _maybe_handle_operator_reply_locked(
                     decision=decision,
                 ).to_dict()
         if not _persist_or_restore(client, pending, before):
-            return True
+            return False
     resolved_approved = next(iter(terminal), decision) == "approved"
     for record in matched:
         await _finalize_record(

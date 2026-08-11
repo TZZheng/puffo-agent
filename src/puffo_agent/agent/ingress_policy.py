@@ -63,6 +63,7 @@ class GateVerdict:
     disposition: ReceiptDisposition
     reason: str
     content: str | None = None
+    defer_ack: bool = False
 
 
 def signed_http_available(client: Any) -> bool:
