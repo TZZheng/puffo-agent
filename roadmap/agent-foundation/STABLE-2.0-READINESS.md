@@ -4,6 +4,12 @@ This is the execution backlog for moving `puffo-agent==2.0.0a1` toward a
 stable `2.0.0` release. The release contract and acceptance cases remain in
 [`docs/RELEASE-CANDIDATE-2.0.0a1.md`](../../docs/RELEASE-CANDIDATE-2.0.0a1.md).
 
+The reviewed, source-grounded inventory of every item below against the frozen
+Agent source and local git evidence is in
+[`roadmap/agent-foundation/STABLE-2.0-SOURCE-AUDIT.md`](STABLE-2.0-SOURCE-AUDIT.md).
+Treat that audit as authoritative for classifications and evidence; this table
+tracks status and evidence links.
+
 The goal is readiness evidence and the smallest required fixes. This branch is
 not a new feature integration branch.
 
@@ -47,9 +53,14 @@ evidence.
 
 - Channel encryption and plaintext-channel policy are owned by Han's Agent PR
   #212 and must not be duplicated here.
-- Keyless invitation approval, complete keyless DM trust management, Runtime
-  Event UI, encrypted remote runtime-output streaming, reactions, Hermes,
-  Gemini, ACP, and plaintext DMs remain separate product work.
+- Keyless invitation/DM **operator authorization** is in scope for this
+  workstream as a bounded requirement from the current goal: when an
+  invitation or DM action is not already operator-authorized, the Agent routes
+  a clear authorization request to its configured operator. See the
+  [source audit](STABLE-2.0-SOURCE-AUDIT.md) for the exact missing behavior
+  boundary. The broader keyless DM trust-management surface, Runtime Event UI,
+  encrypted remote runtime-output streaming, reactions, Hermes, Gemini, ACP,
+  and plaintext DMs remain separate product work.
 - Broad refactoring and test-suite expansion are not readiness work. Add only
   tests that guard a changed boundary or a release acceptance failure.
 
