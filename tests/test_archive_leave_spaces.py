@@ -101,6 +101,12 @@ def _seed(server, *, spaces: list[dict]) -> tuple[Path, dict]:
     return Path(home) / "agents" / AGENT_ID, {"url": url, "spaces": spaces}
 
 
+def _home() -> str:
+    import os
+
+    return os.environ["PUFFO_AGENT_HOME"]
+
+
 def _member(space_id: str) -> dict:
     return {"space_id": space_id, "role": "member", "joined_at": 0}
 
@@ -425,6 +431,43 @@ async def test_cli_archive_leaves_spaces_before_revoking(monkeypatch, mock_serve
     assert rc == 0
     assert order == ["leave", "revoke"]
     assert [b["space_id"] for b in state["posted"]] == ["sp_one"]
+
+
+async def test_cli_archive_defers_the_revoke_when_a_leave_fails(
+    monkeypatch, mock_server, capsys
+):
+    """The CLI honours the same defer contract as the daemon — revoking
+    here would 401 the credential the queued leave still needs."""
+    import argparse
+    import asyncio
+
+    from puffo_agent.portal import cli
+    from puffo_agent.portal import import_agents as imp
+
+    server, state = mock_server
+    _seed(server, spaces=[])
+    state["spaces"] = [_member("sp_bad")]
+    state["fail"] = {"sp_bad"}
+
+    revoked: list[str] = []
+
+    async def spy_revoke(archived_dir, *, slug):
+        revoked.append(slug)
+
+    monkeypatch.setattr(imp, "revoke_archived_device", spy_revoke)
+
+    rc = await asyncio.get_running_loop().run_in_executor(
+        None, cli.cmd_agent_archive, argparse.Namespace(id=AGENT_ID)
+    )
+
+    assert rc == 0
+    assert revoked == []
+    dest = next(
+        d for d in (Path(_home()) / "archived").iterdir() if d.is_dir()
+    )
+    assert imp.archived_pending_leave_path(dest).exists()
+    assert imp.archived_pending_revoke_path(dest).exists()
+    assert "revoke deferred" in capsys.readouterr().err
 
 
 # ────────────────────────────────────────────────────────────────────
