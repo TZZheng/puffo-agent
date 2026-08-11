@@ -584,6 +584,7 @@ async def test_a_inbound_dm_frame_routes_as_dm(tmp_path):
         "plaintext": "ping",
     }])
     client = _bridge_client(tmp_path, bridge, db="dm.db")
+    client.auto_accept_dm = True
     done = asyncio.Event()
 
     await _drive_listen_until(client, done=done)

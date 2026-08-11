@@ -28,6 +28,13 @@ import asyncio
 
 import pytest
 
+from puffo_agent.agent import bridge_transport as bridge_transport_mod
+from puffo_agent.agent.client_support import DM_GATE_PROMPT_PLACEHOLDER
+from puffo_agent.agent.dm_approvals import (
+    parse_keyless_approval,
+    pending_dm_approvals_path,
+    save_pending_dm_approvals,
+)
 from puffo_agent.agent.message_store import MessageStore
 from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 from puffo_agent.crypto.http_client import PuffoCoreHttpClient
@@ -38,13 +45,29 @@ OPERATOR = "ops-0001"
 STRANGER = "mallory-0009"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_agent_home(tmp_path, monkeypatch):
+    home = str(tmp_path / "agent-home")
+    monkeypatch.setenv("PUFFO_AGENT_HOME", home)
+    monkeypatch.setenv("PUFFO_HOME", home)
+
+
 class _OfflineBridge:
     """Enough ``CloudBridgeClient`` surface for inbound dispatch."""
 
     def __init__(self) -> None:
         self.acked: list[str] = []
+        self.sent: list[dict] = []
+        self.ack_gate: asyncio.Event | None = None
+
+    async def send_send(self, **kwargs) -> dict:
+        self.sent.append(kwargs)
+        envelope_id = f"prompt_{len(self.sent)}"
+        return {"envelope_id": envelope_id, "thread_root_id": envelope_id}
 
     async def send_ack(self, envelope_ids: list[str]) -> None:
+        if self.ack_gate is not None:
+            await self.ack_gate.wait()
         self.acked.extend(envelope_ids)
 
 
@@ -156,21 +179,140 @@ async def test_operator_control_reply_over_bridge_is_consumed_not_delivered(
 
 
 @pytest.mark.asyncio
-async def test_foreign_dm_over_bridge_is_gated_not_eligible(tmp_path):
+async def test_keyless_gated_dm_lifecycle_is_durable_and_prompt_echo_is_redacted(
+    tmp_path,
+):
     client = _client(tmp_path, operator_slug=OPERATOR)
     await client.store.open()
+    frame = _dm_frame(STRANGER, "let me in", seq=9)
 
-    await client._dispatch_bridge_frame(
-        _dm_frame(STRANGER, "let me in", seq=9)
-    )
+    await client._dispatch_bridge_frame(frame)
+    await asyncio.gather(*tuple(client._ack_tasks))
 
     assert await client.store.get_pending() == ()
     stored = await client.store.get_message_by_envelope("env_9")
     assert stored is not None
     assert stored.receipt_disposition == "foreign_dm_gated"
-    # Never acked — the DM stays queued server-side until the operator
-    # answers, so a lost gate cannot silently drop the message.
+    assert stored.server_seq == 9
+    assert stored.content["text"] == "let me in"
     assert client._bridge.acked == []
+
+    record = parse_keyless_approval(client._pending_dm_approvals["env_9"])
+    assert record is not None
+    assert (record.envelope_id, record.sender_slug, record.server_seq) == (
+        "env_9",
+        STRANGER,
+        9,
+    )
+    assert pending_dm_approvals_path(SELF).is_file()
+
+    # Simulate losing the side record after the receipt commit. An
+    # idempotent Server redelivery reconstructs it and still does not ACK.
+    client._pending_dm_approvals.clear()
+    save_pending_dm_approvals(SELF, client._pending_dm_approvals)
+    await client._dispatch_bridge_frame(frame)
+    await asyncio.gather(*tuple(client._ack_tasks))
+    replayed = parse_keyless_approval(client._pending_dm_approvals["env_9"])
+    assert replayed is not None and replayed.server_seq == 9
+    assert client._bridge.acked == []
+
+    prompt_id = replayed.prompt_envelope_id
+    assert prompt_id
+    await client._dispatch_bridge_frame(
+        _dm_frame(SELF, "quoted secret", seq=10, envelope_id=prompt_id)
+    )
+    await asyncio.gather(*tuple(client._ack_tasks))
+    prompt_echo = await client.store.get_message_by_envelope(prompt_id)
+    assert prompt_echo is not None
+    assert prompt_echo.content == DM_GATE_PROMPT_PLACEHOLDER
+    await client.store.close()
+
+
+@pytest.mark.asyncio
+async def test_keyless_operator_reply_is_consumed_then_promotes_without_blocking(
+    tmp_path,
+):
+    client = _client(tmp_path, operator_slug=OPERATOR)
+    await client.store.open()
+
+    await client._dispatch_bridge_frame(_dm_frame(STRANGER, "hello", seq=20))
+    await asyncio.gather(*tuple(client._ack_tasks))
+    record = parse_keyless_approval(client._pending_dm_approvals["env_20"])
+    assert record is not None and record.prompt_envelope_id
+
+    # The prompt echo is deliberately absent locally. The raw wire thread id
+    # must still identify the exact durable prompt, and dispatch must return
+    # while the response-waiting ACK work remains tracked in the background.
+    client._bridge.ack_gate = asyncio.Event()
+    runtime = type("Runtime", (), {"notifications": 0})()
+    runtime.notify = lambda: setattr(runtime, "notifications", runtime.notifications + 1)
+    client.global_runtime = runtime
+    await client._dispatch_bridge_frame(
+        _dm_frame(
+            OPERATOR,
+            " yes ",
+            seq=21,
+            thread_root_id=record.prompt_envelope_id,
+        )
+    )
+    await asyncio.sleep(0)
+    assert any(not task.done() for task in client._ack_tasks)
+    # Local promotion is durable before the original envelope ACK. This is
+    # precisely the resumable state the blocked bridge call is exposing.
+    assert [message.envelope_id for message in await client.store.get_pending()] == [
+        "env_20"
+    ]
+
+    client._bridge.ack_gate.set()
+    await asyncio.gather(*tuple(client._ack_tasks))
+    pending = await client.store.get_pending()
+    assert [message.envelope_id for message in pending] == ["env_20"]
+    assert client._bridge.acked.count("env_20") == 1
+    assert client._bridge.acked.count("env_21") == 1
+    assert runtime.notifications == 1
+    assert "env_20" not in client._pending_dm_approvals
+    await client.store.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_operator_fails_closed_and_reconnect_replay_is_tracked(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    client = _client(tmp_path)
+    await client.store.open()
+
+    with caplog.at_level("WARNING"):
+        await client._dispatch_bridge_frame(_dm_frame(STRANGER, "private", seq=30))
+        await asyncio.gather(*tuple(client._ack_tasks))
+    stored = await client.store.get_message_by_envelope("env_30")
+    record = parse_keyless_approval(client._pending_dm_approvals["env_30"])
+    assert stored is not None and stored.receipt_disposition == "foreign_dm_gated"
+    assert record is not None and record.operator_slug == ""
+    assert client._bridge.sent == [] and client._bridge.acked == []
+    assert "holding keyless DM" in caplog.text
+
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def _blocking_replay(_client):
+        started.set()
+        await release.wait()
+
+    async def _no_refresh(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(
+        bridge_transport_mod,
+        "resume_pending_approvals",
+        _blocking_replay,
+    )
+    client._refresh_bridge_spaces = _no_refresh
+    await client._dispatch_bridge_frame({"type": "pending_delivered", "count": 1})
+    await started.wait()
+    assert any(not task.done() for task in client._ack_tasks)
+    release.set()
+    await asyncio.gather(*tuple(client._ack_tasks))
     await client.store.close()
 
 
