@@ -1321,6 +1321,10 @@ async def run_daemon(
     daemon_cfg = DaemonConfig.load()
     pid = os.getpid()
     try:
+        # With no live daemon proven above, a leftover stop sentinel
+        # (old-CLI timestamp-only or stale JSON) must not kill the new
+        # process — clear it before publishing our own pid.
+        clear_stop_request()
         write_daemon_pid(pid)
         daemon = Daemon(daemon_cfg)
         loop = asyncio.get_running_loop()

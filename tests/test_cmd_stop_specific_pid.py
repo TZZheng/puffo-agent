@@ -6,9 +6,11 @@ misleading "still running (pid=<old>)".
 from __future__ import annotations
 
 import argparse
+import asyncio
 from unittest.mock import patch
 
 from puffo_agent.portal import cli, state
+from puffo_agent.portal.daemon import run_daemon
 
 
 def _args(timeout: int = 5) -> argparse.Namespace:
@@ -159,9 +161,41 @@ def test_stop_request_is_scoped_to_target_pid(monkeypatch, tmp_path):
     assert state.clear_stop_request(expected_pid=1234) is True
 
 
-def test_legacy_timestamp_stop_request_is_stale(monkeypatch, tmp_path):
+def test_legacy_stop_request_upgrade_lifecycle(monkeypatch, tmp_path):
+    """Old-CLI (timestamp-only) stop sentinel survives the 2.0 upgrade:
+    startup clears a stale pre-start sentinel before the new daemon
+    publishes its pid, a timestamp sentinel written after startup is a
+    valid stop request for the running daemon, and owned cleanup removes
+    the accepted request."""
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
-    state.stop_request_path().write_text("1720000000", encoding="utf-8")
+    legacy = "1720000000"
+    state.stop_request_path().write_text(legacy, encoding="utf-8")
 
-    assert state.read_stop_request_pid() is None
-    assert state.stop_requested_for(1720000000) is False
+    published: dict[str, int] = {}
+
+    def publish_pid(pid):
+        # Pre-start stale sentinel must be gone before PID publication,
+        # so it cannot kill the freshly started daemon.
+        assert not state.stop_request_path().exists()
+        published["pid"] = pid
+
+    async def fake_daemon_run(_self, external_stop_requested=None):
+        state.stop_request_path().write_text(legacy, encoding="utf-8")
+        assert state.stop_requested_for(published["pid"]) is True
+
+    with patch("puffo_agent.portal.daemon.is_daemon_alive", return_value=False), \
+         patch(
+             "puffo_agent.portal.daemon.write_daemon_pid",
+             side_effect=publish_pid,
+         ), \
+         patch(
+             "puffo_agent.portal.daemon._install_posix_stop_handlers",
+             return_value=True,
+         ), \
+         patch("puffo_agent.portal.daemon.Daemon.run", fake_daemon_run), \
+         patch("puffo_agent.portal.daemon.os._exit"):
+        asyncio.run(run_daemon())
+
+    assert "pid" in published
+    # Owned shutdown cleanup removed the accepted legacy request.
+    assert not state.stop_request_path().exists()
