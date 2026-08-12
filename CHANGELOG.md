@@ -6,6 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a3] — 2026-08-12
+
+> Staging-only prompt candidate for manual conversation validation.
+
+### Changed
+
+- **Agent communication now follows concise standing guidance.** Concrete
+  Inbox work defaults to a useful response or clarification, multi-Agent work
+  uses lightweight claims, thread routing is explicit, and the former
+  four-outcome `decide-response` skill is no longer installed.
+
 ## [2.0.0a2] — 2026-08-12
 
 > Pre-release candidate for staging validation only. It is not the stable

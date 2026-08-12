@@ -44,7 +44,7 @@ from .message_store import (
 from ._logging import log_runtime_event
 from .message_projection import CONTEXT_VERSION, format_message_group
 from .reminder_scheduler import ReminderScheduler
-from .shared_content import INBOX_RESPONSE_DECISION_CUE
+from .shared_content import INBOX_TURN_CUE
 
 logger = logging.getLogger(__name__)
 
@@ -499,7 +499,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             "<global_inbox_notice>\n"
             + summary
             + "\n</global_inbox_notice>\n"
-            + INBOX_RESPONSE_DECISION_CUE
+            + INBOX_TURN_CUE
         )
         log_runtime_event(
             logger,
