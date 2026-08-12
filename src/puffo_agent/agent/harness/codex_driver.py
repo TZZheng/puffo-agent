@@ -218,6 +218,11 @@ class CodexAppServerDriver(Driver):
         self._fallback_block_id: str | None = None
         self._fallback_block_counter = 0
         self._closed = False
+        # Turn-scoped token accounting: the baseline freezes on the first
+        # observed thread totals and the latest derived values stand at
+        # turn/completed. Cleared on every terminal, start-failure, and close.
+        self._usage_baseline: tuple[int, int] | None = None
+        self._usage_latest: dict[str, int] = {}
 
     async def open(
         self, spec: RuntimeSpec, resume: SessionRef | None = None
@@ -338,6 +343,10 @@ class CodexAppServerDriver(Driver):
     async def start_turn(self, input: TurnInput):
         if self._active.value:
             raise RuntimeError("one turn is already active")
+        # Clear the previous turn before issuing turn/start. The reader may
+        # receive this turn's first tokenUsage notification immediately after
+        # the response future resolves, before this coroutine resumes.
+        self._reset_usage()
         local = TurnRef(f"turn_{uuid.uuid4().hex}")
         self._active = local
         params: dict[str, Any] = {
@@ -350,11 +359,13 @@ class CodexAppServerDriver(Driver):
             result = await self._request("turn/start", params)
         except BaseException:
             self._active = TurnRef("")
+            self._reset_usage()
             raise
         turn = result.get("turn", result) if isinstance(result, dict) else {}
         native = str(turn.get("id") or turn.get("turnId") or "")
         if not native:
             self._active = TurnRef("")
+            self._reset_usage()
             raise RuntimeError("Codex turn/start omitted native turn id")
         self._active_native_turn_id = native
         return TurnStarted(local, native)
@@ -457,6 +468,7 @@ class CodexAppServerDriver(Driver):
         self._permission_requests.clear()
         self._open_output_blocks.clear()
         self._fallback_block_id = None
+        self._reset_usage()
         self._context = ContextStatus(stale=True)
         await self._events.put(None)
 
@@ -470,6 +482,7 @@ class CodexAppServerDriver(Driver):
         self._permission_requests.clear()
         self._open_output_blocks.clear()
         self._fallback_block_id = None
+        self._reset_usage()
         self._context = ContextStatus(stale=True)
 
     def _fail_pending_requests(self, message: str) -> None:
@@ -649,6 +662,7 @@ class CodexAppServerDriver(Driver):
                 context_window=_integer(usage.get("modelContextWindow")),
                 stale=False,
             )
+            self._update_usage(usage)
             await self._emit(
                 HarnessEventType.CONTEXT_UPDATED,
                 turn_ref=self._active,
@@ -824,10 +838,13 @@ class CodexAppServerDriver(Driver):
             if "fail" in status
             else "succeeded"
         )
+        data: dict[str, Any] = {"outcome": outcome}
+        if self._usage_latest:
+            data.update(self._usage_latest)
         await self._emit(
             HarnessEventType.TURN_COMPLETED,
             turn_ref=self._active,
-            data={"outcome": outcome},
+            data=data,
             native_payload=frame,
         )
         # Permission requests are scoped to the sole active turn. Once that
@@ -835,6 +852,53 @@ class CodexAppServerDriver(Driver):
         # retain no unreachable request payloads in the long-lived Driver.
         self._permission_requests.clear()
         self._active, self._active_native_turn_id = TurnRef(""), ""
+        self._reset_usage()
+
+    def _update_usage(self, usage: dict[str, Any]) -> None:
+        """Restore the historical per-turn ``last``/``total`` token semantics.
+
+        ``last`` is the latest single request; ``total`` is the whole thread.
+        The turn's input/output are non-negative deltas from the first observed
+        thread totals, with re-sent cached input excluded, and context comes
+        from ``last.totalTokens``. The final values stand at turn/completed.
+        """
+        last = usage.get("last")
+        total = usage.get("total")
+        if not isinstance(last, dict) or not isinstance(total, dict):
+            return
+        context_tokens = last.get("totalTokens")
+        if (
+            isinstance(context_tokens, int)
+            and not isinstance(context_tokens, bool)
+            and context_tokens > 0
+        ):
+            self._usage_latest["context_tokens"] = context_tokens
+        try:
+            cum_out = int(total.get("outputTokens") or 0)
+            cum_in = max(
+                0,
+                int(total.get("inputTokens") or 0)
+                - int(total.get("cachedInputTokens") or 0),
+            )
+            if self._usage_baseline is None:
+                last_in = max(
+                    0,
+                    int(last.get("inputTokens") or 0)
+                    - int(last.get("cachedInputTokens") or 0),
+                )
+                self._usage_baseline = (
+                    cum_out - int(last.get("outputTokens") or 0),
+                    cum_in - last_in,
+                )
+            out_base, in_base = self._usage_baseline
+            self._usage_latest["output_tokens"] = max(0, cum_out - out_base)
+            self._usage_latest["input_tokens"] = max(0, cum_in - in_base)
+        except (TypeError, ValueError):
+            return
+
+    def _reset_usage(self) -> None:
+        self._usage_baseline = None
+        self._usage_latest = {}
 
     async def _emit(
         self,
