@@ -1,8 +1,8 @@
 # Agent Foundation 2.0 Compatibility Matrix
 
 Source-grounded inventory of pre-2.0 Web-visible contracts affected by the
-Agent Foundation 2.0 migration, with classifications, exact evidence, ownership,
-and bounded acceptance criteria for later work.
+Agent Foundation 2.0 migration, their original failure evidence, implemented
+repairs, and bounded acceptance evidence.
 
 ## Purpose and method
 
@@ -10,9 +10,9 @@ and bounded acceptance criteria for later work.
   (referenced, not modified).
 - Findings F001-F006:
   `/Users/glimmer/Desktop/projects/puffo.ai/slock-agent/research/puffo-agent-staging-findings/`.
-- Current-source behavior was re-checked against the **Agent worktree** at the
-  recorded HEAD and the **bounded Server contract** at the recorded Server HEAD.
-  Web-side claims are attributed to the frozen findings, not re-inspected here.
+- The detailed pre-repair source blocks remain frozen at the diagnosis snapshots
+  so the failure mechanism stays auditable. Resolution claims are pinned
+  separately to the current Agent and Server heads below.
 - Git history was used only to recover specific pre-2.0 contracts (stop sentinel,
   `cli-docker + codex` admission/adapter/image/tests, status lifecycle wiring,
   telemetry projection, baseline fallback introduction).
@@ -23,20 +23,63 @@ and bounded acceptance criteria for later work.
 
 | Surface | Snapshot |
 |---|---|
-| Agent worktree | `dd5f4ef517decaa814ffb9bc27b7c2d2b53efc89` (matches canonical `puffo-agent-stable-readiness`) |
-| Server worktree | `393a1af6f54b9f44e0711437bd787ce0f093e80b` (`puffo-server-keyless-agent-auth`) |
+| Agent diagnosis snapshot | `dd5f4ef517decaa814ffb9bc27b7c2d2b53efc89` |
+| Server diagnosis snapshot | `393a1af6f54b9f44e0711437bd787ce0f093e80b` |
+| Agent repaired head | `8641a89` (`feat/agent-foundation-stable-readiness`) |
+| Server repaired head | `ae0f238` (`feat/keyless-agent-authorization`) |
 | Integration commit audited | `0d9f44d` "Integrate Agent Foundation across native and keyless cloud runtimes (#225)" |
 | Findings source | `puffo-agent-staging-findings` snapshot 2026-08-11; staging Server `sha-7ad4698b959a`; package `puffo-agent==2.0.0a1` |
 
 All Agent path citations below are relative to the Agent worktree root; Server
-citations are under `server/` in the Server worktree. Line numbers are from the
-recorded HEADs.
+citations are under `server/` in the Server worktree. Line numbers in the
+diagnosis blocks refer to the recorded diagnosis snapshots.
+
+## Resolution status
+
+| Finding | Status | Bounded evidence |
+|---|---|---|
+| F001 introduction / baseline | Restored | Missing local row remains `None`; JSON `null`, authoritative `0`, and positive sequence values stay distinct. Server establishes a numeric baseline only inside the first successful coordinated send. Five Agents joining both empty-history and pre-history channels each introduced themselves once. |
+| F002 busy / activity strip | Restored | Global Inbox turns open and close the legacy Server status lifecycle. Real Web acceptance showed `Processing` during work and `Idle` after completion for all five Agents. Daemon-local membership/reminder envelopes no longer call message-processing endpoints for nonexistent message IDs. |
+| F003 Docker Codex | Restored with residual live-provider risk | `cli-docker + openai + codex` is admitted and wired through the Driver transport, isolated home, image, cleanup, and persisted-session paths. The bounded Docker smoke did not execute a live provider turn because the local Agent Core data/RPC dependency was unavailable. |
+| F004 stop upgrade | Restored | Current daemon accepts both legacy timestamp-only and PID-scoped JSON stop sentinels; current CLI waits on the exact daemon PID. Focused old/new compatibility and bounded shutdown tests pass. |
+| F005 logs / telemetry | Restored at Agent contracts | Safe Driver lifecycle/tool events and Codex/Claude token/context telemetry are projected without raw reasoning. Runtime-event recovery was proven for 5/5 Agents. The current local Web session could not verify the local Profile Log body because it was not paired to the Python daemon and correctly disabled device-local Log/Files tabs. |
+| F006 Activity / Files | Intentionally deferred | These surfaces did not have a complete pre-2.0 contract and remain product work. |
+
+### Cross-cutting reconnect recovery
+
+Product acceptance exposed a separate compatibility failure: three Agents had
+old `agent_runtime_state` rows left `running` after an earlier Runtime session
+disappeared. Every event from their replacement session was rejected with
+`409 invalid_turn_transition`, leaving Profile/runtime projection data stale.
+
+Server commit `ae0f238` allows a `turn.started` from a different `session_ref`
+to atomically replace an incomplete active turn. A second turn in the same
+session remains invalid, reused turn references remain invalid, and late events
+from the replaced session are fenced. No schema change or backfill is needed;
+existing installations recover lazily on their next real turn.
+
+Evidence:
+
+- 14 focused Runtime Events tests pass, including replacement-session recovery
+  and rejection of a late event from the old session.
+- The unchanged local database contained three independently reproduced stale
+  projections. A fresh five-Agent channel produced three explicit
+  `runtime_event_session_takeover` transitions, Runtime Events for all 5/5
+  Agents, five introductions, and five terminal `succeeded` projections.
+- The same real browser run showed all five avatar states return to `Idle`; no
+  runtime-event `409` remained after takeover.
 
 ---
 
 ## F001 — New-member introduction stalls at the visibility boundary
 
-**Classification: `missing`**
+**Classification: `restored`**
+
+Resolution: Agent merge `1f980ea` and Server merge `b1acd07` restore the
+optional baseline contract. Missing local state is represented by no row and
+serializes as JSON `null`; `0` remains an authoritative empty boundary. The
+Server returns the established numeric value, which the daemon persists for
+later sends and restarts. Membership/attach does not inspect encrypted history.
 
 ### Frozen compatibility contract
 
@@ -50,7 +93,7 @@ The 2026-07-26 design intent was to send JSON `null` for
 Server lazily establish the numeric baseline inside a successful coordinated
 send. Freshness fields are daemon-owned; the model never supplies them.
 
-### Current source behavior
+### Pre-repair source behavior (frozen diagnosis)
 
 - Agent storage for the baseline exists but has **no production writer**:
   `src/puffo_agent/agent/inbox_store.py:1024-1061` defines
@@ -138,7 +181,12 @@ Agent (`send_coordinator`, `inbox_store`, `membership_actions`,
 
 ## F002 — Agent busy status and chat activity strip are missing
 
-**Classification: `missing`**
+**Classification: `restored`**
+
+Resolution: Agent merge `8472281` restores the Global Inbox status lifecycle;
+commit `8641a89` classifies membership, intro, and reminder envelopes as local
+synthetic work so they update Agent busy state without inventing a processing
+run for a nonexistent server message.
 
 ### Old contract
 
@@ -150,7 +198,7 @@ turn: `reporter.begin_turn(first_post_id)` before the batch and
 `message_processing_runs`, which the chat UI renders as avatar busy state and
 the activity strip.
 
-### Current source behavior
+### Pre-repair source behavior (frozen diagnosis)
 
 - The Global Inbox turn path never calls the lifecycle:
   `src/puffo_agent/portal/worker_run.py:430-452` (`_execute_global_turn`) calls
@@ -211,7 +259,12 @@ owns the status/run storage and broadcast contract.
 
 ## F003 — `cli-docker + codex` support regressed in 2.0.0a1
 
-**Classification: `missing`**
+**Classification: `restored`**
+
+Resolution: Agent merge `8fc5c43` restores the Docker Codex admission,
+preparation, Driver transport, isolated runtime home, cleanup, and persisted
+session compatibility paths. The real-provider-turn residual is recorded in
+the status table rather than hidden by the passing bounded smoke.
 
 ### Old contract
 
@@ -228,7 +281,7 @@ provider `openai` and harness `codex`:
   credential view, MCP config, app-server command, persisted sessions, and
   Docker binary selection.
 
-### Current source behavior
+### Pre-repair source behavior (frozen diagnosis)
 
 - The runtime matrix rejects the combination:
   `src/puffo_agent/portal/runtime_matrix.py:204-211` admits only `claude-code`
@@ -283,7 +336,11 @@ Agent.
 
 ## F004 — `puffo-agent stop` does not exit normally after upgrade
 
-**Classification: `missing`**
+**Classification: `restored`**
+
+Resolution: Agent merge `f65e9ee` restores legacy sentinel parsing and exact
+PID-scoped shutdown behavior; follow-up commit `0609961` records the accepted
+upgrade contract and evidence.
 
 ### Old contract
 
@@ -292,7 +349,7 @@ the daemon treated the mere existence of the file as a stop request
 (`0d9f44d^:src/puffo_agent/portal/state.py:1502-1506`,
 `write_stop_request` writes `str(int(time.time()))`).
 
-### Current source behavior
+### Pre-repair source behavior (frozen diagnosis)
 
 - The sentinel is now PID-scoped JSON: `write_stop_request` writes
   `{"pid": ..., "created_at": ...}` (`src/puffo_agent/portal/state.py:1145-1156`;
@@ -353,7 +410,11 @@ Agent.
 
 ## F005 — Agent Profile Log loses Driver detail and Codex telemetry
 
-**Classification: `missing`**
+**Classification: `restored at Agent contracts`**
+
+Resolution: Agent merge `5bec939` restores safe Driver-to-legacy projection and
+token/context telemetry; follow-up commit `d5ddb2b` records the compatibility
+evidence. Raw provider frames and private chain-of-thought remain excluded.
 
 ### Old contract
 
@@ -365,7 +426,7 @@ The Web Profile Log consumed decrypted legacy `agent.status` events
 retained current-context usage; the old `core.py` added `current_context` to
 `turn_complete` when present.
 
-### Current source behavior
+### Pre-repair source behavior (frozen diagnosis)
 
 - The 2.0 core emits only the outer legacy boundaries and drops `current_context`:
   `src/puffo_agent/agent/core.py:380-404` emits `turn_start` and
@@ -476,25 +537,29 @@ distinguish `no results`, `not loaded`, `not supported`, `not authorized`.
 
 ## Additional evidence-backed pre-2.0 Web-visible contracts
 
-Within the bounded evidence inventory (the six findings plus the named contract
-areas: Global Inbox/status-run ownership, encrypted `agent.status` projection,
-Codex/Claude normalized events and token/context mapping, Docker/Codex
-admission and adapters, stop sentinel read/write/shutdown, and baseline storage,
-request construction, response validation, and held/replay/retry behavior), no
-further confirmed lost pre-2.0 Web-visible contract was found beyond F001-F005.
+Within the bounded evidence inventory, F001-F005 are restored and F006 remains
+intentionally deferred. Acceptance found the additional stale Runtime-session
+projection failure documented above; it is fixed at Server `ae0f238`.
 
-Two observations attached to F001 remain **unclassified unknowns** (recorded
-under F001): an intro Inbox row can be marked `processed` without a committed
-outbound introduction, and delayed recovery can surface coordination internals
-to channel users. No unsupported additional contract is presented as confirmed.
+The legacy Python `machine link` command still emits a `/link-machine` URL while
+the current Web exposes the newer `/agents/pair` flow. This is a separate
+unresolved compatibility finding, not part of F001-F006 and not silently
+classified as restored here.
+
+The extended behavioral acceptance prompt asking five Agents to count five
+times stopped after `11/25`. Its Inbox slice was complete and untruncated, and
+the deciding Agent returned `[SILENT]` despite an open repeated obligation.
+Ordinary counting (`1,2,3,4,5`) and the fourth-is-one variant (`1,2,3,1,5`)
+passed. This remains a model-behavior residual rather than evidence that the
+baseline, status, or Runtime Events compatibility contracts are broken.
 
 ---
 
-## Downstream slice definitions
+## Historical implementation slices (completed)
 
-These bounds the two later independent work slices. Normalized Harness Driver
-events remain the single internal source of truth; both slices must preserve
-that invariant.
+These were the ownership bounds used while restoring the contracts. They are
+retained as implementation history. Normalized Harness Driver events remain the
+single internal source of truth.
 
 ### Slice 1 — Agent-only legacy status/processing and safe projection (observability)
 
@@ -574,7 +639,8 @@ without blocking unrelated compatibility restoration.
 
 ## Source evidence index
 
-Agent (at `dd5f4ef517decaa814ffb9bc27b7c2d2b53efc89`):
+Pre-repair Agent diagnosis (at
+`dd5f4ef517decaa814ffb9bc27b7c2d2b53efc89`):
 
 - `src/puffo_agent/portal/runtime_matrix.py:204-211` (F003 current rejection)
 - `src/puffo_agent/agent/adapters/docker_cli.py:103,183-189` (F003 Claude-only)
@@ -594,7 +660,8 @@ Agent (at `dd5f4ef517decaa814ffb9bc27b7c2d2b53efc89`):
 - `src/puffo_agent/agent/harness/runtime_manager.py:800-812` (F005)
 - `src/puffo_agent/agent/adapters/cli_session.py:1351-1372` (F005 projection)
 
-Server (at `393a1af6f54b9f44e0711437bd787ce0f093e80b`):
+Pre-repair Server diagnosis (at
+`393a1af6f54b9f44e0711437bd787ce0f093e80b`):
 
 - `server/src/v2/agent_runtime_messages.rs:27-31,73-96` (F001 DTO/validation)
 - `server/src/messages.rs:828-912` (F001 send decision / held)
@@ -615,8 +682,7 @@ History (`git show <commit>:<path>` verified for each):
 
 ## Confirmed evidence vs unknowns
 
-Each entry separates confirmed source/history evidence (citations verified
-against the recorded HEADs above) from explicitly stated unknowns. Claims about
-staging observation, the installed wheel, and the Web consumer are attributed to
-the frozen findings (F001-F006) and were not re-run or re-inspected in this
-documentation run.
+Each entry separates confirmed source/history evidence from explicitly stated
+unknowns. The resolution table adds the later focused tests and local product
+acceptance. It does not claim a paired-device Profile Log UI test or a live
+Docker provider turn where those environments were unavailable.
