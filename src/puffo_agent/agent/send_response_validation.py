@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Mapping
 
 if TYPE_CHECKING:
     from .send_coordinator import SendResult
+
+
+logger = logging.getLogger(__name__)
 
 
 _LEGACY_HELD_RESPONSE_FIELDS = frozenset(
@@ -61,6 +65,25 @@ def optional_response_int(raw: Any, name: str, prefix: str) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError(f"{prefix} has invalid {name}")
     return value
+
+
+async def persist_baseline(
+    source: Any,
+    space_id: str,
+    channel_id: str,
+    request_baseline: int | None,
+    established: int | None,
+) -> None:
+    """Persist a validated Server-established baseline from a null-baseline commit."""
+    if request_baseline is not None or established is None:
+        return
+    try:
+        from .send_coordinator import _call_first
+
+        await _call_first(source, ("set_context_baseline_seq",),
+                          space_id, channel_id, established)
+    except Exception:
+        logger.exception("persist baseline failed for %s/%s", space_id, channel_id)
 
 
 def validate_keyless_response(raw: Any, request_body: Mapping[str, Any]) -> SendResult:
@@ -128,7 +151,7 @@ def _keyless_sent_result(
         replay=replay,
         devices_queued=queued,
         missing_devices=list(missing),
-        context_baseline_seq=freshness["context_baseline_seq"],
+        context_baseline_seq=echoed["context_baseline_seq"],
         seen_seq=freshness["seen_seq"],
         latest_seq_before_send=echoed["latest_seq_before_send"],
         mode=echoed["mode"],
@@ -144,14 +167,33 @@ def _keyless_freshness_is_valid(echoed: Any, freshness: Mapping[str, Any]) -> bo
     }:
         return False
     latest = echoed.get("latest_seq_before_send")
+    echoed_baseline = echoed.get("context_baseline_seq")
+    request_baseline = freshness["context_baseline_seq"]
+    baseline_ok = (
+        not isinstance(echoed_baseline, bool)
+        and isinstance(echoed_baseline, int)
+        and echoed_baseline >= 0
+        and (request_baseline is None or echoed_baseline == request_baseline)
+    )
+    # A null-baseline commit has no local boundary, so the Server establishes
+    # the baseline at the latest committed seq; the echo must agree exactly.
+    established_at_latest = request_baseline is not None or (
+        not isinstance(latest, bool)
+        and isinstance(latest, int)
+        and latest == echoed_baseline
+    )
     return (
         echoed.get("mode") == freshness["mode"]
         and echoed.get("seen_seq") == freshness["seen_seq"]
-        and echoed.get("context_baseline_seq") == freshness["context_baseline_seq"]
+        and baseline_ok
+        and established_at_latest
         and not isinstance(latest, bool)
         and isinstance(latest, int)
         and latest >= freshness["seen_seq"]
-        and (freshness["mode"] != "require_current" or latest == freshness["seen_seq"])
+        and (
+            freshness["mode"] != "require_current"
+            or latest == max(echoed_baseline, freshness["seen_seq"])
+        )
     )
 
 
@@ -164,10 +206,7 @@ def _keyless_held_result(
     has_blocker = any(key in raw for key in _BLOCKING_HELD_RESPONSE_FIELDS)
     valid = (
         raw.get("seen_seq") == freshness["seen_seq"]
-        and (
-            raw.get("context_baseline_seq") is None
-            or raw.get("context_baseline_seq") == freshness["context_baseline_seq"]
-        )
+        and raw.get("context_baseline_seq") == freshness["context_baseline_seq"]
         and not isinstance(latest, bool)
         and isinstance(latest, int)
         and latest > freshness["seen_seq"]
@@ -243,7 +282,7 @@ def _validate_sent_channel_response(
     validated = _validate_sent_freshness(raw, freshness, replay)
     if isinstance(validated, SendResult):
         return validated
-    has_freshness, latest_before = validated
+    has_freshness, latest_before, established_baseline = validated
     if "missing_devices" not in raw:
         return _protocol_error("sent response omitted missing_devices")
     missing = raw["missing_devices"]
@@ -264,7 +303,7 @@ def _validate_sent_channel_response(
         seq=seq,
         replay=replay,
         devices_queued=devices_queued,
-        context_baseline_seq=freshness["context_baseline_seq"],
+        context_baseline_seq=established_baseline,
         seen_seq=freshness["seen_seq"],
         latest_seq_before_send=latest_before if has_freshness else None,
         missing_devices=missing,
@@ -273,7 +312,7 @@ def _validate_sent_channel_response(
 
 def _validate_sent_freshness(
     raw: Mapping[str, Any], freshness: Mapping[str, Any], replay: bool
-) -> tuple[bool, int | None] | SendResult:
+) -> tuple[bool, int | None, int | None] | SendResult:
     has_freshness = "freshness" in raw
     response = raw.get("freshness")
     # Legacy-created replay is identified by replay=true and no stored v2
@@ -281,7 +320,7 @@ def _validate_sent_freshness(
     if not has_freshness and replay is not True:
         return _protocol_error("sent response omitted freshness")
     if not has_freshness:
-        return False, None
+        return False, None, None
     if not isinstance(response, Mapping):
         return _protocol_error("sent response freshness is malformed")
     if set(response) != {
@@ -298,7 +337,7 @@ def _validate_sent_freshness(
         response, freshness, baseline_echo, seen_echo, latest_before
     ):
         return _protocol_error("sent response freshness mismatch")
-    return True, latest_before
+    return True, latest_before, baseline_echo
 
 
 def _sent_freshness_matches(
@@ -308,12 +347,24 @@ def _sent_freshness_matches(
     seen_echo: Any,
     latest_before: Any,
 ) -> bool:
+    request_baseline = freshness["context_baseline_seq"]
+    baseline_ok = (
+        not isinstance(baseline_echo, bool)
+        and isinstance(baseline_echo, int)
+        and baseline_echo >= 0
+        and (request_baseline is None or baseline_echo == request_baseline)
+    )
+    # A null-baseline commit has no local boundary, so the Server establishes
+    # the baseline at the latest committed seq; the echo must agree exactly.
+    established_at_latest = request_baseline is not None or (
+        not isinstance(latest_before, bool)
+        and isinstance(latest_before, int)
+        and latest_before == baseline_echo
+    )
     return not (
         response.get("mode") != freshness["mode"]
-        or isinstance(baseline_echo, bool)
-        or not isinstance(baseline_echo, int)
-        or baseline_echo < 0
-        or baseline_echo != freshness["context_baseline_seq"]
+        or not baseline_ok
+        or not established_at_latest
         or isinstance(seen_echo, bool)
         or not isinstance(seen_echo, int)
         or seen_echo < 0
@@ -322,7 +373,10 @@ def _sent_freshness_matches(
         or not isinstance(latest_before, int)
         or latest_before < 0
         or latest_before < max(baseline_echo, seen_echo)
-        or (freshness["mode"] == "require_current" and latest_before != seen_echo)
+        or (
+            freshness["mode"] == "require_current"
+            and latest_before != max(baseline_echo, seen_echo)
+        )
     )
 
 
@@ -337,8 +391,9 @@ def _validate_held_channel_response(
         _CURRENT_HELD_RESPONSE_FIELDS,
     }:
         return _protocol_error("held response fields mismatch")
+    if raw["context_baseline_seq"] != freshness["context_baseline_seq"]:
+        return _protocol_error("held response watermark mismatch")
     values = {
-        "context_baseline_seq": raw["context_baseline_seq"],
         "seen_seq": raw["seen_seq"],
         "latest_seq": raw["latest_seq"],
     }
@@ -347,11 +402,12 @@ def _validate_held_channel_response(
         for value in values.values()
     ):
         return _protocol_error("held response has incomplete boundary watermarks")
+    boundary = freshness["seen_seq"]
+    if freshness["context_baseline_seq"] is not None:
+        boundary = max(boundary, freshness["context_baseline_seq"])
     if (
-        values["context_baseline_seq"] != freshness["context_baseline_seq"]
-        or values["seen_seq"] != freshness["seen_seq"]
-        or values["latest_seq"]
-        <= max(freshness["context_baseline_seq"], freshness["seen_seq"])
+        values["seen_seq"] != freshness["seen_seq"]
+        or values["latest_seq"] <= boundary
         or not isinstance(raw.get("latest_envelope_id"), str)
         or not raw.get("latest_envelope_id").strip()
     ):

@@ -227,6 +227,11 @@ class BaselineAdapter:
     ) -> int | None:
         return await self.store.get_context_baseline(space_id, channel_id)
 
+    async def set_context_baseline_seq(
+        self, space_id: str, channel_id: str, context_baseline_seq: int
+    ) -> None:
+        await self.store.set_context_baseline(space_id, channel_id, context_baseline_seq)
+
 
 class ActiveBoundaryAdapter:
     """Inject the active turn id into the authoritative store query."""
