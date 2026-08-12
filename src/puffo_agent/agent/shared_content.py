@@ -99,10 +99,8 @@ at the point of use. `refresh` rebuilds the prompt and resyncs those skills.
 
 ## Your workspace
 
-Your `cwd` is `/workspace` (cli-docker) or
-`~/.puffo-agent/agents/<your-id>/workspace/` (cli-local). Survives
-daemon and container restarts. Agents on the same host share
-`/workspace/.shared` (cli-docker) or `~/.puffo-agent/shared/` (cli-local).
+Your `cwd` is your persistent private workspace. `shared/` inside it is the
+host-wide collaboration directory for Agents managed by the same Puffo home.
 
 ## Memory
 
@@ -1141,7 +1139,7 @@ _MANAGED_MARKER = ".puffo-managed"
 _MANAGED_MARKER_BODY = (
     "This skill is mirrored from the puffo-agent install on every "
     "worker start. Edits to SKILL.md here are overwritten; edit "
-    "the source under ~/.puffo-agent/shared/skills/<id>/SKILL.md\n"
+    "the source under <puffo-home>/docker/shared/skills/<id>/SKILL.md\n"
 )
 
 

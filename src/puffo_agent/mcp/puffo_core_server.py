@@ -320,6 +320,7 @@ def build_server(
     workspace: str,
     agent_id: str,
     data_service_url: str,
+    shared_workspace: str = "",
     runtime_kind: str = "",
     harness: str = "",
     memory_dir: str = "",
@@ -356,6 +357,7 @@ def build_server(
         data_client=data,
         space_id=space_id,
         workspace=workspace,
+        shared_workspace=shared_workspace or None,
         rpc_client=rpc_client,
     )
 
@@ -406,6 +408,7 @@ def _cfg_from_env() -> dict[str, str]:
         "space_id": os.environ.get("PUFFO_CORE_SPACE_ID", ""),
         "keystore_dir": os.environ.get("PUFFO_CORE_KEYSTORE_DIR", ""),
         "workspace": os.environ.get("PUFFO_WORKSPACE", "/workspace"),
+        "shared_workspace": os.environ.get("PUFFO_SHARED_WORKSPACE", ""),
         "agent_id": agent_id,
         "data_service_url": data_service_url,
         "runtime_kind": os.environ.get("PUFFO_RUNTIME_KIND", ""),

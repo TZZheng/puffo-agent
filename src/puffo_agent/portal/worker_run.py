@@ -18,7 +18,8 @@ from .runtime_matrix import (
     resolve_effective_harness,
     resolve_effective_provider,
 )
-from .state import agent_dir
+from .state import agent_dir, shared_fs_dir
+from .workspace_layout import ensure_workspace_shared_link
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -183,7 +184,7 @@ class StandardWorkerRun:
         workspace_path = str(agent_cfg.resolve_workspace_dir())
         claude_path = str(agent_cfg.resolve_claude_dir())
         shared_path = worker_module.docker_shared_dir()
-        Path(workspace_path).mkdir(parents=True, exist_ok=True)
+        ensure_workspace_shared_link(Path(workspace_path), shared_fs_dir())
         worker_module._seed_claude_dir(Path(claude_path))
         system_prompt = worker_module._rebuild_managed_system_prompt(
             harness_name=effective_harness,
@@ -682,6 +683,7 @@ class StandardWorkerRun:
             http_client=client.http,
             data_client=InProcessDataClient(client.store, client),
             workspace=paths.workspace_path,
+            shared_workspace=str(shared_fs_dir()),
             baseline_source=BaselineAdapter(client.store),
             active_turn_source=ActiveBoundaryAdapter(
                 client.store, global_runtime.active

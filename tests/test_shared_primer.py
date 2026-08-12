@@ -74,8 +74,11 @@ def test_policy_has_one_detailed_owner_and_primer_retains_contract():
         "claim one uncovered part",
         "only after its message is committed",
         "A reminder is a future request to reconsider",
+        "`shared/` inside it is the host-wide collaboration directory",
     ):
         assert phrase in primer
+    assert "~/.puffo-agent/shared" not in primer
+    assert "/workspace/.shared" not in primer
     for absent in (
         "prior_context", "visible_draft_basis", "new_channel_context",
         "context_ready", "same originating assignment", "send_anyway=True",

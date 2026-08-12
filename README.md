@@ -145,7 +145,9 @@ entirely on disk:
     ├── messages.db              # message, Inbox, turn, reminder state
     ├── runtime_events.db        # bounded Runtime event outbox
     ├── runtime.json             # heartbeat / status (daemon-managed)
-    └── workspace/.puffo/inbox/  # decrypted incoming attachments
+    └── workspace/
+        ├── shared -> ../../../shared/ # cross-Agent files on this Puffo home
+        └── .puffo/inbox/              # decrypted incoming attachments
 ```
 
 ### 3.2 Network proxies

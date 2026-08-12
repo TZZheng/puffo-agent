@@ -129,6 +129,7 @@ def test_docker_codex_runtime_boundary(tmp_path, monkeypatch):
     config = (preparer.codex_home / "config.toml").read_text(encoding="utf-8")
     assert 'CODEX_HOME = "/home/agent/.codex"' in config
     assert 'PUFFO_WORKSPACE = "/workspace"' in config
+    assert 'PUFFO_SHARED_WORKSPACE = "/workspace/shared"' in config
     assert 'PUFFO_RUNTIME_KIND = "cli-docker"' in config
     assert 'PUFFO_HARNESS = "codex"' in config
     assert "host.docker.internal" in config
@@ -165,6 +166,7 @@ def test_docker_codex_runtime_boundary(tmp_path, monkeypatch):
         assert f"{preparer.codex_home}:/home/agent/.codex" in run_cmd
         assert f"{preparer.agent_home}:/home/agent/.puffo-agent-state" in run_cmd
         assert any(":/workspace" in part for part in run_cmd)
+        assert any(":/workspace/shared" in part for part in run_cmd)
         assert any(":/workspace/.shared" in part for part in run_cmd)
         assert any(
             str(part).endswith(":/opt/puffoagent-pkg:ro") for part in run_cmd

@@ -329,6 +329,7 @@ def puffo_core_mcp_env(
     space_id: str = "",
     keystore_dir: str,
     workspace: str,
+    shared_workspace: str = "",
     agent_id: str = "",
     data_service_url: str = "http://127.0.0.1:63386",
     rpc_url: str = "http://127.0.0.1:63385",
@@ -360,6 +361,8 @@ def puffo_core_mcp_env(
         LOCAL_SERVICE_TOKEN_ENV: issue_local_service_token(effective_agent_id),
         **_python_user_base_env(runtime_kind),
     }
+    if shared_workspace:
+        env["PUFFO_SHARED_WORKSPACE"] = shared_workspace
     # The MCP starts with the agent workspace as cwd. A relative PYTHONPATH
     # would therefore resolve against the wrong directory and can silently
     # load a different editable checkout than the daemon.

@@ -30,6 +30,7 @@ from .in_process_data_client import InProcessDataClient
 from .protocol import Error, encode
 from .session import Transport, WsLocalSession
 from .tool_dispatch import build_dispatch as _build_dispatch
+from ..state import shared_fs_dir
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +194,7 @@ def _build_tool_dispatch(point: AttachPoint, runtime=None):
         data_client=InProcessDataClient(client.store, client),
         space_id=getattr(client, "space_id", None),
         workspace=getattr(client, "workspace", None),
+        shared_workspace=str(shared_fs_dir()),
         message_client=client,
         send_coordinator=send_coordinator,
         inbox_runtime=inbox_runtime,
@@ -331,6 +333,7 @@ def _make_owned_runtime(point: AttachPoint, bridge, holder: dict[str, WsLocalSes
         http_client=client.http,
         data_client=InProcessDataClient(client.store, client),
         workspace=workspace,
+        shared_workspace=str(shared_fs_dir()),
         baseline_source=BaselineAdapter(client.store),
         active_turn_source=ActiveBoundaryAdapter(client.store, runtime.active),
         held_recovery_source=runtime.held_recovery_source,

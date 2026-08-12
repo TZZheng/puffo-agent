@@ -62,11 +62,13 @@ from .state import (
     refresh_session_flag_path,
     refresh_token_request_path,
     restart_flag_path,
+    shared_fs_dir,
     stop_request_path,
     stop_requested_for,
     write_daemon_pid,
     write_daemon_ready,
 )
+from .workspace_layout import ensure_workspace_shared_link
 from .worker import Worker
 
 logger = logging.getLogger(__name__)
@@ -286,6 +288,7 @@ class Daemon:
         if cached is not None and (cached[0], cached[1]) == key:
             return cached[2]
         cfg = AgentConfig.load(agent_id)
+        ensure_workspace_shared_link(cfg.resolve_workspace_dir(), shared_fs_dir())
         self._agent_cfg_cache[agent_id] = (st.st_mtime_ns, st.st_size, cfg)
         return cfg
 

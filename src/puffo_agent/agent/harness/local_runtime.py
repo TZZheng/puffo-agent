@@ -38,6 +38,7 @@ from ...portal.state import (
     cli_session_json_path,
     read_host_codex_mcp_servers,
     seed_claude_home,
+    shared_fs_dir,
     sync_host_claude_code_auth_view,
     sync_host_codex_auth_view,
     sync_host_enabled_plugins,
@@ -46,6 +47,7 @@ from ...portal.state import (
     sync_host_skills,
     strip_claude_api_key_from_settings,
 )
+from ...portal.workspace_layout import ensure_workspace_shared_link
 from ...portal.runtime_matrix import (
     resolve_effective_harness,
     resolve_effective_provider,
@@ -378,7 +380,7 @@ class LocalRuntimePreparer:
         )
 
     async def refresh_spec(self, system_prompt: str) -> RuntimeSpec:
-        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        ensure_workspace_shared_link(self.workspace_dir, shared_fs_dir())
         self.claude_dir.mkdir(parents=True, exist_ok=True)
         if self.harness_name == "claude-code":
             self._sync_claude_host_state()
@@ -404,6 +406,7 @@ class LocalRuntimePreparer:
             space_id=pc.space_id,
             keystore_dir=str(agent_dir(self.agent_id) / "keys"),
             workspace=str(self.workspace_dir),
+            shared_workspace=str(shared_fs_dir()),
             agent_id=self.agent_id,
             data_service_url=(
                 f"http://127.0.0.1:{self.daemon_cfg.data_service.port}"

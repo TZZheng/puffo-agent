@@ -234,6 +234,7 @@ def _configure_docker_mcp(
         space_id=core.space_id,
         keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
         workspace=str(agent_cfg.resolve_workspace_dir()),
+        shared_workspace="/workspace/shared",
         agent_id=agent_cfg.id,
         data_service_url=f"http://host.docker.internal:{daemon_cfg.data_service.port}",
         rpc_url=f"http://host.docker.internal:{daemon_cfg.rpc_service.port}",

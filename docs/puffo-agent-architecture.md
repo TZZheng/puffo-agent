@@ -131,6 +131,7 @@ Memory tools are split between `mcp/memory_tools.py` and
     runtime.json
     memory/
     workspace/
+      shared -> ../../../shared/
 ```
 
 | Artifact | Owner |
@@ -141,6 +142,7 @@ Memory tools are split between `mcp/memory_tools.py` and
 | `runtime_events.db` | Bounded local outbox and resumable local Driver session references. |
 | `runtime.json` | Daemon health and status projection for CLI/UI. |
 | `memory/` | Bounded briefing, notes, recollection, imports, and Git history. |
+| `workspace/shared/` | Managed link to the Puffo-home cross-Agent collaboration directory. |
 | `workspace/.puffo/inbox/` | Materialized inbound attachments. |
 
 Native Agents use `keys/`. Keyless bridge Agents use a scoped token and do not

@@ -220,6 +220,7 @@ Default state is rooted at `~/.puffo-agent/` (overridable with
       imports/
         index.md
     workspace/
+      shared -> ../../../shared/ # same host-wide directory for every Agent
       .puffo/inbox/          # materialized inbound attachments
       .puffo-agent/          # current turn and refresh flags
 ```

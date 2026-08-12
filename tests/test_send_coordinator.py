@@ -20,6 +20,7 @@ from puffo_agent.crypto.http_client import HttpError
 from puffo_agent.crypto.http_client import PuffoCoreHttpClient
 from puffo_agent.crypto.primitives import KemKeyPair
 from puffo_agent.mcp.data_client import DataNotFound
+from puffo_agent.portal.workspace_layout import ensure_workspace_shared_link
 
 from .test_puffo_core_tools import _setup, _setup_keyless
 
@@ -84,6 +85,42 @@ async def coordinator_fixture(*, baseline=0, active=None):
         active_turn_source=freshness,
     )
     return coordinator, freshness, http
+
+
+def test_attachment_validation_allows_only_managed_shared_link(tmp_path):
+    workspace = tmp_path / "agents" / "alice" / "workspace"
+    shared = tmp_path / "shared"
+    ensure_workspace_shared_link(workspace, shared)
+    (shared / "evidence.txt").write_text("shared evidence", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("private", encoding="utf-8")
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+
+    coordinator = SendCoordinator(
+        slug="alice",
+        keystore=SimpleNamespace(),
+        http_client=SimpleNamespace(),
+        data_client=SimpleNamespace(),
+        workspace=str(workspace),
+        shared_workspace=str(shared),
+    )
+    request = SemanticSendRequest(
+        destination="ch_test",
+        text="evidence",
+        attachment_paths=("shared/evidence.txt",),
+    )
+    assert coordinator._validate_attachment_targets(request) == [
+        (shared / "evidence.txt").resolve()
+    ]
+
+    escaped = SemanticSendRequest(
+        destination="ch_test",
+        text="secret",
+        attachment_paths=("escape/secret.txt",),
+    )
+    with pytest.raises(RuntimeError, match="escapes the workspace"):
+        coordinator._validate_attachment_targets(escaped)
 
 
 @pytest.mark.asyncio

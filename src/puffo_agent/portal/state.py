@@ -93,9 +93,7 @@ def agent_codex_user_dir(agent_id: str) -> Path:
 
 
 def shared_fs_dir() -> Path:
-    """Shared dir for cross-agent cooperation. Bind-mounted to
-    ``/workspace/.shared`` for cli-docker; referenced by absolute path
-    for cli-local agents."""
+    """Canonical host-wide directory exposed as ``workspace/shared``."""
     return home_dir() / "shared"
 
 

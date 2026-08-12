@@ -112,6 +112,7 @@ def test_puffo_core_mcp_env():
         space_id="sp_test",
         keystore_dir="/tmp/keys",
         workspace="/workspace",
+        shared_workspace="/workspace/shared",
         agent_id="bot-0001",
         runtime_kind="cli-local",
         harness="claude-code",
@@ -127,6 +128,7 @@ def test_puffo_core_mcp_env():
     assert env["PUFFO_DATA_SERVICE_URL"] == "http://127.0.0.1:63386"
     assert env["PUFFO_AGENT_ID"] == "bot-0001"
     assert env["PUFFO_WORKSPACE"] == "/workspace"
+    assert env["PUFFO_SHARED_WORKSPACE"] == "/workspace/shared"
     assert env["PUFFO_RUNTIME_KIND"] == "cli-local"
     assert env["PUFFO_HARNESS"] == "claude-code"
     assert env[LOCAL_SERVICE_TOKEN_ENV]

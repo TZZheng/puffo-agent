@@ -10,9 +10,9 @@ settings — seeded once from the operator's real ``~/.claude``). A private
 credential view is refreshed from the host before the per-agent Claude home
 is mounted into the container.
 
-A second bind-mount exposes ``~/.puffo-agent/shared/`` at
-``/workspace/.shared`` so all agents on this host can cooperate at
-the filesystem level.
+A second bind-mount exposes the Puffo-home ``shared/`` directory at
+``/workspace/shared`` so all agents on this host can cooperate at the
+filesystem level. ``/workspace/.shared`` remains as a compatibility alias.
 
 Lifecycle:
   - container: one per agent (``puffo-<id>``), started lazily,
@@ -46,6 +46,7 @@ from ...portal.state import (
     sync_host_mcp_servers,
     sync_host_skills,
 )
+from ...portal.workspace_layout import ensure_workspace_shared_link
 from .base import Adapter, TurnContext, TurnResult
 from ..context_controller import (
     ContextCapabilities,
@@ -71,7 +72,7 @@ def _puffo_agent_pkg_dir() -> Path:
 # image-tag pruning. ``_ensure_image`` only builds when the tag is
 # missing locally.
 DEFAULT_IMAGE = "puffo/agent-runtime:v19"
-CONTAINER_LAYOUT_VERSION = "19"
+CONTAINER_LAYOUT_VERSION = "20"
 
 # Pinned Claude Code CLI version baked into the image. Floating would
 # let an upstream release shift the stream-json protocol or
@@ -754,12 +755,11 @@ class DockerCLIAdapter(Adapter):
             )
 
     def _prepare_container_mounts(self) -> Path:
-        Path(self.workspace_dir).mkdir(parents=True, exist_ok=True)
+        ensure_workspace_shared_link(Path(self.workspace_dir), self.shared_fs_dir)
         self.agent_home_dir.mkdir(parents=True, exist_ok=True)
         (self.agent_home_dir / ".claude").mkdir(parents=True, exist_ok=True)
         agent_claude_json = self.agent_home_dir / ".claude.json"
         agent_claude_json.touch(exist_ok=True)
-        self.shared_fs_dir.mkdir(parents=True, exist_ok=True)
         return agent_claude_json
 
     def _container_run_command(
@@ -782,6 +782,9 @@ class DockerCLIAdapter(Adapter):
             # container's ephemeral fs and is lost on restart.
             "-v",
             f"{agent_claude_json}:/home/agent/.claude.json",
+            "-v",
+            f"{self.shared_fs_dir}:/workspace/shared",
+            # Compatibility for existing sessions and user-authored paths.
             "-v",
             f"{self.shared_fs_dir}:/workspace/.shared",
             "-v",

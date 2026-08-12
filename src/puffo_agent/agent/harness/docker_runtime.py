@@ -37,6 +37,7 @@ from ...portal.state import (
     sync_host_codex_auth_view,
     sync_host_codex_skills,
 )
+from ...portal.workspace_layout import ensure_workspace_shared_link
 from ..adapters.desired_install import run_spawn_install
 from ..adapters.docker_cli import (
     DEFAULT_IMAGE,
@@ -235,6 +236,7 @@ class DockerCodexPreparer:
             space_id=pc.space_id,
             keystore_dir=f"{CODEX_CONTAINER_STATE_DIR}/keys",
             workspace="/workspace",
+            shared_workspace="/workspace/shared",
             agent_id=self.agent_id,
             data_service_url=(
                 f"http://host.docker.internal:{self.daemon_cfg.data_service.port}"
@@ -444,10 +446,9 @@ class DockerCodexPreparer:
             pass
 
     async def _start_container(self) -> None:
-        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        ensure_workspace_shared_link(self.workspace_dir, self.shared_fs_dir)
         self.codex_home.mkdir(parents=True, exist_ok=True)
         self.agent_home.mkdir(parents=True, exist_ok=True)
-        self.shared_fs_dir.mkdir(parents=True, exist_ok=True)
         command = [
             self._docker_bin,
             "run",
@@ -464,6 +465,9 @@ class DockerCodexPreparer:
             # Per-agent keystore + memory for the puffo-core MCP.
             "-v",
             f"{self.agent_home}:{CODEX_CONTAINER_STATE_DIR}",
+            "-v",
+            f"{self.shared_fs_dir}:/workspace/shared",
+            # Compatibility for existing sessions and user-authored paths.
             "-v",
             f"{self.shared_fs_dir}:/workspace/.shared",
             "-v",

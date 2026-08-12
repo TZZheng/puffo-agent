@@ -50,9 +50,11 @@ from .state import (
     refresh_model_flag_path,
     refresh_runtime_flag_path,
     refresh_session_flag_path,
+    shared_fs_dir,
     write_refresh_token_request,
     write_stop_request,
 )
+from .workspace_layout import ensure_workspace_shared_link
 
 DEFAULT_PROFILE = """# Agent Profile
 
@@ -534,6 +536,7 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
         created_at=int(time.time()),
     )
     cfg.save()
+    ensure_workspace_shared_link(cfg.resolve_workspace_dir(), shared_fs_dir())
 
     from ..agent.memory import ensure_memory_tree, sync_profile_briefing
 

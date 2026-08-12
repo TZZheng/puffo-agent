@@ -304,6 +304,7 @@ class SendCoordinator:
         http_client: Any,
         data_client: Any,
         workspace: str | None = None,
+        shared_workspace: str | None = None,
         baseline_source: ContextBaselineSource | Any | None = None,
         active_turn_source: ActiveTurnBoundarySource | Any | None = None,
         held_recovery_source: HeldRecoverySource | Any | None = None,
@@ -314,6 +315,7 @@ class SendCoordinator:
         self.http_client = http_client
         self.data_client = data_client
         self.workspace = workspace
+        self.shared_workspace = shared_workspace
         self.baseline_source = baseline_source
         self.active_turn_source = active_turn_source
         self.held_recovery_source = held_recovery_source
@@ -1463,6 +1465,9 @@ class SendCoordinator:
                 "send_message_with_attachments: too many files (> 10 cap)"
             )
         workspace = Path(self.workspace).resolve()
+        shared_workspace = (
+            Path(self.shared_workspace).resolve() if self.shared_workspace else None
+        )
         targets: list[Path] = []
         for raw in request.attachment_paths:
             rel = raw.strip()
@@ -1474,10 +1479,15 @@ class SendCoordinator:
             if rel_path.is_absolute():
                 raise RuntimeError(f"absolute paths not allowed ({rel!r})")
             target = (workspace / rel_path).resolve()
-            try:
-                target.relative_to(workspace)
-            except ValueError as exc:
-                raise RuntimeError(f"{rel!r} escapes the workspace") from exc
+            inside_workspace = target.is_relative_to(workspace)
+            inside_managed_shared = bool(
+                shared_workspace
+                and rel_path.parts
+                and rel_path.parts[0] == "shared"
+                and target.is_relative_to(shared_workspace)
+            )
+            if not (inside_workspace or inside_managed_shared):
+                raise RuntimeError(f"{rel!r} escapes the workspace")
             if not target.is_file():
                 raise RuntimeError(f"{rel!r} is not a file")
             if target.stat().st_size > 8 * 1024 * 1024:
