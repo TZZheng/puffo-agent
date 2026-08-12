@@ -38,6 +38,7 @@ from .send_response_validation import (
     coordinator_config,
     http_error_detail,
     optional_response_int,
+    persist_baseline,
     validate_channel_response,
     validate_keyless_response,
 )
@@ -214,7 +215,7 @@ class _ReconsiderationDecision:
 
 @dataclass(frozen=True)
 class _ChannelSendBoundary:
-    baseline: int
+    baseline: int | None
     seen_seq: int
     held_key: tuple[str, str, str, str]
     attempt_fingerprint: str
@@ -243,6 +244,7 @@ class ContextBaselineSource(Protocol):
     async def get_context_baseline_seq(
         self, space_id: str, channel_id: str
     ) -> Optional[int]: ...
+    async def set_context_baseline_seq(self, space_id, channel_id, context_baseline_seq: int) -> None: ...
 
 
 @runtime_checkable
@@ -774,8 +776,11 @@ class SendCoordinator:
                 logger.exception(
                     "sent keyless message but could not clear held state"
                 )
+            await persist_baseline(self.baseline_source, space_id, channel_id,
+                                   boundary.baseline, result.context_baseline_seq)
+            acknowledged = max(result.seen_seq or 0, result.context_baseline_seq or 0)
             if (
-                result.latest_seq_before_send == boundary.seen_seq
+                result.latest_seq_before_send == acknowledged
                 and result.seq is not None
             ):
                 try:
@@ -867,9 +872,7 @@ class SendCoordinator:
     ) -> _ChannelSendBoundary | dict[str, Any]:
         held_generation = self._held_generation  # read before any await
         baseline = await self._baseline(space_id, channel_id)
-        if baseline is None:
-            baseline = 0
-        baseline_invalid = (
+        baseline_invalid = baseline is not None and (
             isinstance(baseline, bool) or not isinstance(baseline, int) or baseline < 0
         )
         if baseline_invalid and not combined_error:
@@ -911,7 +914,7 @@ class SendCoordinator:
                 result["_reconsideration_audit"] = reconsideration.audit_fields()
                 return result
             active = reconsideration.admitted_seq
-        seen_seq = max(baseline, active if active is not None else baseline)
+        seen_seq = max(baseline or 0, active or 0)
         session_id, turn_id = self._turn_identity()
         return _ChannelSendBoundary(
             baseline=baseline,
@@ -1087,7 +1090,10 @@ class SendCoordinator:
             logger.exception("sent message but could not clear held state")
         # A stale send_anyway may cross messages this turn has not seen. The
         # outbound is visible, but the boundary advances only without a gap.
-        if result.latest_seq_before_send == result.seen_seq:
+        await persist_baseline(self.baseline_source, space_id, channel_id,
+                               boundary.baseline, result.context_baseline_seq)
+        acknowledged = max(result.seen_seq or 0, result.context_baseline_seq or 0)
+        if result.latest_seq_before_send == acknowledged:
             try:
                 await self._advance(
                     space_id,
