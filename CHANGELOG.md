@@ -6,6 +6,33 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a2] — 2026-08-12
+
+> Pre-release candidate for staging validation only. It is not the stable
+> `2.0.0` release and supersedes the TestPyPI-only `2.0.0a1` candidate.
+
+### Added
+
+- **Keyless Agents can durably ask their operator about foreign DMs and space
+  invitations.** Approval decisions survive restart and replay through the
+  bridge without giving the model transport credentials.
+
+- **Every Agent workspace exposes the Puffo-home collaboration directory as
+  `shared/`.** Existing Agents are repaired during daemon reconciliation,
+  Docker retains `.shared` as a compatibility alias, and existing conflicting
+  files are preserved rather than overwritten.
+
+### Fixed
+
+- **Restored Agent Foundation compatibility needed for staging.** Docker Codex,
+  Windows Claude shim launch handling, legacy daemon stop requests, Global
+  Inbox status lifecycle, local Runtime Event status, telemetry privacy, and
+  optional context baselines now follow the post-`2.0.0a1` contracts.
+
+- **Shared-workspace attachments retain the workspace escape boundary.** The
+  managed `shared/` target is accepted explicitly while unrelated symlink
+  escapes remain rejected.
+
 ## [2.0.0a1] — 2026-08-11
 
 > Pre-release published to TestPyPI for staging validation only. It is not the
@@ -4397,7 +4424,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.0a1...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.0a2...HEAD
+[2.0.0a2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0a2
 [2.0.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0a1
 [1.2.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v1.2.0
 [0.10.0a2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v0.10.0a2

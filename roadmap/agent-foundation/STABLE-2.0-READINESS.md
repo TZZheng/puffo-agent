@@ -1,8 +1,8 @@
 # Agent Foundation 2.0 Stable Readiness
 
-This is the execution backlog for moving `puffo-agent==2.0.0a1` toward a
+This is the execution backlog for moving `puffo-agent==2.0.0a2` toward a
 stable `2.0.0` release. The release contract and acceptance cases remain in
-[`docs/RELEASE-CANDIDATE-2.0.0a1.md`](../../docs/RELEASE-CANDIDATE-2.0.0a1.md).
+[`docs/RELEASE-CANDIDATE-2.0.0a2.md`](../../docs/RELEASE-CANDIDATE-2.0.0a2.md).
 
 The reviewed, source-grounded inventory of every item below against the frozen
 Agent source and local git evidence is in
