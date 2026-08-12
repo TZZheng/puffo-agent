@@ -802,6 +802,7 @@ class RuntimeManagerAdapter(Adapter):
                     if key in {
                         "input_tokens", "output_tokens", "tool_calls",
                         "provider_session_id", "send_message_targets",
+                        "context_tokens",
                     }
                 })
                 return TurnResult(

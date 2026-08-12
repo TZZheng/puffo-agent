@@ -9,6 +9,7 @@ those responsibilities belong to :mod:`codex_driver`,
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -48,7 +49,11 @@ from ...portal.runtime_matrix import (
     resolve_effective_harness,
     resolve_effective_provider,
 )
-from ..adapters.base import anthropic_base_url_env
+from ..adapters.base import (
+    STATUS_PREVIEW_CHARS,
+    anthropic_base_url_env,
+    is_silent,
+)
 from ..adapters.desired_install import run_spawn_install
 from ..cli_bin import resolve_claude_bin, resolve_codex_bin
 from ..runtime_event_outbox import (
@@ -58,7 +63,13 @@ from ..runtime_event_outbox import (
 from ..runtime_events import RuntimeEventProjector, TrustedScope
 from ..shared_content import MEMORY_SECTION_HEADER
 from . import UnsupportedDriver, build_driver
-from .driver import HarnessEvent, RuntimeSpec, SessionRef, TurnRef
+from .driver import (
+    HarnessEvent,
+    HarnessEventType,
+    RuntimeSpec,
+    SessionRef,
+    TurnRef,
+)
 from .runtime_manager import RuntimeManager, RuntimeManagerAdapter
 
 logger = logging.getLogger(__name__)
@@ -643,6 +654,93 @@ class LocalRuntimePreparer:
         )
 
 
+def _event_kind(event: HarnessEvent) -> str:
+    return (
+        event.type.value
+        if isinstance(event.type, HarnessEventType)
+        else str(event.type)
+    )
+
+
+def _normalized_tool_label(label: str) -> str:
+    """Normalize an MCP-scoped tool label to its bare name for status."""
+    if label.startswith("mcp__") and "__" in label:
+        return label.rsplit("__", 1)[-1]
+    return label
+
+
+def _emit_status(agent_id: str, event: str, payload: dict[str, Any]) -> None:
+    from ...portal.control.reporter import get_reporter
+
+    asyncio.ensure_future(get_reporter().emit(agent_id, event, payload))
+
+
+class _LegacyStatusProjector:
+    """Turn-scoped pre-2.0 status projection from normalized Driver events.
+
+    Emits only the safe legacy surface: one bounded ``assistant_text`` per
+    completed assistant block unless the accumulated text is silent, and one
+    label-only ``tool_use`` per normalized tool start. It never reads the
+    native diagnostic payload, tool arguments or results, reasoning events, or
+    unknown provider frames; duplicate lifecycle events and post-terminal
+    fragments are ignored, and buffers are discarded at terminal, abandonment,
+    or runtime teardown.
+    """
+
+    def __init__(self, agent_id: str) -> None:
+        self._agent_id = agent_id
+        self._turn: str | None = None
+        self._block_buffers: dict[str, str] = {}
+        self._emitted_blocks: set[str] = set()
+        self._emitted_tools: set[str] = set()
+
+    def project(self, event: HarnessEvent) -> None:
+        kind = _event_kind(event)
+        turn = str(event.turn_ref.value) if event.turn_ref is not None else ""
+        if kind == "turn.started":
+            self._turn = turn
+            self._reset()
+            return
+        if kind in {"turn.completed", "turn.abandoned", "runtime.exited"}:
+            self._turn = None
+            self._reset()
+            return
+        if not turn or self._turn != turn:
+            return
+        data = event.data
+        if kind == "turn.assistant_delta":
+            text = data.get("text")
+            if isinstance(text, str):
+                block_id = str(data.get("block_id") or "")
+                buffer = self._block_buffers.get(block_id, "")
+                room = STATUS_PREVIEW_CHARS - len(buffer)
+                if room > 0:
+                    self._block_buffers[block_id] = buffer + text[:room]
+            return
+        if kind == "turn.assistant_completed":
+            block_id = str(data.get("block_id") or "")
+            if block_id in self._emitted_blocks:
+                return
+            self._emitted_blocks.add(block_id)
+            text = self._block_buffers.pop(block_id, "")
+            if text and not is_silent(text):
+                _emit_status(self._agent_id, "assistant_text", {"text": text})
+            return
+        if kind == "turn.tool_started":
+            ref = str(data.get("tool_call_ref") or "")
+            if ref in self._emitted_tools:
+                return
+            self._emitted_tools.add(ref)
+            label = _normalized_tool_label(str(data.get("label") or ""))
+            if label:
+                _emit_status(self._agent_id, "tool_use", {"tool": label})
+
+    def _reset(self) -> None:
+        self._block_buffers.clear()
+        self._emitted_blocks.clear()
+        self._emitted_tools.clear()
+
+
 def build_local_runtime_adapter(
     prepared: PreparedLocalRuntime,
     *,
@@ -659,6 +757,7 @@ def build_local_runtime_adapter(
         scope=TrustedScope(),
     )
     projecting_sink = RuntimeEventProjectingSink(outbox, projector)
+    legacy_projector = _LegacyStatusProjector(prepared.preparer.agent_id)
     manager: RuntimeManager
     session_fingerprint = [prepared.session_fingerprint]
 
@@ -684,6 +783,7 @@ def build_local_runtime_adapter(
         await outbox.arequire_turn_capacity(estimated_start_bytes=estimated)
 
     async def persist_event(event: HarnessEvent) -> None:
+        legacy_projector.project(event)
         logical_session = str(event.session_ref or manager.session_ref)
         projector.session_ref = logical_session
         await projecting_sink(event)

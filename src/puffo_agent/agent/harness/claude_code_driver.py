@@ -616,13 +616,20 @@ class ClaudeCodeCliDriver(Driver):
             )
             return
         usage = frame.get("usage") or {}
+        input_tokens = int(usage.get("input_tokens") or 0) + int(
+            usage.get("cache_creation_input_tokens") or 0
+        )
+        context_tokens = input_tokens + int(
+            usage.get("cache_read_input_tokens") or 0
+        )
         await self._emit(
             HarnessEventType.TURN_COMPLETED,
             turn_ref=self._active,
             data={
                 "outcome": "failed" if subtype not in {"success", ""} else "succeeded",
-                "input_tokens": int(usage.get("input_tokens") or 0),
+                "input_tokens": input_tokens,
                 "output_tokens": int(usage.get("output_tokens") or 0),
+                "context_tokens": context_tokens,
             },
             native_payload=frame,
         )
