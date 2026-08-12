@@ -87,6 +87,69 @@ class _NoopStatusReporter:
         return None
 
 
+class GlobalInboxStatusLifecycle:
+    """Mirror one durable Global Inbox turn into Server processing rows.
+
+    ``begin_turn`` fires once for the first admitted real message and its run
+    id is retained; later active-union expansions reuse that lifecycle without
+    reopening rows. Terminal cleanup settles the exact active union in one
+    ``end_turn_batch``: the initial run id is reused for the first entry, every
+    additional entry mints a fresh run id, and the same success/error result is
+    applied to all. State always resets so the next turn cannot inherit runs.
+    """
+
+    def __init__(self, reporter) -> None:
+        self._reporter = reporter
+        self._began = False
+        self._begin_run_id: str | None = None
+
+    async def on_turn_active(self, message_ids: tuple[str, ...]) -> None:
+        if not message_ids or self._began:
+            return
+        self._began = True
+        self._begin_run_id = await self._reporter.begin_turn(message_ids[0])
+
+    async def on_turn_terminal(
+        self,
+        *,
+        message_ids: tuple[str, ...],
+        succeeded: bool,
+        error_text: str | None,
+    ) -> None:
+        runs = self._build_runs(message_ids, succeeded, error_text) if self._began else []
+        try:
+            if runs:
+                await self._reporter.end_turn_batch(runs)
+        finally:
+            self.reset()
+
+    def _build_runs(
+        self,
+        message_ids: tuple[str, ...],
+        succeeded: bool,
+        error_text: str | None,
+    ) -> list[dict[str, Any]]:
+        runs: list[dict[str, Any]] = []
+        for index, message_id in enumerate(message_ids):
+            entry: dict[str, Any] = {
+                "run_id": self._begin_run_id if index == 0 else self._mint_run_id(),
+                "message_id": message_id,
+                "succeeded": succeeded,
+            }
+            if error_text is not None:
+                entry["error_text"] = error_text
+            runs.append(entry)
+        return runs
+
+    def reset(self) -> None:
+        self._began = False
+        self._begin_run_id = None
+
+    @staticmethod
+    def _mint_run_id() -> str:
+        return f"run_{uuid.uuid4().hex}"
+
+
 class StandardWorkerRun:
     """Own the non-ws-local phases of one ``Worker._run`` invocation."""
 
@@ -499,7 +562,7 @@ class StandardWorkerRun:
         run_global_turn.handle_global_inbox_retry = retry_global_turn
         return run_global_turn
 
-    def _build_global_runtime(self, context: WorkerRunContext):
+    def _build_global_runtime(self, context: WorkerRunContext, *, status_lifecycle=None):
         from ..agent.global_inbox_runtime import (
             ActiveBoundaryAdapter,
             BaselineAdapter,
@@ -521,6 +584,7 @@ class StandardWorkerRun:
             send_mode_keys=(paths.agent_id, client.slug),
             agent_id=paths.agent_id,
             runtime_event_outbox=context.runtime_event_outbox,
+            status_lifecycle=status_lifecycle,
         )
         coordinator = SendCoordinator(
             slug=client.slug,
@@ -594,7 +658,11 @@ class StandardWorkerRun:
     async def _start_services(self, context: WorkerRunContext) -> WorkerRunServices:
         worker = self.worker
         uploader = self._build_runtime_event_uploader(context)
-        global_runtime = self._build_global_runtime(context)
+        reporter = self._build_reporter(context.client)
+        global_runtime = self._build_global_runtime(
+            context,
+            status_lifecycle=GlobalInboxStatusLifecycle(reporter),
+        )
         reminder_sync = await self._prepare_reminder_sync(context, global_runtime)
         global_task = asyncio.ensure_future(global_runtime.run())
         reminder_task = None
@@ -602,7 +670,6 @@ class StandardWorkerRun:
             reminder_task = asyncio.ensure_future(
                 reminder_sync.run(request_snapshot_on_start=False)
             )
-        reporter = self._build_reporter(context.client)
         heartbeat_task = asyncio.ensure_future(self._heartbeat(context.paths.agent_id))
         status_task = asyncio.ensure_future(reporter.run_heartbeat_loop())
         watch_task = asyncio.ensure_future(
