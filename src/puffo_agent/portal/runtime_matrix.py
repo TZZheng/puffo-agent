@@ -6,13 +6,14 @@ are bound to one provider (``claude-code`` → anthropic, ``gemini-cli``
 → google); ``hermes`` is multi-provider.
 
 Supported today: ``cli-local`` with ``claude-code`` or ``codex``,
-``cli-docker`` with ``claude-code``, and ``ws-local`` (external tool,
-no internal engine). ``hermes`` and ``gemini-cli`` remain design-only —
-no runtime accepts them, because their provider admission happens after
-MCP execution and they cannot correlate a concrete ``read_inbox`` tool
-result, so they cannot complete the metadata-notified Inbox contract.
-They stay enumerated here so a persisted agent.yml carrying one fails
-with that explicit diagnostic instead of a misleading "unknown harness".
+``cli-docker`` with ``claude-code`` or ``codex``, and ``ws-local``
+(external tool, no internal engine). ``hermes`` and ``gemini-cli``
+remain design-only — no runtime accepts them, because their provider
+admission happens after MCP execution and they cannot correlate a
+concrete ``read_inbox`` tool result, so they cannot complete the
+metadata-notified Inbox contract. They stay enumerated here so a
+persisted agent.yml carrying one fails with that explicit diagnostic
+instead of a misleading "unknown harness".
 """
 
 from __future__ import annotations
@@ -69,9 +70,10 @@ VALID_HARNESSES: frozenset[str] = frozenset({
 # ── Constraints ───────────────────────────────────────────────────────────────
 
 # Harness → providers it supports. ``resolve_effective_harness`` selects Codex
-# for OpenAI on ``cli-local``. The design-only Hermes/Gemini entries are kept
-# so provider defaults still resolve to a named harness and ``validate_triple``
-# can reject it with the design-only diagnostic; no runtime admits them.
+# for OpenAI on both harness-bearing CLI runtimes. The design-only
+# Hermes/Gemini entries are kept so provider defaults still resolve to a
+# named harness and ``validate_triple`` can reject it with the design-only
+# diagnostic; no runtime admits them.
 HARNESS_PROVIDERS: dict[str, frozenset[str]] = {
     HARNESS_CLAUDE_CODE: frozenset({PROVIDER_ANTHROPIC}),
     HARNESS_HERMES:      frozenset({PROVIDER_ANTHROPIC, PROVIDER_OPENAI}),
@@ -201,21 +203,19 @@ def validate_triple(
             f"harness {harness!r} is not implemented by the Driver runtime"
         ))
 
-    if runtime == RUNTIME_CLI_DOCKER and harness != HARNESS_CLAUDE_CODE:
-        if harness == HARNESS_CODEX:
-            return ValidationResult(False, (
-                f"runtime {RUNTIME_CLI_DOCKER!r} supports only "
-                f"{HARNESS_CLAUDE_CODE!r}; harness {HARNESS_CODEX!r} "
-                "requires the host-local Driver runtime — set runtime.kind "
-                f"to {RUNTIME_CLI_LOCAL!r}"
-            ))
+    if runtime == RUNTIME_CLI_DOCKER and harness not in {
+        HARNESS_CLAUDE_CODE,
+        HARNESS_CODEX,
+    }:
         return ValidationResult(False, (
             f"runtime {RUNTIME_CLI_DOCKER!r} supports only "
-            f"{HARNESS_CLAUDE_CODE!r}; harness {harness!r} is design-only in "
-            "this release — it cannot complete the metadata-notified Inbox "
-            f"contract. Set runtime.kind {RUNTIME_CLI_LOCAL!r} with harness "
-            f"{HARNESS_CLAUDE_CODE!r} or {HARNESS_CODEX!r}, or keep "
-            f"{RUNTIME_CLI_DOCKER!r} with harness {HARNESS_CLAUDE_CODE!r}"
+            f"{HARNESS_CLAUDE_CODE!r} and {HARNESS_CODEX!r}; "
+            f"harness {harness!r} is design-only in this release — it "
+            "cannot complete the metadata-notified Inbox contract. Keep "
+            f"{RUNTIME_CLI_DOCKER!r} with harness {HARNESS_CLAUDE_CODE!r} "
+            f"or {HARNESS_CODEX!r}, or set runtime.kind "
+            f"{RUNTIME_CLI_LOCAL!r} with harness {HARNESS_CLAUDE_CODE!r} "
+            f"or {HARNESS_CODEX!r}"
         ))
 
     if provider:
@@ -240,15 +240,14 @@ def resolve_effective_harness(runtime: str, provider: str, harness: str) -> str:
     """Return the effective harness for this runtime.
 
     Empty string when the field doesn't apply; otherwise the input if
-    set, or the provider-specific default.
+    set, or the provider-specific default. Both CLI runtimes default
+    OpenAI to Codex and Anthropic to Claude Code.
     """
     if not harness_applies(runtime):
         return ""
     if harness:
         return harness
     provider = resolve_effective_provider(runtime, provider)
-    if runtime == RUNTIME_CLI_LOCAL and provider == PROVIDER_OPENAI:
-        return HARNESS_CODEX
     return DEFAULT_HARNESS_FOR_PROVIDER.get(provider, HARNESS_CLAUDE_CODE)
 
 

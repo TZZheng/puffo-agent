@@ -122,8 +122,9 @@ def build_docker_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Ad
     """Construct a non-Driver adapter for ``runtime.kind``.
 
     Host-local Claude and Codex runtimes are built by Worker through the
-    Driver runtime. This factory remains only for the Docker compatibility
-    runtime.
+    Driver runtime; cli-docker + codex routes through
+    :func:`build_docker_codex_runtime`. This factory remains only for the
+    Docker Claude compatibility runtime.
     """
     kind = agent_cfg.runtime.kind or "cli-local"
     if kind == "cli-docker":
@@ -142,6 +143,22 @@ def build_docker_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Ad
         f"agent {agent_cfg.id!r}: unknown runtime kind {kind!r} "
         "(valid: cli-local, cli-docker, ws-local)"
     )
+
+
+def build_docker_codex_runtime(
+    daemon_cfg: DaemonConfig, agent_cfg: AgentConfig,
+):
+    """Construct the Docker Codex runtime owner for the Driver path.
+
+    ``cli-docker`` + ``codex`` runs the pinned Codex CLI through
+    ``CodexAppServerDriver`` over a per-agent ``docker exec`` transport;
+    the returned preparer owns the container, the agent-scoped Codex home,
+    and the bounded ``docker stop`` shutdown. The Driver/outbox assembly
+    lives in ``worker_run`` through ``build_local_runtime_adapter``.
+    """
+    from ..agent.harness.docker_runtime import DockerCodexPreparer
+
+    return DockerCodexPreparer(daemon_cfg, agent_cfg)
 
 
 def _resolve_docker_harness(agent_cfg: AgentConfig):

@@ -14,9 +14,10 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ...macos.keychain import is_macos
 from ...mcp.config import (
@@ -64,6 +65,7 @@ from ..runtime_events import RuntimeEventProjector, TrustedScope
 from ..shared_content import MEMORY_SECTION_HEADER
 from . import UnsupportedDriver, build_driver
 from .driver import (
+    Driver,
     HarnessEvent,
     HarnessEventType,
     RuntimeSpec,
@@ -171,6 +173,82 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def compute_session_fingerprint(
+    *,
+    agent_cfg: AgentConfig,
+    harness_name: str,
+    provider: str,
+    spec: RuntimeSpec,
+) -> str:
+    """Fingerprint only inputs that make a native session incompatible.
+
+    Shared by the host-local and Docker runtime owners so a persisted
+    logical session stays comparable across restarts of the same runtime.
+    """
+    prompt_core = spec.system_prompt.split(MEMORY_SECTION_HEADER, 1)[0]
+    payload = {
+        "version": 1,
+        "harness": harness_name,
+        "provider": provider,
+        "model": spec.model,
+        "workspace": str(Path(spec.workspace_dir).resolve()),
+        "sandbox": spec.sandbox,
+        "permission_mode": spec.permission_mode,
+        "inference_level": agent_cfg.runtime.inference_level,
+        "llm_base_url": agent_cfg.runtime.llm_base_url.rstrip("/"),
+        "prompt_core_sha256": hashlib.sha256(
+            prompt_core.encode("utf-8")
+        ).hexdigest(),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return "v1:" + hashlib.sha256(encoded).hexdigest()
+
+
+def build_codex_gateway_provider(
+    *,
+    model: str,
+    llm_base_url: str,
+    api_key: str,
+) -> dict[str, str] | None:
+    """Return the LiteLLM / OpenAI-compatible gateway provider block.
+
+    ``None`` unless both a gateway URL and a virtual key are configured;
+    when present codex talks to ``base_url`` via the Responses API using
+    the bearer key in ``env_key`` instead of native ChatGPT OAuth.
+    """
+    if not (llm_base_url and api_key):
+        return None
+    base = llm_base_url.rstrip("/")
+    if not base.endswith("/v1"):
+        base += "/v1"
+    return {
+        "name": "litellm",
+        "display_name": "LiteLLM gateway",
+        "base_url": base,
+        "env_key": "OPENAI_API_KEY",
+        "model": model or "codex",
+        "wire_api": "responses",
+    }
+
+
+class RuntimePreparer(Protocol):
+    """Minimal contract a runtime owner satisfies to be bound into the
+    durable Runtime Manager by :func:`build_local_runtime_adapter`.
+
+    Both the host-local and the Docker Codex preparers implement it; the
+    Docker owner additionally exposes ``process_factory`` and ``aclose``
+    that the composition boundary wires into the Driver.
+    """
+
+    agent_id: str
+
+    async def refresh_spec(self, system_prompt: str) -> RuntimeSpec: ...
+
+    def session_fingerprint(self, spec: RuntimeSpec) -> str: ...
+
+
 @dataclass(slots=True)
 class PreparedLocalRuntime:
     harness_name: str
@@ -178,7 +256,7 @@ class PreparedLocalRuntime:
     native_session_id: str
     migration_source: str
     legacy_session_path: Path
-    preparer: LocalRuntimePreparer
+    preparer: RuntimePreparer
     session_fingerprint: str
     discarded_persisted_session: bool = False
 
@@ -289,28 +367,15 @@ class LocalRuntimePreparer:
 
     def session_fingerprint(self, spec: RuntimeSpec) -> str:
         """Fingerprint only inputs that make a native session incompatible."""
-        prompt_core = spec.system_prompt.split(MEMORY_SECTION_HEADER, 1)[0]
-        payload = {
-            "version": 1,
-            "harness": self.harness_name,
-            "provider": resolve_effective_provider(
+        return compute_session_fingerprint(
+            agent_cfg=self.agent_cfg,
+            harness_name=self.harness_name,
+            provider=resolve_effective_provider(
                 self.agent_cfg.runtime.kind or "cli-local",
                 self.agent_cfg.runtime.provider,
             ),
-            "model": spec.model,
-            "workspace": str(Path(spec.workspace_dir).resolve()),
-            "sandbox": spec.sandbox,
-            "permission_mode": spec.permission_mode,
-            "inference_level": self.agent_cfg.runtime.inference_level,
-            "llm_base_url": self.agent_cfg.runtime.llm_base_url.rstrip("/"),
-            "prompt_core_sha256": hashlib.sha256(
-                prompt_core.encode("utf-8")
-            ).hexdigest(),
-        }
-        encoded = json.dumps(
-            payload, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        return "v1:" + hashlib.sha256(encoded).hexdigest()
+            spec=spec,
+        )
 
     async def refresh_spec(self, system_prompt: str) -> RuntimeSpec:
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -568,20 +633,11 @@ class LocalRuntimePreparer:
         )
 
     def _codex_gateway_provider(self) -> dict[str, str] | None:
-        runtime = self.agent_cfg.runtime
-        if not (runtime.llm_base_url and runtime.api_key):
-            return None
-        base = runtime.llm_base_url.rstrip("/")
-        if not base.endswith("/v1"):
-            base += "/v1"
-        return {
-            "name": "litellm",
-            "display_name": "LiteLLM gateway",
-            "base_url": base,
-            "env_key": "OPENAI_API_KEY",
-            "model": self.model or "codex",
-            "wire_api": "responses",
-        }
+        return build_codex_gateway_provider(
+            model=self.model,
+            llm_base_url=self.agent_cfg.runtime.llm_base_url,
+            api_key=self.agent_cfg.runtime.api_key,
+        )
 
     def _ensure_codex_self_invoke(self, executable: str) -> None:
         if not is_macos():
@@ -746,9 +802,18 @@ def build_local_runtime_adapter(
     *,
     outbox: RuntimeEventOutbox,
     logical_session_ref: str,
+    driver: Driver | None = None,
+    cleanup: Callable[[], Awaitable[None]] | None = None,
 ) -> RuntimeManagerAdapter:
-    """Bind a prepared local Driver to the durable Runtime Manager."""
-    driver = build_driver(prepared.harness_name)
+    """Bind a prepared Driver runtime to the durable Runtime Manager.
+
+    ``driver`` defaults to the ratified Driver for ``prepared.harness_name``;
+    the Docker Codex composition injects ``CodexAppServerDriver`` with its
+    exec transport factory and passes ``cleanup`` (bounded container stop)
+    that runs after the manager closes.
+    """
+    if driver is None:
+        driver = build_driver(prepared.harness_name)
     if isinstance(driver, UnsupportedDriver):
         raise RuntimeError(driver.diagnostic)
     projector = RuntimeEventProjector(
@@ -824,14 +889,18 @@ def build_local_runtime_adapter(
     return RuntimeManagerAdapter(
         manager,
         spec_reloader=reload_spec,
+        post_close=cleanup,
     )
 
 
 __all__ = [
     "LocalRuntimePreparer",
     "PreparedLocalRuntime",
+    "RuntimePreparer",
     "SUPPORTED_LOCAL_DRIVERS",
     "VALID_PERMISSION_MODES",
     "VALID_SANDBOX_MODES",
     "build_local_runtime_adapter",
+    "build_codex_gateway_provider",
+    "compute_session_fingerprint",
 ]

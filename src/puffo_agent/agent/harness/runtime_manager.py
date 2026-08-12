@@ -733,10 +733,15 @@ class RuntimeManagerAdapter(Adapter):
         *,
         spec_reloader: Callable[[str], Awaitable[RuntimeSpec]] | None = None,
         compaction_wait_seconds: float = COMPACTION_WAIT_SECONDS,
+        post_close: Callable[[], Awaitable[None]] | None = None,
     ):
         self.manager = manager
         self.spec_reloader = spec_reloader
         self.compaction_wait_seconds = compaction_wait_seconds
+        # Optional bounded lifecycle owner hook awaited after the manager
+        # (and its Driver) close. Used by the Docker Codex runtime to stop
+        # the per-agent container once the exec transport has terminated.
+        self.post_close = post_close
         self.assistant_text_parts: list[str] = []
         self._latest_context_limits: tuple[int | None, int | None] = (
             None,
@@ -925,7 +930,11 @@ class RuntimeManagerAdapter(Adapter):
         )
 
     async def aclose(self) -> None:
-        await self.manager.close()
+        try:
+            await self.manager.close()
+        finally:
+            if self.post_close is not None:
+                await self.post_close()
 
     def get_provider_session_id(self) -> str | None:
         value = (
