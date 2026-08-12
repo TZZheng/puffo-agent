@@ -25,8 +25,9 @@ repairs, and bounded acceptance evidence.
 |---|---|
 | Agent diagnosis snapshot | `dd5f4ef517decaa814ffb9bc27b7c2d2b53efc89` |
 | Server diagnosis snapshot | `393a1af6f54b9f44e0711437bd787ce0f093e80b` |
-| Agent repaired head | `8641a89` (`feat/agent-foundation-stable-readiness`) |
+| Agent repaired head | `df635e9` (`feat/agent-foundation-stable-readiness`) |
 | Server repaired head | `ae0f238` (`feat/keyless-agent-authorization`) |
+| Web product-validation snapshot | `bc5db876` (`origin/main`, local compatibility worktree) |
 | Integration commit audited | `0d9f44d` "Integrate Agent Foundation across native and keyless cloud runtimes (#225)" |
 | Findings source | `puffo-agent-staging-findings` snapshot 2026-08-11; staging Server `sha-7ad4698b959a`; package `puffo-agent==2.0.0a1` |
 
@@ -42,8 +43,29 @@ diagnosis blocks refer to the recorded diagnosis snapshots.
 | F002 busy / activity strip | Restored | Global Inbox turns open and close the legacy Server status lifecycle. Real Web acceptance showed `Processing` during work and `Idle` after completion for all five Agents. Daemon-local membership/reminder envelopes no longer call message-processing endpoints for nonexistent message IDs. |
 | F003 Docker Codex | Restored with residual live-provider risk | `cli-docker + openai + codex` is admitted and wired through the Driver transport, isolated home, image, cleanup, and persisted-session paths. The bounded Docker smoke did not execute a live provider turn because the local Agent Core data/RPC dependency was unavailable. |
 | F004 stop upgrade | Restored | Current daemon accepts both legacy timestamp-only and PID-scoped JSON stop sentinels; current CLI waits on the exact daemon PID. Focused old/new compatibility and bounded shutdown tests pass. |
-| F005 logs / telemetry | Restored at Agent contracts | Safe Driver lifecycle/tool events and Codex/Claude token/context telemetry are projected without raw reasoning. Runtime-event recovery was proven for 5/5 Agents. The current local Web session could not verify the local Profile Log body because it was not paired to the Python daemon and correctly disabled device-local Log/Files tabs. |
+| F005 logs / telemetry | Restored | A currently paired Python daemon delivered encrypted `turn_start`, bounded `assistant_text`, tool labels, and `turn_complete` to the current Web. Profile Log rendered the safe rows and nonzero Codex tokens (`14405` input / `599` output) while avatar and chat activity state returned to Idle. |
 | F006 Activity / Files | Intentionally deferred | These surfaces did not have a complete pre-2.0 contract and remain product work. |
+
+### Current local product evidence (2026-08-11)
+
+- The legacy Python CLI created a device code from the real Agent home. Current
+  Web `origin/main` opened `/link-machine`, approved **Agent Foundation
+  Compatibility**, and the waiting CLI completed with the expected operator.
+  The running daemon then established its control WebSocket and enabled the
+  encrypted `agent.status` reverse channel. No old browser-to-daemon HTTP
+  bridge was restored.
+- A real channel turn showed `Processing` on the avatar and the chat activity
+  strip, returned to `Idle`, and populated Profile Log with `Working`, safe
+  tool labels, bounded assistant summaries, `Done`, and nonzero Codex token
+  usage. Raw tool arguments, provider frames, and hidden reasoning were not
+  exposed.
+- In fresh channel `ch_08f31122-fad7-4f64-8f08-6b415b37a556`, all five Agent
+  stores had no `channel_context_state` row immediately after membership, so
+  all five baselines read as `None`. After each Agent's first successful
+  coordinated introduction, the persisted values became one authoritative
+  empty boundary (`0`) and four positive established boundaries
+  (`2569`-`2572`). The Web showed five introductions exactly once and all five
+  Agents settled to `Idle`.
 
 ### Cross-cutting reconnect recovery
 
@@ -410,7 +432,7 @@ Agent.
 
 ## F005 — Agent Profile Log loses Driver detail and Codex telemetry
 
-**Classification: `restored at Agent contracts`**
+**Classification: `restored`**
 
 Resolution: Agent merge `5bec939` restores safe Driver-to-legacy projection and
 token/context telemetry; follow-up commit `d5ddb2b` records the compatibility
@@ -463,19 +485,24 @@ render `in token: 0, out token: 0`, and context telemetry is absent.
 - History: `git show 0d9f44d^:src/puffo_agent/agent/adapters/codex_session.py`
   (`tokenUsage` `last`/`total` delta math at lines ~1182-1215) and
   pre-integration `core.py` `current_context` handling.
+- Current Web `bc5db876` consumes decrypted machine messages in
+  `use-realtime.ts`, stores safe rows in `agent-status-history.ts`, and renders
+  them through `AgentStatusHistory.tsx`.
+- A paired real Codex turn rendered `Working`, `read_inbox`, `send_message`,
+  bounded assistant summaries, terminal `Done`, and `14405/599` token usage.
 
-### Unknowns
+### Residuals
 
-- Whether every observed `0/0` row came from Codex or a separate Claude Code
-  runtime issue also exists (source-level cause proven here is Codex-specific).
-- Which safe activity details the future Profile Log should expose; this must
-  not be conflated with publishing raw chain-of-thought or provider-native
-  payloads.
+- The Profile Log is a per-device live history. Events emitted while the
+  device is disconnected are intentionally best-effort and are not replayed as
+  a durable cross-device audit log.
+- Future presentation changes must not be conflated with publishing raw
+  chain-of-thought, tool arguments, or provider-native payloads.
 
 ### Repository owner
 
 Agent (driver telemetry + legacy projection); Web owns the consuming Profile
-Log contract (not re-inspected).
+Log contract, inspected and exercised at `bc5db876`.
 
 ### Bounded acceptance criteria
 
@@ -504,10 +531,10 @@ testing rather than removing an established pipeline.
 
 ### Current source behavior
 
-Agent source does not feed these surfaces. Web-side evidence (attributed to
-F006, not re-inspected): Activity is a view over the current Web message cache
-(`ProfilePanels.tsx:1333-1340`) and Files renders the static placeholder text
-(`ProfilePanels.tsx:1188-1191`).
+Agent source does not feed these surfaces. Current Web inspection confirms
+Activity is a view over the current Web message cache and Files renders the
+static `No files yet · Coming soon` placeholder. Pairing a current Python
+daemon enables the tab but does not create a file index.
 
 ### User-visible impact
 
@@ -541,10 +568,11 @@ Within the bounded evidence inventory, F001-F005 are restored and F006 remains
 intentionally deferred. Acceptance found the additional stale Runtime-session
 projection failure documented above; it is fixed at Server `ae0f238`.
 
-The legacy Python `machine link` command still emits a `/link-machine` URL while
-the current Web exposes the newer `/agents/pair` flow. This is a separate
-unresolved compatibility finding, not part of F001-F006 and not silently
-classified as restored here.
+The legacy Python `machine link` command and current Web `/link-machine` route
+were exercised together successfully. The earlier claim that current Web only
+exposed `/agents/pair` came from a Web worktree 211 commits behind
+`origin/main`; it is superseded and must not motivate restoration of the
+deprecated local HTTP bridge.
 
 The extended behavioral acceptance prompt asking five Agents to count five
 times stopped after `11/25`. Its Inbox slice was complete and untruncated, and
@@ -683,6 +711,6 @@ History (`git show <commit>:<path>` verified for each):
 ## Confirmed evidence vs unknowns
 
 Each entry separates confirmed source/history evidence from explicitly stated
-unknowns. The resolution table adds the later focused tests and local product
-acceptance. It does not claim a paired-device Profile Log UI test or a live
-Docker provider turn where those environments were unavailable.
+unknowns. The resolution table adds focused tests and local product acceptance,
+including a paired-device Profile Log UI test. It still does not claim a live
+Docker provider turn where that environment was unavailable.
