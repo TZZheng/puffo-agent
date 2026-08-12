@@ -11,7 +11,13 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from . import worker as worker_module
-from .runtime_matrix import RUNTIME_CLI_DOCKER, RUNTIME_CLI_LOCAL
+from .runtime_matrix import (
+    HARNESS_CODEX,
+    RUNTIME_CLI_DOCKER,
+    RUNTIME_CLI_LOCAL,
+    resolve_effective_harness,
+    resolve_effective_provider,
+)
 from .state import agent_dir
 
 if TYPE_CHECKING:
@@ -174,15 +180,44 @@ class StandardWorkerRun:
         self, paths: WorkerRunPaths, outbox_ref: list[Any]
     ) -> tuple[Any, str, Any]:
         worker = self.worker
-        if worker.agent_cfg.runtime.kind != RUNTIME_CLI_LOCAL:
+        kind = worker.agent_cfg.runtime.kind or RUNTIME_CLI_LOCAL
+        provider = resolve_effective_provider(
+            kind, worker.agent_cfg.runtime.provider
+        )
+        harness = resolve_effective_harness(
+            kind, provider, worker.agent_cfg.runtime.harness
+        )
+        if kind == RUNTIME_CLI_DOCKER and harness == HARNESS_CODEX:
+            return await self._prepare_driver_runtime(
+                paths,
+                outbox_ref,
+                worker_module.build_docker_codex_runtime(
+                    worker.daemon_cfg, worker.agent_cfg
+                ),
+            )
+        if kind != RUNTIME_CLI_LOCAL:
             worker._adapter = worker_module.build_docker_adapter(
                 worker.daemon_cfg, worker.agent_cfg
             )
             return None, "", None
-        from ..agent.harness.local_runtime import (
-            LocalRuntimePreparer,
-            build_local_runtime_adapter,
+        from ..agent.harness.local_runtime import LocalRuntimePreparer
+
+        return await self._prepare_driver_runtime(
+            paths,
+            outbox_ref,
+            LocalRuntimePreparer(worker.daemon_cfg, worker.agent_cfg),
         )
+
+    async def _prepare_driver_runtime(
+        self,
+        paths: WorkerRunPaths,
+        outbox_ref: list[Any],
+        preparer: Any,
+    ) -> tuple[Any, str, Any]:
+        """Prepare a Driver-backed runtime and bind it to the durable
+        outbox. Shared by host-local Claude/Codex and Docker Codex; the
+        Docker owner's exec transport and bounded container stop are wired
+        into the Driver here at the composition boundary."""
         from ..agent.runtime_event_outbox import (
             RuntimeEventOutbox,
             runtime_event_outbox_path,
@@ -193,7 +228,6 @@ class StandardWorkerRun:
         )
         outbox_ref[0] = outbox
         persisted = outbox.state()
-        preparer = LocalRuntimePreparer(worker.daemon_cfg, worker.agent_cfg)
         prepared = await preparer.prepare(
             system_prompt=paths.system_prompt,
             persisted_native_session_id=persisted.get("native_session_id", ""),
@@ -201,6 +235,32 @@ class StandardWorkerRun:
                 "session_fingerprint", ""
             ),
         )
+        try:
+            return await self._bind_driver_runtime(
+                outbox, prepared, persisted
+            )
+        except Exception:
+            # The Docker owner starts the per-agent container inside
+            # ``prepare``; if anything between that and adapter
+            # construction fails, the not-yet-wired preparer must stop it
+            # so partial initialization never orphans a running container.
+            await self._abort_docker_preparation(preparer)
+            raise
+
+    async def _bind_driver_runtime(
+        self,
+        outbox: Any,
+        prepared: Any,
+        persisted: dict[str, Any],
+    ) -> tuple[Any, str, Any]:
+        """Bind the prepared runtime to the durable outbox and the Runtime
+        Manager, injecting the Docker Codex Driver transport at the
+        composition boundary."""
+        worker = self.worker
+        from ..agent.harness.codex_driver import CodexAppServerDriver
+        from ..agent.harness.docker_runtime import DockerCodexPreparer
+        from ..agent.harness.local_runtime import build_local_runtime_adapter
+
         if prepared.discarded_persisted_session:
             session_ref = f"session_{uuid.uuid4().hex}"
             active_turn_ref = None
@@ -216,10 +276,40 @@ class StandardWorkerRun:
             native_session_id=prepared.native_session_id,
             session_fingerprint=prepared.session_fingerprint,
         )
+        driver = None
+        cleanup = None
+        if isinstance(preparer := prepared.preparer, DockerCodexPreparer):
+            driver = CodexAppServerDriver(
+                process_factory=preparer.process_factory
+            )
+            cleanup = preparer.aclose
         worker._adapter = build_local_runtime_adapter(
-            prepared, outbox=outbox, logical_session_ref=session_ref
+            prepared,
+            outbox=outbox,
+            logical_session_ref=session_ref,
+            driver=driver,
+            cleanup=cleanup,
         )
         return outbox, session_ref, prepared
+
+    async def _abort_docker_preparation(self, preparer: Any) -> None:
+        """Stop the Docker Codex container after a partial Driver assembly.
+
+        Only the Docker owner starts a container inside ``prepare``; the
+        host-local preparer has nothing to tear down.
+        """
+        from ..agent.harness.docker_runtime import DockerCodexPreparer
+
+        if not isinstance(preparer, DockerCodexPreparer):
+            return
+        try:
+            await preparer.aclose()
+        except Exception:
+            logger.exception(
+                "agent %s: failed to stop Docker Codex container after "
+                "preparation failure",
+                self.worker.agent_cfg.id,
+            )
 
     async def _initialize(self) -> WorkerRunContext | None:
         worker = self.worker

@@ -72,6 +72,8 @@ def test_supported_runtime_surface_is_explicit():
     (RUNTIME_CLI_LOCAL, PROVIDER_OPENAI, HARNESS_CODEX),
     (RUNTIME_CLI_LOCAL, PROVIDER_OPENAI, ""),
     (RUNTIME_CLI_DOCKER, PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE),
+    (RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, HARNESS_CODEX),
+    (RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, ""),
     (RUNTIME_CLI_DOCKER, "", ""),
     (RUNTIME_WS_LOCAL, "", "anything-external"),
 ])
@@ -86,14 +88,12 @@ def test_validate_triple_accepts_supported_combinations(
     (RUNTIME_CLI_LOCAL, "cohere", HARNESS_CLAUDE_CODE, "unknown provider"),
     (RUNTIME_CLI_LOCAL, PROVIDER_GOOGLE, HARNESS_GEMINI_CLI, "Driver runtime"),
     (RUNTIME_CLI_LOCAL, PROVIDER_ANTHROPIC, HARNESS_HERMES, "Driver runtime"),
-    (RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, HARNESS_CODEX, "Driver runtime"),
     (RUNTIME_CLI_DOCKER, PROVIDER_GOOGLE, HARNESS_CLAUDE_CODE, "does not support"),
     # Docker Hermes/Gemini cannot complete the metadata-notified Inbox
     # contract, so the matrix rejects them before any Worker is built —
     # explicitly, and via the provider-resolved default harness.
     (RUNTIME_CLI_DOCKER, PROVIDER_ANTHROPIC, HARNESS_HERMES, "design-only"),
     (RUNTIME_CLI_DOCKER, PROVIDER_GOOGLE, HARNESS_GEMINI_CLI, "design-only"),
-    (RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, "", "Driver runtime"),
     (RUNTIME_CLI_SANDBOX, PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE, "reserved"),
 ])
 def test_validate_triple_rejects_unsupported_combinations(
@@ -112,6 +112,13 @@ def test_runtime_defaults_select_the_ratified_local_drivers():
     assert resolve_effective_harness(
         RUNTIME_CLI_LOCAL, PROVIDER_OPENAI, "",
     ) == HARNESS_CODEX
+    # Docker defaults mirror cli-local: openai → codex, anthropic → claude.
+    assert resolve_effective_harness(
+        RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, "",
+    ) == HARNESS_CODEX
+    assert resolve_effective_harness(
+        RUNTIME_CLI_DOCKER, PROVIDER_ANTHROPIC, "",
+    ) == HARNESS_CLAUDE_CODE
     assert harness_applies(RUNTIME_CLI_LOCAL)
     assert harness_applies(RUNTIME_CLI_DOCKER)
     assert not harness_applies(RUNTIME_WS_LOCAL)
