@@ -631,6 +631,16 @@ async def test_keyless_end_turn_batch_emits_over_bridge():
         {"run_id": "run_a", "message_id": "msg_a", "succeeded": True},
     ])
     assert sender.calls[0]["status"] == "idle"
+
+    sender.calls.clear()
+    await rep.end_turn_batch([{
+        "run_id": "run_b",
+        "message_id": "msg_b",
+        "succeeded": False,
+        "error_text": "batch failed",
+    }])
+    assert sender.calls[0]["status"] == "error"
+    assert sender.calls[0]["error_text"] == "batch failed"
     assert http.calls == []
 
 

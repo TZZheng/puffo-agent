@@ -37,7 +37,7 @@ from ...portal.state import (
     sync_host_codex_auth_view,
     sync_host_codex_skills,
 )
-from ...portal.workspace_layout import ensure_workspace_shared_link
+from ...portal.workspace_layout import prepare_workspace_shared_access
 from ..adapters.desired_install import run_spawn_install
 from ..adapters.docker_cli import (
     DEFAULT_IMAGE,
@@ -446,7 +446,11 @@ class DockerCodexPreparer:
             pass
 
     async def _start_container(self) -> None:
-        ensure_workspace_shared_link(self.workspace_dir, self.shared_fs_dir)
+        shared_status = prepare_workspace_shared_access(
+            self.workspace_dir,
+            self.shared_fs_dir,
+            mounted=True,
+        )
         self.codex_home.mkdir(parents=True, exist_ok=True)
         self.agent_home.mkdir(parents=True, exist_ok=True)
         command = [
@@ -465,8 +469,11 @@ class DockerCodexPreparer:
             # Per-agent keystore + memory for the puffo-core MCP.
             "-v",
             f"{self.agent_home}:{CODEX_CONTAINER_STATE_DIR}",
-            "-v",
-            f"{self.shared_fs_dir}:/workspace/shared",
+            *(
+                ["-v", f"{self.shared_fs_dir}:/workspace/shared"]
+                if shared_status == "mounted"
+                else []
+            ),
             # Compatibility for existing sessions and user-authored paths.
             "-v",
             f"{self.shared_fs_dir}:/workspace/.shared",

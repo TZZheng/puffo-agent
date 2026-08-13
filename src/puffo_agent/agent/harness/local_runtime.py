@@ -47,7 +47,10 @@ from ...portal.state import (
     sync_host_skills,
     strip_claude_api_key_from_settings,
 )
-from ...portal.workspace_layout import ensure_workspace_shared_link
+from ...portal.workspace_layout import (
+    AVAILABLE_SHARED_WORKSPACE_STATES,
+    ensure_workspace_shared_link,
+)
 from ...portal.runtime_matrix import (
     resolve_effective_harness,
     resolve_effective_provider,
@@ -380,7 +383,17 @@ class LocalRuntimePreparer:
         )
 
     async def refresh_spec(self, system_prompt: str) -> RuntimeSpec:
-        ensure_workspace_shared_link(self.workspace_dir, shared_fs_dir())
+        shared_status = ensure_workspace_shared_link(
+            self.workspace_dir,
+            shared_fs_dir(),
+        )
+        if shared_status not in AVAILABLE_SHARED_WORKSPACE_STATES:
+            logger.error(
+                "agent %s: shared workspace is %s; cross-Agent file handoffs "
+                "are unavailable",
+                self.agent_id,
+                shared_status,
+            )
         self.claude_dir.mkdir(parents=True, exist_ok=True)
         if self.harness_name == "claude-code":
             self._sync_claude_host_state()

@@ -46,7 +46,7 @@ from ...portal.state import (
     sync_host_mcp_servers,
     sync_host_skills,
 )
-from ...portal.workspace_layout import ensure_workspace_shared_link
+from ...portal.workspace_layout import prepare_workspace_shared_access
 from .base import Adapter, TurnContext, TurnResult
 from ..context_controller import (
     ContextCapabilities,
@@ -72,7 +72,7 @@ def _puffo_agent_pkg_dir() -> Path:
 # image-tag pruning. ``_ensure_image`` only builds when the tag is
 # missing locally.
 DEFAULT_IMAGE = "puffo/agent-runtime:v19"
-CONTAINER_LAYOUT_VERSION = "20"
+CONTAINER_LAYOUT_VERSION = "21"
 
 # Pinned Claude Code CLI version baked into the image. Floating would
 # let an upstream release shift the stream-json protocol or
@@ -743,8 +743,8 @@ class DockerCLIAdapter(Adapter):
         )
 
     async def _start_container(self) -> None:
-        agent_claude_json = self._prepare_container_mounts()
-        command = self._container_run_command(agent_claude_json)
+        agent_claude_json, shared_status = self._prepare_container_mounts()
+        command = self._container_run_command(agent_claude_json, shared_status)
         self._add_optional_container_args(command)
         command.append(self.image)
         rc, _, stderr = await _run_cmd(command, check=False)
@@ -754,17 +754,22 @@ class DockerCLIAdapter(Adapter):
                 f"{stderr.decode('utf-8', errors='replace').strip()[:500]}"
             )
 
-    def _prepare_container_mounts(self) -> Path:
-        ensure_workspace_shared_link(Path(self.workspace_dir), self.shared_fs_dir)
+    def _prepare_container_mounts(self) -> tuple[Path, str]:
+        shared_status = prepare_workspace_shared_access(
+            Path(self.workspace_dir),
+            self.shared_fs_dir,
+            mounted=True,
+        )
         self.agent_home_dir.mkdir(parents=True, exist_ok=True)
         (self.agent_home_dir / ".claude").mkdir(parents=True, exist_ok=True)
         agent_claude_json = self.agent_home_dir / ".claude.json"
         agent_claude_json.touch(exist_ok=True)
-        return agent_claude_json
+        return agent_claude_json, shared_status
 
     def _container_run_command(
         self,
         agent_claude_json: Path,
+        shared_status: str,
     ) -> list[str]:
         return [
             self._docker_bin,
@@ -782,8 +787,11 @@ class DockerCLIAdapter(Adapter):
             # container's ephemeral fs and is lost on restart.
             "-v",
             f"{agent_claude_json}:/home/agent/.claude.json",
-            "-v",
-            f"{self.shared_fs_dir}:/workspace/shared",
+            *(
+                ["-v", f"{self.shared_fs_dir}:/workspace/shared"]
+                if shared_status == "mounted"
+                else []
+            ),
             # Compatibility for existing sessions and user-authored paths.
             "-v",
             f"{self.shared_fs_dir}:/workspace/.shared",

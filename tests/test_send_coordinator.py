@@ -274,6 +274,58 @@ async def test_null_baseline_lifecycle_preserves_none_and_persists_established(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["native", "keyless"])
+async def test_committed_send_reports_baseline_persistence_failure(lane):
+    coordinator, _active, http, store = await _baseline_lifecycle_coordinator(lane)
+
+    class FailingBaseline:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_context_baseline_seq(self, _space_id, _channel_id):
+            return None
+
+        async def set_context_baseline_seq(self, _space_id, _channel_id, _seq):
+            self.calls += 1
+            raise RuntimeError("sqlite unavailable")
+
+    baseline = FailingBaseline()
+    coordinator.baseline_source = baseline
+
+    async def commit(_path, body=None):
+        envelope_id = (
+            body["envelope"]["envelope_id"] if lane == "native" else "msg_keyless"
+        )
+        return {
+            "state": "sent",
+            "envelope_id": envelope_id,
+            "seq": 7,
+            "replay": False,
+            "missing_devices": [],
+            "freshness": {
+                "mode": "require_current",
+                "context_baseline_seq": 5,
+                "seen_seq": 0,
+                "latest_seq_before_send": 5,
+            },
+        }
+
+    if lane == "native":
+        http.post = commit
+    else:
+        http.post_unsigned = commit
+
+    result = await coordinator.send(SemanticSendRequest(
+        destination="ch_a", text="already committed",
+    ))
+
+    assert result["state"] == "sent"
+    assert "local freshness baseline could not be saved" in result["note"]
+    assert baseline.calls == 2
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_committed_send_stays_sent_when_local_boundary_update_fails():
     coordinator, _freshness, http = await coordinator_fixture(
         baseline=5, active=5

@@ -19,6 +19,7 @@ from pathlib import Path
 # the claude-code convention, so the codex variants must strip the
 # prefix or codex rejects with "unsupported call".
 _MCP_PUFFO_PREFIX_RE = re.compile(r"\bmcp__puffo__")
+_WORKSPACE_STATUS_MARKER = "<!-- puffo:workspace-status -->"
 
 
 def _strip_puffo_mcp_prefix_for_codex(text: str) -> str:
@@ -117,8 +118,8 @@ at the point of use. `refresh` rebuilds the prompt and resyncs those skills.
 
 ## Your workspace
 
-Your `cwd` is your persistent private workspace. `shared/` inside it is the
-host-wide collaboration directory for Agents managed by the same Puffo home.
+Your `cwd` is your persistent private workspace.
+<!-- puffo:workspace-status -->
 
 ## Memory
 
@@ -1251,12 +1252,22 @@ def assemble_claude_md(
     shared_primer: str,
     profile: str,
     memory_briefing: str,
+    workspace_shared_status: str = "existing",
 ) -> str:
     """Produce the per-agent CLAUDE.md. Order: primer (platform
     conventions) → memory (the compiled bounded briefing, including profile).
     """
     parts: list[str] = []
     if shared_primer.strip():
+        workspace_context = _workspace_shared_context(workspace_shared_status)
+        if _WORKSPACE_STATUS_MARKER in shared_primer:
+            shared_primer = shared_primer.replace(
+                _WORKSPACE_STATUS_MARKER,
+                workspace_context,
+                1,
+            )
+        else:
+            shared_primer = f"{shared_primer.rstrip()}\n\n{workspace_context}"
         parts.append(shared_primer.strip())
     if memory_briefing.strip():
         # ``briefing/profile.md`` retains its title on disk, but the generated
@@ -1269,6 +1280,24 @@ def assemble_claude_md(
         )
         parts.append(MEMORY_SECTION_HEADER + memory_briefing.strip())
     return "\n\n".join(parts) + "\n"
+
+
+def _workspace_shared_context(status: str) -> str:
+    if status in {"created", "existing", "mounted"}:
+        return (
+            "`shared/` inside it is the host-wide collaboration directory for "
+            "Agents managed by the same Puffo home."
+        )
+    if status == "conflict":
+        return (
+            "`shared/` currently contains private local data and is not connected "
+            "to the host-wide collaboration directory. Do not use it for "
+            "cross-Agent handoffs until the operator resolves the conflict."
+        )
+    return (
+        "The host-wide collaboration directory is unavailable in this runtime. "
+        "Do not rely on `shared/` for cross-Agent handoffs."
+    )
 
 
 def write_claude_md(claude_dir: Path, content: str) -> Path:
@@ -1319,6 +1348,7 @@ def rebuild_agent_codex_md(
     role: str = "",
     role_short: str = "",
     puffo_handle: str = "",
+    workspace_shared_status: str = "existing",
 ) -> str:
     """Assemble + write one codex agent's AGENTS.md.
 
@@ -1339,6 +1369,7 @@ def rebuild_agent_codex_md(
     agents_md = assemble_claude_md(
         shared_primer=primer,
         profile=profile_text,
+        workspace_shared_status=workspace_shared_status,
         memory_briefing=compile_agent_memory_briefing(
             memory_dir=memory_dir,
             profile_text=profile_text,
@@ -1366,6 +1397,7 @@ def rebuild_agent_claude_md(
     role: str = "",
     role_short: str = "",
     puffo_handle: str = "",
+    workspace_shared_status: str = "existing",
 ) -> str:
     """Assemble + write one agent's managed CLAUDE.md / GEMINI.md.
 
@@ -1390,6 +1422,7 @@ def rebuild_agent_claude_md(
     claude_md = assemble_claude_md(
         shared_primer=primer,
         profile=profile_text,
+        workspace_shared_status=workspace_shared_status,
         memory_briefing=compile_agent_memory_briefing(
             memory_dir=memory_dir,
             profile_text=profile_text,

@@ -206,3 +206,59 @@ async def test_global_inbox_turn_owns_one_status_lifecycle(tmp_path, monkeypatch
         assert await runtime.process_once() is True
     _assert_status_wire(case, http, lifecycle)
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_crash_recovery_reuses_and_settles_original_processing_run(tmp_path):
+    store = await make_store(tmp_path)
+    await receipt(store, "m1", 1)
+    http = FakeHttp()
+
+    original_adapter = _ContinuationAdapter()
+    original_lifecycle = GlobalInboxStatusLifecycle(
+        StatusReporter(http, heartbeat_interval_s=999)
+    )
+    original = GlobalInboxRuntime(
+        store=store,
+        adapter=original_adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+        status_lifecycle=original_lifecycle,
+    )
+    planned = await original.plan_pending(items=tuple(await store.get_pending()))
+    assert planned is not None
+    original._write_current_turn(planned)
+    original_adapter.register_admission_callback(
+        lambda event: original._admit(planned, event),
+        planned.planning_cycle_key,
+    )
+    await original_adapter.admit()
+
+    class RecoveredRunner:
+        async def handle_global_inbox_retry(self, _planned):
+            return None
+
+    recovered = GlobalInboxRuntime(
+        store=store,
+        adapter=_ContinuationAdapter(),
+        run_turn=RecoveredRunner(),
+        workspace=tmp_path,
+        status_lifecycle=GlobalInboxStatusLifecycle(
+            StatusReporter(http, heartbeat_interval_s=999)
+        ),
+    )
+
+    assert await recovered.recover_current_turn() is True
+    starts = [
+        body
+        for path, body in http.calls
+        if path.endswith("/processing/start")
+    ]
+    assert len(starts) == 2
+    assert starts[0]["run_id"] == starts[1]["run_id"]
+    assert _batch_runs(http) == [[{
+        "run_id": starts[0]["run_id"],
+        "message_id": "m1",
+        "succeeded": True,
+    }]]
+    await store.close()

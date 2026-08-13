@@ -68,6 +68,7 @@ def _rebuild_managed_system_prompt(
     role: str = "",
     role_short: str = "",
     puffo_handle: str = "",
+    workspace_shared_status: str = "existing",
 ) -> str:
     """Dispatch wrapper: write the right system-prompt file(s) for the
     agent's harness. Codex agents get ``$CODEX_HOME/AGENTS.md``; other
@@ -91,6 +92,7 @@ def _rebuild_managed_system_prompt(
             role=role,
             role_short=role_short,
             puffo_handle=puffo_handle,
+            workspace_shared_status=workspace_shared_status,
         )
     return rebuild_agent_claude_md(
         shared_dir=shared_path,
@@ -104,6 +106,7 @@ def _rebuild_managed_system_prompt(
         role=role,
         role_short=role_short,
         puffo_handle=puffo_handle,
+        workspace_shared_status=workspace_shared_status,
     )
 
 
@@ -1335,6 +1338,7 @@ async def _process_refresh_flags(
     role: str = "",
     role_short: str = "",
     puffo_handle: str = "",
+    workspace_shared_status: str = "existing",
 ) -> None:
     """Consume any worker-scope refresh flags into a single
     ``adapter.reload(prompt, with_session=…)`` call at turn start.
@@ -1369,6 +1373,7 @@ async def _process_refresh_flags(
                 role=role,
                 role_short=role_short,
                 puffo_handle=puffo_handle,
+                workspace_shared_status=workspace_shared_status,
             )
             from ..agent.shared_content import MEMORY_SECTION_HEADER
 

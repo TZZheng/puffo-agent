@@ -31,6 +31,7 @@ from puffo_agent.portal.state import (
     RuntimeConfig,
 )
 from puffo_agent.portal.worker_run import StandardWorkerRun, WorkerRunPaths
+from puffo_agent.portal.workspace_layout import ensure_workspace_shared_link
 
 
 def _preparer(tmp_path, monkeypatch, *, gateway=False) -> DockerCodexPreparer:
@@ -96,6 +97,7 @@ def _wire_driver_runtime(tmp_path, preparer):
         workspace_path=str(preparer.workspace_dir),
         claude_path=str(preparer.claude_dir),
         shared_path=tmp_path / "shared",
+        workspace_shared_status="mounted",
         system_prompt="prompt",
     )
     outbox_ref: list = [None]
@@ -103,6 +105,16 @@ def _wire_driver_runtime(tmp_path, preparer):
         run._prepare_driver_runtime(paths, outbox_ref, preparer)
     )
     return outbox, worker._adapter
+
+
+def _seed_local_to_docker_layout(preparer):
+    preparer.agent_home.mkdir(parents=True)
+    (preparer.agent_home / ".docker-layout").write_text(
+        docker_cli.CONTAINER_LAYOUT_VERSION + "\n", encoding="utf-8"
+    )
+    assert ensure_workspace_shared_link(
+        preparer.workspace_dir, preparer.shared_fs_dir
+    ) == "created"
 
 
 def test_docker_codex_runtime_boundary(tmp_path, monkeypatch):
@@ -113,10 +125,7 @@ def test_docker_codex_runtime_boundary(tmp_path, monkeypatch):
         'command = "/Users/operator/bin/server"\n',
         encoding="utf-8",
     )
-    (preparer.agent_home).mkdir(parents=True)
-    (preparer.agent_home / ".docker-layout").write_text(
-        docker_cli.CONTAINER_LAYOUT_VERSION + "\n", encoding="utf-8"
-    )
+    _seed_local_to_docker_layout(preparer)
 
     assert docker_cli.DEFAULT_IMAGE == "puffo/agent-runtime:v19"
     assert f"@openai/codex@{docker_cli.CODEX_NPM_VERSION}" in docker_cli.DOCKERFILE
@@ -166,7 +175,8 @@ def test_docker_codex_runtime_boundary(tmp_path, monkeypatch):
         assert f"{preparer.codex_home}:/home/agent/.codex" in run_cmd
         assert f"{preparer.agent_home}:/home/agent/.puffo-agent-state" in run_cmd
         assert any(":/workspace" in part for part in run_cmd)
-        assert any(":/workspace/shared" in part for part in run_cmd)
+        assert f"{preparer.shared_fs_dir}:/workspace/shared" in run_cmd
+        assert not (preparer.workspace_dir / "shared").is_symlink()
         assert any(":/workspace/.shared" in part for part in run_cmd)
         assert any(
             str(part).endswith(":/opt/puffoagent-pkg:ro") for part in run_cmd

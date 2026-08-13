@@ -20,7 +20,9 @@ def _tmp() -> Path:
     return Path(tempfile.mkdtemp())
 
 
-def _rebuild(root: Path) -> tuple[str, str]:
+def _rebuild(
+    root: Path, *, workspace_shared_status: str = "existing"
+) -> tuple[str, str]:
     profile = root / "profile.md"
     profile.write_text("# Soul\nSOUL-MARKER-7b", encoding="utf-8")
     memory = root / "memory"
@@ -31,6 +33,7 @@ def _rebuild(root: Path) -> tuple[str, str]:
         workspace_dir=workspace, agent_id="AGENT-ID-MARKER-8c",
         display_name="DISPLAY-NAME-MARKER-9d", role="LONG-ROLE-MARKER-ae",
         role_short="SHORT-ROLE-MARKER-bf",
+        workspace_shared_status=workspace_shared_status,
     )
     claude = rebuild_agent_claude_md(
         **common, claude_user_dir=root / ".claude", gemini_user_dir=root / ".gemini",
@@ -75,7 +78,6 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
         "ordinary assistant text is not delivered",
         "message comes from an existing thread",
         "message_id` as `root_id",
-        "`shared/` inside it is the host-wide collaboration directory",
     ):
         assert phrase in primer
     for absent in ("decide-response", "[SILENT]", "Send, Clarify, Wait, or Silent"):
@@ -124,6 +126,17 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
         assert phrase.lower() in normalized_send
     assert "common held-send procedure" in DEFAULT_SKILLS["send-message-with-attachments"][1]
     assert "A held draft was attempted but not sent" not in send
+
+    for text in _rebuild(_tmp()):
+        assert "`shared/` inside it is the host-wide collaboration directory" in text
+
+
+def test_standing_prompt_reports_unavailable_shared_workspace_truthfully():
+    conflict, _ = _rebuild(_tmp(), workspace_shared_status="conflict")
+    unavailable, _ = _rebuild(_tmp(), workspace_shared_status="unavailable")
+
+    assert "not connected to the host-wide collaboration directory" in conflict
+    assert "host-wide collaboration directory is unavailable" in unavailable
 
 
 def test_inbox_turn_cue_is_short_and_reinforces_the_standing_default():
