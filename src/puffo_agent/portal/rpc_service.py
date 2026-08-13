@@ -12,7 +12,11 @@ from typing import Awaitable, Callable, Optional
 
 from aiohttp import web
 
-from ..agent.message_store import MAX_REMINDER_LIST_LIMIT, REMINDER_STATES, parse_reminder_target
+from ..agent.message_store import (
+    MAX_REMINDER_LIST_LIMIT,
+    PUBLIC_REMINDER_STATES,
+    parse_reminder_target,
+)
 from ..agent.message_store_models import LifecycleConflict
 from ..agent.reminder_scheduler import normalize_reminder_timestamp
 from . import host_mcp_handler
@@ -412,7 +416,9 @@ async def list_reminders_route(request: web.Request) -> web.Response:
         )
     state = body.get("state", "")
     limit = body.get("limit", 50)
-    if not isinstance(state, str) or (state and state not in REMINDER_STATES):
+    if not isinstance(state, str) or (
+        state and state not in PUBLIC_REMINDER_STATES
+    ):
         return web.json_response(
             {"error": "state must be empty or a reminder state"}, status=400,
         )
@@ -465,6 +471,52 @@ async def cancel_reminder_route(request: web.Request) -> web.Response:
         return web.json_response({"error": f"handler raised: {exc}"}, status=500)
 
 
+async def replace_reminder_route(request: web.Request) -> web.Response:
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    expected = {"reminder_id", "content", "target", "intended_at"}
+    if not isinstance(body, dict) or set(body) != expected:
+        return web.json_response(
+            {"error": "replace_reminder accepts reminder_id and replacement fields"},
+            status=400,
+        )
+    if not all(isinstance(body[field], str) for field in expected):
+        return web.json_response(
+            {"error": "replacement fields must be strings"}, status=400
+        )
+    if not body["reminder_id"] or not any(
+        body[field] for field in ("content", "target", "intended_at")
+    ):
+        return web.json_response(
+            {"error": "replace_reminder requires an id and one changed field"},
+            status=400,
+        )
+    try:
+        if body["target"]:
+            parse_reminder_target(body["target"])
+        if body["intended_at"]:
+            _ms, body["intended_at"] = normalize_reminder_timestamp(
+                body["intended_at"]
+            )
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    ctx = _warm_context(request.match_info["agent_id"])
+    if ctx is None:
+        return web.json_response({"error": "no warm worker"}, status=503)
+    try:
+        result = await host_mcp_handler.replace_reminder(ctx, **body)
+    except LifecycleConflict as exc:
+        return web.json_response({"error": str(exc)}, status=409)
+    except (RuntimeError, ValueError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        logger.exception("rpc-service: replace reminder failed")
+        return web.json_response({"error": f"handler raised: {exc}"}, status=500)
+    return web.json_response(result)
+
+
 def build_app(cfg: RpcServiceConfig) -> web.Application:
     app = web.Application(middlewares=[require_local_service_auth])
     app.router.add_post(
@@ -506,6 +558,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/cancel-reminder",
         cancel_reminder_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/replace-reminder",
+        replace_reminder_route,
     )
     return app
 

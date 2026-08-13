@@ -31,6 +31,7 @@ def test_allowed_tools_are_the_send_read_and_membership_tools():
         "create_reminder",
         "list_reminders",
         "cancel_reminder",
+        "replace_reminder",
         "get_user_info",
         "whoami",
         "get_post",
@@ -108,6 +109,7 @@ def test_ws_local_semantic_tool_signatures_expose_no_internal_controls():
         "create_reminder": {"content", "target", "intended_at"},
         "list_reminders": {"state", "limit"},
         "cancel_reminder": {"reminder_id"},
+        "replace_reminder": {"reminder_id", "content", "target", "intended_at"},
         "send_message": {
             "channel", "text", "root_id", "visibility_level", "send_anyway",
         },
@@ -195,6 +197,10 @@ async def test_ws_local_reminder_tools_use_the_live_runtime():
             calls.append(("cancel", kwargs))
             return {"reminder_id": "r", "occurrence_id": "o", "state": "cancelled"}
 
+        async def replace_reminder(self, **kwargs):
+            calls.append(("replace", kwargs))
+            return {"cancelled": {"reminder_id": "r"}, "replacement": {"reminder_id": "r2"}}
+
     cfg = PuffoCoreToolsConfig(
         slug="agent-1", device_id="dev-1", keystore=MagicMock(),
         http_client=MagicMock(), data_client=MagicMock(), inbox_runtime=Runtime(),
@@ -207,6 +213,9 @@ async def test_ws_local_reminder_tools_use_the_live_runtime():
     assert await dispatch["cancel_reminder"](reminder_id="r") == {
         "reminder_id": "r", "occurrence_id": "o", "state": "cancelled",
     }
+    assert await dispatch["replace_reminder"](
+        reminder_id="r", content="new",
+    ) == {"cancelled": {"reminder_id": "r"}, "replacement": {"reminder_id": "r2"}}
     assert calls == [
         ("create", {
             "content": "x", "target": "channel:sp:ch",
@@ -214,6 +223,9 @@ async def test_ws_local_reminder_tools_use_the_live_runtime():
         }),
         ("list", {"state": "scheduled", "limit": 7}),
         ("cancel", {"reminder_id": "r"}),
+        ("replace", {
+            "reminder_id": "r", "content": "new", "target": "", "intended_at": "",
+        }),
     ]
 
 

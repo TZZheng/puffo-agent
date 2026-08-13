@@ -67,10 +67,8 @@ def register_reminder_tools(mcp: FastMCP, cfg: Any) -> None:
         """Create one durable local reminder for a canonical Inbox target.
 
         ``intended_at`` is an explicit-offset RFC3339 timestamp. The result
-        is a provider-neutral reminder object. Reminders are immutable and
-        single-fire; replace a pending reminder by cancelling it and creating
-        another. A due occurrence enters the ordinary durable Inbox and leaves
-        any action decision to the model.
+        is a provider-neutral reminder object. A due occurrence enters the
+        ordinary durable Inbox and leaves any action decision to the model.
         """
         runtime = getattr(cfg, "inbox_runtime", None)
         if runtime is None:
@@ -114,7 +112,7 @@ def register_reminder_tools(mcp: FastMCP, cfg: Any) -> None:
 
     @mcp.tool()
     async def cancel_reminder(reminder_id: str) -> dict[str, Any]:
-        """Idempotently cancel a local reminder that has not delivered."""
+        """Idempotently cancel a reminder whose delivery has not started."""
         runtime = getattr(cfg, "inbox_runtime", None)
         if runtime is None:
             runtime = getattr(
@@ -129,7 +127,47 @@ def register_reminder_tools(mcp: FastMCP, cfg: Any) -> None:
         raise RuntimeError("global Inbox runtime is unavailable")
 
 
+def register_reminder_replace_tool(mcp: FastMCP, cfg: Any) -> None:
+    @mcp.tool()
+    async def replace_reminder(
+        reminder_id: str,
+        content: str = "",
+        target: str = "",
+        intended_at: str = "",
+    ) -> dict[str, Any]:
+        """Atomically replace one scheduled reminder.
+
+        Supply one or more changed fields; empty fields inherit the existing
+        value. ``intended_at`` uses explicit-offset RFC3339. The result contains
+        the cancelled reminder and its scheduled replacement. Delivery that
+        already started is never revoked.
+        """
+        runtime = getattr(cfg, "inbox_runtime", None)
+        if runtime is None:
+            runtime = getattr(
+                getattr(cfg, "message_client", None),
+                "global_runtime",
+                None,
+            )
+        if runtime is not None:
+            return await runtime.replace_reminder(
+                reminder_id=reminder_id,
+                content=content,
+                target=target,
+                intended_at=intended_at,
+            )
+        if cfg.rpc_client is not None:
+            return await cfg.rpc_client.replace_reminder(
+                reminder_id=reminder_id,
+                content=content,
+                target=target,
+                intended_at=intended_at,
+            )
+        raise RuntimeError("global Inbox runtime is unavailable")
+
+
 def register_inbox_tools(mcp: FastMCP, cfg: Any) -> None:
     """Register Inbox and reminder tools in their established order."""
     register_inbox_read_tool(mcp, cfg)
     register_reminder_tools(mcp, cfg)
+    register_reminder_replace_tool(mcp, cfg)

@@ -434,6 +434,7 @@ async def test_puffo_rpc_client_round_trips_all_reminder_objects(
         "state": "cancelled",
         "cancelled_at": "2026-08-02T11:01:00.000Z",
     }
+    legacy_claimed = {**scheduled, "state": "claimed"}
 
     async def create(_ctx, **kwargs):
         captured.append(("create", kwargs))
@@ -441,15 +442,20 @@ async def test_puffo_rpc_client_round_trips_all_reminder_objects(
 
     async def list_(_ctx, **kwargs):
         captured.append(("list", kwargs))
-        return {"reminders": [scheduled]}
+        return {"reminders": [legacy_claimed]}
 
     async def cancel(_ctx, **kwargs):
         captured.append(("cancel", kwargs))
         return cancelled
 
+    async def replace(_ctx, **kwargs):
+        captured.append(("replace", kwargs))
+        return {"cancelled": cancelled, "replacement": scheduled}
+
     monkeypatch.setattr(rpc_service.host_mcp_handler, "create_reminder", create)
     monkeypatch.setattr(rpc_service.host_mcp_handler, "list_reminders", list_)
     monkeypatch.setattr(rpc_service.host_mcp_handler, "cancel_reminder", cancel)
+    monkeypatch.setattr(rpc_service.host_mcp_handler, "replace_reminder", replace)
     rpc_service.set_rpc_resolver(lambda aid: _stub_ctx(aid))
     app_client = await app_client_factory()
     client = PuffoRpcClient(
@@ -467,6 +473,10 @@ async def test_puffo_rpc_client_round_trips_all_reminder_objects(
             "reminders": [scheduled],
         }
         assert await client.cancel_reminder(reminder_id="reminder-1") == cancelled
+        assert await client.replace_reminder(
+            reminder_id="reminder-1",
+            intended_at="2026-08-03T12:00:00Z",
+        ) == {"cancelled": cancelled, "replacement": scheduled}
     finally:
         await client.close()
     assert captured == [
@@ -476,6 +486,10 @@ async def test_puffo_rpc_client_round_trips_all_reminder_objects(
         }),
         ("list", {"state": "scheduled", "limit": 3}),
         ("cancel", {"reminder_id": "reminder-1"}),
+        ("replace", {
+            "reminder_id": "reminder-1", "content": "", "target": "",
+            "intended_at": "2026-08-03T12:00:00.000Z",
+        }),
     ]
 
 

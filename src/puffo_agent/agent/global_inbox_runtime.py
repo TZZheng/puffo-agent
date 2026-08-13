@@ -268,6 +268,21 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             reminder_id=reminder_id,
         )
 
+    async def replace_reminder(
+        self,
+        *,
+        reminder_id: str,
+        content: str = "",
+        target: str = "",
+        intended_at: str = "",
+    ) -> dict[str, object]:
+        return await self.reminder_scheduler.replace_reminder(
+            reminder_id=reminder_id,
+            content=content,
+            target=target,
+            intended_at=intended_at,
+        )
+
     def notify_delivery(self) -> None:
         self.held_recovery_source.notify_delivery()
 

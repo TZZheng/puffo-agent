@@ -10,17 +10,22 @@ content, cancellation, delivery, and local scheduling in its per-Agent
   content, a canonical target (`dm:<peer>`, `channel:<space>:<channel>`, or a
   channel thread target), and an RFC3339 timestamp with an explicit offset.
 - `list_reminders(state="", limit=50)` returns reminders ordered by intended
-  time and occurrence identity.
-- `cancel_reminder(reminder_id)` is idempotent after a local cancellation. It
-  succeeds only for scheduled, untouched local-only work. Once the occurrence
-  is claimed, or once an envelope, Server acknowledgement, snapshot conflict,
-  or delivery claim is durable,
-  cancellation fails closed because this client cannot revoke possible remote
-  custody. It never removes a delivered local Inbox event.
+  time and occurrence identity. Public states are `scheduled`, `cancelled`,
+  and `delivered`; the internal `claimed` coordination state is projected as
+  `scheduled`.
+- `cancel_reminder(reminder_id)` idempotently cancels scheduled work. Local-only
+  work commits in SQLite; remotely prepared work is fenced against a live
+  delivery claim by the Server. A transient local `claimed` state is resolved
+  against that lease; work already delivered locally is too late to cancel.
+- `replace_reminder(reminder_id, content="", target="", intended_at="")`
+  atomically cancels one scheduled occurrence and creates its replacement.
+  At least one non-empty field is required; omitted fields inherit their old
+  values. A live delivery claim makes the replacement too late.
 
 Each create/cancel result is the same structured object containing immutable
 `reminder_id`, `occurrence_id`, target, exact content, intended UTC time, and
 the actual-fire, creation, cancellation, and delivery facts when present.
+Replace returns the cancelled object and the replacement object together.
 
 ## Durable delivery
 
@@ -29,8 +34,13 @@ The state transition is:
 
 ```text
 scheduled -> claimed -> delivered
-scheduled -> cancelled (only before claim or remote preparation)
+scheduled -> cancelled
+scheduled -> cancelled + replacement scheduled (one atomic replace)
 ```
+
+`claimed` is transient local delivery coordination, not a separate
+user-visible reminder phase. Product surfaces may label terminal `delivered`
+as `fired`; the v1 wire and SQLite compatibility name remains `delivered`.
 
 Claiming records the actual fire time once. Delivery creates
 `reminder-occurrence:<occurrence_id>` as a `local_runtime` pending Inbox row
@@ -88,11 +98,15 @@ body contains only:
 The ciphertext encrypts exactly canonical `{"content":...,"target":...}`
 JSON using a fresh 12-byte nonce. Canonical AAD binds `owner_slug`,
 `reminder_id`, `occurrence_id`, canonical UTC `intended_at`, and envelope
-version. Every retry reuses the same stored envelope bytes; it never
-re-encrypts an occurrence. The Server receives only base64url of that envelope
-plus occurrence metadata, never target, content, a DEK, provider/model data,
-or a payload-derived wake reason. The complete encoded envelope is limited to
-32,768 bytes; create rejects content that cannot fit that bound.
+version. Once an occurrence is materialized locally, every retry reuses its
+stored envelope bytes. An atomic replacement whose first response is lost may
+reconstruct a fresh envelope under the same deterministic replacement identity;
+the Server returns the first committed canonical envelope, which the Agent
+decrypts and validates before local materialization. The Server receives only
+base64url envelope bytes plus occurrence metadata, never target, content, a
+DEK, provider/model data, or a payload-derived wake reason. The complete
+encoded envelope is limited to 32,768 bytes; create rejects content that cannot
+fit that bound.
 
 `reminder_occurrences` remains both the local source of truth and its embedded
 outbox. A create is local revision 1. `claimed` is local crash recovery only
@@ -108,16 +122,19 @@ Native Agents use signed:
 - `PUT /v2/agent-runtime/reminder-occurrences/{occurrence_id}`
 - `GET /v2/agent-runtime/reminder-occurrences?after=<opaque_cursor>&limit=<n>`
 - `POST /v2/agent-runtime/reminder-occurrences/{occurrence_id}/delivery-claim`
+- `POST /v2/agent-runtime/reminder-occurrences/{occurrence_id}/replace`
 
 Bridge Agents use the same DTO through the existing keyless boundary:
 
 - `PUT /v2/cloud-agents/agent-runtime/reminder-occurrences/{occurrence_id}`
 - `GET /v2/cloud-agents/agent-runtime/reminder-occurrences?after=<opaque_cursor>&limit=<n>`
 - `POST /v2/cloud-agents/agent-runtime/reminder-occurrences/{occurrence_id}/delivery-claim`
+- `POST /v2/cloud-agents/agent-runtime/reminder-occurrences/{occurrence_id}/replace`
 
 PUT sends `revision`, `reminder_id`, RFC3339 `due_at`, `lifecycle`,
 `lifecycle_at`, `payload_format`, and base64url `opaque_payload`. The Server
-current-state snapshot returns scheduled rows as `{occurrences,next_after}`.
+current-state snapshot returns retained scheduled and terminal rows as
+`{occurrences,next_after}`. Terminal rows omit `opaque_payload`.
 `next_after` is an opaque, snapshot-bound cursor; the Agent passes it back
 verbatim and restarts the snapshot if the Server reports that the cursor's
 snapshot revision changed. On startup and reconnect, the Agent consumes every
@@ -148,9 +165,14 @@ ID and `lease_expires_at`; an acquired bit without an expiry is not custody.
 Only `acquired` may enter the existing atomic local Inbox-event and
 delivered-state transaction. `terminal` reconciles local state without creating
 an Inbox row or Agent turn. Claim IDs are coordination metadata only: snapshots
-never expose them and the Server never sees reminder plaintext. Once work is
-claimed or any remote-custody evidence is durable, local cancellation fails
-closed; cancellation cannot erase work in flight or a possible Server copy.
+never expose them and the Server never sees reminder plaintext. Cancellation
+and replacement lock the old Server row and reject a live delivery claim. An
+expired claim does not permanently strand scheduled work. The replacement
+endpoint inserts the new row and cancels the old row in one PostgreSQL
+transaction. Its replacement occurrence identity is also the retry identity:
+after a response is lost, the Server returns the first committed canonical
+row, and the Agent decrypts and validates it before committing the paired
+result to SQLite.
 
 Successful local delivery immediately wakes the outbox so revision 2 reaches
 the Server without waiting for the idle sync cadence. A held runtime retries
@@ -178,30 +200,19 @@ SQLite transaction prevents duplicate Inbox events within one local database,
 but the transferable lease does not provide cross-runtime exactly-once delivery
 after a crashed or partitioned holder loses its lease.
 
-## Current Server limits
+## Current limits
 
-The deployed Server contract is narrower than the eventual protocol:
-
-- snapshots currently return only `scheduled` rows; terminal rows are retained
-  for 30 days but are not snapshot tombstones, so a fresh runtime cannot fully
-  reconstruct prior cancellation or delivery from the snapshot alone;
-- the Agent emits revision 1 for scheduled and revision 2 for terminal state,
-  while the Server currently validates only that a revision is positive;
-- a terminal cancellation can clear a live delivery claim, so the Agent must
-  fail closed once an occurrence has entered remote custody rather than promise
-  race-free remote cancellation; and
-- a lease prevents concurrent live holders, not duplicate delivery after lease
-  transfer.
-
-Terminal snapshot rows and strict revision transitions must land in the Server
-before the client may advertise cross-runtime terminal reconstruction.
-Cancellation fencing would be required before supporting remote cancellation.
-None of these prerequisites upgrades a transferable lease to cross-runtime
+Terminal rows are retained by the Server for 30 days. They reconcile matching
+local occurrences after restart but omit plaintext and cannot recreate missing
+terminal history in a fresh local database. The Server enforces revision 1 for
+scheduled and revision 2 for terminal rows. A lease prevents concurrent live
+holders, not duplicate delivery after lease transfer; none of the cancellation
+or replacement guarantees upgrades that transferable lease to cross-runtime
 exactly-once delivery.
 
 ## Non-goals
 
-This slice has no editing, rescheduling, recurrence, snooze, browser surface,
-cloud sandbox lifecycle scheduling, race-free remote cancellation, or
-provider-specific scheduler behavior. Server-side decryption, recovery-key
-upload, and cross-runtime exactly-once delivery are not part of this contract.
+This slice has no recurrence, snooze, browser surface, cloud sandbox lifecycle
+scheduling, or provider-specific scheduler behavior. Server-side decryption,
+recovery-key upload, and cross-runtime exactly-once delivery are not part of
+this contract.

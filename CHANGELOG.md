@@ -6,6 +6,25 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a4] — 2026-08-12
+
+> Staging candidate for the complete one-shot Reminder lifecycle.
+
+### Added
+
+- **Scheduled reminders can be replaced atomically.** The new semantic
+  `replace_reminder` tool preserves omitted fields, fences live delivery, and
+  converges after an uncertain network result without creating duplicate work.
+
+### Changed
+
+- **Cancellation now coordinates with remote custody.** Prepared reminders can
+  be cancelled until delivery starts, and retained terminal snapshots rebuild
+  matching local cancelled or fired state after restart.
+- **Delivery claims stay internal.** Reminder tools continue to show claimed
+  work as `scheduled`; the transient SQLite custody state is not part of the
+  public lifecycle.
+
 ## [2.0.0a3] — 2026-08-12
 
 > Staging-only prompt candidate for manual conversation validation.

@@ -261,13 +261,17 @@ class PuffoRpcClient:
 
     @staticmethod
     def _validate_reminder_object(data: dict[str, Any]) -> dict[str, Any]:
+        # During a rolling local upgrade, a new MCP subprocess can briefly
+        # talk to an older daemon that still exposed this internal state.
+        if data.get("state") == "claimed":
+            data = {**data, "state": "scheduled"}
         required = {
             "reminder_id", "occurrence_id", "state", "target", "content",
             "intended_at", "actual_fire_at", "created_at", "cancelled_at",
             "delivered_at",
         }
         if set(data) != required or data.get("state") not in {
-            "scheduled", "claimed", "cancelled", "delivered",
+            "scheduled", "cancelled", "delivered",
         } or not all(
             isinstance(data.get(key), str)
             for key in (
@@ -308,6 +312,34 @@ class PuffoRpcClient:
         return self._validate_reminder_object(await self._post_object(
             "cancel-reminder", {"reminder_id": reminder_id},
         ))
+
+    async def replace_reminder(
+        self,
+        *,
+        reminder_id: str,
+        content: str = "",
+        target: str = "",
+        intended_at: str = "",
+    ) -> dict[str, Any]:
+        data = await self._post_object(
+            "replace-reminder",
+            {
+                "reminder_id": reminder_id,
+                "content": content,
+                "target": target,
+                "intended_at": intended_at,
+            },
+        )
+        if set(data) != {"cancelled", "replacement"}:
+            raise RuntimeError("rpc replace reminder returned an invalid result")
+        cancelled = data["cancelled"]
+        replacement = data["replacement"]
+        if not isinstance(cancelled, dict) or not isinstance(replacement, dict):
+            raise RuntimeError("rpc replace reminder returned an invalid result")
+        return {
+            "cancelled": self._validate_reminder_object(cancelled),
+            "replacement": self._validate_reminder_object(replacement),
+        }
 
     async def install_mcp(
         self,

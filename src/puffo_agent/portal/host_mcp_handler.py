@@ -754,6 +754,25 @@ async def cancel_reminder(
     return await runtime.cancel_reminder(reminder_id=reminder_id)
 
 
+async def replace_reminder(
+    ctx: HostMcpContext,
+    *,
+    reminder_id: str,
+    content: str = "",
+    target: str = "",
+    intended_at: str = "",
+) -> dict[str, object]:
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global Inbox runtime is unavailable")
+    return await runtime.replace_reminder(
+        reminder_id=reminder_id,
+        content=content,
+        target=target,
+        intended_at=intended_at,
+    )
+
+
 async def request_command_permission(
     ctx: HostMcpContext,
     *,

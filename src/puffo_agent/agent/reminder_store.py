@@ -321,10 +321,9 @@ class ReminderStoreMixin:
         values = cls._terminal_values(record, lifecycle, lifecycle_at_ms)
         next_state = values[0]
         next_revision = max(record.revision, revision)
-        # A snapshot only acknowledges the lifecycle it actually returned.
-        next_ack_revision = record.server_ack_revision
-        if next_state == lifecycle:
-            next_ack_revision = max(next_ack_revision, revision)
+        # The remote terminal revision is authoritative for future sync even
+        # when a locally committed delivery fact must remain visible.
+        next_ack_revision = max(record.server_ack_revision, revision)
         return (*values, next_revision, next_ack_revision)
 
     async def create_reminder(
@@ -432,6 +431,26 @@ class ReminderStoreMixin:
             return await self._get_reminder_sync_by_occurrence_unlocked(
                 await self._ensure_db(),
                 occurrence_id,
+            )
+
+    async def get_reminder_sync_record_by_reminder_id(
+        self,
+        reminder_id: str,
+    ) -> ReminderSyncRecord | None:
+        """Return the worker-only sync view addressed by the MCP identity."""
+        if not isinstance(reminder_id, str) or not reminder_id:
+            raise ValueError("reminder_id must be a non-empty string")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            async with db.execute(
+                "SELECT * FROM reminder_occurrences WHERE reminder_id = ?",
+                (reminder_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            return (
+                self._reminder_sync_record_from_row(row)
+                if row is not None
+                else None
             )
 
     async def persist_reminder_envelope(
@@ -688,6 +707,9 @@ class ReminderStoreMixin:
             or record.sync_retry_count != 0
             or record.sync_permanent_revision is not None
             or record.sync_permanent_code is not None
+            or record.delivery_claim_id is not None
+            or record.delivery_claim_acquired
+            or record.delivery_claim_expires_at_ms is not None
             or record.snapshot_conflict
         )
 
@@ -902,7 +924,8 @@ class ReminderStoreMixin:
                            sync_retry_after_ms = NULL, sync_retry_count = 0,
                            sync_permanent_revision = NULL,
                            sync_permanent_code = NULL,
-                           snapshot_conflict = 0
+                           delivery_claim_id = NULL, delivery_claim_acquired = 0,
+                           delivery_claim_expires_at_ms = NULL, snapshot_conflict = 0
                        WHERE occurrence_id = ?""",
                     (
                         next_state,
@@ -938,12 +961,19 @@ class ReminderStoreMixin:
             raise ValueError(f"limit must be between 1 and {MAX_REMINDER_LIST_LIMIT}")
         async with self._inbox_lock:
             db = await self._ensure_db()
-            if state:
+            if state == "scheduled":
+                query = (
+                    "SELECT * FROM reminder_occurrences "
+                    "WHERE state IN ('scheduled', 'claimed') "
+                    "ORDER BY intended_at_ms, occurrence_id LIMIT ?"
+                )
+                params: tuple[Any, ...] = (limit,)
+            elif state:
                 query = (
                     "SELECT * FROM reminder_occurrences WHERE state = ? "
                     "ORDER BY intended_at_ms, occurrence_id LIMIT ?"
                 )
-                params: tuple[Any, ...] = (state, limit)
+                params = (state, limit)
             else:
                 query = (
                     "SELECT * FROM reminder_occurrences "
@@ -1373,6 +1403,363 @@ class ReminderStoreMixin:
                     delivered.append(occurrence)
             return tuple(delivered)
 
+    @staticmethod
+    def _replacement_terminal_fields(
+        lifecycle: str,
+        lifecycle_at_ms: int,
+    ) -> tuple[int | None, int | None, int | None]:
+        if lifecycle == "scheduled":
+            return None, None, None
+        if lifecycle == "cancelled":
+            return None, lifecycle_at_ms, None
+        if lifecycle == "delivered":
+            return lifecycle_at_ms, None, lifecycle_at_ms
+        raise ValueError("invalid replacement lifecycle")
+
+    @staticmethod
+    def _replacement_matches(
+        record: ReminderSyncRecord,
+        *,
+        reminder_id: str,
+        target: str,
+        content: str,
+        intended_at_ms: int,
+        payload_format: str | None,
+        opaque_payload: bytes | None,
+    ) -> bool:
+        return (
+            record.reminder_id == reminder_id
+            and record.target == target
+            and record.content == content
+            and record.intended_at_ms == intended_at_ms
+            and record.payload_format == payload_format
+            and record.opaque_payload == opaque_payload
+        )
+
+    async def replace_local_reminder(
+        self,
+        *,
+        reminder_id: str,
+        replacement_reminder_id: str,
+        replacement_occurrence_id: str,
+        content: str,
+        target: str,
+        intended_at_ms: int,
+        replaced_at_ms: int,
+    ) -> tuple[ReminderOccurrence, ReminderOccurrence]:
+        """Atomically replace work that has never crossed the remote boundary."""
+        parse_reminder_target(target)
+        if (
+            not content
+            or reminder_plaintext_envelope_size(target, content)
+            > MAX_REMINDER_ENVELOPE_BYTES
+            or not self._valid_reminder_time(intended_at_ms)
+            or not self._valid_reminder_time(replaced_at_ms)
+        ):
+            raise ValueError("invalid reminder replacement")
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                old = await self._get_reminder_unlocked(db, reminder_id)
+                if old is None:
+                    raise ValueError("unknown reminder_id")
+                record = await self._get_reminder_sync_by_occurrence_unlocked(
+                    db, old.occurrence_id
+                )
+                assert record is not None
+                existing = await self._get_reminder_sync_by_occurrence_unlocked(
+                    db, replacement_occurrence_id
+                )
+                if old.state == "cancelled" and existing is not None:
+                    if not self._replacement_matches(
+                        existing,
+                        reminder_id=replacement_reminder_id,
+                        target=target,
+                        content=content,
+                        intended_at_ms=intended_at_ms,
+                        payload_format=None,
+                        opaque_payload=None,
+                    ):
+                        raise LifecycleConflict("replacement identity changed")
+                    await db.rollback()
+                    return old, self._reminder_from_sync_record(existing)
+                if existing is not None:
+                    raise LifecycleConflict("replacement identity already exists")
+                if old.state != "scheduled" or not record.is_unprepared_local_only:
+                    raise LifecycleConflict(
+                        "reminder replacement conflicts with claimed or remote work"
+                    )
+                await db.execute(
+                    """INSERT INTO reminder_occurrences
+                       (reminder_id, occurrence_id, target, content, intended_at_ms,
+                        state, created_at_ms, revision, server_ack_revision)
+                       VALUES (?, ?, ?, ?, ?, 'scheduled', ?, 1, 0)""",
+                    (
+                        replacement_reminder_id,
+                        replacement_occurrence_id,
+                        target,
+                        content,
+                        intended_at_ms,
+                        replaced_at_ms,
+                    ),
+                )
+                await db.execute(
+                    """UPDATE reminder_occurrences
+                       SET state = 'cancelled', cancelled_at_ms = ?, revision = 2,
+                           sync_retry_after_ms = NULL, sync_retry_count = 0
+                       WHERE reminder_id = ? AND state = 'scheduled'""",
+                    (replaced_at_ms, reminder_id),
+                )
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+            cancelled = await self._get_reminder_unlocked(db, reminder_id)
+            replacement = await self._get_reminder_unlocked(
+                db, replacement_reminder_id
+            )
+            assert cancelled is not None and replacement is not None
+            return cancelled, replacement
+
+    @staticmethod
+    def _reminder_from_sync_record(record: ReminderSyncRecord) -> ReminderOccurrence:
+        return ReminderOccurrence(
+            reminder_id=record.reminder_id,
+            occurrence_id=record.occurrence_id,
+            target=record.target,
+            content=record.content,
+            intended_at_ms=record.intended_at_ms,
+            state=record.state,
+            created_at_ms=record.created_at_ms,
+            claimed_at_ms=record.claimed_at_ms,
+            actual_fire_at_ms=record.actual_fire_at_ms,
+            cancelled_at_ms=record.cancelled_at_ms,
+            delivered_at_ms=record.delivered_at_ms,
+            delivered_event_id=record.delivered_event_id,
+        )
+
+    def _validate_remote_replacement_fields(
+        self,
+        *,
+        reminder_id: str,
+        occurrence_id: str,
+        target: str,
+        content: str,
+        intended_at_ms: int,
+        lifecycle: str,
+        lifecycle_at_ms: int,
+        revision: int,
+        payload_format: str,
+        opaque_payload: bytes,
+    ) -> tuple[int | None, int | None, int | None]:
+        self._validate_remote_scheduled_reminder(
+            reminder_id=reminder_id,
+            occurrence_id=occurrence_id,
+            target=target,
+            content=content,
+            intended_at_ms=intended_at_ms,
+            lifecycle_at_ms=lifecycle_at_ms,
+            revision=revision,
+            payload_format=payload_format,
+            opaque_payload=opaque_payload,
+        )
+        if revision != (1 if lifecycle == "scheduled" else 2):
+            raise ValueError("invalid replacement lifecycle revision")
+        return self._replacement_terminal_fields(lifecycle, lifecycle_at_ms)
+
+    async def _upsert_remote_replacement_unlocked(
+        self,
+        db: aiosqlite.Connection,
+        *,
+        reminder_id: str,
+        occurrence_id: str,
+        target: str,
+        content: str,
+        intended_at_ms: int,
+        lifecycle: str,
+        lifecycle_at_ms: int,
+        revision: int,
+        payload_format: str,
+        opaque_payload: bytes,
+        actual_fire_at_ms: int | None,
+        cancelled_at_ms: int | None,
+        delivered_at_ms: int | None,
+    ) -> None:
+        replacement = await self._get_reminder_sync_by_occurrence_unlocked(
+            db, occurrence_id
+        )
+        if replacement is None:
+            await db.execute(
+                """INSERT INTO reminder_occurrences
+                   (reminder_id, occurrence_id, target, content, intended_at_ms,
+                    state, created_at_ms, actual_fire_at_ms, cancelled_at_ms,
+                    delivered_at_ms, revision, server_ack_revision,
+                    payload_format, opaque_payload)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    reminder_id,
+                    occurrence_id,
+                    target,
+                    content,
+                    intended_at_ms,
+                    lifecycle,
+                    lifecycle_at_ms,
+                    actual_fire_at_ms,
+                    cancelled_at_ms,
+                    delivered_at_ms,
+                    revision,
+                    revision,
+                    payload_format,
+                    opaque_payload,
+                ),
+            )
+            return
+        if not self._replacement_matches(
+            replacement,
+            reminder_id=reminder_id,
+            target=target,
+            content=content,
+            intended_at_ms=intended_at_ms,
+            payload_format=payload_format,
+            opaque_payload=opaque_payload,
+        ):
+            raise LifecycleConflict("replacement identity changed")
+        if replacement.state == "scheduled" and lifecycle != "scheduled":
+            await db.execute(
+                """UPDATE reminder_occurrences
+                   SET state = ?, actual_fire_at_ms = ?, cancelled_at_ms = ?,
+                       delivered_at_ms = ?, revision = ?, server_ack_revision = ?,
+                       claimed_at_ms = NULL, delivery_claim_id = NULL,
+                       delivery_claim_acquired = 0,
+                       delivery_claim_expires_at_ms = NULL,
+                       sync_retry_after_ms = NULL, sync_retry_count = 0,
+                       sync_permanent_revision = NULL,
+                       sync_permanent_code = NULL, snapshot_conflict = 0
+                   WHERE occurrence_id = ? AND state = 'scheduled'""",
+                (
+                    lifecycle,
+                    actual_fire_at_ms,
+                    cancelled_at_ms,
+                    delivered_at_ms,
+                    revision,
+                    revision,
+                    occurrence_id,
+                ),
+            )
+
+    @staticmethod
+    async def _cancel_replaced_occurrence_unlocked(
+        db: aiosqlite.Connection,
+        occurrence_id: str,
+        cancelled_at_ms: int,
+    ) -> None:
+        await db.execute(
+            """UPDATE reminder_occurrences
+               SET state = CASE
+                       WHEN state = 'delivered' THEN state
+                       ELSE 'cancelled'
+                   END,
+                   claimed_at_ms = NULL,
+                   actual_fire_at_ms = CASE
+                       WHEN state = 'delivered' THEN actual_fire_at_ms
+                       ELSE NULL
+                   END,
+                   cancelled_at_ms = CASE
+                       WHEN state = 'delivered' THEN cancelled_at_ms
+                       ELSE ?
+                   END,
+                   delivered_at_ms = CASE
+                       WHEN state = 'delivered' THEN delivered_at_ms
+                       ELSE NULL
+                   END,
+                   delivered_event_id = CASE
+                       WHEN state = 'delivered' THEN delivered_event_id
+                       ELSE NULL
+                   END,
+                   revision = MAX(revision, 2),
+                   server_ack_revision = MAX(server_ack_revision, 2),
+                   delivery_claim_id = NULL, delivery_claim_acquired = 0,
+                   delivery_claim_expires_at_ms = NULL,
+                   sync_retry_after_ms = NULL, sync_retry_count = 0,
+                   sync_permanent_revision = NULL,
+                   sync_permanent_code = NULL, snapshot_conflict = 0
+               WHERE occurrence_id = ?""",
+            (cancelled_at_ms, occurrence_id),
+        )
+
+    async def materialize_remote_replacement(
+        self,
+        *,
+        reminder_id: str,
+        occurrence_id: str,
+        cancelled_at_ms: int,
+        replacement_reminder_id: str,
+        replacement_occurrence_id: str,
+        target: str,
+        content: str,
+        intended_at_ms: int,
+        lifecycle: str,
+        lifecycle_at_ms: int,
+        revision: int,
+        payload_format: str,
+        opaque_payload: bytes,
+    ) -> tuple[ReminderOccurrence, ReminderOccurrence]:
+        """Commit one authenticated Server replacement to SQLite atomically."""
+        fields = self._validate_remote_replacement_fields(
+            reminder_id=replacement_reminder_id,
+            occurrence_id=replacement_occurrence_id,
+            target=target,
+            content=content,
+            intended_at_ms=intended_at_ms,
+            lifecycle=lifecycle,
+            lifecycle_at_ms=lifecycle_at_ms,
+            revision=revision,
+            payload_format=payload_format,
+            opaque_payload=opaque_payload,
+        )
+        actual_fire_at_ms, replacement_cancelled_at_ms, delivered_at_ms = fields
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                old = await self._get_reminder_sync_by_occurrence_unlocked(
+                    db, occurrence_id
+                )
+                if old is None or old.reminder_id != reminder_id:
+                    raise LifecycleConflict("reminder replacement identity changed")
+                if old.state not in {
+                    "scheduled", "claimed", "cancelled", "delivered",
+                }:
+                    raise LifecycleConflict("invalid reminder lifecycle")
+                await self._upsert_remote_replacement_unlocked(
+                    db,
+                    reminder_id=replacement_reminder_id,
+                    occurrence_id=replacement_occurrence_id,
+                    target=target,
+                    content=content,
+                    intended_at_ms=intended_at_ms,
+                    lifecycle=lifecycle,
+                    lifecycle_at_ms=lifecycle_at_ms,
+                    revision=revision,
+                    payload_format=payload_format,
+                    opaque_payload=opaque_payload,
+                    actual_fire_at_ms=actual_fire_at_ms,
+                    cancelled_at_ms=replacement_cancelled_at_ms,
+                    delivered_at_ms=delivered_at_ms,
+                )
+                await self._cancel_replaced_occurrence_unlocked(
+                    db, occurrence_id, cancelled_at_ms
+                )
+                await db.commit()
+            except BaseException:
+                await db.rollback()
+                raise
+            cancelled = await self._get_reminder_unlocked(db, reminder_id)
+            created = await self._get_reminder_unlocked(db, replacement_reminder_id)
+            assert cancelled is not None and created is not None
+            return cancelled, created
+
     async def cancel_reminder(
         self,
         reminder_id: str,
@@ -1399,8 +1786,8 @@ class ReminderStoreMixin:
                     reminder.occurrence_id,
                 )
                 assert record is not None
-                if reminder.state == "claimed" or (
-                    reminder.state == "scheduled"
+                if (
+                    reminder.state in {"scheduled", "claimed"}
                     and not record.is_unprepared_local_only
                 ):
                     raise LifecycleConflict(
@@ -1410,6 +1797,7 @@ class ReminderStoreMixin:
                     cursor = await db.execute(
                         """UPDATE reminder_occurrences
                            SET state = 'cancelled', cancelled_at_ms = ?,
+                               claimed_at_ms = NULL, actual_fire_at_ms = NULL,
                                revision = revision + 1,
                                delivery_claim_id = NULL,
                                delivery_claim_acquired = 0,

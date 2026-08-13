@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -25,6 +27,7 @@ from .message_store import (
     LifecycleConflict,
     MAX_REMINDER_ENVELOPE_BYTES,
     MessageStore,
+    ReminderOccurrence,
     ReminderSyncRecord,
     parse_reminder_target,
     reminder_time_to_rfc3339,
@@ -50,6 +53,7 @@ DELIVERY_CLAIM_RETRY_MS = 5_000
 MIN_DELIVERY_LEASE_REMAINING_MS = 5_000
 SNAPSHOT_REQUEST_TIMEOUT_SECONDS = 10.0
 CLAIM_REQUEST_TIMEOUT_SECONDS = 10.0
+MUTATION_REQUEST_TIMEOUT_SECONDS = 10.0
 SYNC_IDLE_SECONDS = 30.0
 
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -291,6 +295,15 @@ class _RemoteOccurrence:
     content: str | None
 
 
+@dataclass(frozen=True)
+class _ReplacementIntent:
+    reminder_id: str
+    occurrence_id: str
+    target: str
+    content: str
+    intended_at_ms: int
+
+
 class ReminderSync:
     """Small provider-neutral outbox + snapshot state machine."""
 
@@ -306,6 +319,7 @@ class ReminderSync:
         idle_seconds: float = SYNC_IDLE_SECONDS,
         snapshot_request_timeout_seconds: float = SNAPSHOT_REQUEST_TIMEOUT_SECONDS,
         claim_request_timeout_seconds: float = CLAIM_REQUEST_TIMEOUT_SECONDS,
+        mutation_request_timeout_seconds: float = MUTATION_REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         self.store = store
         self.owner_slug = _validate_owner(owner_slug)
@@ -318,6 +332,9 @@ class ReminderSync:
         )
         self._claim_request_timeout_seconds = max(
             0.01, float(claim_request_timeout_seconds)
+        )
+        self._mutation_request_timeout_seconds = max(
+            0.01, float(mutation_request_timeout_seconds)
         )
         # This is the sole custody call.  Nothing in this object logs or
         # returns these bytes; only the AEAD helpers receive them.
@@ -441,6 +458,386 @@ class ReminderSync:
                 raise ReminderContractError("missing keyless reminder transport")
             return await method(path, body)
         return await self.http_client.post(path, body)
+
+    @staticmethod
+    def _http_error_code(exc: HttpError) -> str:
+        try:
+            body = json.loads(exc.body)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ""
+        code = body.get("error") if isinstance(body, Mapping) else None
+        return code if isinstance(code, str) else ""
+
+    def _replacement_ids(
+        self,
+        *,
+        occurrence_id: str,
+        target: str,
+        content: str,
+        intended_at_ms: int,
+    ) -> tuple[str, str]:
+        intent = _canonical_json({
+            "content": content,
+            "intended_at": _canonical_utc(intended_at_ms),
+            "occurrence_id": occurrence_id,
+            "target": target,
+        })
+
+        def identifier(kind: bytes) -> str:
+            digest = hmac.new(self._dek, kind + b"\0" + intent, hashlib.sha256).digest()
+            return str(uuid.UUID(bytes=digest[:16], version=4))
+
+        return (
+            f"reminder-{identifier(b'reminder')}",
+            f"occurrence-{identifier(b'occurrence')}",
+        )
+
+    async def _record_by_reminder_id(self, reminder_id: str) -> ReminderSyncRecord:
+        record = await self.store.get_reminder_sync_record_by_reminder_id(reminder_id)
+        if record is None:
+            raise ValueError("unknown reminder_id")
+        return record
+
+    async def _ensure_remote_scheduled(
+        self,
+        record: ReminderSyncRecord,
+    ) -> ReminderSyncRecord:
+        prepared = await self._ensure_envelope(record)
+        if prepared.server_ack_revision >= 1:
+            return prepared
+        body = self._put_body(prepared)
+        response = await asyncio.wait_for(
+            self._put(f"{self.route_prefix}/{prepared.occurrence_id}", body),
+            timeout=self._mutation_request_timeout_seconds,
+        )
+        self._validate_put_response(response, prepared, body)
+        await self.store.acknowledge_reminder_sync_revision(
+            occurrence_id=prepared.occurrence_id,
+            revision=1,
+        )
+        refreshed = await self.store.get_reminder_sync_record(
+            prepared.occurrence_id
+        )
+        if refreshed is None:
+            raise LifecycleConflict("reminder identity changed")
+        return refreshed
+
+    def _validate_cancel_response(
+        self,
+        response: Any,
+        record: ReminderSyncRecord,
+    ) -> _RemoteOccurrence:
+        remote = self._validate_snapshot_row(response)
+        if (
+            remote.occurrence_id != record.occurrence_id
+            or remote.reminder_id != record.reminder_id
+            or remote.intended_at_ms != record.intended_at_ms
+            or remote.lifecycle != "cancelled"
+            or remote.revision != 2
+        ):
+            raise ReminderContractError("invalid reminder cancellation response")
+        return remote
+
+    async def cancel_reminder(self, reminder_id: str) -> ReminderOccurrence:
+        """Cancel locally untouched work or coordinate a remote terminal write."""
+        record = await self._record_by_reminder_id(reminder_id)
+        if record.state == "cancelled":
+            reminder = await self.store.get_reminder(reminder_id)
+            assert reminder is not None
+            return reminder
+        if record.state == "delivered":
+            raise LifecycleConflict("reminder delivery already started")
+        if record.is_unprepared_local_only:
+            try:
+                return await self.store.cancel_reminder(reminder_id)
+            except LifecycleConflict:
+                record = await self._record_by_reminder_id(reminder_id)
+                if record.state == "cancelled":
+                    reminder = await self.store.get_reminder(reminder_id)
+                    assert reminder is not None
+                    return reminder
+                if record.state == "delivered":
+                    raise LifecycleConflict("reminder delivery already started")
+
+        prepared = await self._ensure_envelope(record)
+        if prepared.opaque_payload is None:
+            raise ReminderEnvelopeError("invalid opaque envelope")
+        cancelled_at_ms = int(self._now_ms())
+        body = {
+            "revision": 2,
+            "delivery_claim_id": None,
+            "reminder_id": prepared.reminder_id,
+            "due_at": _canonical_utc(prepared.intended_at_ms),
+            "lifecycle": "cancelled",
+            "lifecycle_at": _canonical_utc(cancelled_at_ms),
+            "payload_format": prepared.payload_format,
+            "opaque_payload": _base64url_encode(prepared.opaque_payload),
+        }
+        try:
+            response = await asyncio.wait_for(
+                self._put(f"{self.route_prefix}/{prepared.occurrence_id}", body),
+                timeout=self._mutation_request_timeout_seconds,
+            )
+            remote = self._validate_cancel_response(response, prepared)
+        except asyncio.CancelledError:
+            raise
+        except HttpError as exc:
+            self.signal_snapshot()
+            if exc.status == 409 and self._http_error_code(exc) == "too_late":
+                raise LifecycleConflict("reminder delivery already started") from exc
+            raise RuntimeError("reminder cancellation could not be confirmed") from exc
+        except (asyncio.TimeoutError, TimeoutError, OSError) as exc:
+            self.signal_snapshot()
+            raise RuntimeError("reminder cancellation could not be confirmed") from exc
+        except ReminderContractError:
+            self.signal_snapshot()
+            raise
+        except Exception as exc:
+            self.signal_snapshot()
+            raise RuntimeError("reminder cancellation could not be confirmed") from exc
+        result = await self.store.materialize_remote_terminal_reminder(
+            reminder_id=remote.reminder_id,
+            occurrence_id=remote.occurrence_id,
+            intended_at_ms=remote.intended_at_ms,
+            lifecycle=remote.lifecycle,
+            lifecycle_at_ms=remote.lifecycle_at_ms,
+            revision=remote.revision,
+            payload_format=remote.payload_format,
+        )
+        if result.conflict:
+            raise LifecycleConflict("reminder cancellation conflicted locally")
+        reminder = await self.store.get_reminder(reminder_id)
+        assert reminder is not None
+        if reminder.state != "cancelled":
+            raise LifecycleConflict("reminder delivery already started")
+        return reminder
+
+    def _validate_replacement_response(
+        self,
+        response: Any,
+        *,
+        old: ReminderSyncRecord,
+        replacement_reminder_id: str,
+        replacement_occurrence_id: str,
+        target: str,
+        content: str,
+        intended_at_ms: int,
+    ) -> tuple[_RemoteOccurrence, _RemoteOccurrence]:
+        if not isinstance(response, Mapping) or set(response) != {
+            "cancelled", "replacement",
+        }:
+            raise ReminderContractError("invalid reminder replacement response")
+        cancelled = self._validate_snapshot_row(response["cancelled"])
+        replacement = self._validate_snapshot_row(response["replacement"])
+        if (
+            cancelled.occurrence_id != old.occurrence_id
+            or cancelled.reminder_id != old.reminder_id
+            or cancelled.intended_at_ms != old.intended_at_ms
+            or cancelled.lifecycle != "cancelled"
+            or replacement.occurrence_id != replacement_occurrence_id
+            or replacement.reminder_id != replacement_reminder_id
+            or replacement.intended_at_ms != intended_at_ms
+        ):
+            raise ReminderContractError("invalid reminder replacement response")
+        if replacement.lifecycle == "scheduled":
+            if replacement.target != target or replacement.content != content:
+                raise ReminderContractError("invalid reminder replacement response")
+        elif replacement.lifecycle not in {"cancelled", "delivered"}:
+            raise ReminderContractError("invalid reminder replacement response")
+        return cancelled, replacement
+
+    def _replacement_intent(
+        self,
+        record: ReminderSyncRecord,
+        *,
+        content: str | None,
+        target: str | None,
+        intended_at_ms: int | None,
+    ) -> _ReplacementIntent:
+        replacement_content = content if content is not None else record.content
+        replacement_target = target if target is not None else record.target
+        replacement_time = (
+            intended_at_ms if intended_at_ms is not None else record.intended_at_ms
+        )
+        if (
+            replacement_content == record.content
+            and replacement_target == record.target
+            and replacement_time == record.intended_at_ms
+        ):
+            raise ValueError("replacement must change content, target, or intended_at")
+        parse_reminder_target(replacement_target)
+        reminder_id, occurrence_id = self._replacement_ids(
+            occurrence_id=record.occurrence_id,
+            target=replacement_target,
+            content=replacement_content,
+            intended_at_ms=replacement_time,
+        )
+        return _ReplacementIntent(
+            reminder_id=reminder_id,
+            occurrence_id=occurrence_id,
+            target=replacement_target,
+            content=replacement_content,
+            intended_at_ms=replacement_time,
+        )
+
+    async def _existing_replacement_result(
+        self,
+        record: ReminderSyncRecord,
+        intent: _ReplacementIntent,
+    ) -> tuple[ReminderOccurrence, ReminderOccurrence] | None:
+        if record.state != "cancelled":
+            return None
+        existing = await self.store.get_reminder_sync_record(intent.occurrence_id)
+        if existing is None:
+            return None
+        if (
+            existing.reminder_id != intent.reminder_id
+            or existing.target != intent.target
+            or existing.content != intent.content
+            or existing.intended_at_ms != intent.intended_at_ms
+        ):
+            raise LifecycleConflict("replacement identity changed")
+        cancelled = await self.store.get_reminder(record.reminder_id)
+        replacement = await self.store.get_reminder(intent.reminder_id)
+        if cancelled is None or replacement is None:
+            raise LifecycleConflict("replacement identity changed")
+        return cancelled, replacement
+
+    async def _perform_remote_replacement(
+        self,
+        record: ReminderSyncRecord,
+        intent: _ReplacementIntent,
+        replaced_at_ms: int,
+    ) -> tuple[ReminderOccurrence, ReminderOccurrence]:
+        prepared = await self._ensure_remote_scheduled(record)
+        envelope = encrypt_reminder_payload(
+            dek=self._dek,
+            owner_slug=self.owner_slug,
+            reminder_id=intent.reminder_id,
+            occurrence_id=intent.occurrence_id,
+            intended_at_ms=intent.intended_at_ms,
+            target=intent.target,
+            content=intent.content,
+        )
+        replacement_body: dict[str, object] = {
+            "revision": 1,
+            "delivery_claim_id": None,
+            "reminder_id": intent.reminder_id,
+            "due_at": _canonical_utc(intent.intended_at_ms),
+            "lifecycle": "scheduled",
+            "lifecycle_at": _canonical_utc(replaced_at_ms),
+            "payload_format": REMINDER_PAYLOAD_FORMAT,
+            "opaque_payload": _base64url_encode(envelope),
+        }
+        response = await asyncio.wait_for(
+            self._post(
+                f"{self.route_prefix}/{prepared.occurrence_id}/replace",
+                {
+                    "expected_revision": 1,
+                    "cancelled_at": _canonical_utc(replaced_at_ms),
+                    "replacement_occurrence_id": intent.occurrence_id,
+                    "replacement": replacement_body,
+                },
+            ),
+            timeout=self._mutation_request_timeout_seconds,
+        )
+        cancelled, replacement = self._validate_replacement_response(
+            response,
+            old=prepared,
+            replacement_reminder_id=intent.reminder_id,
+            replacement_occurrence_id=intent.occurrence_id,
+            target=intent.target,
+            content=intent.content,
+            intended_at_ms=intent.intended_at_ms,
+        )
+        materialized_envelope = replacement.opaque_payload or envelope
+        return await self.store.materialize_remote_replacement(
+            reminder_id=prepared.reminder_id,
+            occurrence_id=prepared.occurrence_id,
+            cancelled_at_ms=cancelled.lifecycle_at_ms,
+            replacement_reminder_id=intent.reminder_id,
+            replacement_occurrence_id=intent.occurrence_id,
+            target=intent.target,
+            content=intent.content,
+            intended_at_ms=intent.intended_at_ms,
+            lifecycle=replacement.lifecycle,
+            lifecycle_at_ms=replacement.lifecycle_at_ms,
+            revision=replacement.revision,
+            payload_format=REMINDER_PAYLOAD_FORMAT,
+            opaque_payload=materialized_envelope,
+        )
+
+    async def replace_reminder(
+        self,
+        reminder_id: str,
+        content: str | None,
+        target: str | None,
+        intended_at_ms: int | None,
+    ) -> tuple[ReminderOccurrence, ReminderOccurrence]:
+        """Replace one reminder while preserving Server and SQLite atomicity."""
+        record = await self._record_by_reminder_id(reminder_id)
+        intent = self._replacement_intent(
+            record,
+            content=content,
+            target=target,
+            intended_at_ms=intended_at_ms,
+        )
+        existing_result = await self._existing_replacement_result(record, intent)
+        if existing_result is not None:
+            return existing_result
+        if record.state in {"cancelled", "delivered"}:
+            raise LifecycleConflict("reminder delivery already started or was replaced")
+        replaced_at_ms = int(self._now_ms())
+        if record.is_unprepared_local_only:
+            try:
+                return await self.store.replace_local_reminder(
+                    reminder_id=reminder_id,
+                    replacement_reminder_id=intent.reminder_id,
+                    replacement_occurrence_id=intent.occurrence_id,
+                    content=intent.content,
+                    target=intent.target,
+                    intended_at_ms=intent.intended_at_ms,
+                    replaced_at_ms=replaced_at_ms,
+                )
+            except LifecycleConflict as local_conflict:
+                record = await self._record_by_reminder_id(reminder_id)
+                existing_result = await self._existing_replacement_result(
+                    record, intent
+                )
+                if existing_result is not None:
+                    return existing_result
+                if record.state in {"cancelled", "delivered"}:
+                    raise LifecycleConflict(
+                        "reminder delivery already started or was replaced"
+                    ) from local_conflict
+                if record.is_unprepared_local_only:
+                    raise
+
+        try:
+            return await self._perform_remote_replacement(
+                record, intent, replaced_at_ms
+            )
+        except asyncio.CancelledError:
+            raise
+        except HttpError as exc:
+            self.signal_snapshot()
+            code = self._http_error_code(exc)
+            if exc.status == 409 and code == "too_late":
+                raise LifecycleConflict("reminder delivery already started") from exc
+            if exc.status == 409:
+                raise LifecycleConflict("reminder replacement conflicts with current state") from exc
+            raise RuntimeError("reminder replacement could not be confirmed") from exc
+        except (asyncio.TimeoutError, TimeoutError, OSError) as exc:
+            self.signal_snapshot()
+            raise RuntimeError("reminder replacement could not be confirmed") from exc
+        except ReminderContractError:
+            self.signal_snapshot()
+            raise
+        except (LifecycleConflict, ReminderEnvelopeError, ValueError):
+            raise
+        except Exception as exc:
+            self.signal_snapshot()
+            raise RuntimeError("reminder replacement could not be confirmed") from exc
 
     def _validate_delivery_claim_response(
         self, response: Any, record: ReminderSyncRecord,
@@ -936,6 +1333,10 @@ async def prepare_reminder_sync(
     )
     runtime.reminder_scheduler.set_lifecycle_committed_callback(
         reminder_sync.signal_lifecycle_committed
+    )
+    runtime.reminder_scheduler.set_mutation_handlers(
+        cancel=reminder_sync.cancel_reminder,
+        replace=reminder_sync.replace_reminder,
     )
     register = register_connected or client.add_connected_callback
     register(reminder_sync.on_transport_connected)
