@@ -786,7 +786,9 @@ class ReminderSync:
         existing_result = await self._existing_replacement_result(record, intent)
         if existing_result is not None:
             return existing_result
-        if record.state in {"cancelled", "delivered"}:
+        if record.state == "delivered" or (
+            record.state == "cancelled" and record.server_ack_revision < 1
+        ):
             raise LifecycleConflict("reminder delivery already started or was replaced")
         replaced_at_ms = int(self._now_ms())
         if record.is_unprepared_local_only:
@@ -807,7 +809,9 @@ class ReminderSync:
                 )
                 if existing_result is not None:
                     return existing_result
-                if record.state in {"cancelled", "delivered"}:
+                if record.state == "delivered" or (
+                    record.state == "cancelled" and record.server_ack_revision < 1
+                ):
                     raise LifecycleConflict(
                         "reminder delivery already started or was replaced"
                     ) from local_conflict

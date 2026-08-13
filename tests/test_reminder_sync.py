@@ -448,6 +448,12 @@ async def test_remote_replace_retry_preserves_terminal_replacement_creation_time
         "lifecycle_at": reminder_time_to_rfc3339(2_500),
     })
     remote.pop("opaque_payload")
+    transport.rows = list(transport.committed_replace_response.values())
+    assert await sync.reconcile_snapshot() == 1
+    reconciled = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert reconciled is not None
+    assert (reconciled.state, reconciled.server_ack_revision) == ("cancelled", 2)
+    assert await store.get_reminder(str(remote["reminder_id"])) is None
     _cancelled, replacement = await sync.replace_reminder(
         reminder.reminder_id, "new", None, None,
     )
