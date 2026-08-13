@@ -487,7 +487,6 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     if not validation.ok:
         print(f"error: {validation.error}", file=sys.stderr)
         return 2
-
     role = (args.role or "").strip()
     role_short_raw = getattr(args, "role_short", None)
     role_short_raw = role_short_raw.strip() if role_short_raw else ""
