@@ -760,6 +760,7 @@ class ReminderSync:
             target=intent.target,
             content=intent.content,
             intended_at_ms=intent.intended_at_ms,
+            replacement_created_at_ms=cancelled.lifecycle_at_ms,
             lifecycle=replacement.lifecycle,
             lifecycle_at_ms=replacement.lifecycle_at_ms,
             revision=replacement.revision,

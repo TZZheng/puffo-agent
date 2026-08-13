@@ -1547,6 +1547,7 @@ class ReminderStoreMixin:
         target: str,
         content: str,
         intended_at_ms: int,
+        created_at_ms: int,
         lifecycle: str,
         lifecycle_at_ms: int,
         revision: int,
@@ -1564,6 +1565,8 @@ class ReminderStoreMixin:
             payload_format=payload_format,
             opaque_payload=opaque_payload,
         )
+        if not self._valid_reminder_time(created_at_ms):
+            raise ValueError("invalid replacement creation time")
         if revision != (1 if lifecycle == "scheduled" else 2):
             raise ValueError("invalid replacement lifecycle revision")
         return self._replacement_terminal_fields(lifecycle, lifecycle_at_ms)
@@ -1577,6 +1580,7 @@ class ReminderStoreMixin:
         target: str,
         content: str,
         intended_at_ms: int,
+        created_at_ms: int,
         lifecycle: str,
         lifecycle_at_ms: int,
         revision: int,
@@ -1604,7 +1608,7 @@ class ReminderStoreMixin:
                     content,
                     intended_at_ms,
                     lifecycle,
-                    lifecycle_at_ms,
+                    created_at_ms,
                     actual_fire_at_ms,
                     cancelled_at_ms,
                     delivered_at_ms,
@@ -1699,6 +1703,7 @@ class ReminderStoreMixin:
         target: str,
         content: str,
         intended_at_ms: int,
+        replacement_created_at_ms: int,
         lifecycle: str,
         lifecycle_at_ms: int,
         revision: int,
@@ -1712,6 +1717,7 @@ class ReminderStoreMixin:
             target=target,
             content=content,
             intended_at_ms=intended_at_ms,
+            created_at_ms=replacement_created_at_ms,
             lifecycle=lifecycle,
             lifecycle_at_ms=lifecycle_at_ms,
             revision=revision,
@@ -1739,6 +1745,7 @@ class ReminderStoreMixin:
                     target=target,
                     content=content,
                     intended_at_ms=intended_at_ms,
+                    created_at_ms=replacement_created_at_ms,
                     lifecycle=lifecycle,
                     lifecycle_at_ms=lifecycle_at_ms,
                     revision=revision,

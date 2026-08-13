@@ -428,6 +428,36 @@ async def test_remote_replace_is_atomic_locally_and_idempotent(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_remote_replace_retry_preserves_terminal_replacement_creation_time(tmp_path):
+    transport = _RecordingTransport()
+    sync, store, _scheduler, _keys = _sync(tmp_path, transport, now=[2_000])
+    reminder = await store.create_reminder(
+        content="old", target="dm:peer", intended_at_ms=5_000,
+    )
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None
+    await sync._ensure_envelope(record)
+    transport.drop_replace_response_once = True
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        await sync.replace_reminder(reminder.reminder_id, "new", None, None)
+    assert transport.committed_replace_response is not None
+    remote = transport.committed_replace_response["replacement"]
+    remote.update({
+        "revision": 2,
+        "lifecycle": "cancelled",
+        "lifecycle_at": reminder_time_to_rfc3339(2_500),
+    })
+    remote.pop("opaque_payload")
+    _cancelled, replacement = await sync.replace_reminder(
+        reminder.reminder_id, "new", None, None,
+    )
+    assert (replacement.state, replacement.created_at_ms, replacement.cancelled_at_ms) == (
+        "cancelled", 2_000, 2_500,
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_remote_replace_preserves_a_racing_local_delivery(
     tmp_path, monkeypatch,
 ):

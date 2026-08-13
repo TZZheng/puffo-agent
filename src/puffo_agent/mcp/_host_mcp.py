@@ -264,7 +264,7 @@ class PuffoRpcClient:
         # During a rolling local upgrade, a new MCP subprocess can briefly
         # talk to an older daemon that still exposed this internal state.
         if data.get("state") == "claimed":
-            data = {**data, "state": "scheduled"}
+            data = {**data, "state": "scheduled", "actual_fire_at": None}
         required = {
             "reminder_id", "occurrence_id", "state", "target", "content",
             "intended_at", "actual_fire_at", "created_at", "cancelled_at",

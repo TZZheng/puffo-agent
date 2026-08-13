@@ -434,7 +434,11 @@ async def test_puffo_rpc_client_round_trips_all_reminder_objects(
         "state": "cancelled",
         "cancelled_at": "2026-08-02T11:01:00.000Z",
     }
-    legacy_claimed = {**scheduled, "state": "claimed"}
+    legacy_claimed = {
+        **scheduled,
+        "state": "claimed",
+        "actual_fire_at": "2026-08-02T12:00:01.000Z",
+    }
 
     async def create(_ctx, **kwargs):
         captured.append(("create", kwargs))
