@@ -1629,7 +1629,7 @@ class ReminderStoreMixin:
             opaque_payload=opaque_payload,
         ):
             raise LifecycleConflict("replacement identity changed")
-        if replacement.state == "scheduled" and lifecycle != "scheduled":
+        if replacement.state in {"scheduled", "claimed"} and lifecycle != "scheduled":
             await db.execute(
                 """UPDATE reminder_occurrences
                    SET state = ?, actual_fire_at_ms = ?, cancelled_at_ms = ?,
@@ -1640,7 +1640,7 @@ class ReminderStoreMixin:
                        sync_retry_after_ms = NULL, sync_retry_count = 0,
                        sync_permanent_revision = NULL,
                        sync_permanent_code = NULL, snapshot_conflict = 0
-                   WHERE occurrence_id = ? AND state = 'scheduled'""",
+                   WHERE occurrence_id = ? AND state IN ('scheduled', 'claimed')""",
                 (
                     lifecycle,
                     actual_fire_at_ms,

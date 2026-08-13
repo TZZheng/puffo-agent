@@ -595,20 +595,31 @@ class ReminderSync:
         except Exception as exc:
             self.signal_snapshot()
             raise RuntimeError("reminder cancellation could not be confirmed") from exc
-        result = await self.store.materialize_remote_terminal_reminder(
-            reminder_id=remote.reminder_id,
-            occurrence_id=remote.occurrence_id,
-            intended_at_ms=remote.intended_at_ms,
-            lifecycle=remote.lifecycle,
-            lifecycle_at_ms=remote.lifecycle_at_ms,
-            revision=remote.revision,
-            payload_format=remote.payload_format,
-        )
+        try:
+            result = await self.store.materialize_remote_terminal_reminder(
+                reminder_id=remote.reminder_id,
+                occurrence_id=remote.occurrence_id,
+                intended_at_ms=remote.intended_at_ms,
+                lifecycle=remote.lifecycle,
+                lifecycle_at_ms=remote.lifecycle_at_ms,
+                revision=remote.revision,
+                payload_format=remote.payload_format,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (LifecycleConflict, ValueError):
+            self.signal_snapshot()
+            raise
+        except Exception as exc:
+            self.signal_snapshot()
+            raise RuntimeError("reminder cancellation could not be confirmed") from exc
         if result.conflict:
+            self.signal_snapshot()
             raise LifecycleConflict("reminder cancellation conflicted locally")
         reminder = await self.store.get_reminder(reminder_id)
         assert reminder is not None
         if reminder.state != "cancelled":
+            self.signal_snapshot()
             raise LifecycleConflict("reminder delivery already started")
         return reminder
 
