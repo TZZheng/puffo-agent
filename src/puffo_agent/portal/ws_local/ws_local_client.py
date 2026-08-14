@@ -58,7 +58,15 @@ async def run_attach(
     events_path = session_dir / "events.ndjson"
     commands_path = session_dir / "commands.ndjson"
     status_path = session_dir / "status"
-    commands_path.touch()
+    # A session directory may be reused after a client restart. Commands are an
+    # ephemeral, at-most-once outbound queue: replaying historical lines can
+    # duplicate messages and attachments. Clear the queue before connecting;
+    # commands appended after this point are consumed normally.
+    commands_path.write_text("", encoding="utf-8")
+    try:
+        os.chmod(commands_path, 0o600)
+    except OSError:
+        pass
 
     # First stdout line so the wrapping AI can pick the path up.
     print(f"SESSION_DIR={session_dir}", flush=True)
