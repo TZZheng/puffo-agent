@@ -371,8 +371,6 @@ async def test_edit_sets_env_override_threshold(home):
 async def test_edit_maps_legacy_threshold_key_to_codex(home):
     write_test_agent(home, "scout")
     cfg = AgentConfig.load("scout")
-    cfg.runtime.kind = "cli-local"
-    cfg.runtime.provider = "openai"
     cfg.runtime.harness = "codex"
     cfg.env_overrides = {"CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "75"}
     cfg.save()
@@ -392,8 +390,6 @@ async def test_edit_maps_legacy_threshold_key_to_codex(home):
 async def test_edit_prefers_explicit_codex_threshold_key(home):
     write_test_agent(home, "scout")
     cfg = AgentConfig.load("scout")
-    cfg.runtime.kind = "cli-local"
-    cfg.runtime.provider = "openai"
     cfg.runtime.harness = "codex"
     cfg.save()
 

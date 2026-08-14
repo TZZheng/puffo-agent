@@ -3,8 +3,8 @@ its MCP subprocess.
 
 The daemon is the sole SQLite reader/writer; MCP goes through this
 service so cli-docker doesn't open the WAL'd DB across a bind-mount
-boundary (which fails with "disk I/O error"). Requests carry a daemon-issued,
-per-Agent bearer token so one local process cannot select another Agent's path.
+boundary (which fails with "disk I/O error"). Loopback-only, no auth
+— same trust boundary as the keystore bind-mount.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from aiohttp import web
 
 from ..agent.message_store import DataNotFound, MessageStore
 from ._port import bind_tcp_with_fallback
-from .local_service_auth import require_local_service_auth
 from .state import agent_dir
 
 logger = logging.getLogger(__name__)
@@ -324,18 +323,14 @@ async def list_thread_messages(request: web.Request) -> web.Response:
 
 
 async def get_message_by_envelope(request: web.Request) -> web.Response:
-    """GET a single message by envelope_id. 404 if not stored.
-
-    Model-visible read: a foreign DM still held for operator approval is
-    withheld here (404) just as it is from the DM and thread reads.
-    """
+    """GET a single message by envelope_id. 404 if not stored."""
     agent_id = request.match_info["agent_id"]
     envelope_id = request.match_info["envelope_id"]
     store = await _store_for(request.app, agent_id)
     if store is None:
         return web.json_response({"error": "agent db not found"}, status=404)
     try:
-        msg = await store.get_visible_message_by_envelope(envelope_id)
+        msg = await store.get_message_by_envelope(envelope_id)
     except Exception as exc:
         logger.exception(
             "data-service: lookup by envelope_id failed (agent=%s env=%s)",
@@ -364,7 +359,6 @@ def _msg_to_dict(m: Any) -> dict[str, Any]:
         "thread_root_id": m.thread_root_id,
         "reply_to_id": m.reply_to_id,
         "is_encrypted": m.is_encrypted,
-        "server_seq": getattr(m, "server_seq", None),
     }
 
 
@@ -434,7 +428,7 @@ async def get_send_encryption(request: web.Request) -> web.Response:
 
 
 def build_app(cfg: DataServiceConfig) -> web.Application:
-    app = web.Application(middlewares=[require_local_service_auth])
+    app = web.Application()
     app[_STORES_KEY] = _AppState()
     app.router.add_get(
         "/v1/data/{agent_id}/channels/{channel_id}/space",

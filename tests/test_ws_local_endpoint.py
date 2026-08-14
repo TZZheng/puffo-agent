@@ -72,9 +72,8 @@ AUTHED = AuthedAgent("puffotest-19b1", "puffotest", "Puffo Test")
 def _serve(transport, **overrides):
     built = []
 
-    def make_session(authed, session_id, t, bridge, capabilities):
+    def make_session(authed, session_id, t, bridge):
         sess = overrides.get("session") or FakeSession(bridge)
-        sess.capabilities = frozenset(capabilities)
         built.append((authed, session_id, sess, bridge))
         return sess
 

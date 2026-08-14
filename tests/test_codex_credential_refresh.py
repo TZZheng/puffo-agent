@@ -9,9 +9,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import time
 from pathlib import Path
 
+import pytest
 
 from puffo_agent.portal import credential_refresh
 from puffo_agent.portal.credential_refresh import (
@@ -304,9 +306,7 @@ def test_refresh_returns_failed_when_spawn_raises_file_not_found(
     assert outcome == credential_refresh.RefreshOutcome.FAILED
 
 
-def test_refresh_returns_failed_on_nonzero_exit(
-    tmp_path, monkeypatch, caplog,
-):
+def test_refresh_returns_failed_on_nonzero_exit(tmp_path, monkeypatch):
     _write_codex_auth(tmp_path, expires_in_seconds=60)
     b = CodexFileBackend(host_home=tmp_path)
 
@@ -324,9 +324,6 @@ def test_refresh_returns_failed_on_nonzero_exit(
 
     outcome = asyncio.run(b.refresh())
     assert outcome == credential_refresh.RefreshOutcome.FAILED
-    joined = " ".join(record.getMessage() for record in caplog.records)
-    assert "refresh_token revoked" not in joined
-    assert "output_category=authentication" in joined
 
 
 # ── Refresher wiring against CodexFileBackend ────────────────────

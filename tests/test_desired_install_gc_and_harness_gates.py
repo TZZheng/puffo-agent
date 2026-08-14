@@ -1,11 +1,14 @@
-"""Spawn-time provenance GC, Docker asset wiring, and harness gates.
+"""Spawn-time desired-content provenance, Docker wiring, and Hermes
+early-return.
 
 Covers the three follow-up items deferred from PUF-268:
 
   (a) ``prune_stale_desired_skills`` removes only desired-installed-
       only skill dirs whose ids no longer appear in the current
       desired list. host-synced and agent-installed markers win.
-  (b) The cli-docker branch forwards desired assets to its installer.
+  (b) The cli-docker branch in ``portal.worker._build_adapter``
+      raises when an agent.yml carries non-empty desired_skills /
+      desired_mcps.
   (c) ``install_desired`` early-returns for harness=hermes without
       writing any skills or MCPs.
 """
@@ -264,13 +267,16 @@ def _make_agent_cfg(
     desired_skills: list[str] | None = None,
     desired_mcps: list[str] | None = None,
 ):
-    """Minimal stub for the cli-docker construction boundary."""
+    """Minimal config accepted by the cli-docker worker branch."""
     from types import SimpleNamespace
     runtime = SimpleNamespace(
         kind=runtime_kind,
         harness="claude-code",
         model="",
         permission_mode="bypassPermissions",
+        sandbox="danger-full-access",
+        inference_level="",
+        task_timeout_seconds=1800.0,
         docker_image="",
         docker_memory_limit="",
         docker_memory_reservation="",
@@ -311,7 +317,7 @@ def test_build_adapter_cli_docker_installs_desired_skills(monkeypatch):
     """desired_skills no longer reject on cli-docker — they install into
     the bind-mounted .claude/skills/. The adapter must receive both the
     skills and the puffo_core install wiring."""
-    from puffo_agent.portal.worker import build_docker_adapter
+    from puffo_agent.portal.worker import build_adapter
     from puffo_agent.agent.adapters import docker_cli as dc
     from puffo_agent.agent import harness
 
@@ -327,20 +333,19 @@ def test_build_adapter_cli_docker_installs_desired_skills(monkeypatch):
         def name(self) -> str:
             return "claude-code"
 
-    monkeypatch.setattr(harness, "build_docker_harness", lambda _: _Harness())
+    monkeypatch.setattr(harness, "build_harness", lambda _: _Harness())
 
     agent_cfg = _make_agent_cfg(
         runtime_kind="cli-docker", desired_skills=["s1", "s2"],
     )
-    build_docker_adapter(_make_daemon_cfg(), agent_cfg)  # no RuntimeError
+    build_adapter(_make_daemon_cfg(), agent_cfg)  # no RuntimeError
     assert captured.get("desired_skills") == ["s1", "s2"]
     assert "puffo_core_keys_dir" in captured
 
 
-def test_build_adapter_cli_docker_forwards_desired_mcps(monkeypatch):
-    from puffo_agent.portal.worker import build_docker_adapter
+def test_build_adapter_cli_docker_accepts_non_empty_desired_mcps(monkeypatch):
+    from puffo_agent.portal.worker import build_adapter
     from puffo_agent.agent.adapters import docker_cli as dc
-    from puffo_agent.agent import harness
 
     captured: dict = {}
 
@@ -348,24 +353,19 @@ def test_build_adapter_cli_docker_forwards_desired_mcps(monkeypatch):
         def __init__(self, **kw):
             captured.update(kw)
 
-    class _Harness:
-        def name(self) -> str:
-            return "claude-code"
-
     monkeypatch.setattr(dc, "DockerCLIAdapter", _Stub)
-    monkeypatch.setattr(harness, "build_docker_harness", lambda _: _Harness())
+
     agent_cfg = _make_agent_cfg(
         runtime_kind="cli-docker", desired_mcps=["m1"],
     )
-    build_docker_adapter(_make_daemon_cfg(), agent_cfg)
-
+    build_adapter(_make_daemon_cfg(), agent_cfg)
     assert captured["desired_mcps"] == ["m1"]
 
 
 def test_build_adapter_cli_docker_empty_desired_does_not_reject(monkeypatch):
     """Reject gate must not fire when the lists are empty — that's the
     cli-docker happy path operators have today."""
-    from puffo_agent.portal.worker import build_docker_adapter
+    from puffo_agent.portal.worker import build_adapter
     from puffo_agent.agent.adapters import docker_cli as dc
     from puffo_agent.agent import harness
 
@@ -381,32 +381,23 @@ def test_build_adapter_cli_docker_empty_desired_does_not_reject(monkeypatch):
         def name(self) -> str:
             return "claude-code"
 
-    monkeypatch.setattr(harness, "build_docker_harness", lambda _: _Harness())
+    monkeypatch.setattr(harness, "build_harness", lambda _: _Harness())
 
     agent_cfg = _make_agent_cfg(runtime_kind="cli-docker")
-    build_docker_adapter(_make_daemon_cfg(), agent_cfg)
+    build_adapter(_make_daemon_cfg(), agent_cfg)
     # Reaching here without RuntimeError is the assertion. Cheap
     # tail-check that the stub adapter actually saw the agent_id so
     # we know the code path executed past the reject gate.
     assert captured.get("agent_id") == "t-agent"
 
 
-@pytest.mark.parametrize("harness", ["hermes", "gemini-cli"])
-def test_build_adapter_rejects_design_only_docker_harnesses(harness):
-    from puffo_agent.portal.worker import build_docker_adapter
-
-    agent_cfg = _make_agent_cfg(runtime_kind="cli-docker")
-    agent_cfg.runtime.harness = harness
-
-    with pytest.raises(RuntimeError, match="design-only"):
-        build_docker_adapter(_make_daemon_cfg(), agent_cfg)
-
-
 @pytest.mark.asyncio
-async def test_docker_install_desired_passes_assets_once(
+async def test_docker_install_desired_passes_skills_and_mcps(
     monkeypatch, tmp_path,
 ):
-    """The Docker adapter forwards both asset classes with its boundary."""
+    """The docker adapter installs skills but never MCPs — MCPs are
+    gated out upstream, so it always calls run_spawn_install with an
+    empty desired_mcps list."""
     from puffo_agent.agent.adapters import desired_install
     from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
 

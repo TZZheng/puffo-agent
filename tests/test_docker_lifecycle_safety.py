@@ -54,11 +54,7 @@ def _patch_startup_dependencies(adapter, host_home, *, package_probe):
             docker_cli, "sync_host_claude_code_auth_view", lambda *_args: "none",
         ),
         patch.object(docker_cli, "sync_host_skills", lambda *_args: 0),
-        patch.object(
-            docker_cli,
-            "sync_host_mcp_servers",
-            lambda *_args, **_kwargs: (0, []),
-        ),
+        patch.object(docker_cli, "sync_host_mcp_servers", lambda *_args: (0, [])),
         patch.object(docker_cli, "sync_host_enabled_plugins", lambda *_args: 0),
         patch.object(adapter, "_install_desired", new=AsyncMock()),
         patch.object(adapter, "_container_state", new=AsyncMock(return_value="running")),
@@ -77,14 +73,14 @@ def _patch_startup_dependencies(adapter, host_home, *, package_probe):
     )
 
 
-def test_stale_rebuild_preserves_host_workspace_and_claude_state(tmp_path):
+def test_stale_rebuild_preserves_host_workspace_and_codex_session(tmp_path):
     adapter = _adapter(tmp_path)
     workspace_sentinel = tmp_path / "workspace" / "keep.txt"
-    claude_sentinel = adapter.claude_home_src / "session.json"
+    codex_sentinel = adapter.codex_home / "codex_session.json"
     workspace_sentinel.parent.mkdir(parents=True)
-    claude_sentinel.parent.mkdir(parents=True)
+    codex_sentinel.parent.mkdir(parents=True)
     workspace_sentinel.write_text("workspace", encoding="utf-8")
-    claude_sentinel.write_text("session", encoding="utf-8")
+    codex_sentinel.write_text("session", encoding="utf-8")
     (adapter.agent_home_dir / ".docker-layout").write_text(
         docker_cli.CONTAINER_LAYOUT_VERSION, encoding="utf-8",
     )
@@ -105,7 +101,7 @@ def test_stale_rebuild_preserves_host_workspace_and_claude_state(tmp_path):
 
     assert ["/fake/docker", "rm", "-f", adapter.container_name] in captured
     assert workspace_sentinel.read_text(encoding="utf-8") == "workspace"
-    assert claude_sentinel.read_text(encoding="utf-8") == "session"
+    assert codex_sentinel.read_text(encoding="utf-8") == "session"
 
 
 def test_unknown_staleness_probe_never_removes_container(tmp_path):

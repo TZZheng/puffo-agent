@@ -12,6 +12,7 @@ from PySide6.QtCore import QDir, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFileSystemModel,
+    QLabel,
     QListWidget,
     QListWidgetItem,
     QSplitter,

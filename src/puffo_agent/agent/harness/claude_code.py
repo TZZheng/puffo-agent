@@ -1,16 +1,17 @@
-"""Declarative Claude Code harness used by the Docker runtime.
+"""Claude Code harness — the default.
 
-Host-local Claude Code execution uses :class:`ClaudeCodeCliDriver` instead;
-the Docker adapter retains this lightweight metadata object and its
-``ClaudeSession`` transport.
+The turn protocol lives in ``agent/adapters/cli_session.py``; the
+adapter constructs a ``ClaudeSession`` directly when
+``harness.name() == "claude-code"``. Lift ``ClaudeSession`` behind
+the harness boundary only when a second claude-like harness arrives.
 """
 
 from __future__ import annotations
 
-from .base import DockerHarness
+from .base import Harness
 
 
-class ClaudeCodeHarness(DockerHarness):
+class ClaudeCodeHarness(Harness):
     def name(self) -> str:
         return "claude-code"
 

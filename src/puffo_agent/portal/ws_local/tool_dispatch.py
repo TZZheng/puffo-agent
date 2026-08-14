@@ -23,12 +23,6 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "send_message",
     "send_message_with_attachments",
     # read / navigation
-    "read_inbox",
-    # durable Agent-local reminders
-    "create_reminder",
-    "list_reminders",
-    "cancel_reminder",
-    "replace_reminder",
     "get_user_info",
     "whoami",
     "get_post",
@@ -45,13 +39,6 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     # membership
     "leave_space",
     "leave_channel",
-    # bridge-only sandbox lifecycle (registered only when
-    # cfg.bridge_client is set — native agents never see these)
-    "schedule_wake",
-    "cancel_wake",
-    "get_scheduled_wake",
-    "get_runtime_status",
-    "keep_alive",
 })
 
 

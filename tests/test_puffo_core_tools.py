@@ -1,5 +1,4 @@
 import json
-import logging
 import os
 import sys
 import tempfile
@@ -9,13 +8,14 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from puffo_agent.agent.message_store import MessageStore, ReceiptDisposition
+from puffo_agent.agent.message_store import MessageStore
 from puffo_agent.crypto.encoding import base64url_encode
 from puffo_agent.crypto.keystore import KeyStore, Session, StoredIdentity, encode_secret
 from puffo_agent.crypto.primitives import Ed25519KeyPair, KemKeyPair
-from puffo_agent.agent.send_coordinator import SendCoordinator
+from puffo_agent.agent._visibility import resolve_visibility
 from puffo_agent.mcp.puffo_core_tools import (
     PuffoCoreToolsConfig,
+    _resolve_outgoing_root,
     register_core_tools,
 )
 
@@ -33,7 +33,6 @@ class FakeHttpClient:
     def __init__(self):
         self.calls: list[tuple[str, str, dict | None]] = []
         self.responses: dict[str, dict] = {}
-        self._seq = 100
 
     def _match(self, path: str) -> dict:
         if path in self.responses:
@@ -65,24 +64,6 @@ class FakeHttpClient:
         self.calls.append(("POST", path, body))
         if path in self.responses:
             return self.responses[path]
-        if path == "/v2/agent-runtime/messages:send":
-            self._seq += 1
-            freshness = body["freshness"]
-            return {
-                "state": "sent",
-                "envelope_id": body["envelope"]["envelope_id"],
-                "seq": self._seq,
-                "replay": False,
-                "missing_devices": [],
-                "freshness": {
-                    "mode": freshness["mode"],
-                    "context_baseline_seq": (
-                        freshness["context_baseline_seq"]
-                    ),
-                    "seen_seq": freshness["seen_seq"],
-                    "latest_seq_before_send": freshness["seen_seq"],
-                },
-            }
         return {"ok": True}
 
     async def post_bytes(self, path, headers=None, data=None):
@@ -136,132 +117,7 @@ def _setup():
         data_client=ms,
         space_id="sp_test",
     )
-    class _Freshness:
-        async def get_context_baseline_seq(self, _space_id, _channel_id):
-            return 0
-
-        async def get_active_turn_through_seq(self, _space_id, _channel_id):
-            return None
-
-        async def advance_active_turn_through_seq(self, *_args):
-            return None
-
-    freshness = _Freshness()
-    cfg.send_coordinator = SendCoordinator(
-        slug=cfg.slug,
-        keystore=cfg.keystore,
-        http_client=cfg.http_client,
-        data_client=cfg.data_client,
-        workspace=cfg.workspace,
-        baseline_source=freshness,
-        active_turn_source=freshness,
-    )
     return cfg, http, ms
-
-
-class KeylessFakeHttpClient:
-    """Recording stub for the T23 keyless transport. ``keyless=True``
-    flips ``PuffoCoreToolsConfig.keyless`` so the tools take the unsigned
-    ``/v2/cloud-agents/*`` seam. Records every unsigned call and mints a
-    fresh blob_id per upload. The signed ``get``/``post``/``post_bytes``
-    methods are deliberately ABSENT so any accidental signed call fails
-    loud (proving keyless tools never hit the signed path)."""
-
-    def __init__(self, server_url: str = "http://sandbox.local"):
-        self.keyless = True
-        self.server_url = server_url
-        self.calls: list[tuple[str, str, object]] = []
-        self.responses: dict[str, dict] = {}
-        self.uploaded: list[bytes] = []
-        self._blob_seq = 0
-
-    def _match(self, path: str) -> dict:
-        if path in self.responses:
-            return self.responses[path]
-        base = path.split("?", 1)[0]
-        return self.responses.get(base, {})
-
-    async def get_unsigned(self, path):
-        self.calls.append(("GET_UNSIGNED", path, None))
-        return self._match(path)
-
-    async def post_unsigned(self, path, body=None):
-        self.calls.append(("POST_UNSIGNED", path, body))
-        if path in self.responses:
-            return self.responses[path]
-        if path == "/v2/cloud-agents/agent-runtime/messages:send":
-            freshness = body["freshness"]
-            request_baseline = freshness["context_baseline_seq"]
-            return {
-                "state": "sent",
-                "envelope_id": "msg_keyless",
-                "seq": freshness["seen_seq"] + 1,
-                "replay": False,
-                "missing_devices": [],
-                "freshness": {
-                    "mode": freshness["mode"],
-                    "context_baseline_seq": (
-                        request_baseline
-                        if request_baseline is not None
-                        else freshness["seen_seq"]
-                    ),
-                    "seen_seq": freshness["seen_seq"],
-                    "latest_seq_before_send": freshness["seen_seq"],
-                },
-            }
-        return {"envelope_id": "msg_keyless"}
-
-    async def post_bytes_unsigned(self, path, body):
-        self._blob_seq += 1
-        self.uploaded.append(body)
-        self.calls.append(
-            ("POST_BYTES_UNSIGNED", path, len(body) if body else 0)
-        )
-        return {
-            "blob_id": f"blob_{self._blob_seq:04d}",
-            "size_bytes": len(body) if body else 0,
-        }
-
-
-class _SpyKeyStore:
-    """Records any keystore load so a keyless tool that accidentally
-    reaches the keystore is caught. Both loads raise, mirroring the
-    ``_BridgeNoKeysStore`` dead-end."""
-
-    def __init__(self):
-        self.loads: list[tuple[str, str]] = []
-
-    def load_identity(self, slug):
-        self.loads.append(("identity", slug))
-        raise AssertionError("keyless tool must not load identity")
-
-    def load_session(self, slug):
-        self.loads.append(("session", slug))
-        raise AssertionError("keyless tool must not load session")
-
-
-def _setup_keyless():
-    """Keyless tools config: recording keyless http client + a real
-    MessageStore, and NO keystore identity/session written to disk —
-    proving the keyless tools never touch the keystore."""
-    d = tempfile.mkdtemp()
-    ks = KeyStore(os.path.join(d, "keys"))
-    ms = MessageStore(os.path.join(d, "messages.db"))
-    http = KeylessFakeHttpClient()
-    cfg = PuffoCoreToolsConfig(
-        slug="agent-0001",
-        device_id="dev_test",
-        keystore=ks,
-        http_client=http,
-        data_client=ms,
-        space_id="sp_test",
-    )
-    return cfg, http, ms
-
-
-def _keyless_sends(http):
-    """The bodies of every keyless ``POST /v2/cloud-agents/messages``."""
-    return [b for m, p, b in http.calls if m == "POST_UNSIGNED"]
 
 
 def _build_tools(cfg):
@@ -273,27 +129,11 @@ def _build_tools(cfg):
 
 async def _call(mcp, name, args=None):
     result = await mcp.call_tool(name, args or {})
-    if (
-        isinstance(result, tuple)
-        and len(result) > 1
-        and isinstance(result[1], dict)
-        and result[1].get("state") == "failed"
-    ):
-        raise RuntimeError(json.dumps(result[1]))
-    if isinstance(result, tuple):
-        result = result[0]
     if isinstance(result, list):
         return "".join(
             getattr(item, "text", str(item)) for item in result
         )
     return str(result)
-
-
-async def _call_structured(mcp, name, args=None):
-    result = await mcp.call_tool(name, args or {})
-    assert isinstance(result, tuple)
-    assert isinstance(result[1], dict)
-    return result[1]
 
 
 @pytest.mark.asyncio
@@ -313,394 +153,9 @@ async def test_whoami_includes_display_name():
         "profiles": [{"slug": "agent-0001", "display_name": "Helper Bot"}],
     }
     mcp = _build_tools(cfg)
-    result = await _call_structured(mcp, "whoami")
-    assert result["context_version"] == 1
-    assert result["identity"]["display_name"] == "Helper Bot"
-    assert result["identity"]["identity"] == "@agent-0001"
-
-
-@pytest.mark.asyncio
-async def test_hidden_schema_semantic_send_fields_only():
-    cfg, _, _ = _setup()
-    tools = {tool.name: tool for tool in await _build_tools(cfg).list_tools()}
-    expected = {
-        "send_message": {
-            "channel", "text", "root_id", "visibility_level", "send_anyway",
-        },
-        "send_message_with_attachments": {
-            "paths", "channel", "caption", "root_id",
-            "visibility_level", "send_anyway",
-        },
-    }
-    forbidden = {
-        "freshness", "freshness_mode", "mode", "context_baseline_seq",
-        "seen_seq", "synchronized", "transport", "provider_session_id",
-        "session_ref", "turn_id", "turn_ref", "sequence", "seq",
-        "through_seq", "latest_seq", "latest_envelope_id", "held_pair",
-        "client_ref", "admission_receipt", "correlation_receipt",
-        "tool_name", "tool_arguments",
-    }
-    for name, property_set in expected.items():
-        properties = set(tools[name].inputSchema["properties"])
-        assert properties == property_set
-        assert properties.isdisjoint(forbidden)
-
-
-@pytest.mark.asyncio
-async def test_send_tool_descriptions_stay_at_mcp_boundary():
-    cfg, _, _ = _setup()
-    tools = {tool.name: tool for tool in await _build_tools(cfg).list_tools()}
-    for name in ("send_message", "send_message_with_attachments"):
-        description = " ".join(tools[name].description.lower().split())
-        for phrase in ("channel", "root_id", "visibility_level", "send_anyway", "held", "error"):
-            assert phrase in description, (name, phrase, description)
-        for forbidden in (
-            "same originating assignment", "not an automatic retry",
-            "visible_draft_basis", "new_channel_context", "context_ready",
-            "benchmark", "assignment-completion", "response quota", "counting",
-        ):
-            assert forbidden not in description
-
-
-@pytest.mark.asyncio
-async def test_send_tool_descriptions_point_to_managed_skill():
-    cfg, _, _ = _setup()
-    tools = {tool.name: tool for tool in await _build_tools(cfg).list_tools()}
-    for name in ("send_message", "send_message_with_attachments"):
-        description = " ".join(tools[name].description.lower().split())
-        assert "managed" in description and "send-message" in description
-
-
-@pytest.mark.asyncio
-async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
-    cfg, _, _ = _setup()
-    calls = []
-
-    class Runtime:
-        async def read_inbox(self, **kwargs):
-            calls.append(kwargs)
-            return {
-                "messages": ["message"],
-                "prior_context": ["prior"],
-                "next_cursor": "cursor-2",
-                "has_more": True,
-                "remaining_count": 72,
-                "snapshot_generation": 9,
-                "correlation_receipt": "receipt-9",
-            }
-
-    cfg.inbox_runtime = Runtime()
-    mcp = _build_tools(cfg)
-    tools = {tool.name: tool for tool in await mcp.list_tools()}
-    schema = tools["read_inbox"].inputSchema
-    assert set(schema["properties"]) == {"target", "cursor", "limit"}
-    assert set(schema["properties"]).isdisjoint({
-        "freshness", "freshness_mode", "mode", "context_baseline_seq",
-        "seen_seq", "synchronized", "transport", "provider_session_id",
-        "session_ref", "turn_id", "turn_ref", "sequence", "seq",
-        "through_seq", "latest_seq", "latest_envelope_id", "held_pair",
-        "client_ref", "admission_receipt", "correlation_receipt",
-        "message_ids", "tool_name", "tool_arguments",
-    })
-    result = await mcp.call_tool(
-        "read_inbox",
-        {"target": "channel:sp_1:ch_1", "cursor": "opaque", "limit": 17},
-    )
-    structured = result[1]
-    assert structured == {
-        "messages": ["message"],
-        "prior_context": ["prior"],
-        "next_cursor": "cursor-2",
-        "has_more": True,
-        "remaining_count": 72,
-        "snapshot_generation": 9,
-        "admission_receipt": "[puffo:model-visible-read:receipt-9]",
-    }
-    assert calls == [{
-        "target": "channel:sp_1:ch_1",
-        "cursor": "opaque",
-        "limit": 17,
-        "tool_arguments": {
-            "target": "channel:sp_1:ch_1",
-            "cursor": "opaque",
-            "limit": 17,
-        },
-    }]
-
-    description = " ".join(tools["read_inbox"].description.lower().split())
-    for phrase in (
-        "target", "cursor", "limit", "messages", "prior_context",
-        "prior_context_has_more", "next_cursor", "has_more",
-    ):
-        assert phrase.lower() in description, (phrase, description)
-    for forbidden in ("same originating assignment", "send-anyway", "held", "benchmark", "assignment-completion"):
-        assert forbidden not in description
-    assert "managed" in description and "read-inbox" in description
-
-
-@pytest.mark.asyncio
-async def test_reminder_tools_have_exact_semantic_schemas_and_live_dispatch():
-    cfg, _, _ = _setup()
-    calls: list[tuple[str, dict]] = []
-    reminder = {
-        "reminder_id": "reminder-1",
-        "occurrence_id": "occurrence-1",
-        "state": "scheduled",
-        "target": "channel:sp:ch",
-        "content": "exact content",
-        "intended_at": "2026-08-02T12:00:00.000Z",
-        "actual_fire_at": None,
-        "created_at": "2026-08-02T11:00:00.000Z",
-        "cancelled_at": None,
-        "delivered_at": None,
-    }
-
-    class Runtime:
-        async def create_reminder(self, **kwargs):
-            calls.append(("create", kwargs))
-            return reminder
-
-        async def list_reminders(self, **kwargs):
-            calls.append(("list", kwargs))
-            return {"reminders": [reminder]}
-
-        async def cancel_reminder(self, **kwargs):
-            calls.append(("cancel", kwargs))
-            return {**reminder, "state": "cancelled", "cancelled_at": "2026-08-02T11:01:00.000Z"}
-
-        async def replace_reminder(self, **kwargs):
-            calls.append(("replace", kwargs))
-            return {"cancelled": reminder, "replacement": {**reminder, "content": "new"}}
-
-    cfg.inbox_runtime = Runtime()
-    mcp = _build_tools(cfg)
-    tools = {tool.name: tool for tool in await mcp.list_tools()}
-    assert set(tools).issuperset({
-        "create_reminder", "list_reminders", "cancel_reminder", "replace_reminder",
-    })
-    assert set(tools["create_reminder"].inputSchema["properties"]) == {
-        "content", "target", "intended_at",
-    }
-    assert set(tools["list_reminders"].inputSchema["properties"]) == {
-        "state", "limit",
-    }
-    assert set(tools["cancel_reminder"].inputSchema["properties"]) == {
-        "reminder_id",
-    }
-    assert set(tools["replace_reminder"].inputSchema["properties"]) == {
-        "reminder_id", "content", "target", "intended_at",
-    }
-    forbidden = {
-        "recurrence", "provider", "server", "schedule_wake", "pause",
-        "resume", "execute", "skip", "apologize", "reply", "silence",
-        "state_machine", "actual_fire_at", "occurrence_id",
-    }
-    for name in ("create_reminder", "list_reminders", "cancel_reminder", "replace_reminder"):
-        assert set(tools[name].inputSchema["properties"]).isdisjoint(forbidden)
-
-    assert (await mcp.call_tool("create_reminder", {
-        "content": "exact content", "target": "channel:sp:ch",
-        "intended_at": "2026-08-02T12:00:00Z",
-    }))[1] == reminder
-    assert (await mcp.call_tool("list_reminders", {
-        "state": "scheduled", "limit": 3,
-    }))[1] == {"reminders": [reminder]}
-    cancelled = (await mcp.call_tool("cancel_reminder", {
-        "reminder_id": "reminder-1",
-    }))[1]
-    assert cancelled["state"] == "cancelled"
-    replaced = (await mcp.call_tool("replace_reminder", {
-        "reminder_id": "reminder-1", "content": "new",
-    }))[1]
-    assert replaced["replacement"]["content"] == "new"
-    assert calls == [
-        ("create", {
-            "content": "exact content", "target": "channel:sp:ch",
-            "intended_at": "2026-08-02T12:00:00Z",
-        }),
-        ("list", {"state": "scheduled", "limit": 3}),
-        ("cancel", {"reminder_id": "reminder-1"}),
-        ("replace", {
-            "reminder_id": "reminder-1", "content": "new",
-            "target": "", "intended_at": "",
-        }),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_reminder_tools_fall_back_to_configured_loopback_rpc_client():
-    """The subprocess MCP surface must use the same semantic objects."""
-    cfg, _, _ = _setup()
-    calls: list[tuple[str, dict]] = []
-    scheduled = {
-        "reminder_id": "reminder-1",
-        "occurrence_id": "occurrence-1",
-        "state": "scheduled",
-        "target": "channel:sp:ch",
-        "content": "exact content",
-        "intended_at": "2026-08-02T12:00:00.000Z",
-        "actual_fire_at": None,
-        "created_at": "2026-08-02T11:00:00.000Z",
-        "cancelled_at": None,
-        "delivered_at": None,
-    }
-    cancelled = {
-        **scheduled,
-        "state": "cancelled",
-        "cancelled_at": "2026-08-02T11:01:00.000Z",
-    }
-
-    class Rpc:
-        async def create_reminder(self, **kwargs):
-            calls.append(("create", kwargs))
-            return scheduled
-
-        async def list_reminders(self, **kwargs):
-            calls.append(("list", kwargs))
-            return {"reminders": [scheduled]}
-
-        async def cancel_reminder(self, **kwargs):
-            calls.append(("cancel", kwargs))
-            return cancelled
-
-        async def replace_reminder(self, **kwargs):
-            calls.append(("replace", kwargs))
-            return {"cancelled": cancelled, "replacement": scheduled}
-
-    # No warm in-process runtime is available on the subprocess MCP path.
-    cfg.inbox_runtime = None
-    cfg.message_client = None
-    cfg.rpc_client = Rpc()
-    mcp = _build_tools(cfg)
-
-    assert (await mcp.call_tool("create_reminder", {
-        "content": "exact content", "target": "channel:sp:ch",
-        "intended_at": "2026-08-02T12:00:00Z",
-    }))[1] == scheduled
-    assert (await mcp.call_tool("list_reminders", {
-        "state": "scheduled", "limit": 3,
-    }))[1] == {"reminders": [scheduled]}
-    assert (await mcp.call_tool("cancel_reminder", {
-        "reminder_id": "reminder-1",
-    }))[1] == cancelled
-    assert (await mcp.call_tool("replace_reminder", {
-        "reminder_id": "reminder-1", "intended_at": "2026-08-03T12:00:00Z",
-    }))[1] == {"cancelled": cancelled, "replacement": scheduled}
-    assert calls == [
-        ("create", {
-            "content": "exact content", "target": "channel:sp:ch",
-            "intended_at": "2026-08-02T12:00:00Z",
-        }),
-        ("list", {"state": "scheduled", "limit": 3}),
-        ("cancel", {"reminder_id": "reminder-1"}),
-        ("replace", {
-            "reminder_id": "reminder-1", "content": "", "target": "",
-            "intended_at": "2026-08-03T12:00:00Z",
-        }),
-    ]
-
-
-@pytest.mark.asyncio
-async def test_semantic_rpc_unavailable_returns_structured_failure():
-    cfg, http, _ = _setup()
-    cfg.send_coordinator = None
-    cfg.rpc_client = None
-    result = await _build_tools(cfg).call_tool(
-        "send_message", {"channel": "ch_a", "text": "do not post"},
-    )
-    structured = result[1]
-    assert structured["state"] == "failed"
-    assert structured["attempted"] is True
-    assert not [call for call in http.calls if call[0] == "POST"]
-
-
-@pytest.mark.asyncio
-async def test_semantic_in_process_uses_injected_persistent_coordinator():
-    cfg, _, _ = _setup()
-    calls = []
-
-    class Stub:
-        async def send(self, request):
-            calls.append(request)
-            return {"state": "held", "attempted": True}
-
-    cfg.send_coordinator = Stub()
-    result = await _build_tools(cfg).call_tool(
-        "send_message",
-        {"channel": "ch_a", "text": "x", "send_anyway": True},
-    )
-    assert result[1] == {"state": "held", "attempted": True}
-    assert calls[0].send_anyway is True
-
-
-@pytest.mark.asyncio
-async def test_semantic_out_of_process_uses_structured_rpc_client():
-    cfg, _, _ = _setup()
-    bodies = []
-
-    class Rpc:
-        async def send_message(self, **body):
-            bodies.append(body)
-            return {"state": "sent", "attempted": True, "seq": 3}
-
-    cfg.send_coordinator = None
-    cfg.rpc_client = Rpc()
-    result = await _build_tools(cfg).call_tool(
-        "send_message", {"channel": "ch_a", "text": "x", "send_anyway": True},
-    )
-    assert result[1]["state"] == "sent"
-    assert bodies == [{
-        "channel": "ch_a",
-        "root_id": "",
-        "visibility_level": "default",
-        "send_anyway": True,
-        "text": "x",
-    }]
-
-
-@pytest.mark.asyncio
-async def test_keyless_configured_rpc_precedes_direct_unsigned_coordinator():
-    cfg, http, _store = _setup_keyless()
-    bodies = []
-
-    class Rpc:
-        async def send_message(self, **body):
-            bodies.append(body)
-            return {"state": "sent", "attempted": True, "seq": 3}
-
-    cfg.send_coordinator = None
-    cfg.rpc_client = Rpc()
-    result = await _build_tools(cfg).call_tool(
-        "send_message",
-        {
-            "channel": "ch_a",
-            "text": "x",
-            "visibility_level": "human",
-            "send_anyway": True,
-        },
-    )
-    assert result[1]["state"] == "sent"
-    assert len(bodies) == 1
-    assert bodies[0]["visibility_level"] == "human"
-    assert bodies[0]["send_anyway"] is True
-    assert not [call for call in http.calls if call[0] == "POST_UNSIGNED"]
-
-
-@pytest.mark.asyncio
-async def test_keyless_configured_rpc_failure_does_not_fall_back_to_http():
-    cfg, http, _store = _setup_keyless()
-
-    class Rpc:
-        async def send_message(self, **_body):
-            raise ConnectionError("daemon unavailable")
-
-    cfg.send_coordinator = None
-    cfg.rpc_client = Rpc()
-    result = await _build_tools(cfg).call_tool(
-        "send_message", {"channel": "ch_a", "text": "x"},
-    )
-    assert result[1]["error_kind"] == "rpc_unavailable"
-    assert not [call for call in http.calls if call[0] == "POST_UNSIGNED"]
+    result = await _call(mcp, "whoami")
+    assert "display_name: Helper Bot" in result
+    assert "agent-0001" in result
 
 
 @pytest.mark.asyncio
@@ -716,13 +171,22 @@ async def test_send_message_plaintext_when_daemon_says_unencrypted():
 
     ms.get_send_encryption = _no_encrypt
     mcp = _build_tools(cfg)
-    with pytest.raises(RuntimeError, match="plaintext channel"):
-        await _call(
-            mcp,
-            "send_message",
-            {"channel": "ch_abc", "text": "hello world", "visibility_level": "human"},
-        )
-    assert not any(m.startswith("POST") for m, _, _ in http.calls)
+    result = await _call(
+        mcp,
+        "send_message",
+        {"channel": "ch_abc", "text": "hello world", "visibility_level": "human"},
+    )
+    assert "posted" in result
+    # No device resolution on the plaintext path.
+    assert not any(
+        p.startswith("/certs/sync") for m, p, _ in http.calls if m == "GET"
+    )
+    post_calls = [(p, b) for m, p, b in http.calls if m == "POST"]
+    assert len(post_calls) == 1
+    path, body = post_calls[0]
+    assert path == "/v2/messages/plaintext"
+    assert body["type"] == "plaintext_message_envelope"
+    assert body["signed_payload"]["payload"]["channel_id"] == "ch_abc"
 
 
 @pytest.mark.asyncio
@@ -766,9 +230,9 @@ async def test_send_message_channel():
     post_calls = [(p, b) for m, p, b in http.calls if m == "POST"]
     assert len(post_calls) == 1
     path, body = post_calls[0]
-    assert path == "/v2/agent-runtime/messages:send"
-    assert set(body) == {"envelope", "freshness"}
-    envelope = body["envelope"]
+    assert path == "/messages"
+    # Body IS the envelope; no ``{"envelope": ...}`` wrapper.
+    envelope = body
     assert envelope["type"] == "message_envelope"
     assert envelope["version"] == 1
     assert envelope["envelope_kind"] == "channel"
@@ -1130,6 +594,8 @@ async def test_get_channel_history_bare_slug_gets_dm_hint():
         await _call(mcp, "get_channel_history", {"channel": "alice-1234"})
     _assert_dm_hint(excinfo.value, "alice-1234")
     await ms.close()
+
+
 @pytest.mark.asyncio
 async def test_get_channel_history_non_ch_ref_known_to_cache_still_works():
     """The slug-hint guard only fires on refs the cache does NOT
@@ -1256,243 +722,6 @@ async def test_get_channel_history_from_local():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("content, expected", [
-    ({"text": "structured text", "caption": "unused caption"}, "structured text"),
-    ({"caption": "caption fallback"}, "caption fallback"),
-])
-async def test_structured_content_read_boundaries(content, expected):
-    """Every local read surface renders structured content as text, never
-    the Python representation of the dict."""
-    cfg, _, ms = _setup()
-    await ms.open()
-    try:
-        base = _now_ms()
-        rows = [
-            {"envelope_id": "root", "envelope_kind": "channel", "sender_slug": "alice",
-             "channel_id": "ch_struct", "space_id": "sp_test", "content": content,
-             "content_type": "puffo/message+attachments/v1", "sent_at": base},
-            {"envelope_id": "reply", "envelope_kind": "channel", "sender_slug": "alice",
-             "channel_id": "ch_struct", "space_id": "sp_test", "content": content,
-             "content_type": "puffo/message+attachments/v1", "thread_root_id": "root", "sent_at": base + 1},
-            {"envelope_id": "dm", "envelope_kind": "dm", "sender_slug": "alice",
-             "recipient_slug": "agent-0001", "content": content,
-             "content_type": "puffo/message+attachments/v1", "sent_at": base + 2},
-        ]
-        for row in rows:
-            await ms.store(row)
-        mcp = _build_tools(cfg)
-        outputs = [
-            await _call(mcp, "get_channel_history", {"channel": "ch_struct"}),
-            await _call(mcp, "get_dm_history", {"peer": "alice"}),
-            await _call(mcp, "get_thread_history", {"root_id": "root"}),
-            await _call(mcp, "get_post", {"post_ref": "root"}),
-            await _call(mcp, "get_post_segment", {"envelope_id": "root", "segment": 0}),
-        ]
-        assert all(expected in output for output in outputs)
-        assert all("{'text':" not in output and "{'caption':" not in output for output in outputs)
-    finally:
-        await ms.close()
-
-
-@pytest.mark.asyncio
-async def test_message_read_tools_stage_highest_model_visible_server_sequence():
-    cfg, _, ms = _setup()
-    base = _now_ms()
-    root = {
-        "envelope_id": "env_root",
-        "envelope_kind": "channel",
-        "sender_slug": "alice-0001",
-        "channel_id": "ch_visible",
-        "space_id": "sp_visible",
-        "content_type": "text/plain",
-        "content": "root body",
-        "sent_at": base,
-    }
-    reply = {
-        "envelope_id": "env_reply",
-        "envelope_kind": "channel",
-        "sender_slug": "bob-0001",
-        "channel_id": "ch_visible",
-        "space_id": "sp_visible",
-        "content_type": "text/plain",
-        "content": "reply body",
-        "sent_at": base + 1,
-        "thread_root_id": "env_root",
-    }
-    for seq, payload in ((41, root), (42, reply)):
-        await ms.store_receipt(
-            payload,
-            server_seq=seq,
-            disposition=ReceiptDisposition.ELIGIBLE,
-            reason="test",
-        )
-
-    class RecordingRpc:
-        def __init__(self):
-            self.calls = []
-
-        async def stage_model_visible_read(self, **kwargs):
-            self.calls.append(kwargs)
-            return {
-                "state": "staged",
-                "correlation_receipt": f"receipt-{len(self.calls)}",
-            }
-
-    rpc = RecordingRpc()
-    cfg.rpc_client = rpc
-    mcp = _build_tools(cfg)
-
-    channel_result = await _call(
-        mcp, "get_channel_history", {"channel": "ch_visible"},
-    )
-    clamped_result = await _call(
-        mcp,
-        "get_channel_history",
-        {"channel": "ch_visible", "limit": 999},
-    )
-    await _call(mcp, "get_thread_history", {"root_id": "env_root"})
-    await _call(mcp, "get_post", {"post_ref": "env_reply"})
-    await _call(
-        mcp,
-        "get_post_segment",
-        {"envelope_id": "env_reply", "segment": 0},
-    )
-
-    assert [
-        (call["tool_name"], call["through_seq"], call["through_envelope_id"])
-        for call in rpc.calls
-    ] == [
-        ("get_channel_history", 41, "env_root"),
-        ("get_channel_history", 41, "env_root"),
-        ("get_thread_history", 42, "env_reply"),
-        ("get_post", 42, "env_reply"),
-        ("get_post_segment", 42, "env_reply"),
-    ]
-    assert [call["tool_arguments"] for call in rpc.calls] == [
-        {"channel": "ch_visible"},
-        {"channel": "ch_visible", "limit": 200},
-        {"root_id": "env_root"},
-        {"post_ref": "env_reply"},
-        {"envelope_id": "env_reply", "segment": 0},
-    ]
-    assert [call["visible_message_ids"] for call in rpc.calls] == [
-        ["env_root"], ["env_root"], ["env_root", "env_reply"],
-        ["env_reply"], ["env_reply"],
-    ]
-    assert "[puffo:model-visible-read:receipt-1]" in channel_result
-    assert "[puffo:model-visible-read:receipt-2]" in clamped_result
-    await ms.close()
-
-
-@pytest.mark.asyncio
-async def test_history_reads_stage_through_the_in_process_inbox_runtime():
-    """MAJOR 8: in-process (ws-local) tools have a runtime and no rpc_client.
-
-    Returning early on ``rpc_client is None`` meant a ws-local agent's channel
-    watermark never advanced, so already-read content was re-presented on the
-    next planning cycle.
-    """
-    cfg, _, ms = _setup()
-    await ms.store_receipt(
-        {
-            "envelope_id": "env_runtime",
-            "envelope_kind": "channel",
-            "sender_slug": "alice-0001",
-            "channel_id": "ch_runtime",
-            "space_id": "sp_runtime",
-            "content_type": "text/plain",
-            "content": "runtime body",
-            "sent_at": _now_ms(),
-        },
-        server_seq=77,
-        disposition=ReceiptDisposition.ELIGIBLE,
-        reason="test",
-    )
-
-    class RecordingRuntime:
-        def __init__(self):
-            self.calls = []
-
-        async def stage_model_visible_read(self, **kwargs):
-            self.calls.append(kwargs)
-            return {"state": "staged", "correlation_receipt": "runtime-receipt"}
-
-    runtime = RecordingRuntime()
-    assert cfg.rpc_client is None
-    cfg.inbox_runtime = runtime
-    mcp = _build_tools(cfg)
-
-    result = await _call(mcp, "get_channel_history", {"channel": "ch_runtime"})
-    assert "[puffo:model-visible-read:runtime-receipt]" in result
-    assert len(runtime.calls) == 1
-    assert runtime.calls[0]["through_seq"] == 77
-    assert runtime.calls[0]["through_envelope_id"] == "env_runtime"
-    assert runtime.calls[0]["visible_message_ids"] == ["env_runtime"]
-    await ms.close()
-
-
-@pytest.mark.asyncio
-async def test_dm_and_unsequenced_reads_do_not_stage_channel_freshness(caplog):
-    caplog.set_level(
-        logging.DEBUG,
-        logger="puffo_agent.mcp.puffo_core_tools",
-    )
-    cfg, _, ms = _setup()
-    await ms.store({
-        "envelope_id": "legacy",
-        "envelope_kind": "channel",
-        "sender_slug": "alice-0001",
-        "channel_id": "ch_legacy",
-        "space_id": "sp_legacy",
-        "content_type": "text/plain",
-        "content": "legacy body",
-        "sent_at": _now_ms(),
-    })
-    await ms.store_receipt(
-        {
-            "envelope_id": "dm_9",
-            "envelope_kind": "dm",
-            "sender_slug": "alice-0001",
-            "recipient_slug": "agent-0001",
-            "content_type": "text/plain",
-            "content": "private",
-            "sent_at": _now_ms() + 1,
-        },
-        server_seq=43,
-        disposition=ReceiptDisposition.ELIGIBLE,
-        reason="test",
-    )
-
-    class RecordingRpc:
-        def __init__(self):
-            self.calls = []
-
-        async def stage_model_visible_read(self, **kwargs):
-            self.calls.append(kwargs)
-            return {
-                "state": "staged",
-                "correlation_receipt": f"receipt-{len(self.calls)}",
-            }
-
-    rpc = RecordingRpc()
-    cfg.rpc_client = rpc
-    mcp = _build_tools(cfg)
-    await _call(mcp, "get_post", {"post_ref": "legacy"})
-    await _call(mcp, "get_post", {"post_ref": "dm_9"})
-    assert rpc.calls == []
-    history_states = []
-    for record in caplog.records:
-        message = record.getMessage()
-        if "runtime_event=" not in message:
-            continue
-        event = json.loads(message.split("runtime_event=", 1)[1])
-        if event["event"] == "history.read_staged":
-            history_states.append(event["state"])
-    assert history_states == ["unsequenced", "dm_unsupported"]
-    await ms.close()
-
-
-@pytest.mark.asyncio
 async def test_get_channel_history_unknown_channel():
     """Channel never seen → 'no such channel: …'. Distinct from
     the empty-window message so the agent doesn't conflate a
@@ -1518,7 +747,7 @@ async def test_get_dm_history_from_local():
     })
     await ms.store({
         "envelope_id": "dm_2", "envelope_kind": "dm",
-        "sender_slug": "agent-0001", "recipient_slug": "alice-0001",
+        "sender_slug": "me-0001", "recipient_slug": "alice-0001",
         "content_type": "text/plain", "content": "hi back", "sent_at": base + 1000,
     })
     await ms.store({
@@ -1531,8 +760,6 @@ async def test_get_dm_history_from_local():
     assert "hi from alice" in result
     assert "hi back" in result
     assert "bob here" not in result   # a different peer is filtered out
-    assert 'message_id="dm_2"' in result
-    assert "self=true" in result
     await ms.close()
 
 
@@ -1611,25 +838,14 @@ async def test_list_spaces_returns_server_filtered_memberships():
     cfg, http, ms = _setup()
     http.responses["/spaces"] = {
         "spaces": [
-            {
-                "space_id": "sp_team",
-                "name": "Team",
-                "description": "Core team",
-                "role": "member",
-                "joined_at": 1700000000000,
-            },
+            {"space_id": "sp_team", "name": "Team"},
             {"space_id": "sp_other", "name": "Other"},
         ],
     }
     mcp = _build_tools(cfg)
-    result = await _call_structured(mcp, "list_spaces")
-    assert result["context_version"] == 1
-    assert result["count"] == 2
-    spaces = {space["space_id"]: space for space in result["spaces"]}
-    assert spaces["sp_team"]["name"] == "Team"
-    assert spaces["sp_team"]["description"] == "Core team"
-    assert spaces["sp_team"]["role"] == "member"
-    assert spaces["sp_other"]["name"] == "Other"
+    result = await _call(mcp, "list_spaces")
+    assert "sp_team" in result and "Team" in result
+    assert "sp_other" in result and "Other" in result
     # No per-space round-trips — list_spaces stays cheap.
     per_space_calls = [c for c in http.calls if "/channels" in c[1]]
     assert per_space_calls == []
@@ -1640,8 +856,8 @@ async def test_list_spaces_returns_empty_marker_when_not_a_member():
     cfg, http, ms = _setup()
     http.responses["/spaces"] = {"spaces": []}
     mcp = _build_tools(cfg)
-    result = await _call_structured(mcp, "list_spaces")
-    assert result == {"context_version": 1, "count": 0, "spaces": []}
+    result = await _call(mcp, "list_spaces")
+    assert "not a member" in result
 
 
 @pytest.mark.asyncio
@@ -1653,27 +869,15 @@ async def test_list_channels_in_space_scopes_to_one_space():
     cfg.space_id = "sp_legacy"  # must be irrelevant
     http.responses["/spaces/sp_target/channels"] = {
         "channels": [
-            {
-                "channel_id": "ch_g",
-                "name": "general",
-                "description": "Team discussion",
-                "is_public": True,
-                "owner_slug": "alice-0001",
-            },
+            {"channel_id": "ch_g", "name": "general"},
             {"channel_id": "ch_r", "name": "random"},
         ],
     }
     mcp = _build_tools(cfg)
-    result = await _call_structured(
-        mcp, "list_channels_in_space", {"space_id": "sp_target"},
-    )
+    result = await _call(mcp, "list_channels_in_space", {"space_id": "sp_target"})
 
-    channels = {channel["channel_id"]: channel for channel in result["channels"]}
-    assert channels["ch_g"]["name"] == "general"
-    assert channels["ch_g"]["description"] == "Team discussion"
-    assert channels["ch_g"]["visibility"] == "public"
-    assert channels["ch_g"]["owner_identity"] == "@alice-0001"
-    assert channels["ch_r"]["name"] == "random"
+    assert "ch_g" in result and "general" in result
+    assert "ch_r" in result and "random" in result
     # Exactly one round-trip; never to cfg.space_id or /spaces.
     assert ("GET", "/spaces/sp_target/channels", None) in http.calls
     assert not any(c[1] == "/spaces" for c in http.calls)
@@ -1697,12 +901,8 @@ async def test_list_channels_in_space_tolerates_string_response():
     cfg, http, ms = _setup()
     http.responses["/spaces/sp_racy/channels"] = ""
     mcp = _build_tools(cfg)
-    result = await _call_structured(
-        mcp, "list_channels_in_space", {"space_id": "sp_racy"},
-    )
-    assert result["space_id"] == "sp_racy"
-    assert result["count"] == 0
-    assert result["channels"] == []
+    result = await _call(mcp, "list_channels_in_space", {"space_id": "sp_racy"})
+    assert "no channels" in result
 
 
 @pytest.mark.asyncio
@@ -1749,11 +949,9 @@ async def test_list_channels_in_all_spaces_returns_empty_message_with_no_spaces(
     cfg, http, ms = _setup()
     http.responses["/spaces"] = {"spaces": []}
     mcp = _build_tools(cfg)
-    result = await _call_structured(mcp, "list_channels_in_all_spaces")
+    result = await _call(mcp, "list_channels_in_all_spaces")
 
-    assert result["space_count"] == 0
-    assert result["channel_count"] == 0
-    assert result["spaces"] == []
+    assert "not a member" in result
     per_space_calls = [c for c in http.calls if "/channels" in c[1]]
     assert per_space_calls == []
 
@@ -1804,11 +1002,11 @@ async def test_list_channels_in_all_spaces_tolerates_per_space_string_response()
         "channels": [{"channel_id": "ch_x", "name": "general"}],
     }
     mcp = _build_tools(cfg)
-    result = await _call_structured(mcp, "list_channels_in_all_spaces")
+    result = await _call(mcp, "list_channels_in_all_spaces")
 
-    by_space = {space["space_id"]: space for space in result["spaces"]}
-    assert by_space["sp_a"]["channels"] == []
-    assert by_space["sp_b"]["channels"][0]["channel_id"] == "ch_x"
+    assert "sp_a" in result
+    assert "(no channels)" in result
+    assert "ch_x" in result
 
 
 @pytest.mark.asyncio
@@ -1822,44 +1020,17 @@ async def test_list_channel_members():
     await ms.mark_channel_space("ch_abc", "sp_test")
     http.responses["/spaces/sp_test/channels/ch_abc/members"] = {
         "members": [
-            {
-                "slug": "alice-0001",
-                "role": "owner",
-                "identity_type": "human",
-                "owner_slug": None,
-            },
-            {
-                "slug": "agent-0001",
-                "role": "member",
-                "identity_type": "agent",
-                "owner_slug": "alice-0001",
-            },
+            {"slug": "alice-0001", "role": "owner"},
+            {"slug": "agent-0001", "role": "member"},
         ]
     }
-    http.responses[
-        "/identities/profiles?slugs=alice-0001,agent-0001"
-    ] = {
-        "profiles": [
-            {"slug": "alice-0001", "display_name": "Alice"},
-            {"slug": "agent-0001", "display_name": "Helper"},
-        ],
-    }
     mcp = _build_tools(cfg)
-    result = await _call_structured(
-        mcp, "list_channel_members", {"channel": "ch_abc"},
-    )
-    assert result["context_version"] == 1
-    assert result["target"]["target_ref"] == "channel:sp_test:ch_abc"
-    members = {member["identity"]: member for member in result["members"]}
-    assert members["@alice-0001"]["role"] == "owner"
-    assert members["@alice-0001"]["display_name"] == "Alice"
-    assert members["@alice-0001"]["identity_type"] == "human"
-    assert members["@alice-0001"]["owner_identity"] is None
-    assert members["@agent-0001"]["role"] == "member"
-    assert members["@agent-0001"]["display_name"] == "Helper"
-    assert members["@agent-0001"]["identity_type"] == "agent"
-    assert members["@agent-0001"]["owner_identity"] == "@alice-0001"
-    assert members["@agent-0001"]["self"] is True
+    result = await _call(mcp, "list_channel_members", {"channel": "ch_abc"})
+    assert "alice-0001" in result
+    assert "agent-0001" in result
+    # Roles render as ``(owner)`` / ``(member)``.
+    assert "(owner)" in result
+    assert "(member)" in result
 
 
 @pytest.mark.asyncio
@@ -1880,15 +1051,10 @@ async def test_get_user_info():
         }],
     }
     mcp = _build_tools(cfg)
-    result = await _call_structured(
-        mcp, "get_user_info", {"username": "@alice-0001"},
-    )
-    assert result["context_version"] == 1
-    assert result["found"] is True
-    assert result["identity"]["identity"] == "@alice-0001"
-    assert result["identity"]["display_name"] == "Alice"
-    assert result["identity"]["identity_type"] == "unknown"
-    assert result["identity"]["bio"] == "A test user"
+    result = await _call(mcp, "get_user_info", {"username": "@alice-0001"})
+    assert "alice-0001" in result
+    assert "Alice" in result
+    assert "A test user" in result
 
 
 @pytest.mark.asyncio
@@ -1917,3 +1083,889 @@ async def test_get_post_not_found():
     result = await _call(mcp, "get_post", {"post_ref": "env_nonexistent"})
     assert "not found" in result.lower() or "error" in result.lower()
     await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_attachments_requires_workspace():
+    """Without ``cfg.workspace``, send_message_with_attachments refuses
+    rather than silently dropping into a "no agent dir" hole. Real
+    upload path is exercised end-to-end against a live daemon."""
+    cfg, _, _ = _setup()
+    # Fixture leaves cfg.workspace as None.
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as exc_info:
+        await _call(
+            mcp,
+            "send_message_with_attachments",
+            {"paths": ["test.txt"], "channel": "ch_1", "visibility_level": "human"},
+        )
+    assert "workspace" in str(exc_info.value).lower()
+
+
+# Send-side root resolution: walk + scope rejection + system-envelope rules.
+
+
+class _FakeDataClient:
+    """Stand-in for ``DataClient`` — seed thread_root_id values and
+    inject lookup failures without touching SQLite."""
+
+    def __init__(self):
+        self.messages: dict[str, object] = {}
+        self.exc: Exception | None = None
+        self.calls: list[str] = []
+        # Existing tool tests exercise the E2EE branch; plaintext-branch
+        # tests flip this to False.
+        self.send_encryption = True
+
+    async def get_send_encryption(self, slug, thread_root_id):
+        return self.send_encryption
+
+    def add(
+        self,
+        envelope_id: str,
+        thread_root_id: str | None,
+        *,
+        channel_id: str | None = None,
+        space_id: str | None = None,
+        sender_slug: str = "alice-0001",
+        envelope_kind: str = "channel",
+        recipient_slug: str | None = None,
+    ) -> None:
+        class _Msg:
+            pass
+        m = _Msg()
+        m.envelope_id = envelope_id
+        m.thread_root_id = thread_root_id
+        m.channel_id = channel_id
+        m.space_id = space_id
+        m.sender_slug = sender_slug
+        m.envelope_kind = envelope_kind
+        m.recipient_slug = recipient_slug
+        self.messages[envelope_id] = m
+
+    async def get_message_by_envelope(self, envelope_id: str):
+        self.calls.append(envelope_id)
+        if self.exc is not None:
+            raise self.exc
+        return self.messages.get(envelope_id)
+
+
+async def _resolve(dc, root_id, **kw):
+    defaults = dict(self_slug="agent-0001", channel_id=None, space_id=None, dm_peer=None)
+    defaults.update(kw)
+    return await _resolve_outgoing_root(root_id, dc, **defaults)
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_empty_skips_lookup():
+    dc = _FakeDataClient()
+    resolved, note = await _resolve(dc, "")
+    assert resolved is None and note == "" and dc.calls == []
+    resolved, note = await _resolve(dc, "   ")
+    assert resolved is None and note == "" and dc.calls == []
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_true_root_unchanged():
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None)
+    resolved, note = await _resolve(dc, "msg_root")
+    assert resolved == "msg_root" and note == ""
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_reply_auto_corrected():
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None)
+    dc.add("msg_reply", thread_root_id="msg_root")
+    resolved, note = await _resolve(dc, "msg_reply")
+    assert resolved == "msg_root"
+    assert "auto-corrected" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_depth_two_chain_walks_to_root():
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None)
+    dc.add("msg_mid", thread_root_id="msg_root")
+    dc.add("msg_leaf", thread_root_id="msg_mid")
+    resolved, note = await _resolve(dc, "msg_leaf")
+    assert resolved == "msg_root"
+    assert dc.calls == ["msg_leaf", "msg_mid", "msg_root"]
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_lookup_miss_wipes_to_none():
+    dc = _FakeDataClient()
+    resolved, note = await _resolve(dc, "msg_unknown")
+    assert resolved is None
+    assert "not in local cache" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_data_not_found_treated_as_miss():
+    from puffo_agent.agent.message_store import DataNotFound
+    dc = _FakeDataClient()
+    dc.exc = DataNotFound("msg_only_on_server")
+    resolved, note = await _resolve(dc, "msg_only_on_server")
+    assert resolved is None
+    assert "not in local cache" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_transport_error_wipes_to_none():
+    dc = _FakeDataClient()
+    dc.exc = RuntimeError("simulated transport blip")
+    resolved, note = await _resolve(dc, "msg_anything")
+    assert resolved is None
+    assert "could not be verified" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_cycle_preserves_root_id_with_warning():
+    dc = _FakeDataClient()
+    dc.add("msg_a", thread_root_id="msg_b")
+    dc.add("msg_b", thread_root_id="msg_a")
+    resolved, note = await _resolve(dc, "msg_a")
+    assert resolved == "msg_a"
+    assert "cycle detected" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_depth_cap_preserves_root_id_with_warning():
+    dc = _FakeDataClient()
+    for i in range(9):
+        dc.add(f"msg_l{i}", thread_root_id=f"msg_l{i + 1}")
+    dc.add("msg_l9", thread_root_id=None)
+    resolved, note = await _resolve(dc, "msg_l0")
+    assert resolved == "msg_l0"
+    assert "deeper than" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_system_sender_wiped_to_new_root():
+    """Rule 1: daemon-minted system envelope -> send as a new top-level."""
+    dc = _FakeDataClient()
+    dc.add("intro-prompt-1", thread_root_id="intro-prompt-1", sender_slug="system")
+    resolved, note = await _resolve(dc, "intro-prompt-1")
+    assert resolved is None
+    assert "system message" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_self_reference_wiped_to_new_root():
+    """Rule 2: self-referencing root (non-system sender) -> same wipe."""
+    dc = _FakeDataClient()
+    dc.add("msg_weird", thread_root_id="msg_weird")
+    resolved, note = await _resolve(dc, "msg_weird")
+    assert resolved is None
+    assert "system message" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_walk_into_system_root_wiped():
+    """Rule 1 via rule 4: a reply whose chain tops out at a system
+    envelope wipes instead of auto-correcting to a dangling id."""
+    dc = _FakeDataClient()
+    dc.add("intro-prompt-1", thread_root_id="intro-prompt-1", sender_slug="system")
+    dc.add("msg_reply", thread_root_id="intro-prompt-1")
+    resolved, note = await _resolve(dc, "msg_reply")
+    assert resolved is None
+    assert "system message" in note
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_cross_channel_rejected():
+    """Rule 3: cross-channel reference is an agent error -> reject."""
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None, channel_id="ch_general", space_id="sp_1")
+    with pytest.raises(RuntimeError) as ei:
+        await _resolve(dc, "msg_root", channel_id="ch_gtm", space_id="sp_1")
+    assert "ch_general" in str(ei.value)
+    assert "ch_gtm" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_cross_space_rejected():
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None, channel_id="ch_x", space_id="sp_OTHER")
+    with pytest.raises(RuntimeError):
+        await _resolve(dc, "msg_root", channel_id="ch_x", space_id="sp_1")
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_same_channel_passes_scope():
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None, channel_id="ch_x", space_id="sp_1")
+    resolved, note = await _resolve(dc, "msg_root", channel_id="ch_x", space_id="sp_1")
+    assert resolved == "msg_root" and note == ""
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_dm_target_rejects_channel_message():
+    dc = _FakeDataClient()
+    dc.add("msg_root", thread_root_id=None, channel_id="ch_x")
+    with pytest.raises(RuntimeError) as ei:
+        await _resolve(dc, "msg_root", dm_peer="alice-0001")
+    assert "DM" in str(ei.value)
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_dm_target_rejects_wrong_peer():
+    dc = _FakeDataClient()
+    dc.add(
+        "msg_root", thread_root_id=None, envelope_kind="dm",
+        sender_slug="bob-0002", recipient_slug="agent-0001",
+    )
+    with pytest.raises(RuntimeError):
+        await _resolve(dc, "msg_root", dm_peer="alice-0001")
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_dm_target_accepts_both_directions():
+    dc = _FakeDataClient()
+    dc.add(
+        "msg_in", thread_root_id=None, envelope_kind="dm",
+        sender_slug="alice-0001", recipient_slug="agent-0001",
+    )
+    dc.add(
+        "msg_out", thread_root_id=None, envelope_kind="dm",
+        sender_slug="agent-0001", recipient_slug="alice-0001",
+    )
+    for mid in ("msg_in", "msg_out"):
+        resolved, note = await _resolve(dc, mid, dm_peer="alice-0001")
+        assert resolved == mid and note == ""
+
+
+@pytest.mark.asyncio
+async def test_outgoing_root_cross_scope_rejects_before_system_wipe():
+    """A system envelope from ANOTHER channel must reject (rule 3), not
+    silently become a top-level post in the wrong channel (rule 1)."""
+    dc = _FakeDataClient()
+    dc.add(
+        "intro-prompt-1", thread_root_id="intro-prompt-1",
+        sender_slug="system", channel_id="ch_other",
+    )
+    with pytest.raises(RuntimeError):
+        await _resolve(dc, "intro-prompt-1", channel_id="ch_x")
+
+
+def _spy_encrypt_input(monkeypatch):
+    """Capture the EncryptInput so tests can assert on the payload's
+    thread_root_id. Patches both encrypt entrypoints — send paths
+    use the with_content_key variant."""
+    import puffo_agent.mcp.puffo_core_tools as pct
+    captured: dict = {}
+    real = pct.encrypt_message
+    real_with_key = pct.encrypt_message_with_content_key
+
+    def spy(inp, signing_key, **kw):
+        captured["inp"] = inp
+        return real(inp, signing_key, **kw)
+
+    def spy_with_key(inp, signing_key, **kw):
+        captured["inp"] = inp
+        return real_with_key(inp, signing_key, **kw)
+
+    monkeypatch.setattr(pct, "encrypt_message", spy)
+    monkeypatch.setattr(pct, "encrypt_message_with_content_key", spy_with_key)
+    return captured
+
+
+def _seed_recipient(http, recipient_slug: str):
+    recipient_kem = KemKeyPair.generate()
+    http.responses[f"/certs/sync?slugs={recipient_slug}"] = {
+        "entries": [{
+            "seq": 1, "kind": "device_cert", "slug": recipient_slug,
+            "cert": {
+                "device_id": f"dev_{recipient_slug}",
+                "kem_public_key": base64url_encode(
+                    recipient_kem.public_key_bytes()
+                ),
+            },
+        }],
+        "has_more": False,
+    }
+
+
+async def _seed_channel(ms, http, channel_id: str, space_id: str,
+                        recipient_slug: str):
+    await ms.mark_channel_space(channel_id, space_id)
+    http.responses[f"/spaces/{space_id}/channels/{channel_id}/members"] = {
+        "members": [{"slug": recipient_slug, "role": "owner"}],
+    }
+    _seed_recipient(http, recipient_slug)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "wrong_post_id, real_root_id, scenario",
+    [
+        # The two live failures we hit on 2026-05-18 with operator
+        # mingvase-8795 — the clone-report send (post_id of the
+        # operator's "please clone" message used as root_id) and
+        # the build-test report send (post_id of the operator's
+        # "ensure you can build/test" message used as root_id).
+        ("msg_38364760-cd04-408a-9daf-aad66a2487fc",
+         "msg_610fec10-122f-4fff-8dcb-498770809c84",
+         "clone-report-live-failure"),
+        ("msg_9e8f1a83-05ff-4775-8e07-b90999c61d53",
+         "msg_610fec10-122f-4fff-8dcb-498770809c84",
+         "build-test-report-live-failure"),
+    ],
+)
+async def test_send_message_auto_corrects_real_live_failures(
+    monkeypatch, wrong_post_id, real_root_id, scenario,
+):
+    """Each parameter is one of the two real failures we observed
+    on 2026-05-18 — operator's post is the thread root, the message
+    Calculation incorrectly passed as root_id is a reply in that
+    same thread. After the fix the EncryptInput must carry the real
+    root and the response must include the correction note."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    await ms.store({
+        "envelope_id": real_root_id, "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "real root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+    await ms.store({
+        "envelope_id": wrong_post_id, "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": f"reply in thread ({scenario})", "sent_at": _now_ms(),
+        "thread_root_id": real_root_id,
+    })
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc",
+        "text": f"replaying {scenario}",
+        "visibility_level": "default",
+        "root_id": wrong_post_id,
+    })
+
+    assert "posted" in result
+    assert "auto-corrected" in result
+    assert wrong_post_id in result and real_root_id in result
+    assert captured["inp"].thread_root_id == real_root_id
+
+
+@pytest.mark.asyncio
+async def test_send_message_keeps_real_root_id_unchanged(monkeypatch):
+    """Happy path: agent passes a real root id; no correction note,
+    EncryptInput's thread_root_id is the supplied id."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    await ms.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root post", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc",
+        "text": "correctly threaded reply",
+        "visibility_level": "default",
+        "root_id": "msg_root",
+    })
+
+    assert "posted" in result
+    assert "auto-corrected" not in result
+    assert "could not verify" not in result
+    assert captured["inp"].thread_root_id == "msg_root"
+
+
+@pytest.mark.asyncio
+async def test_send_message_unknown_root_id_wiped_to_null_with_warning(monkeypatch):
+    """PUF-227-A: strict cache-validation invariant. An unknown
+    root_id (not in this agent's local store) gets WIPED to null
+    before the envelope ships — the operator locked Q1(a) "client
+    should only see thread_root_id that's in its local cache." The
+    tool response carries a warning so the agent self-corrects on
+    its next compose. Replaces PUF-200's "fall through with the
+    original id" behavior, which was the permissive shape PUF-227-A
+    explicitly overrides."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc",
+        "text": "racing the inbound write",
+        "visibility_level": "default",
+        "root_id": "msg_never_seen",
+    })
+
+    assert "posted" in result
+    assert "not in local cache" in result
+    assert "wiped to null" in result or "sent as top-level" in result
+    # PUF-227-A strict: invalid id wiped to None, NOT carried into
+    # the payload.
+    assert captured["inp"].thread_root_id is None
+
+
+@pytest.mark.asyncio
+async def test_send_message_root_level_send_skips_resolve(monkeypatch):
+    """No root_id → no lookup attempted, EncryptInput's thread_root_id
+    is None, no resolve-style note in the response."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc", "text": "top-level", "visibility_level": "human",
+    })
+
+    assert "posted" in result
+    assert "auto-corrected" not in result
+    assert "could not verify" not in result
+    assert captured["inp"].thread_root_id is None
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_attachments_auto_corrects_reply_as_root_id(
+    monkeypatch, tmp_path,
+):
+    """Same auto-correction behaviour on the attachments path."""
+    cfg, http, ms = _setup()
+    cfg.workspace = tmp_path
+    (tmp_path / "hello.txt").write_bytes(b"hello attachments")
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    http.responses["/blobs/upload"] = {"blob_id": "blob_xyz"}
+    await ms.store({
+        "envelope_id": "msg_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+    await ms.store({
+        "envelope_id": "msg_reply", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "reply", "sent_at": _now_ms(),
+        "thread_root_id": "msg_root",
+    })
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message_with_attachments", {
+        "paths": ["hello.txt"],
+        "channel": "ch_abc",
+        "visibility_level": "default",
+        "root_id": "msg_reply",
+        "caption": "files",
+    })
+
+    assert "uploaded" in result
+    assert "auto-corrected" in result
+    # Display string reflects the *resolved* thread, not the wrong id.
+    assert "in thread msg_root" in result
+    assert captured["inp"].thread_root_id == "msg_root"
+
+
+@pytest.mark.asyncio
+async def test_core_tools_registered():
+    cfg, _, _ = _setup()
+    mcp = _build_tools(cfg)
+    tool_names = {t.name for t in await mcp.list_tools()}
+    expected = {
+        "whoami", "send_message", "get_channel_history",
+        "list_spaces", "list_channels_in_all_spaces",
+        "list_channels_in_space", "list_channel_members",
+        "get_user_info", "get_post", "send_message_with_attachments",
+    }
+    assert expected.issubset(tool_names)
+
+
+
+
+
+# resolve_visibility — one entry point that combines level parsing,
+# root-level coerce, DM/@-mention detection, and the per-level note
+# wording.
+
+
+class _VisHttp:
+    """Stub for ``/identities/profiles?slugs=<csv>``."""
+
+    def __init__(
+        self,
+        types: dict[str, str] | None = None,
+        *,
+        raise_error: bool = False,
+    ):
+        self.types = types or {}
+        self.raise_error = raise_error
+        self.calls: list[str] = []
+
+    async def get(self, path: str):
+        self.calls.append(path)
+        if self.raise_error:
+            raise RuntimeError("simulated transport failure")
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(path).query)
+        slugs = (qs.get("slugs", [""])[0]).split(",") if qs.get("slugs") else []
+        profiles = [
+            {"slug": s, "identity_type": self.types.get(s, "human")}
+            for s in slugs if s
+        ]
+        return {"profiles": profiles}
+
+
+# ── level="human" ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resolve_human_returns_visible_no_note_no_lookup():
+    http = _VisHttp({"alice-1234": "human"})
+    visible, note = await resolve_visibility(
+        "human", "@alice-1234", "@alice-1234 hi", "msg_root", http,
+    )
+    assert visible is True
+    assert note == ""
+    assert http.calls == []
+
+
+# ── level="default" ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_dm_coerces_and_nudges_human():
+    http = _VisHttp()
+    visible, note = await resolve_visibility(
+        "default", "@alice-1234", "hi", "msg_root", http,
+    )
+    assert visible is True
+    assert "sent visible" in note
+    assert "DM" in note
+    assert "'human'" in note
+    assert http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_mention_human_coerces():
+    http = _VisHttp({"alice-1234": "human"})
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "@alice-1234 here's the answer", "msg_root", http,
+    )
+    assert visible is True
+    assert "@-mentions a human" in note
+    assert "'human'" in note
+    assert http.calls and "alice-1234" in http.calls[0]
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_mention_agent_only_stays_hidden_but_nudges():
+    http = _VisHttp({"scout-5678": "agent"})
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "@scout-5678 pipeline done", "msg_root", http,
+    )
+    assert visible is False
+    assert "sent hidden" in note
+    assert "'human'" in note and "'agent_only'" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_no_signal_nudges_explicit():
+    http = _VisHttp()
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "internal retry", "msg_root", http,
+    )
+    assert visible is False
+    assert "sent hidden" in note
+    assert "'human'" in note and "'agent_only'" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_root_level_always_coerces():
+    """No root_id → can't fold → always sent visible regardless of
+    DM / @-mention signals."""
+    http = _VisHttp()
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "top-level chatter", "", http,
+    )
+    assert visible is True
+    assert "root-level messages can't fold" in note
+    assert http.calls == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_mixed_mentions_any_human_wins():
+    http = _VisHttp({"alice-1234": "human", "scout-5678": "agent"})
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "@scout-5678 @alice-1234 status", "msg_root", http,
+    )
+    assert visible is True
+    assert "@-mentions a human" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_profile_error_soft_fails_to_hidden():
+    """Transport error on profile fetch can't flip an intentional
+    hidden send — nudge fires, no coerce."""
+    http = _VisHttp({"alice-1234": "human"}, raise_error=True)
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "@alice-1234 hi", "msg_root", http,
+    )
+    assert visible is False
+    assert "sent hidden" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_default_email_not_mistaken_for_mention():
+    http = _VisHttp({"alice-1234": "human"})
+    visible, note = await resolve_visibility(
+        "default", "ch_abcd", "see contact@alice-1234 for details",
+        "msg_root", http,
+    )
+    assert visible is False
+    assert "sent hidden" in note
+    assert http.calls == []
+
+
+# ── level="agent_only" ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_only_dm_stays_hidden_but_warns():
+    http = _VisHttp()
+    visible, note = await resolve_visibility(
+        "agent_only", "@alice-1234", "hi", "msg_root", http,
+    )
+    assert visible is False
+    assert "sent hidden per" in note
+    assert "DM" in note
+    assert "Double-check" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_only_mention_human_stays_hidden_but_warns():
+    http = _VisHttp({"alice-1234": "human"})
+    visible, note = await resolve_visibility(
+        "agent_only", "ch_abcd", "@alice-1234 fyi", "msg_root", http,
+    )
+    assert visible is False
+    assert "@-mentions a human" in note
+    assert "Double-check" in note
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_only_mention_agent_no_note():
+    http = _VisHttp({"scout-5678": "agent"})
+    visible, note = await resolve_visibility(
+        "agent_only", "ch_abcd", "@scout-5678 done", "msg_root", http,
+    )
+    assert visible is False
+    assert note == ""
+
+
+@pytest.mark.asyncio
+async def test_resolve_agent_only_root_level_still_coerces():
+    """agent_only doesn't override the root-level constraint — the UI
+    can't fold root-level so it goes out visible."""
+    http = _VisHttp()
+    visible, note = await resolve_visibility(
+        "agent_only", "ch_abcd", "top-level", "", http,
+    )
+    assert visible is True
+    assert "root-level messages can't fold" in note
+
+
+# ── validation ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resolve_rejects_unknown_level():
+    http = _VisHttp()
+    with pytest.raises(RuntimeError, match="visibility_level"):
+        await resolve_visibility("visible", "ch_x", "hi", "msg_root", http)
+    with pytest.raises(RuntimeError):
+        await resolve_visibility("", "ch_x", "hi", "msg_root", http)
+
+
+async def _store_msg(ms, eid, *, is_encrypted, channel_id="ch_1", thread_root_id=None):
+    await ms.store({
+        "envelope_id": eid,
+        "envelope_kind": "channel",
+        "sender_slug": "alice-0001",
+        "channel_id": channel_id,
+        "space_id": "sp_test",
+        "content_type": "text/plain",
+        "content": f"body {eid}",
+        "sent_at": _now_ms(),
+        "thread_root_id": thread_root_id,
+        "is_encrypted": is_encrypted,
+    })
+
+
+@pytest.mark.asyncio
+async def test_get_post_shows_is_encrypted():
+    cfg, _, ms = _setup()
+    await _store_msg(ms, "msg_plain", is_encrypted=False)
+    result = await _call(_build_tools(cfg), "get_post", {"post_ref": "msg_plain"})
+    assert "is_encrypted: false" in result
+
+
+@pytest.mark.asyncio
+async def test_get_channel_history_tags_encryption():
+    cfg, _, ms = _setup()
+    await _store_msg(ms, "msg_enc", is_encrypted=True)
+    await _store_msg(ms, "msg_plain", is_encrypted=False)
+    result = await _call(_build_tools(cfg), "get_channel_history", {"channel": "ch_1"})
+    assert "[encrypted]" in result and "[plaintext]" in result
+
+
+@pytest.mark.asyncio
+async def test_get_thread_history_tags_encryption():
+    cfg, _, ms = _setup()
+    await _store_msg(ms, "msg_root", is_encrypted=True)
+    await _store_msg(ms, "msg_reply", is_encrypted=False, thread_root_id="msg_root")
+    result = await _call(_build_tools(cfg), "get_thread_history", {"root_id": "msg_root"})
+    assert "[plaintext]" in result
+
+# Send-side thread-root rules, end to end through the send_message tool.
+
+
+@pytest.mark.asyncio
+async def test_send_message_system_root_ships_as_new_top_level(monkeypatch):
+    """Replying to a daemon-minted intro nudge (self-referencing system
+    envelope, no server row) ships as a new top-level message."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    _seed_recipient(http, "alice-0001")
+    await ms.store({
+        "envelope_id": "intro-prompt-xyz", "envelope_kind": "channel",
+        "sender_slug": "system", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "welcome!", "sent_at": _now_ms(),
+        "thread_root_id": "intro-prompt-xyz",
+    })
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc",
+        "text": "hello, thanks for the intro",
+        "visibility_level": "human",
+        "root_id": "intro-prompt-xyz",
+    })
+
+    assert "posted" in result
+    assert "system message" in result
+    assert captured["inp"].thread_root_id is None
+
+
+@pytest.mark.asyncio
+async def test_send_message_cross_channel_root_rejected():
+    """A root from another channel rejects the send outright — the
+    agent gets a correctable error instead of a misfiled message."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    _seed_recipient(http, "alice-0001")
+    await ms.store({
+        "envelope_id": "msg_elsewhere", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_OTHER",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "send_message", {
+            "channel": "ch_abc",
+            "text": "misdirected reply",
+            "root_id": "msg_elsewhere",
+        })
+    assert "ch_OTHER" in str(excinfo.value)
+    assert "ch_abc" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_send_message_wiped_root_forces_visible_as_root_level(monkeypatch):
+    """Ordering contract: root resolution runs BEFORE the visibility
+    floors. A wiped root makes the message root-level, which cannot fold
+    in the UI — 'default' must coerce it visible instead of shipping an
+    invisible hidden top-level post."""
+    cfg, http, ms = _setup()
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    _seed_recipient(http, "alice-0001")
+    captured = _spy_encrypt_input(monkeypatch)
+
+    mcp = _build_tools(cfg)
+    result = await _call(mcp, "send_message", {
+        "channel": "ch_abc",
+        "text": "agent chatter",
+        "visibility_level": "default",
+        "root_id": "msg_never_recorded",
+    })
+
+    assert "posted" in result
+    assert "not in local cache" in result
+    assert captured["inp"].thread_root_id is None
+    assert captured["inp"].is_visible_to_human is True
+
+@pytest.mark.asyncio
+async def test_send_message_dm_rejects_channel_root():
+    """DM sends scope-check too: a channel message as root rejects."""
+    cfg, http, ms = _setup()
+    _seed_recipient(http, "alice-0001")
+    http.responses["/certs/sync?slugs=agent-0001,alice-0001"] = (
+        http.responses["/certs/sync?slugs=alice-0001"]
+    )
+    await ms.store({
+        "envelope_id": "msg_channel_root", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_abc",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "send_message", {
+            "channel": "@alice-0001",
+            "text": "dm reply",
+            "root_id": "msg_channel_root",
+        })
+    assert "DM" in str(excinfo.value)
+    assert "alice-0001" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_send_message_with_attachments_cross_channel_root_rejected(tmp_path):
+    """The attachments send path wires the same scope rejection."""
+    cfg, http, ms = _setup()
+    cfg.workspace = tmp_path
+    (tmp_path / "hello.txt").write_bytes(b"hello attachments")
+    await _seed_channel(ms, http, "ch_abc", "sp_test", "alice-0001")
+    _seed_recipient(http, "alice-0001")
+    http.responses["/blobs/upload"] = {"blob_id": "blob_xyz"}
+    await ms.store({
+        "envelope_id": "msg_elsewhere", "envelope_kind": "channel",
+        "sender_slug": "alice-0001", "channel_id": "ch_OTHER",
+        "space_id": "sp_test", "content_type": "text/plain",
+        "content": "root", "sent_at": _now_ms(),
+        "thread_root_id": None,
+    })
+
+    mcp = _build_tools(cfg)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "send_message_with_attachments", {
+            "channel": "ch_abc",
+            "caption": "misdirected attachment reply",
+            "paths": ["hello.txt"],
+            "root_id": "msg_elsewhere",
+        })
+    assert "ch_OTHER" in str(excinfo.value)

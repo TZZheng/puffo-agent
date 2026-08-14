@@ -28,13 +28,11 @@ class ProtocolError(Exception):
 class Connect:
     """Handshake opener. The tool proves it holds the agent's
     ``.puffoagent`` export and its password by sending both; the daemon
-    decrypts the export and binds its root identity to the locally managed
-    attach point (``auth.authenticate_bundle``). ``bundle`` is the base64
-    export blob."""
+    authenticates by decrypting (``auth.authenticate_bundle``). ``bundle``
+    is the base64 export blob."""
 
     bundle: str
     password: str
-    capabilities: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -43,15 +41,6 @@ class Ack:
     working_on. Idempotent."""
 
     bundle_id: str
-
-
-@dataclass(frozen=True)
-class Admitted:
-    """v2 model-visible transition, distinct from status-only ``ack``."""
-
-    bundle_id: str
-    turn_id: str
-    correlation_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,7 +70,6 @@ class Connected:
     # tool to configure itself with. Opaque on the wire — the tool owns
     # interpretation.
     agent: dict[str, Any] = field(default_factory=dict)
-    capabilities: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -95,14 +83,9 @@ class Error:
 @dataclass(frozen=True)
 class SendBundle:
     bundle_id: str
-    root_id: str = ""
-    channel_meta: dict[str, Any] = field(default_factory=dict)
+    root_id: str
+    channel_meta: dict[str, Any]
     messages: list[dict[str, Any]] = field(default_factory=list)
-    version: int = 2
-    turn_id: str = ""
-    targets: list[list[str]] = field(default_factory=list)
-    routes: list[dict[str, Any]] = field(default_factory=list)
-    notice: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -135,32 +118,21 @@ _Outbound = Connected | Error | SendBundle | ToolResult | Ping | Pong
 
 def encode(frame: _Outbound) -> str:
     if isinstance(frame, Connected):
-        body: dict[str, Any] = {
+        return json.dumps({
             "type": "connected",
             "session_id": frame.session_id,
             "agent": frame.agent,
-        }
-        if frame.capabilities:
-            body["capabilities"] = list(frame.capabilities)
-        return json.dumps(body)
+        })
     if isinstance(frame, Error):
         return json.dumps({"type": "error", "reason": frame.reason})
     if isinstance(frame, SendBundle):
-        body: dict[str, Any] = {
+        return json.dumps({
             "type": "bundle",
-            "version": frame.version,
             "bundle_id": frame.bundle_id,
-            "turn_id": frame.turn_id,
-            "targets": frame.targets,
-            "routes": frame.routes,
+            "root_id": frame.root_id,
+            "channel_meta": frame.channel_meta,
             "messages": frame.messages,
-            "notice": frame.notice,
-        }
-        # Compatibility route fields are safe only for one destination.
-        if len(frame.targets) <= 1:
-            body["root_id"] = frame.root_id
-            body["channel_meta"] = frame.channel_meta
-        return json.dumps(body)
+        })
     if isinstance(frame, ToolResult):
         body: dict[str, Any] = {
             "type": "tool_result",
@@ -179,7 +151,7 @@ def encode(frame: _Outbound) -> str:
     raise ProtocolError(f"cannot encode {type(frame).__name__}")
 
 
-_Inbound = Connect | Ack | Admitted | End | ToolCall | Ping | Pong
+_Inbound = Connect | Ack | End | ToolCall | Ping | Pong
 
 
 def decode_inbound(raw: str) -> _Inbound:
@@ -191,27 +163,9 @@ def decode_inbound(raw: str) -> _Inbound:
         raise ProtocolError("frame is not a JSON object")
     kind = msg.get("type")
     if kind == "connect":
-        raw_capabilities = msg.get("capabilities") or []
-        if not isinstance(raw_capabilities, list) or not all(
-            isinstance(value, str) for value in raw_capabilities
-        ):
-            raise ProtocolError("connect.capabilities must be a string list")
-        return Connect(
-            bundle=_req(msg, "bundle"),
-            password=_req(msg, "password"),
-            capabilities=tuple(raw_capabilities),
-        )
+        return Connect(bundle=_req(msg, "bundle"), password=_req(msg, "password"))
     if kind == "ack":
         return Ack(bundle_id=_req(msg, "bundle_id"))
-    if kind == "admitted":
-        version = msg.get("version")
-        if version != 2:
-            raise ProtocolError("admitted.version must be 2")
-        return Admitted(
-            bundle_id=_req(msg, "bundle_id"),
-            turn_id=_req(msg, "turn_id"),
-            correlation_key=str(msg.get("correlation_key") or ""),
-        )
     if kind == "end":
         return End(bundle_id=_req(msg, "bundle_id"))
     if kind == "tool_call":

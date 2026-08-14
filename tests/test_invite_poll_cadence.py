@@ -369,7 +369,7 @@ def test_build_puffo_core_client_threads_agent_created_at(monkeypatch, tmp_path)
             operator_slug="",
         ),
         runtime=RuntimeConfig(
-            kind="cli-local",
+            kind="chat-local",
             harness="claude-code",
         ),
         created_at=1_700_000_000,
@@ -416,11 +416,18 @@ def test_build_puffo_core_client_threads_agent_created_at(monkeypatch, tmp_path)
     )
 
 
-@pytest.mark.parametrize("harness", ["claude-code", "codex"])
-def test_build_puffo_core_client_has_no_retired_queue_budget(
-    monkeypatch, tmp_path, harness,
+@pytest.mark.parametrize(
+    ("harness", "expected_budget"),
+    [
+        ("claude-code", 180_000),
+        ("codex", 4_000_000),
+    ],
+)
+def test_build_puffo_core_client_selects_harness_input_budget(
+    monkeypatch, tmp_path, harness, expected_budget,
 ):
-    """The worker must not restore the retired per-thread queue budget."""
+    """The per-harness greedy-fill budget must thread through the worker:
+    Claude Code gets the adapter-cap default, Codex the safety-net ceiling."""
     from puffo_agent.portal import worker
     from puffo_agent.portal.state import AgentConfig, PuffoCoreConfig, RuntimeConfig
 
@@ -434,7 +441,7 @@ def test_build_puffo_core_client_has_no_retired_queue_budget(
             operator_slug="",
         ),
         runtime=RuntimeConfig(
-            kind="cli-local",
+            kind="chat-local",
             harness=harness,
         ),
     )
@@ -470,4 +477,4 @@ def test_build_puffo_core_client_has_no_retired_queue_budget(
 
     worker._build_puffo_core_client(cfg, "agent-test-1234")
 
-    assert "max_input_bytes" not in captured
+    assert captured.get("max_input_bytes") == expected_budget

@@ -1,26 +1,23 @@
-"""Docker CLI adapter.
+"""Docker CLI adapter for Claude Code and Codex.
 
-Runs the Claude Code CLI inside a per-agent Docker container. The
-container is the sandbox; Claude Code runs with
-``--dangerously-skip-permissions`` inside.
+Each agent runs its selected CLI in a dedicated container. Claude Code
+uses its stream-json protocol; Codex uses its app-server JSON-RPC
+protocol. The container is the sandbox, so Claude Code runs with
+``--dangerously-skip-permissions``.
 
-Auth: each agent gets its own isolated claude identity at
-``~/.puffo-agent/agents/<id>/.claude/`` (sessions, history, cache,
-settings — seeded once from the operator's real ``~/.claude``). A private
-credential view is refreshed from the host before the per-agent Claude home
-is mounted into the container.
+Per-agent ``.claude`` and ``.codex`` directories are bind-mounted into
+the container. The daemon owns credential refresh and writes sanitized
+credential views into those directories, matching ``cli-local``.
 
-A second bind-mount exposes the Puffo-home ``shared/`` directory at
-``/workspace/shared`` so all agents on this host can cooperate at the
-filesystem level. ``/workspace/.shared`` remains as a compatibility alias.
+A second bind-mount exposes ``~/.puffo-agent/shared/`` at
+``/workspace/.shared`` so all agents on this host can cooperate at
+the filesystem level.
 
 Lifecycle:
   - container: one per agent (``puffo-<id>``), started lazily,
     ``docker stop`` on ``aclose()``.
-  - claude: one long-lived stream-json subprocess inside the
-    container, kept alive across turns by ``ClaudeSession``.
-  - session id: persisted to ``cli_session.json`` so daemon /
-    container restarts re-spawn with ``--resume <id>``.
+  - harness: one long-lived ClaudeSession or CodexSession subprocess.
+  - session ids persist on the host so daemon/container restarts resume.
 
 Image: bundled inline as a Dockerfile string, built on first use.
 Users can override via ``runtime.docker_image`` to skip the build.
@@ -37,22 +34,23 @@ from ..cli_bin import resolve_docker_bin
 from ...mcp.config import (
     INFERENCE_LEVELS,
     write_cli_mcp_config,
+    write_codex_mcp_config,
 )
 from ...portal.state import (
+    filter_container_mcp_servers,
+    read_host_codex_mcp_servers,
     seed_claude_home,
     strip_claude_api_key_from_settings,
     sync_host_claude_code_auth_view,
+    sync_host_codex_auth_view,
+    sync_host_codex_skills,
     sync_host_enabled_plugins,
     sync_host_mcp_servers,
     sync_host_skills,
 )
-from ...portal.workspace_layout import prepare_workspace_shared_access
 from .base import Adapter, TurnContext, TurnResult
-from ..context_controller import (
-    ContextCapabilities,
-    ContextSnapshot,
-)
 from .cli_session import AuditLog, ClaudeSession
+from .codex_session import CodexSession
 
 
 logger = logging.getLogger(__name__)
@@ -64,15 +62,15 @@ def _puffo_agent_pkg_dir() -> Path:
     the in-container puffo-core MCP server can ``import puffo_agent.*``.
     """
     import puffo_agent
-
     return Path(puffo_agent.__file__).resolve().parent.parent
 
 
 # Bump on Dockerfile changes so existing hosts rebuild without manual
 # image-tag pruning. ``_ensure_image`` only builds when the tag is
 # missing locally.
-DEFAULT_IMAGE = "puffo/agent-runtime:v19"
-CONTAINER_LAYOUT_VERSION = "21"
+DEFAULT_IMAGE = "puffo/agent-runtime:v16"
+CONTAINER_CODEX_SANDBOX = "danger-full-access"
+CONTAINER_LAYOUT_VERSION = "16"
 
 # Pinned Claude Code CLI version baked into the image. Floating would
 # let an upstream release shift the stream-json protocol or
@@ -80,10 +78,9 @@ CONTAINER_LAYOUT_VERSION = "21"
 # verification.
 CLAUDE_CODE_NPM_VERSION = "2.1.224"
 
-# Pinned Codex CLI version baked into the same image. The Driver talks
-# ``codex app-server`` JSON-RPC, whose frame shapes move between
-# releases, so the version is pinned and only bumped after verification.
-CODEX_NPM_VERSION = "0.147.0"
+# Pinned Codex CLI version. Keep this aligned with the app-server
+# protocol exercised by ``CodexSession``.
+CODEX_NPM_VERSION = "0.145.0"
 
 DOCKER_COMMAND_TIMEOUT_SECONDS = 60.0
 DOCKER_BUILD_TIMEOUT_SECONDS = 900.0
@@ -106,9 +103,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
         python3 python3-pip \\
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @anthropic-ai/claude-code@__CLAUDE_CODE_VERSION__
-
-RUN npm install -g @openai/codex@__CODEX_CODE_VERSION__
+RUN npm install -g \\
+        @anthropic-ai/claude-code@__CLAUDE_CODE_VERSION__ \\
+        @openai/codex@__CODEX_VERSION__
 
 # Puffo MCP tools server deps. ``--break-system-packages`` is
 # required on Debian bookworm (PEP 668); acceptable since the
@@ -116,8 +113,10 @@ RUN npm install -g @openai/codex@__CODEX_CODE_VERSION__
 # (Python counterpart of ``npx``) so agents can register stdio MCPs
 # without per-server pip/npm install.
 RUN pip3 install --break-system-packages --no-cache-dir \\
-        "mcp>=1.0" "aiohttp>=3.9" "uv>=0.5" \\
-        "cryptography>=43" "pyhpke>=0.6" "aiosqlite>=0.20" "pyyaml>=6.0"
+        "mcp>=1.0,<2" "aiohttp>=3.9" "aiohttp-socks>=0.10" \\
+        "aiosqlite>=0.20" "certifi>=2024.2.2" "cryptography>=43" \\
+        "pillow>=10.0" "psutil>=5.9" "pyhpke>=0.6" "python-socks>=2.4" \\
+        "pyyaml>=6.0" "tzdata>=2024.1" "uv>=0.5" "websockets>=12.0"
 
 RUN useradd -m -u 2000 -s /bin/bash agent
 USER agent
@@ -130,11 +129,9 @@ WORKDIR /workspace
 # re-dump history on every restart.
 CMD ["sh", "-c", "set -eu; mkdir -p /workspace/.puffo-agent; touch /workspace/.puffo-agent/audit.log; echo \\"[$(date -u +%FT%TZ)] puffo agent=${PUFFO_AGENT_ID:-unknown} container starting; polling /workspace/.puffo-agent/audit.log every 1s\\"; last=$(stat -c%s /workspace/.puffo-agent/audit.log 2>/dev/null || echo 0); while :; do size=$(stat -c%s /workspace/.puffo-agent/audit.log 2>/dev/null || echo 0); if [ \\"$size\\" -gt \\"$last\\" ]; then tail -c +$((last + 1)) /workspace/.puffo-agent/audit.log; last=$size; elif [ \\"$size\\" -lt \\"$last\\" ]; then last=0; fi; sleep 1; done"]
 """.replace(
-    "__CLAUDE_CODE_VERSION__",
-    CLAUDE_CODE_NPM_VERSION,
+    "__CLAUDE_CODE_VERSION__", CLAUDE_CODE_NPM_VERSION,
 ).replace(
-    "__CODEX_CODE_VERSION__",
-    CODEX_NPM_VERSION,
+    "__CODEX_VERSION__", CODEX_NPM_VERSION,
 )
 
 
@@ -150,14 +147,16 @@ class DockerCLIAdapter(Adapter):
         agent_home_dir: str,
         shared_fs_dir: str,
         owner_username: str = "",
+        permission_mode: str = "bypassPermissions",
         inference_level: str = "",
         auto_compact_threshold_pct: float | None = None,
+        task_timeout_seconds: float = 1800.0,
         harness=None,
         memory_limit: str = "",
         memory_reservation: str = "",
         desired_skills: list[str] | None = None,
-        desired_mcps: list[str] | None = None,
         env_overrides: dict[str, str] | None = None,
+        desired_mcps: list[str] | None = None,
         puffo_core_server_url: str = "",
         puffo_core_slug: str = "",
         puffo_core_keys_dir: str = "",
@@ -170,9 +169,8 @@ class DockerCLIAdapter(Adapter):
         self.claude_dir = claude_dir
         self.session_file = Path(session_file)
         self.container_name = f"puffo-{agent_id}"
-        # Agent's virtual $HOME; only .claude and .claude.json
-        # are bind-mounted in, not the whole home, so the container's
-        # default home skeleton stays intact.
+        # Per-agent harness state is mounted into the container without
+        # replacing its complete home directory.
         self.agent_home_dir = Path(agent_home_dir)
         self.claude_home_src = self.agent_home_dir / ".claude"
         # Cross-agent cooperation dir; same mount in every container
@@ -180,8 +178,13 @@ class DockerCLIAdapter(Adapter):
         # isolation.
         self.shared_fs_dir = Path(shared_fs_dir)
         self.owner_username = owner_username
+        self.permission_mode = permission_mode
+        # Docker is the filesystem boundary. A second bubblewrap sandbox
+        # cannot create user namespaces under Docker's default seccomp policy.
+        self.sandbox = CONTAINER_CODEX_SANDBOX
         self.inference_level = inference_level
         self.auto_compact_threshold_pct = auto_compact_threshold_pct
+        self.task_timeout_seconds = task_timeout_seconds
         # Optional cgroup caps. ``--memory`` is a hard ceiling that
         # OOM-kills processes in this container only; ``--memory-
         # reservation`` is a soft floor. Bound a runaway claude so it
@@ -192,29 +195,28 @@ class DockerCLIAdapter(Adapter):
         # Which agent engine runs inside the container.
         if harness is None:
             from ..harness import ClaudeCodeHarness
-
             harness = ClaudeCodeHarness()
-        if harness.name() != "claude-code":
-            raise ValueError(
-                f"Docker harness {harness.name()!r} is not executable; "
-                "the supported Docker harness is 'claude-code'"
+        if harness.name() not in {"claude-code", "codex"}:
+            raise RuntimeError(
+                f"agent {agent_id!r}: cli-docker supports only "
+                "claude-code and codex harnesses"
             )
         self.harness = harness
-        # Installed into the bind-mounted Claude home on first start.
         self.desired_skills = list(desired_skills or [])
+        self.env_overrides = {str(k): str(v) for k, v in (env_overrides or {}).items()}
         self.desired_mcps = list(desired_mcps or [])
-        self.env_overrides = {
-            str(key): str(value) for key, value in (env_overrides or {}).items()
-        }
         self.puffo_core_server_url = puffo_core_server_url
         self.puffo_core_slug = puffo_core_slug
         self.puffo_core_keys_dir = puffo_core_keys_dir
         self.claude_api_key = claude_api_key
+        self._desired_codex_extras: dict[str, dict] = {}
+        self._codex_bearer_env_names: tuple[str, ...] = ()
         self._desired_installed = False
         self._started_lock = asyncio.Lock()
         self._started = False
         self._docker_bin = "docker"
         self._session: ClaudeSession | None = None
+        self._codex_session: CodexSession | None = None
         # Set post-construction by worker.py. When non-None, claude-
         # code is routed at ``puffo_core_server``. Values must be
         # CONTAINER-local paths since the MCP subprocess runs inside
@@ -224,8 +226,19 @@ class DockerCLIAdapter(Adapter):
     async def run_turn(self, ctx: TurnContext) -> TurnResult:
         await self._ensure_started()
         user_message = ctx.messages[-1]["content"] if ctx.messages else ""
+        if self.harness.name() == "codex":
+            return await self._ensure_codex_session().run_turn(
+                user_message, ctx.system_prompt,
+            )
         session = self._ensure_session()
         return await session.run_turn(user_message, ctx.system_prompt)
+
+    def context_limits(self) -> tuple[int | None, int | None]:
+        if self._codex_session is not None:
+            return self._codex_session.context_limits()
+        if self._session is None:
+            return None, None
+        return self._session.context_limits()
 
     async def run_retry_turn(
         self,
@@ -234,20 +247,28 @@ class DockerCLIAdapter(Adapter):
         ctx: TurnContext,
     ) -> TurnResult:
         await self._ensure_started()
+        if self.harness.name() == "codex":
+            return await self._ensure_codex_session().run_turn(
+                fallback_user_message, ctx.system_prompt,
+            )
         session = self._ensure_session()
         return await session.run_retry_turn(
-            kick_text,
-            fallback_user_message,
-            ctx.system_prompt,
+            kick_text, fallback_user_message, ctx.system_prompt,
         )
 
     async def warm(self, system_prompt: str) -> None:
-        """Start the container eagerly; spawn the claude subprocess
-        only when this agent has a persisted session (fresh agents
-        wait for their first message). Container always starts so
-        ``docker logs`` tailing is useful even when idle.
-        """
+        """Start the container and resume a persisted harness session."""
         await self._ensure_started()
+        if self.harness.name() == "codex":
+            session = self._ensure_codex_session()
+            if not session.has_persisted_session():
+                logger.info(
+                    "agent %s: no persisted codex conversation; deferring "
+                    "spawn until first message", self.agent_id,
+                )
+                return
+            await session.warm(system_prompt)
+            return
         session = self._ensure_session()
         if not session.has_persisted_session():
             logger.info(
@@ -258,83 +279,40 @@ class DockerCLIAdapter(Adapter):
         await session.warm(system_prompt)
 
     async def reload(
-        self,
-        new_system_prompt: str,
-        *,
-        with_session: bool = False,
+        self, new_system_prompt: str, *, with_session: bool = False,
     ) -> None:
-        """Close the in-container claude subprocess so the next turn
-        re-reads CLAUDE.md; container stays up.
-        ``with_session=True`` also unlinks ``cli_session.json``."""
+        """Close the harness process so the next turn reloads config."""
+        codex_session_file = (
+            self._codex_session.session_file
+            if self._codex_session is not None else self.codex_home / "codex_session.json"
+        )
         if self._session is not None:
             await self._session.aclose()
             self._session = None
+        if self._codex_session is not None:
+            await self._codex_session.aclose()
+            self._codex_session = None
+        if self.harness.name() == "codex" and self._started:
+            self._prepare_codex_config(Path.home())
         if with_session:
-            try:
-                self.session_file.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as exc:
-                logger.warning(
-                    "agent %s: couldn't unlink session file %s: %s",
-                    self.agent_id,
-                    self.session_file,
-                    exc,
-                )
-
-    async def get_context_snapshot(self) -> ContextSnapshot:
-        return await self._ensure_session().get_context_snapshot()
-
-    def context_limits(self) -> tuple[int | None, int | None]:
-        return self._ensure_session().context_limits()
-
-    def get_context_capabilities(self) -> ContextCapabilities:
-        return self._ensure_session().get_context_capabilities()
-
-    async def compact_context(self):
-        return await self._ensure_session().compact_context()
-
-    async def rollover_context(self):
-        return await self._ensure_session().rollover_context()
-
-    def get_provider_session_id(self) -> str | None:
-        return self._ensure_session().get_provider_session_id()
-
-    def register_admission_callback(
-        self,
-        callback,
-        planning_cycle_key: str = "",
-    ) -> None:
-        self._ensure_session().register_admission_callback(
-            callback,
-            planning_cycle_key,
-        )
-
-    register_provider_admission_callback = register_admission_callback
-
-    def register_continuation_callback(
-        self,
-        callback,
-        planning_cycle_key: str = "",
-        *,
-        channel_id: str = "",
-        tool_names: tuple[str, ...] = (),
-        tool_arguments: dict[str, object] | None = None,
-        correlation_receipt: str = "",
-    ) -> None:
-        self._ensure_session().register_continuation_callback(
-            callback,
-            planning_cycle_key,
-            channel_id=channel_id,
-            tool_names=tool_names,
-            tool_arguments=tool_arguments,
-            correlation_receipt=correlation_receipt,
-        )
+            for path in (self.session_file, codex_session_file):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.warning(
+                        "agent %s: couldn't unlink session file %s: %s",
+                        self.agent_id, path, exc,
+                    )
 
     async def aclose(self) -> None:
         if self._session is not None:
             await self._session.aclose()
             self._session = None
+        if self._codex_session is not None:
+            await self._codex_session.aclose()
+            self._codex_session = None
         if not self._started:
             return
         # ``docker stop`` (not ``rm -f``) preserves the container's
@@ -348,20 +326,54 @@ class DockerCLIAdapter(Adapter):
         )
         self._started = False
 
+    async def health_probe(self) -> bool:
+        if self._codex_session is not None:
+            return await self._codex_session.health_probe()
+        return True
+
+    @property
+    def codex_home(self) -> Path:
+        return self.agent_home_dir / ".codex"
+
+    def _ensure_codex_session(self) -> CodexSession:
+        if self._codex_session is not None:
+            return self._codex_session
+        argv = [self._docker_bin, "exec", "-i"]
+        for name in self._codex_bearer_env_names:
+            argv.extend(["-e", name])
+        argv.extend([
+            "-e", "CODEX_HOME=/home/agent/.codex",
+            self.container_name, "codex", "app-server",
+        ])
+        self._codex_session = CodexSession(
+            agent_id=self.agent_id,
+            session_file=self.codex_home / "codex_session.json",
+            argv=argv,
+            cwd=None,
+            thread_cwd="/workspace",
+            permission_mode=self.permission_mode,
+            sandbox=self.sandbox,
+            model=self.model,
+            auto_compact_threshold_pct=self.auto_compact_threshold_pct,
+            task_timeout_seconds=self.task_timeout_seconds,
+            audit=AuditLog(
+                Path(self.workspace_dir) / ".puffo-agent" / "audit.log",
+                self.agent_id,
+            ),
+        )
+        return self._codex_session
+
     def _ensure_session(self) -> ClaudeSession:
         if self._session is not None:
             return self._session
         extra = self._prepare_mcp_args()
-        environment = dict(os.environ)
-        environment.pop("ANTHROPIC_API_KEY", None)
-        if self.claude_api_key:
-            environment["ANTHROPIC_API_KEY"] = self.claude_api_key
         self._session = ClaudeSession(
             agent_id=self.agent_id,
             session_file=self.session_file,
             build_command=self._build_command,
             # cwd is WORKDIR /workspace inside the container.
             cwd=None,
+            env=self._claude_docker_env(),
             # Host-side write; the workspace bind-mount delivers it
             # to the container's tail loop and ``docker logs``.
             audit=AuditLog(
@@ -370,7 +382,7 @@ class DockerCLIAdapter(Adapter):
             ),
             extra_args=extra,
             model=self.model,
-            env=environment,
+            env_overrides=self.env_overrides,
         )
         return self._session
 
@@ -380,36 +392,41 @@ class DockerCLIAdapter(Adapter):
         env_overrides: dict[str, str] | None = None,
     ) -> list[str]:
         self._strip_claude_api_key_settings()
-        cmd: list[str] = [self._docker_bin, "exec", "-i"]
-        if self.claude_api_key:
+        cmd: list[str] = [getattr(self, "_docker_bin", "docker"), "exec", "-i"]
+        if getattr(self, "claude_api_key", ""):
             cmd.extend(["-e", "ANTHROPIC_API_KEY"])
         else:
+            # docker exec cannot unset a variable. An explicit empty value
+            # prevents the container image from supplying an ambient key;
+            # Claude Code treats the empty value as subscription mode.
             cmd.extend(["-e", "ANTHROPIC_API_KEY="])
         # ``env_overrides`` flows in before the container name so
         # docker treats each ``-e KEY=VALUE`` as an exec flag.
-        merged_overrides = {**self.env_overrides, **(env_overrides or {})}
-        for key, value in merged_overrides.items():
-            if key in {"ANTHROPIC_API_KEY", "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"}:
+        # SECURITY: values are visible in the process list and in command
+        # errors. Never pass secrets here; use Docker's name-only ``-e NAME``
+        # passthrough, as the Codex bearer-token path does.
+        for key, value in (env_overrides or {}).items():
+            if key in {
+                "ANTHROPIC_API_KEY",
+                "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+            }:
                 continue
             cmd.extend(["-e", f"{key}={value}"])
-        cmd.extend(
-            [
-                self.container_name,
-                "claude",
-                "--dangerously-skip-permissions",
-            ]
-        )
-        from ...portal.control.context_telemetry import claude_autocompact_tokens
-
-        compact_tokens = claude_autocompact_tokens(
-            model=self.model,
-            pct=self.auto_compact_threshold_pct,
-            env={},
-        )
-        if compact_tokens is not None:
-            cmd.extend(["--autocompact", str(compact_tokens)])
+        cmd.extend([
+            self.container_name,
+            "claude", "--dangerously-skip-permissions",
+        ])
         if self.model:
             cmd.extend(["--model", self.model])
+        from ...portal.control.context_telemetry import claude_autocompact_tokens
+
+        threshold = claude_autocompact_tokens(
+            model=self.model,
+            pct=getattr(self, "auto_compact_threshold_pct", None),
+            env={},
+        )
+        if threshold is not None:
+            cmd.extend(["--autocompact", str(threshold)])
         if self.inference_level:
             if self.inference_level in INFERENCE_LEVELS:
                 cmd.extend(["--effort", self.inference_level])
@@ -417,31 +434,34 @@ class DockerCLIAdapter(Adapter):
                 logger.warning(
                     "agent %s: ignoring inference_level %r for claude-code "
                     "(expected one of %s)",
-                    self.agent_id,
-                    self.inference_level,
+                    self.agent_id, self.inference_level,
                     ", ".join(INFERENCE_LEVELS),
                 )
         cmd.extend(extra_args)
         return cmd
 
+    def _claude_docker_env(self) -> dict[str, str]:
+        env = dict(os.environ)
+        env.pop("ANTHROPIC_API_KEY", None)
+        api_key = getattr(self, "claude_api_key", "")
+        if api_key:
+            env["ANTHROPIC_API_KEY"] = api_key
+        return env
+
     def _strip_claude_api_key_settings(self) -> None:
         paths: list[Path] = []
         claude_home_src = getattr(self, "claude_home_src", None)
         if claude_home_src is not None:
-            paths.extend(
-                [
-                    Path(claude_home_src) / "settings.json",
-                    Path(claude_home_src) / "settings.local.json",
-                ]
-            )
+            paths.extend([
+                Path(claude_home_src) / "settings.json",
+                Path(claude_home_src) / "settings.local.json",
+            ])
         claude_dir = getattr(self, "claude_dir", None)
         if claude_dir is not None:
-            paths.extend(
-                [
-                    Path(claude_dir) / "settings.json",
-                    Path(claude_dir) / "settings.local.json",
-                ]
-            )
+            paths.extend([
+                Path(claude_dir) / "settings.json",
+                Path(claude_dir) / "settings.local.json",
+            ])
         for settings_path in paths:
             strip_claude_api_key_from_settings(settings_path)
 
@@ -454,16 +474,8 @@ class DockerCLIAdapter(Adapter):
 
         # Path values must be CONTAINER-local — override whatever the
         # worker put in the env dict from the host side.
-        if self.puffo_core_mcp_env is not None:
-            env = dict(self.puffo_core_mcp_env)
-            env["PUFFO_CORE_KEYSTORE_DIR"] = "/home/agent/.puffo-agent-state/keys"
-            # No PUFFO_CORE_DB_PATH — SQLite reads route via the
-            # daemon's data service.
-            env["PUFFO_WORKSPACE"] = "/workspace"
-            env["PUFFO_MEMORY_DIR"] = "/home/agent/.puffo-agent-state/memory"
-            env["PUFFO_RUNTIME_KIND"] = "cli-docker"
-            env["PUFFO_HARNESS"] = self.harness.name()
-            env["PYTHONPATH"] = "/opt/puffoagent-pkg"
+        env = self._container_puffo_mcp_env()
+        if env is not None:
             write_cli_mcp_config(
                 config_host,
                 command="python3",
@@ -499,11 +511,8 @@ class DockerCLIAdapter(Adapter):
         """
         rc, _, _ = await _run_cmd(
             [
-                self._docker_bin,
-                "exec",
-                self.container_name,
-                "sh",
-                "-c",
+                self._docker_bin, "exec", self.container_name,
+                "sh", "-c",
                 "test -f /opt/puffoagent-pkg/puffo_agent/__init__.py "
                 f"&& exit 0 || exit {_PROBE_FALSE_EXIT}",
             ],
@@ -512,14 +521,16 @@ class DockerCLIAdapter(Adapter):
         return _probe_result(rc)
 
     async def _container_harness_is_current(self) -> bool | None:
+        harness = self.harness.name()
+        command = "claude" if harness == "claude-code" else "codex"
+        checks = [f"command -v {command} >/dev/null"]
+        if harness == "codex":
+            checks.append("test -f /home/agent/.codex/config.toml")
         rc, _, _ = await _run_cmd(
             [
-                self._docker_bin,
-                "exec",
-                self.container_name,
-                "sh",
-                "-c",
-                "if command -v claude >/dev/null; then exit 0; "
+                self._docker_bin, "exec", self.container_name,
+                "sh", "-c",
+                f"if {' && '.join(checks)}; then exit 0; "
                 f"else exit {_PROBE_FALSE_EXIT}; fi",
             ],
             check=False,
@@ -532,18 +543,27 @@ class DockerCLIAdapter(Adapter):
         the container doesn't exist, or ``None`` when Docker could not
         answer the probe.
         """
-        return await container_state(self._docker_bin, self.container_name)
+        rc, out, _ = await _run_cmd(
+            [
+                self._docker_bin, "container", "ls", "--all",
+                "--filter", f"name=^/{self.container_name}$",
+                "--format", "{{.State}}",
+            ],
+            check=False,
+        )
+        if rc != 0:
+            return None
+        return out.decode("utf-8", errors="replace").strip()
 
     async def _install_desired(self) -> None:
-        """Install container-compatible desired assets once per instance."""
         if self._desired_installed:
             return
-        self._desired_installed = True
         if not self.desired_skills and not self.desired_mcps:
+            self._desired_installed = True
             return
+        self._desired_installed = True
         from .desired_install import run_spawn_install
-
-        await run_spawn_install(
+        codex_extras = await run_spawn_install(
             agent_id=self.agent_id,
             agent_home=self.agent_home_dir,
             workspace_dir=Path(self.workspace_dir),
@@ -555,361 +575,378 @@ class DockerCLIAdapter(Adapter):
             keys_dir=self.puffo_core_keys_dir,
             containerized=True,
         )
+        if codex_extras:
+            self._desired_codex_extras = codex_extras
+
+    def _container_puffo_mcp_env(self) -> dict[str, str] | None:
+        if self.puffo_core_mcp_env is None:
+            return None
+        env = dict(self.puffo_core_mcp_env)
+        env["PUFFO_CORE_KEYSTORE_DIR"] = "/home/agent/.puffo-agent-state/keys"
+        env["PUFFO_WORKSPACE"] = "/workspace"
+        env["PUFFO_RUNTIME_KIND"] = "cli-docker"
+        env["PUFFO_HARNESS"] = self.harness.name()
+        env["PYTHONPATH"] = "/opt/puffoagent-pkg"
+        if self.harness.name() == "codex":
+            env["CODEX_HOME"] = "/home/agent/.codex"
+        return env
+
+    def _prepare_codex_config(self, host_home: Path) -> None:
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        agents_md = self.codex_home / "AGENTS.md"
+        if not agents_md.exists():
+            agents_md.write_text("", encoding="utf-8")
+
+        auth_mode = sync_host_codex_auth_view(host_home, self.codex_home)
+        if auth_mode == "no-host-file":
+            raise RuntimeError(
+                f"agent {self.agent_id!r}: codex needs auth; run `codex login` "
+                "on the host so ~/.codex/auth.json exists"
+            )
+
+        host_mcps, unreachable = filter_container_mcp_servers(
+            read_host_codex_mcp_servers(host_home),
+        )
+        for name, command in unreachable:
+            logger.warning(
+                "agent %s: skipping host Codex MCP %r because %r does not "
+                "resolve inside the container", self.agent_id, name, command,
+            )
+        extras = dict(self._desired_codex_extras)
+        extras.update(host_mcps)
+        bearer_env_names = {
+            str(spec.get("bearer_token_env_var"))
+            for spec in extras.values()
+            if isinstance(spec, dict) and spec.get("bearer_token_env_var")
+        }
+        self._codex_bearer_env_names = tuple(sorted(
+            name for name in bearer_env_names if os.environ.get(name)
+        ))
+        for name in sorted(bearer_env_names - set(self._codex_bearer_env_names)):
+            logger.warning(
+                "agent %s: host Codex MCP bearer env %r is not set; "
+                "the MCP will start without authentication",
+                self.agent_id, name,
+            )
+        env = self._container_puffo_mcp_env()
+        write_codex_mcp_config(
+            self.codex_home / "config.toml",
+            command="python3" if env is not None else None,
+            args=["-m", "puffo_agent.mcp.puffo_core_server"] if env is not None else None,
+            env=env,
+            extra_servers=extras,
+            inference_level=self.inference_level,
+        )
 
     async def _ensure_started(self) -> None:
         async with self._started_lock:
             if self._started:
                 return
-            self._require_docker()
+            docker_bin = resolve_docker_bin()
+            if docker_bin is None:
+                raise RuntimeError(
+                    "docker binary not found. Tried $PUFFO_DOCKER_BIN, "
+                    "$PATH, the persistent user PATH, and known Docker "
+                    "Desktop install locations. Install Docker Desktop "
+                    "(Windows/macOS) or docker-ce (Linux) to use runtime "
+                    "kind 'cli-docker'."
+                )
+            self._docker_bin = docker_bin
+            # Keep both harness homes ready so switching harnesses does not
+            # require rebuilding the container.
             host_home = Path.home()
-            await self._sync_claude_host_assets(host_home)
-            self._warn_missing_claude_credentials(host_home)
-            existed = await self._start_or_resume_container()
-            await self._recreate_if_mount_stale(existed)
+            seeded = seed_claude_home(host_home, self.agent_home_dir)
+            if seeded:
+                logger.info(
+                    "agent %s: seeded per-agent virtual $HOME at %s from %s",
+                    self.agent_id, self.agent_home_dir, host_home,
+                )
+            self._strip_claude_api_key_settings()
+            claude_auth_mode = sync_host_claude_code_auth_view(
+                host_home, self.agent_home_dir,
+            )
+            logger.info(
+                "agent %s: wrote host Claude credential view (%s)",
+                self.agent_id, claude_auth_mode,
+            )
+            # One-way sync of host skills + MCP registrations into
+            # the per-agent home. Runs every start so host edits
+            # propagate without daemon restart.
+            if self.harness.name() == "codex":
+                skill_count = sync_host_codex_skills(host_home, self.codex_home)
+                skills_dir = self.codex_home / "skills"
+            else:
+                skill_count = sync_host_skills(host_home, self.agent_home_dir)
+                skills_dir = self.agent_home_dir / ".claude" / "skills"
+            if skill_count:
+                logger.info(
+                    "agent %s: synced %d host skill(s) into %s",
+                    self.agent_id, skill_count, skills_dir,
+                )
+            merged_mcp, unreachable = sync_host_mcp_servers(
+                host_home, self.agent_home_dir,
+            )
+            if merged_mcp:
+                logger.info(
+                    "agent %s: merged %d host MCP server registration(s) "
+                    "into per-agent .claude.json", self.agent_id, merged_mcp,
+                )
+            for name, cmd in unreachable:
+                logger.warning(
+                    "agent %s: host MCP %r has host-local path %r that won't "
+                    "resolve inside the container — SKIPPED (not injected). "
+                    "Install the binary in the image or bind-mount it, then "
+                    "re-sync, to make this MCP available.",
+                    self.agent_id, name, cmd,
+                )
+            await self._install_desired()
+            if self.harness.name() == "codex":
+                self._prepare_codex_config(host_home)
+            # Plugins: the actual plugin tree is bind-mounted read-
+            # only into the container by ``_start_container``
+            # (see the ``-v {host_plugins}:/home/agent/.claude/plugins:ro``
+            # line). Here we just propagate the ``enabledPlugins``
+            # array from host settings.json so the container's Claude
+            # knows which plugin names to load. The image bakes in
+            # node/npm/python so most ``npx`` / ``uvx`` plugin
+            # commands resolve naturally; native-binary plugins (e.g.
+            # one that shells out to a host-only path) will still
+            # fail and that surfaces as a runtime error.
+            enabled_count = sync_host_enabled_plugins(
+                host_home, self.agent_home_dir,
+            )
+            if enabled_count:
+                logger.info(
+                    "agent %s: propagated %d enabledPlugins entry/entries "
+                    "from host settings.json", self.agent_id, enabled_count,
+                )
+
+            if (
+                self.harness.name() == "claude-code"
+                and not self.claude_api_key
+                and not (self.agent_home_dir / ".claude" / ".credentials.json").exists()
+            ):
+                logger.warning(
+                    "agent %s: agent has no %s — run `claude login` on the "
+                    "host, then restart the agent. First turn will fail "
+                    "with an auth error otherwise.",
+                    self.agent_id,
+                    self.agent_home_dir / ".claude" / ".credentials.json",
+                )
+            # Reuse the container left behind by a prior daemon run
+            # (``aclose`` does ``docker stop``, not ``rm``) so
+            # ``--resume <session_id>`` reattaches cleanly on the
+            # next turn instead of paying container boot + image
+            # pull every restart.
+            state = await self._container_state()
+            if state is None:
+                raise RuntimeError(
+                    f"could not inspect Docker container {self.container_name!r}; "
+                    "refusing to create or replace it while Docker is unavailable"
+                )
+            existed = state != ""
+            if state == "running":
+                logger.info(
+                    "agent %s: reusing running container %r",
+                    self.agent_id, self.container_name,
+                )
+            elif state in ("exited", "created", "dead"):
+                logger.info(
+                    "agent %s: starting existing container %r (was %s)",
+                    self.agent_id, self.container_name, state,
+                )
+                await _run_cmd([self._docker_bin, "start", self.container_name])
+            elif state == "paused":
+                logger.info(
+                    "agent %s: unpausing container %r",
+                    self.agent_id, self.container_name,
+                )
+                await _run_cmd([self._docker_bin, "unpause", self.container_name])
+            elif state == "":
+                await self._ensure_image()
+                await self._start_container()
+            else:
+                raise RuntimeError(
+                    f"Docker container {self.container_name!r} is in transient "
+                    f"state {state!r}; refusing to replace it"
+                )
+
+            layout_marker = self.agent_home_dir / ".docker-layout"
+            try:
+                layout_current = (
+                    layout_marker.read_text(encoding="utf-8").strip()
+                    == CONTAINER_LAYOUT_VERSION
+                )
+            except OSError:
+                layout_current = False
+            package_current = (
+                await self._puffo_pkg_mount_is_current() if existed else True
+            )
+            harness_current = (
+                await self._container_harness_is_current() if existed else True
+            )
+            if package_current is None or harness_current is None:
+                raise RuntimeError(
+                    f"could not validate existing Docker container "
+                    f"{self.container_name!r}; refusing to remove it after a "
+                    "failed probe"
+                )
+            if existed and not (layout_current and package_current and harness_current):
+                logger.warning(
+                    "agent %s: recreating stale container %r "
+                    "(layout=%s package=%s harness=%s)",
+                    self.agent_id, self.container_name,
+                    layout_current, package_current, harness_current,
+                )
+                await _run_cmd(
+                    [self._docker_bin, "rm", "-f", self.container_name],
+                )
+                await self._ensure_image()
+                await self._start_container()
+            final_harness_probe = await self._container_harness_is_current()
+            if final_harness_probe is None:
+                raise RuntimeError(
+                    f"could not verify harness {self.harness.name()!r} in "
+                    f"Docker container {self.container_name!r}"
+                )
+            if not final_harness_probe:
+                raise RuntimeError(
+                    f"docker image {self.image!r} does not provide a working "
+                    f"{self.harness.name()} harness"
+                )
+            layout_marker.write_text(
+                CONTAINER_LAYOUT_VERSION + "\n", encoding="utf-8",
+            )
             self._started = True
 
-    def _require_docker(self) -> None:
-        docker_bin = resolve_docker_bin()
-        if docker_bin is None:
-            raise RuntimeError(
-                "docker binary not found. Tried $PUFFO_DOCKER_BIN, $PATH, "
-                "the persistent user PATH, and known Docker Desktop install "
-                "locations. Install Docker Desktop (Windows/macOS) or "
-                "docker-ce (Linux) to use runtime kind 'cli-docker'."
-            )
-        self._docker_bin = docker_bin
-
-    async def _sync_claude_host_assets(self, host_home: Path) -> None:
-        if seed_claude_home(host_home, self.agent_home_dir):
-            logger.info(
-                "agent %s: seeded per-agent virtual $HOME at %s from %s",
-                self.agent_id,
-                self.agent_home_dir,
-                host_home,
-            )
-        self._strip_claude_api_key_settings()
-        auth_mode = sync_host_claude_code_auth_view(
-            host_home,
-            self.agent_home_dir,
-        )
-        logger.info(
-            "agent %s: wrote host Claude credential view (%s)",
-            self.agent_id,
-            auth_mode,
-        )
-        skill_count = sync_host_skills(host_home, self.agent_home_dir)
-        if skill_count:
-            logger.info(
-                "agent %s: synced %d host skill(s) into %s",
-                self.agent_id,
-                skill_count,
-                self.agent_home_dir / ".claude" / "skills",
-            )
-        await self._install_desired()
-        merged_mcp, unreachable = sync_host_mcp_servers(
-            host_home,
-            self.agent_home_dir,
-            containerized=True,
-        )
-        if merged_mcp:
-            logger.info(
-                "agent %s: merged %d host MCP server registration(s) "
-                "into per-agent .claude.json",
-                self.agent_id,
-                merged_mcp,
-            )
-        for name, command in unreachable:
-            logger.warning(
-                "agent %s: host MCP %r has host-local path %r that won't "
-                "resolve inside the container — SKIPPED (not injected). "
-                "Install the binary in the image or bind-mount it, then "
-                "re-sync, to make this MCP available.",
-                self.agent_id,
-                name,
-                command,
-            )
-        enabled_count = sync_host_enabled_plugins(host_home, self.agent_home_dir)
-        if enabled_count:
-            logger.info(
-                "agent %s: propagated %d enabledPlugins entry/entries "
-                "from host settings.json",
-                self.agent_id,
-                enabled_count,
-            )
-
-    def _warn_missing_claude_credentials(self, host_home: Path) -> None:
-        if self.claude_api_key:
-            return
-        credentials = self.agent_home_dir / ".claude" / ".credentials.json"
-        if not credentials.exists():
-            logger.warning(
-                "agent %s: host has no %s — run `claude login` on the "
-                "host, then restart the agent. First turn will fail "
-                "with an auth error otherwise.",
-                self.agent_id,
-                credentials,
-            )
-
-    async def _start_or_resume_container(self) -> bool:
-        state = await self._container_state()
-        if state is None:
-            raise RuntimeError(
-                f"could not inspect Docker container {self.container_name!r}; "
-                "refusing to create or replace it while Docker is unavailable"
-            )
-        if state == "running":
-            logger.info(
-                "agent %s: reusing running container %r",
-                self.agent_id,
-                self.container_name,
-            )
-        elif state in ("exited", "created", "dead"):
-            logger.info(
-                "agent %s: starting existing container %r (was %s)",
-                self.agent_id,
-                self.container_name,
-                state,
-            )
-            await _run_cmd([self._docker_bin, "start", self.container_name])
-        elif state == "paused":
-            logger.info(
-                "agent %s: unpausing container %r",
-                self.agent_id,
-                self.container_name,
-            )
-            await _run_cmd([self._docker_bin, "unpause", self.container_name])
-        elif state == "":
-            await self._ensure_image()
-            await self._start_container()
-        else:
-            raise RuntimeError(
-                f"Docker container {self.container_name!r} is in transient "
-                f"state {state!r}; refusing to replace it"
-            )
-        return state != ""
-
-    async def _recreate_if_mount_stale(self, existed: bool) -> None:
-        layout_marker = self.agent_home_dir / ".docker-layout"
-        try:
-            layout_current = (
-                layout_marker.read_text(encoding="utf-8").strip()
-                == CONTAINER_LAYOUT_VERSION
-            )
-        except OSError:
-            layout_current = False
-        package_current = await self._puffo_pkg_mount_is_current() if existed else True
-        harness_current = (
-            await self._container_harness_is_current() if existed else True
-        )
-        if package_current is None or harness_current is None:
-            raise RuntimeError(
-                f"could not validate existing Docker container "
-                f"{self.container_name!r}; refusing to remove it after a "
-                "failed probe"
-            )
-        if existed and not (layout_current and package_current and harness_current):
-            logger.warning(
-                "agent %s: recreating stale container %r "
-                "(layout=%s package=%s harness=%s)",
-                self.agent_id,
-                self.container_name,
-                layout_current,
-                package_current,
-                harness_current,
-            )
-            await _run_cmd(
-                [self._docker_bin, "rm", "-f", self.container_name],
-                check=False,
-            )
-            await self._ensure_image()
-            await self._start_container()
-        final_harness_probe = await self._container_harness_is_current()
-        if final_harness_probe is None:
-            raise RuntimeError(
-                f"could not verify harness {self.harness.name()!r} in "
-                f"Docker container {self.container_name!r}"
-            )
-        if not final_harness_probe:
-            raise RuntimeError(
-                f"docker image {self.image!r} does not provide a working "
-                f"{self.harness.name()} harness"
-            )
-        layout_marker.parent.mkdir(parents=True, exist_ok=True)
-        layout_marker.write_text(CONTAINER_LAYOUT_VERSION + "\n", encoding="utf-8")
-
     async def _ensure_image(self) -> None:
-        await ensure_docker_image(
-            self._docker_bin, self.image, agent_id=self.agent_id
+        if await _image_exists_locally(self._docker_bin, self.image):
+            return
+        if self.image != DEFAULT_IMAGE:
+            raise RuntimeError(
+                f"docker image {self.image!r} not found locally. "
+                f"pull it (`docker pull {self.image}`) or clear "
+                "runtime.docker_image to use the bundled default."
+            )
+        # Daemon-wide lock — concurrent ``docker build -t <tag>``
+        # races in BuildKit's exporter and the loser crashes with
+        # "image already exists". First wins; others wait and re-check.
+        async with _BUILD_LOCK:
+            if await _image_exists_locally(self._docker_bin, self.image):
+                logger.info(
+                    "agent %s: image %s was built by another worker "
+                    "during our wait — skipping rebuild",
+                    self.agent_id, self.image,
+                )
+                return
+            logger.info(
+                "agent %s: building docker image %s (first use — this may take a few minutes)",
+                self.agent_id, self.image,
+            )
+            await self._build_image()
+
+    async def _build_image(self) -> None:
+        from ..._proc import no_window_kwargs
+        proc = await asyncio.create_subprocess_exec(
+            self._docker_bin, "build", "-t", self.image, "-",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            **no_window_kwargs(),
         )
+        stdout, _ = await _communicate_with_timeout(
+            proc,
+            input_data=DOCKERFILE.encode(),
+            timeout_seconds=DOCKER_BUILD_TIMEOUT_SECONDS,
+            operation="docker build",
+        )
+        if proc.returncode != 0:
+            tail = stdout.decode("utf-8", errors="replace")[-1500:]
+            raise RuntimeError(f"docker build failed:\n{tail}")
+        logger.info("agent %s: docker image %s built", self.agent_id, self.image)
 
     async def _start_container(self) -> None:
-        agent_claude_json, shared_status = self._prepare_container_mounts()
-        command = self._container_run_command(agent_claude_json, shared_status)
-        self._add_optional_container_args(command)
-        command.append(self.image)
-        rc, _, stderr = await _run_cmd(command, check=False)
+        Path(self.workspace_dir).mkdir(parents=True, exist_ok=True)
+        # Pre-create every bind-mount source as a real dir/file so
+        # Docker doesn't auto-create one owned by root that the
+        # non-root container user can't write to.
+        self.agent_home_dir.mkdir(parents=True, exist_ok=True)
+        (self.agent_home_dir / ".claude").mkdir(parents=True, exist_ok=True)
+        self.codex_home.mkdir(parents=True, exist_ok=True)
+        # .claude.json is a FILE (not a dir) — touch so the
+        # bind-mount target is a file, not a dir.
+        agent_claude_json = self.agent_home_dir / ".claude.json"
+        agent_claude_json.touch(exist_ok=True)
+        self.shared_fs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Bind-mounts per agent:
+        #   1. workspace            — project root + cwd
+        #   2. .claude dir          — per-agent identity
+        #   3. .codex dir           — per-agent Codex identity/config
+        #   4. .claude.json         — per-agent Claude CLI config
+        #   5. shared_fs            — cross-agent cooperation
+        #   6. puffoagent pkg       — host package for in-container imports
+        #   7. .puffo-agent-state   — keystore + message DB
+        cmd = [
+            self._docker_bin, "run", "-d",
+            "--name", self.container_name,
+            "-e", f"PUFFO_AGENT_ID={self.agent_id}",
+            "-v", f"{self.workspace_dir}:/workspace",
+            "-v", f"{self.claude_home_src}:/home/agent/.claude",
+            "-v", f"{self.codex_home}:/home/agent/.codex",
+            # Sibling .claude.json — without this it lands on the
+            # container's ephemeral fs and is lost on restart.
+            "-v", f"{agent_claude_json}:/home/agent/.claude.json",
+            "-v", f"{self.shared_fs_dir}:/workspace/.shared",
+            "-v", f"{_puffo_agent_pkg_dir()}:/opt/puffoagent-pkg:ro",
+            # RW because subkey rotation rewrites <slug>.session.json.
+            # Mounting :ro surfaced as [Errno 30] from MCP tool calls
+            # past the subkey TTL. Whole agent_home_dir is mounted
+            # rather than individual files because SQLite WAL files
+            # (-wal, -shm) sit alongside the .db.
+            "-v", f"{self.agent_home_dir}:/home/agent/.puffo-agent-state",
+            "--init",  # reap zombies from claude's child processes
+        ]
+        # Host Claude Code plugins ride in via a read-only nested
+        # bind-mount on top of the .claude dir. Plugin code (the
+        # marketplace clones, cache, installed_plugins.json) lives in
+        # ``~/.claude/plugins/`` and can be GB-scale; an extra mount
+        # is cheaper than copying every worker start, and the agent
+        # picks up host installs live. The image bakes in node/npm/
+        # python+uv so most plugin commands (``npx``/``uvx``)
+        # resolve. Sibling ``sync_host_enabled_plugins`` propagates
+        # the ``enabledPlugins`` array via the per-agent
+        # ``.claude/settings.json`` that lives under the existing
+        # ``claude_home_src`` mount. Skipped when the host has no
+        # plugins dir.
+        host_plugins = Path.home() / ".claude" / "plugins"
+        if host_plugins.is_dir():
+            cmd.extend([
+                "-v", f"{host_plugins}:/home/agent/.claude/plugins:ro",
+            ])
+        # ``--memory`` is a hard cgroup ceiling; ``--memory-reservation``
+        # is a soft floor. Either may be empty (operator opt-out).
+        if self.memory_limit:
+            cmd.extend(["--memory", self.memory_limit])
+        if self.memory_reservation:
+            cmd.extend(["--memory-reservation", self.memory_reservation])
+        cmd.extend([
+            self.image,
+            # No command override — the image's CMD tails the audit
+            # log so ``docker logs`` streams turn events.
+        ])
+        rc, _, stderr = await _run_cmd(cmd, check=False)
         if rc != 0:
             raise RuntimeError(
                 f"docker run failed for {self.container_name}: "
                 f"{stderr.decode('utf-8', errors='replace').strip()[:500]}"
             )
 
-    def _prepare_container_mounts(self) -> tuple[Path, str]:
-        shared_status = prepare_workspace_shared_access(
-            Path(self.workspace_dir),
-            self.shared_fs_dir,
-            mounted=True,
-        )
-        self.agent_home_dir.mkdir(parents=True, exist_ok=True)
-        (self.agent_home_dir / ".claude").mkdir(parents=True, exist_ok=True)
-        agent_claude_json = self.agent_home_dir / ".claude.json"
-        agent_claude_json.touch(exist_ok=True)
-        return agent_claude_json, shared_status
-
-    def _container_run_command(
-        self,
-        agent_claude_json: Path,
-        shared_status: str,
-    ) -> list[str]:
-        return [
-            self._docker_bin,
-            "run",
-            "-d",
-            "--name",
-            self.container_name,
-            "-e",
-            f"PUFFO_AGENT_ID={self.agent_id}",
-            "-v",
-            f"{self.workspace_dir}:/workspace",
-            "-v",
-            f"{self.claude_home_src}:/home/agent/.claude",
-            # Sibling .claude.json — without this it lands on the
-            # container's ephemeral fs and is lost on restart.
-            "-v",
-            f"{agent_claude_json}:/home/agent/.claude.json",
-            *(
-                ["-v", f"{self.shared_fs_dir}:/workspace/shared"]
-                if shared_status == "mounted"
-                else []
-            ),
-            # Compatibility for existing sessions and user-authored paths.
-            "-v",
-            f"{self.shared_fs_dir}:/workspace/.shared",
-            "-v",
-            f"{_puffo_agent_pkg_dir()}:/opt/puffoagent-pkg:ro",
-            # RW because subkey rotation rewrites <slug>.session.json.
-            # Mounting :ro surfaced as [Errno 30] from MCP tool calls
-            # past the subkey TTL. Whole agent_home_dir is mounted
-            # rather than individual files because SQLite WAL files
-            # (-wal, -shm) sit alongside the .db.
-            "-v",
-            f"{self.agent_home_dir}:/home/agent/.puffo-agent-state",
-            "--init",
-        ]
-
-    def _add_optional_container_args(self, command: list[str]) -> None:
-        host_plugins = Path.home() / ".claude" / "plugins"
-        if host_plugins.is_dir():
-            command.extend(
-                [
-                    "-v",
-                    f"{host_plugins}:/home/agent/.claude/plugins:ro",
-                ]
-            )
-        if self.memory_limit:
-            command.extend(["--memory", self.memory_limit])
-        if self.memory_reservation:
-            command.extend(["--memory-reservation", self.memory_reservation])
-
 
 # Serialises concurrent ``docker build -t <tag>`` across workers
 # (right after an image-tag bump every cli-docker worker would
 # otherwise race BuildKit's exporter).
 _BUILD_LOCK = asyncio.Lock()
-
-
-async def container_state(docker_bin: str, container_name: str) -> str | None:
-    """Docker-reported container State.Status (``running``, ``exited``,
-    ``paused``, ``created``, ``dead``), ``""`` when the container doesn't
-    exist, or ``None`` when Docker could not answer the probe.
-    """
-    rc, out, _ = await _run_cmd(
-        [
-            docker_bin,
-            "container",
-            "ls",
-            "--all",
-            "--filter",
-            f"name=^/{container_name}$",
-            "--format",
-            "{{.State}}",
-        ],
-        check=False,
-    )
-    if rc != 0:
-        return None
-    return out.decode("utf-8", errors="replace").strip()
-
-
-async def ensure_docker_image(docker_bin: str, image: str, *, agent_id: str = "") -> None:
-    """Build the bundled image when ``image`` is missing locally.
-
-    Shared by the Claude Docker adapter and the Docker Codex runtime
-    owner. A non-default image must already exist (the operator pulled
-    or built it); only ``DEFAULT_IMAGE`` is ever built here.
-    """
-    if await _image_exists_locally(docker_bin, image):
-        return
-    if image != DEFAULT_IMAGE:
-        raise RuntimeError(
-            f"docker image {image!r} not found locally. "
-            f"pull it (`docker pull {image}`) or clear "
-            "runtime.docker_image to use the bundled default."
-        )
-    # Daemon-wide lock — concurrent ``docker build -t <tag>``
-    # races in BuildKit's exporter and the loser crashes with
-    # "image already exists". First wins; others wait and re-check.
-    async with _BUILD_LOCK:
-        if await _image_exists_locally(docker_bin, image):
-            logger.info(
-                "agent %s: image %s was built by another worker "
-                "during our wait — skipping rebuild",
-                agent_id,
-                image,
-            )
-            return
-        logger.info(
-            "agent %s: building docker image %s (first use — this may take a few minutes)",
-            agent_id,
-            image,
-        )
-        await _build_image(docker_bin, image, agent_id)
-
-
-async def _build_image(docker_bin: str, image: str, agent_id: str) -> None:
-    from ..._proc import no_window_kwargs
-
-    proc = await asyncio.create_subprocess_exec(
-        docker_bin,
-        "build",
-        "-t",
-        image,
-        "-",
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        **no_window_kwargs(),
-    )
-    stdout, _ = await _communicate_with_timeout(
-        proc,
-        input_data=DOCKERFILE.encode(),
-        timeout_seconds=DOCKER_BUILD_TIMEOUT_SECONDS,
-        operation="docker build",
-    )
-    if proc.returncode != 0:
-        tail = stdout.decode("utf-8", errors="replace")[-1500:]
-        raise RuntimeError(f"docker build failed:\n{tail}")
-    logger.info("agent %s: docker image %s built", agent_id, image)
 
 
 def _probe_result(returncode: int) -> bool | None:
@@ -930,8 +967,7 @@ async def _communicate_with_timeout(
     communicate_task = asyncio.create_task(proc.communicate(input_data))
     try:
         return await asyncio.wait_for(
-            asyncio.shield(communicate_task),
-            timeout=timeout_seconds,
+            asyncio.shield(communicate_task), timeout=timeout_seconds,
         )
     except TimeoutError as exc:
         await _kill_and_reap(proc, communicate_task)
@@ -961,8 +997,7 @@ async def _kill_and_reap(
 
 async def _image_exists_locally(docker_bin: str, tag: str) -> bool:
     rc, _, _ = await _run_cmd(
-        [docker_bin, "image", "inspect", tag],
-        check=False,
+        [docker_bin, "image", "inspect", tag], check=False,
     )
     return rc == 0
 
@@ -974,7 +1009,6 @@ async def _run_cmd(
     timeout_seconds: float = DOCKER_COMMAND_TIMEOUT_SECONDS,
 ) -> tuple[int, bytes, bytes]:
     from ..._proc import no_window_kwargs
-
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,

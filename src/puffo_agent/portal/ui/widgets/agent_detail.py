@@ -10,6 +10,7 @@ import threading
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
@@ -214,13 +215,7 @@ class AgentDetail(QWidget):
         body = QWidget()
         layout = QFormLayout(body)
         layout.setLabelAlignment(Qt.AlignRight)
-        self._add_identity_fields(layout)
-        self._add_runtime_fields(layout)
-        self._add_info_actions(layout)
-        scroll.setWidget(body)
-        return scroll
 
-    def _add_identity_fields(self, layout: QFormLayout) -> None:
         avatar_row = QHBoxLayout()
         self._avatar_preview = QLabel()
         self._avatar_preview.setFixedSize(64, 64)
@@ -263,7 +258,6 @@ class AgentDetail(QWidget):
         self._soul.setMinimumHeight(160)
         layout.addRow("Soul", self._soul)
 
-    def _add_runtime_fields(self, layout: QFormLayout) -> None:
         # CLI runtimes + ws-local are surfaced. provider is derived from
         # harness for the CLI kinds; ws-local has no harness/model on the
         # daemon side so the dropdowns get locked in ``set_agent`` for
@@ -315,7 +309,6 @@ class AgentDetail(QWidget):
             self._update_autocompact_enabled
         )
 
-    def _add_info_actions(self, layout: QFormLayout) -> None:
         actions = QHBoxLayout()
         self._save_btn = QPushButton("Save")
         self._save_btn.clicked.connect(self._on_save)
@@ -325,6 +318,9 @@ class AgentDetail(QWidget):
         actions.addWidget(self._revert_btn)
         actions.addWidget(self._save_btn)
         layout.addRow("", self._wrap(actions))
+
+        scroll.setWidget(body)
+        return scroll
 
     def _build_skills_tab(self) -> QWidget:
         wrap = QWidget()

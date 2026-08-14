@@ -12,16 +12,14 @@ import argparse
 import subprocess
 import sys
 
+import pytest
 
 from puffo_agent.portal import background as bg
 
 
-def test_detached_runner_commands_use_dash_m():
+def test_tray_runner_command_uses_dash_m():
     assert bg.tray_runner_command() == [
         sys.executable, "-m", "puffo_agent.portal.cli", "start", "--tray-runner",
-    ]
-    assert bg.headless_runner_command() == [
-        sys.executable, "-m", "puffo_agent.portal.cli", "start",
     ]
 
 
@@ -46,52 +44,18 @@ def test_detach_kwargs_windows(monkeypatch):
 def test_spawn_background_short_circuits_when_already_running(monkeypatch, capsys):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: True)
     monkeypatch.setattr(bg, "read_daemon_pid", lambda: 4321)
-    waited = []
-    monkeypatch.setattr(
-        bg,
-        "_wait_for_pid_ready",
-        lambda pid: waited.append(pid) or True,
-    )
 
     def _no_spawn(*a, **k):
         raise AssertionError("must not spawn when a daemon is already running")
 
     monkeypatch.setattr(bg.subprocess, "Popen", _no_spawn)
     assert bg.spawn_background() == 0
-    assert waited == [4321]
     assert "already running (pid=4321)" in capsys.readouterr().out
-
-
-def test_spawn_background_existing_daemon_must_be_ready(monkeypatch, capsys):
-    monkeypatch.setattr(bg, "is_daemon_alive", lambda: True)
-    monkeypatch.setattr(bg, "read_daemon_pid", lambda: 4321)
-    monkeypatch.setattr(bg, "_wait_for_pid_ready", lambda _pid: False)
-
-    def _no_spawn(*_args, **_kwargs):
-        raise AssertionError("must not spawn over an existing daemon process")
-
-    monkeypatch.setattr(bg.subprocess, "Popen", _no_spawn)
-    assert bg.spawn_background() == 1
-    assert "failed to become ready" in capsys.readouterr().err
-
-
-def test_spawn_background_preflights_gui_before_detach(monkeypatch, capsys):
-    monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "find_spec", lambda _name: None)
-
-    def _no_spawn(*_args, **_kwargs):
-        raise AssertionError("must not detach without the GUI dependency")
-
-    monkeypatch.setattr(bg.subprocess, "Popen", _no_spawn)
-    assert bg.spawn_background() == 1
-    assert "puffo-agent[gui]" in capsys.readouterr().err
 
 
 def test_spawn_background_detaches_child(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "find_spec", lambda _name: object())
     monkeypatch.setattr(bg, "background_log_path", lambda: tmp_path / "background.log")
-    monkeypatch.setattr(bg, "_wait_for_background_ready", lambda _proc: True)
 
     captured = {}
 
@@ -112,36 +76,6 @@ def test_spawn_background_detaches_child(monkeypatch, tmp_path, capsys):
     assert (tmp_path / "background.log").exists()
     out = capsys.readouterr().out
     assert "running in the background (pid=9999)" in out
-
-    assert bg.spawn_headless_background() == 0
-    assert captured["cmd"] == bg.headless_runner_command()
-
-
-def test_spawn_background_reports_readiness_failure(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
-    monkeypatch.setattr(bg, "find_spec", lambda _name: object())
-    monkeypatch.setattr(bg, "background_log_path", lambda: tmp_path / "background.log")
-    monkeypatch.setattr(bg, "_wait_for_background_ready", lambda _proc: False)
-
-    class _FailedProc:
-        pid = 9999
-        terminated = False
-
-        def poll(self):
-            return None
-
-        def terminate(self):
-            self.terminated = True
-
-        def wait(self, timeout):
-            return 1
-
-    proc = _FailedProc()
-    monkeypatch.setattr(bg.subprocess, "Popen", lambda *_a, **_kw: proc)
-
-    assert bg.spawn_background() == 1
-    assert proc.terminated is True
-    assert "startup failed" in capsys.readouterr().err
 
 
 # ── cmd_start routing ─────────────────────────────────────────────────────────

@@ -43,12 +43,11 @@ import json
 import logging
 import os
 import platform
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-
-from ..portal.host_assets import _atomic_write_private, _ensure_private_directory
 
 logger = logging.getLogger(__name__)
 
@@ -267,15 +266,18 @@ class CredentialCache:
     path: Path
 
     @classmethod
-    def at(cls, home: Path) -> CredentialCache:
+    def at(cls, home: Path) -> "CredentialCache":
         return cls(home / "run" / CACHE_FILENAME)
 
     def exists(self) -> bool:
         return self.path.exists()
 
     def write(self, blob: str) -> None:
-        _ensure_private_directory(self.path.parent)
-        _atomic_write_private(self.path, blob)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.parent / f".{self.path.name}.tmp.{os.getpid()}"
+        tmp.write_text(blob, encoding="utf-8")
+        tmp.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(tmp, self.path)
 
     def read(self) -> Optional[str]:
         try:

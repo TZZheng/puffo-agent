@@ -19,8 +19,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from ..portal.host_assets import _atomic_write_private
 from ..skill_ids import SKILL_ID_RE
+
 
 # Provenance markers dropped inside every skill directory. Claude
 # Code only executes ``SKILL.md``, so siblings are inert unless
@@ -162,7 +162,10 @@ def _read_json_or_empty(path: Path) -> dict[str, Any]:
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
-    _atomic_write_private(path, json.dumps(data, indent=2))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _install_skill(workspace: Path, name: str, content: str) -> Path:
@@ -358,20 +361,17 @@ def _touch_refresh_flag(workspace: Path, name: str) -> Path:
 
 
 def _write_refresh_model_flag(
-    workspace: Path,
-    *,
-    harness: str,
-    model: str,
-    inference_level: Optional[str] = None,
+    workspace: Path, *, harness: str = "", model: str = "",
+    inference_level: str = "",
 ) -> Path:
-    """Drop the daemon-owned model/inference refresh request."""
+    """Drop ``refresh_model.flag`` (``inference_level`` rides it too)."""
     flag_path = workspace / ".puffo-agent" / "refresh_model.flag"
     payload = {
         "harness": harness,
         "model": model,
         "requested_at": int(time.time()),
     }
-    if inference_level is not None:
+    if inference_level:
         payload["inference_level"] = inference_level
     try:
         flag_path.parent.mkdir(parents=True, exist_ok=True)

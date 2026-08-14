@@ -153,10 +153,6 @@ async def test_data_service_lookup_rewarms_and_heals():
 
     from puffo_agent.agent.message_store import MessageStore
     from puffo_agent.portal import data_service as ds
-    from puffo_agent.portal.local_service_auth import (
-        issue_local_service_token,
-        local_service_headers,
-    )
 
     home = _isolated_home()
     db_path = await _seed_empty_agent(home, "agent-heal-1")
@@ -173,12 +169,7 @@ async def test_data_service_lookup_rewarms_and_heals():
     try:
         app = ds.build_app(ds.DataServiceConfig())
         async with TestClient(TestServer(app)) as client:
-            resp = await client.get(
-                "/v1/data/agent-heal-1/channels/ch_healed/space",
-                headers=local_service_headers(
-                    issue_local_service_token("agent-heal-1")
-                ),
-            )
+            resp = await client.get("/v1/data/agent-heal-1/channels/ch_healed/space")
             assert resp.status == 200
             assert (await resp.json())["space_id"] == "sp_9"
     finally:
@@ -190,10 +181,6 @@ async def test_data_service_lookup_404_when_rewarm_doesnt_heal():
     from aiohttp.test_utils import TestClient, TestServer
 
     from puffo_agent.portal import data_service as ds
-    from puffo_agent.portal.local_service_auth import (
-        issue_local_service_token,
-        local_service_headers,
-    )
 
     home = _isolated_home()
     await _seed_empty_agent(home, "agent-heal-2")
@@ -207,12 +194,7 @@ async def test_data_service_lookup_404_when_rewarm_doesnt_heal():
     try:
         app = ds.build_app(ds.DataServiceConfig())
         async with TestClient(TestServer(app)) as client:
-            resp = await client.get(
-                "/v1/data/agent-heal-2/channels/ch_ghost/space",
-                headers=local_service_headers(
-                    issue_local_service_token("agent-heal-2")
-                ),
-            )
+            resp = await client.get("/v1/data/agent-heal-2/channels/ch_ghost/space")
             assert resp.status == 404
             assert rewarmed == [1]  # tried; authoritative miss
     finally:
@@ -224,22 +206,13 @@ async def test_data_service_lookup_404_without_resolver():
     from aiohttp.test_utils import TestClient, TestServer
 
     from puffo_agent.portal import data_service as ds
-    from puffo_agent.portal.local_service_auth import (
-        issue_local_service_token,
-        local_service_headers,
-    )
 
     home = _isolated_home()
     await _seed_empty_agent(home, "agent-heal-3")
     ds.set_client_resolver(None)
     app = ds.build_app(ds.DataServiceConfig())
     async with TestClient(TestServer(app)) as client:
-        resp = await client.get(
-            "/v1/data/agent-heal-3/channels/ch_x/space",
-            headers=local_service_headers(
-                issue_local_service_token("agent-heal-3")
-            ),
-        )
+        resp = await client.get("/v1/data/agent-heal-3/channels/ch_x/space")
         assert resp.status == 404
 
 

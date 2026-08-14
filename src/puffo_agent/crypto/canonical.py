@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 
 
 def canonicalize(value: object) -> bytes:

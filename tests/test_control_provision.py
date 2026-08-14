@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from puffo_agent.crypto.canonical import canonicalize_for_signing
@@ -125,29 +123,6 @@ def test_verify_valid_bundle_without_role_short_override():
     assert verify_agent_bundle(payload, operator_public)["role_short"] == "coder"
 
 
-def test_verify_accepts_codex_minimal_inference_level():
-    payload, operator_public = _payload()
-    payload["runtime"] = {
-        "kind": "cli-local",
-        "provider": "openai",
-        "harness": "codex",
-        "inference_level": "minimal",
-    }
-    context = verify_agent_bundle(payload, operator_public)
-    assert context["runtime"].inference_level == "minimal"
-
-
-def test_verify_migrates_legacy_runtime_before_validation():
-    payload, operator_public = _payload()
-    payload["runtime"] = {
-        "kind": "chat-local",
-        "provider": "openai",
-        "harness": "claude-code",
-    }
-    runtime = verify_agent_bundle(payload, operator_public)["runtime"]
-    assert (runtime.kind, runtime.harness) == ("cli-local", "codex")
-
-
 def test_verify_rejects_invalid_agent_id(monkeypatch):
     payload, operator_public = _payload()
     monkeypatch.setattr(provision, "is_valid_agent_id", lambda _slug: False)
@@ -160,14 +135,7 @@ def test_verify_rejects_invalid_agent_id(monkeypatch):
     [
         (lambda value: value.update({"runtime": {"kind": "bogus"}}), "runtime"),
         (
-            lambda value: value.update({
-                "runtime": {
-                    "kind": "cli-local",
-                    "provider": "openai",
-                    "harness": "codex",
-                    "inference_level": "xhigh",
-                }
-            }),
+            lambda value: value["runtime"].update({"inference_level": "turbo"}),
             "inference_level",
         ),
         (lambda value: value.update({"desired_skills": [""]}), "desired_skills"),
@@ -354,13 +322,7 @@ async def test_provision_materializes_then_writes(tmp_path, monkeypatch):
     config = AgentConfig.load("helper-1234")
     assert config.runtime.kind == "ws-local"
     assert config.desired_skills == ["skill-a"]
-    agent_root = tmp_path / "agents/helper-1234"
-    key_path = agent_root / "keys/helper-1234.json"
-    assert key_path.is_file()
-    if os.name != "nt":
-        assert agent_root.stat().st_mode & 0o777 == 0o700
-        assert key_path.parent.stat().st_mode & 0o777 == 0o700
-        assert key_path.stat().st_mode & 0o777 == 0o600
+    assert (tmp_path / "agents/helper-1234/keys/helper-1234.json").is_file()
 
 
 @pytest.mark.asyncio

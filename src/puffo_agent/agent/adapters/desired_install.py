@@ -5,7 +5,7 @@ Runs once per worker spawn, after host-sync. Both harnesses install:
   * codex  skills → ``<workspace>/.agents/skills/<id>/SKILL.md``
                     (body has ``mcp__puffo__`` prefix stripped)
   * claude MCPs   → ``<agent_home>/.claude.json#mcpServers[<id>]``
-  * codex  MCPs   → returned to the runtime preparer for config.toml
+  * codex  MCPs   → cached on the adapter so ``_ensure_codex_session``
                     folds them into ``[mcp_servers.*]`` config.toml.
 
 Catalog 404 / fetch error logs + continues — never blocks spawn."""
@@ -288,9 +288,8 @@ async def run_spawn_install(
 ) -> dict[str, dict[str, Any]]:
     """Build the puffo-core client from spawn wiring and run
     ``install_desired``, tolerating fetch / crash errors. Shared by the
-    cli-local runtime preparer and cli-docker adapter. Container runtimes
-    reject MCP commands that only resolve on the host. Returns
-    ``codex_extra_servers``.
+    cli-local and cli-docker adapters. ``containerized`` rejects
+    host-only MCP command paths. Returns ``codex_extra_servers``.
     """
     if not desired_skills and not desired_mcps:
         return {}
@@ -341,7 +340,8 @@ async def install_desired(
 
     Returns ``codex_extra_servers`` — a ``{id: spec}`` map for codex to
     fold into ``[mcp_servers.*]`` config.toml. Always ``{}`` for claude.
-    Containerized installs skip stdio commands that cannot resolve there.
+    Containerized installs skip stdio commands that cannot resolve in
+    the Linux runtime.
     """
     # hermes has no skills / MCP surface — bail rather than write into
     # a ``.claude/`` it never reads.
@@ -355,34 +355,6 @@ async def install_desired(
         return {}
 
     is_codex = harness_name == "codex"
-    await _install_desired_skills(
-        http=http,
-        agent_home=agent_home,
-        workspace_dir=workspace_dir,
-        agent_id=agent_id,
-        desired_skills=desired_skills,
-        is_codex=is_codex,
-    )
-    return await _install_desired_mcps(
-        http=http,
-        agent_home=agent_home,
-        agent_id=agent_id,
-        desired_mcps=desired_mcps,
-        is_codex=is_codex,
-        containerized=containerized,
-    )
-
-
-async def _install_desired_skills(
-    *,
-    http: PuffoCoreHttpClient,
-    agent_home: Path,
-    workspace_dir: Path,
-    agent_id: str,
-    desired_skills: list[str],
-    is_codex: bool,
-) -> None:
-    """Install selected skills and prune stale desired-only entries."""
 
     for sid in desired_skills:
         tpl = await fetch_skill_template(http, sid)
@@ -417,17 +389,6 @@ async def _install_desired_skills(
             agent_id, pruned,
         )
 
-
-async def _install_desired_mcps(
-    *,
-    http: PuffoCoreHttpClient,
-    agent_home: Path,
-    agent_id: str,
-    desired_mcps: list[str],
-    is_codex: bool,
-    containerized: bool,
-) -> dict[str, dict[str, Any]]:
-    """Install selected MCPs or return their Codex config entries."""
     codex_extras: dict[str, dict[str, Any]] = {}
     for mid in desired_mcps:
         tpl = await fetch_mcp_template(http, mid)
@@ -442,16 +403,14 @@ async def _install_desired_mcps(
             )
             continue
         if containerized:
-            from ...portal.host_assets import filter_container_mcp_servers
+            from ...portal.state import filter_container_mcp_servers
 
             _reachable, unreachable = filter_container_mcp_servers({mid: spec})
             if unreachable:
                 logger.warning(
                     "agent %s: desired mcp %r uses host-local path %r; "
                     "skipping because it cannot resolve inside the container",
-                    agent_id,
-                    mid,
-                    unreachable[0][1],
+                    agent_id, mid, unreachable[0][1],
                 )
                 continue
         if is_codex:

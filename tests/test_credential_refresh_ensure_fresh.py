@@ -17,6 +17,7 @@ import pytest
 
 from puffo_agent.portal.credential_refresh import (
     CredentialRefresher,
+    REFRESH_SAFETY_MARGIN_SECONDS,
     RefreshOutcome,
 )
 
