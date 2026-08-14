@@ -4,13 +4,14 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
 from .message_store import (
     MAX_REMINDER_LIST_LIMIT,
-    REMINDER_STATES,
+    PUBLIC_REMINDER_STATES,
     MessageStore,
     ReminderOccurrence,
     ReminderSyncRecord,
@@ -37,6 +38,11 @@ class ReminderDeliveryAuthorization:
 
 ReminderDeliveryAuthorizer = Callable[
     [tuple[ReminderSyncRecord, ...]], Awaitable[ReminderDeliveryAuthorization]
+]
+ReminderCancellationHandler = Callable[[str], Awaitable[ReminderOccurrence]]
+ReminderReplacementHandler = Callable[
+    [str, str | None, str | None, int | None],
+    Awaitable[tuple[ReminderOccurrence, ReminderOccurrence]],
 ]
 
 
@@ -73,6 +79,8 @@ class ReminderScheduler:
         wait_for_change: Callable[[asyncio.Event, float | None], Awaitable[None]] | None = None,
         delivery_authorizer: ReminderDeliveryAuthorizer | None = None,
         on_lifecycle_committed: Callable[[], None] | None = None,
+        cancellation_handler: ReminderCancellationHandler | None = None,
+        replacement_handler: ReminderReplacementHandler | None = None,
     ) -> None:
         self.store = store
         self._notify = notify
@@ -80,6 +88,8 @@ class ReminderScheduler:
         self._wait_for_change = wait_for_change
         self._delivery_authorizer = delivery_authorizer
         self._on_lifecycle_committed = on_lifecycle_committed
+        self._cancellation_handler = cancellation_handler
+        self._replacement_handler = replacement_handler
         self._authorization_retry_after_ms: int | None = None
         self._wakeup = asyncio.Event()
         self._stopping = False
@@ -107,6 +117,16 @@ class ReminderScheduler:
         """Wake a provider-neutral outbox after any local lifecycle commit."""
         self._on_lifecycle_committed = callback
 
+    def set_mutation_handlers(
+        self,
+        *,
+        cancel: ReminderCancellationHandler | None,
+        replace: ReminderReplacementHandler | None,
+    ) -> None:
+        """Install the one coordinator that owns remote lifecycle mutations."""
+        self._cancellation_handler = cancel
+        self._replacement_handler = replace
+
     async def create_reminder(
         self, *, content: str, target: str, intended_at: str,
     ) -> dict[str, object]:
@@ -124,8 +144,12 @@ class ReminderScheduler:
     async def list_reminders(
         self, *, state: str = "", limit: int = 50,
     ) -> dict[str, object]:
-        if not isinstance(state, str) or (state and state not in REMINDER_STATES):
-            raise ValueError("state must be empty or one of scheduled, claimed, cancelled, delivered")
+        if not isinstance(state, str) or (
+            state and state not in PUBLIC_REMINDER_STATES
+        ):
+            raise ValueError(
+                "state must be empty or one of scheduled, cancelled, delivered"
+            )
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_REMINDER_LIST_LIMIT:
             raise ValueError(
                 f"limit must be between 1 and {MAX_REMINDER_LIST_LIMIT}"
@@ -134,11 +158,60 @@ class ReminderScheduler:
         return {"reminders": [item.as_dict() for item in reminders]}
 
     async def cancel_reminder(self, *, reminder_id: str) -> dict[str, object]:
-        reminder = await self.store.cancel_reminder(reminder_id)
+        if self._cancellation_handler is None:
+            reminder = await self.store.cancel_reminder(reminder_id)
+        else:
+            reminder = await self._cancellation_handler(reminder_id)
         self.signal()
         if self._on_lifecycle_committed is not None:
             self._on_lifecycle_committed()
         return reminder.as_dict()
+
+    async def replace_reminder(
+        self,
+        *,
+        reminder_id: str,
+        content: str = "",
+        target: str = "",
+        intended_at: str = "",
+    ) -> dict[str, object]:
+        """Atomically supersede one scheduled reminder with changed intent."""
+        intended_at_ms = (
+            normalize_reminder_timestamp(intended_at)[0] if intended_at else None
+        )
+        if not any((content, target, intended_at)):
+            raise ValueError("replace_reminder requires at least one changed field")
+        if self._replacement_handler is not None:
+            cancelled, replacement = await self._replacement_handler(
+                reminder_id,
+                content or None,
+                target or None,
+                intended_at_ms,
+            )
+        else:
+            old = await self.store.get_reminder(reminder_id)
+            if old is None:
+                raise ValueError("unknown reminder_id")
+            cancelled, replacement = await self.store.replace_local_reminder(
+                reminder_id=reminder_id,
+                replacement_reminder_id=f"reminder-{uuid.uuid4()}",
+                replacement_occurrence_id=f"occurrence-{uuid.uuid4()}",
+                content=content or old.content,
+                target=target or old.target,
+                intended_at_ms=(
+                    intended_at_ms
+                    if intended_at_ms is not None
+                    else old.intended_at_ms
+                ),
+                replaced_at_ms=int(self._now_ms()),
+            )
+        self.signal()
+        if self._on_lifecycle_committed is not None:
+            self._on_lifecycle_committed()
+        return {
+            "cancelled": cancelled.as_dict(),
+            "replacement": replacement.as_dict(),
+        }
 
     async def process_due_once(self) -> tuple[ReminderOccurrence, ...]:
         """Deliver due or restart-recovered claims and wake after each commit set."""

@@ -61,6 +61,11 @@ async def test_scheduler_recovers_claimed_work_after_reopen(tmp_path):
     scheduler = ReminderScheduler(
         store=reopened, notify=lambda: wakes.append("wake"), now_ms=lambda: now[0],
     )
+    listed = await scheduler.list_reminders(state="scheduled")
+    assert listed["reminders"][0]["state"] == "scheduled"
+    assert listed["reminders"][0]["actual_fire_at"] is None
+    with pytest.raises(ValueError, match="scheduled, cancelled, delivered"):
+        await scheduler.list_reminders(state="claimed")
     delivered = await scheduler.process_due_once()
     assert [item.reminder_id for item in delivered] == [reminder.reminder_id]
     assert (await reopened.get_reminder(reminder.reminder_id)).state == "delivered"

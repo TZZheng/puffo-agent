@@ -182,16 +182,17 @@ class ReminderOccurrence:
 
     def as_dict(self) -> dict[str, Any]:
         """The stable, provider-neutral reminder tool result."""
+        is_internal_claim = self.state == "claimed"
         return {
             "reminder_id": self.reminder_id,
             "occurrence_id": self.occurrence_id,
-            "state": self.state,
+            "state": "scheduled" if is_internal_claim else self.state,
             "target": self.target,
             "content": self.content,
             "intended_at": reminder_time_to_rfc3339(self.intended_at_ms),
             "actual_fire_at": (
                 reminder_time_to_rfc3339(self.actual_fire_at_ms)
-                if self.actual_fire_at_ms is not None
+                if self.actual_fire_at_ms is not None and not is_internal_claim
                 else None
             ),
             "created_at": reminder_time_to_rfc3339(self.created_at_ms),
@@ -280,6 +281,7 @@ class ReminderMaterializationResult:
 
 
 REMINDER_STATES = frozenset({"scheduled", "claimed", "cancelled", "delivered"})
+PUBLIC_REMINDER_STATES = frozenset({"scheduled", "cancelled", "delivered"})
 MAX_REMINDER_LIST_LIMIT = 100
 
 

@@ -71,6 +71,8 @@ class _RecordingTransport:
         self.claim_status = "acquired"
         self.lease_expires_at = "2030-01-01T00:00:00.123456Z"
         self.claims: list[tuple[str, dict[str, object]]] = []
+        self.drop_replace_response_once = False
+        self.committed_replace_response: dict[str, object] | None = None
 
     @staticmethod
     def _response(path: str, body: dict[str, object]) -> dict[str, object]:
@@ -95,6 +97,38 @@ class _RecordingTransport:
         return self._response(path, body)
 
     async def post(self, path: str, body: dict[str, object]) -> dict[str, object]:
+        if path.endswith("/replace"):
+            self.calls.append(("post", path, copy.deepcopy(body)))
+            if self.failure is not None:
+                raise self.failure
+            if self.committed_replace_response is not None:
+                return copy.deepcopy(self.committed_replace_response)
+            old_path = path.removesuffix("/replace")
+            old_body = next(
+                call_body
+                for method, call_path, call_body in reversed(self.calls)
+                if method in {"put", "put_unsigned"}
+                and call_path == old_path
+                and call_body is not None
+            )
+            cancelled = {
+                "occurrence_id": old_path.rsplit("/", 1)[-1],
+                **old_body,
+                "revision": 2,
+                "lifecycle": "cancelled",
+                "lifecycle_at": body["cancelled_at"],
+            }
+            cancelled.pop("opaque_payload")
+            cancelled.pop("delivery_claim_id", None)
+            replacement = copy.deepcopy(body["replacement"])
+            replacement["occurrence_id"] = body["replacement_occurrence_id"]
+            replacement.pop("delivery_claim_id", None)
+            response = {"cancelled": cancelled, "replacement": replacement}
+            self.committed_replace_response = copy.deepcopy(response)
+            if self.drop_replace_response_once:
+                self.drop_replace_response_once = False
+                raise OSError("response lost after commit")
+            return response
         self.claims.append((path, copy.deepcopy(body)))
         if self.failure is not None:
             raise self.failure
@@ -278,6 +312,199 @@ async def test_lifecycle_commits_wake_a_sleeping_sync_outbox(tmp_path):
 
     sync.stop()
     await task
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_cancel_converges_and_rejects_live_delivery(
+    tmp_path, monkeypatch,
+):
+    """A prepared reminder must not fork locally when Server says too_late."""
+    transport = _RecordingTransport()
+    sync, store, _scheduler, _keys = _sync(tmp_path, transport)
+    reminder = await store.create_reminder(
+        content="cancel remotely", target="dm:peer", intended_at_ms=5_000,
+    )
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None
+    local_cancel = store.cancel_reminder
+    raced = False
+
+    async def cancel_after_outbox_prepares(reminder_id):
+        nonlocal raced
+        if not raced:
+            raced = True
+            current = await store.get_reminder_sync_record(reminder.occurrence_id)
+            assert current is not None
+            await sync._ensure_envelope(current)
+        return await local_cancel(reminder_id)
+
+    monkeypatch.setattr(store, "cancel_reminder", cancel_after_outbox_prepares)
+
+    cancelled = await sync.cancel_reminder(reminder.reminder_id)
+    synced = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert cancelled.state == "cancelled"
+    assert synced is not None and synced.server_ack_revision == 2
+
+    claimed = await store.create_reminder(
+        content="claimed but not delivered", target="dm:peer", intended_at_ms=1_000,
+    )
+    await store.claim_due_reminders(now_ms=2_000)
+    assert (await store.get_reminder(claimed.reminder_id)).state == "claimed"
+    calls_before_local_cancel = len(transport.calls)
+    cancelled_claim = await sync.cancel_reminder(claimed.reminder_id)
+    assert cancelled_claim.state == "cancelled"
+    assert cancelled_claim.actual_fire_at_ms is None
+    assert len(transport.calls) == calls_before_local_cancel
+
+    blocked = await store.create_reminder(
+        content="already firing", target="dm:peer", intended_at_ms=6_000,
+    )
+    blocked_record = await store.get_reminder_sync_record(blocked.occurrence_id)
+    assert blocked_record is not None
+    await sync._ensure_envelope(blocked_record)
+    transport.failure = HttpError(
+        409, '{"error":"too_late","message":"delivery started"}'
+    )
+    with pytest.raises(LifecycleConflict, match="delivery already started"):
+        await sync.cancel_reminder(blocked.reminder_id)
+    assert (await store.get_reminder(blocked.reminder_id)).state == "scheduled"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_replace_is_atomic_locally_and_idempotent(tmp_path):
+    """A lost retry cannot create a second replacement identity."""
+    transport = _RecordingTransport()
+    sync, store, _scheduler, _keys = _sync(tmp_path, transport)
+    reminder = await store.create_reminder(
+        content="old", target="dm:peer", intended_at_ms=5_000,
+    )
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None
+    await sync._ensure_envelope(record)
+
+    transport.drop_replace_response_once = True
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        await sync.replace_reminder(reminder.reminder_id, "new", None, None)
+    assert (await store.get_reminder(reminder.reminder_id)).state == "scheduled"
+
+    cancelled, replacement = await sync.replace_reminder(
+        reminder.reminder_id, "new", None, None,
+    )
+    assert (cancelled.state, replacement.state, replacement.content) == (
+        "cancelled", "scheduled", "new",
+    )
+    assert [call[0] for call in transport.calls] == ["put", "post", "post"]
+    replacement_posts = [call[2] for call in transport.calls if call[0] == "post"]
+    assert replacement_posts[0]["replacement"]["opaque_payload"] != (
+        replacement_posts[1]["replacement"]["opaque_payload"]
+    )
+    replacement_record = await store.get_reminder_sync_record(
+        replacement.occurrence_id
+    )
+    assert replacement_record is not None
+    assert replacement_record.opaque_payload is not None
+    assert transport.committed_replace_response is not None
+    canonical_payload = transport.committed_replace_response["replacement"][
+        "opaque_payload"
+    ]
+    assert _base64url_encode(replacement_record.opaque_payload) == canonical_payload
+    transport.rows = list(transport.committed_replace_response.values())
+    assert await sync.reconcile_snapshot() == 0
+    before_retry = len(transport.calls)
+    retried = await sync.replace_reminder(reminder.reminder_id, "new", None, None)
+    assert retried[1].reminder_id == replacement.reminder_id
+    assert len(transport.calls) == before_retry
+    rows = await store.list_reminders()
+    assert {
+        row.reminder_id: (row.state, row.content)
+        for row in rows
+    } == {
+        reminder.reminder_id: ("cancelled", "old"),
+        replacement.reminder_id: ("scheduled", "new"),
+    }
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_replace_retry_preserves_terminal_replacement_creation_time(tmp_path):
+    transport = _RecordingTransport()
+    sync, store, _scheduler, _keys = _sync(tmp_path, transport, now=[2_000])
+    reminder = await store.create_reminder(
+        content="old", target="dm:peer", intended_at_ms=5_000,
+    )
+    record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert record is not None
+    await sync._ensure_envelope(record)
+    transport.drop_replace_response_once = True
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        await sync.replace_reminder(reminder.reminder_id, "new", None, None)
+    assert transport.committed_replace_response is not None
+    remote = transport.committed_replace_response["replacement"]
+    remote.update({
+        "revision": 2,
+        "lifecycle": "cancelled",
+        "lifecycle_at": reminder_time_to_rfc3339(2_500),
+    })
+    remote.pop("opaque_payload")
+    transport.rows = list(transport.committed_replace_response.values())
+    assert await sync.reconcile_snapshot() == 1
+    reconciled = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert reconciled is not None
+    assert (reconciled.state, reconciled.server_ack_revision) == ("cancelled", 2)
+    assert await store.get_reminder(str(remote["reminder_id"])) is None
+    _cancelled, replacement = await sync.replace_reminder(
+        reminder.reminder_id, "new", None, None,
+    )
+    assert (replacement.state, replacement.created_at_ms, replacement.cancelled_at_ms) == (
+        "cancelled", 2_000, 2_500,
+    )
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_remote_replace_preserves_a_racing_local_delivery(
+    tmp_path, monkeypatch,
+):
+    """A committed remote replacement converges without erasing a local fire."""
+    transport = _RecordingTransport()
+    sync, store, _scheduler, _keys = _sync(tmp_path, transport, now=[2_000])
+    reminder = await store.create_reminder(
+        content="old", target="dm:peer", intended_at_ms=1_000,
+    )
+    assert await sync.upload_pending_once() == 1
+    original_post = transport.post
+
+    async def post_then_deliver(path, body):
+        response = await original_post(path, body)
+        claim_id = "50c0a35a-7f24-4a9d-879a-f87ec418b790"
+        await store.persist_reminder_delivery_claim_id(
+            occurrence_id=reminder.occurrence_id, revision=1, claim_id=claim_id,
+        )
+        assert await store.acquire_reminder_delivery_claim(
+            occurrence_id=reminder.occurrence_id,
+            revision=1,
+            claim_id=claim_id,
+            lease_expires_at_ms=10_000,
+        )
+        await store.claim_authorized_reminders(
+            (reminder.occurrence_id,), now_ms=2_000,
+        )
+        delivered = await store.deliver_authorized_reminders(
+            (reminder.occurrence_id,), now_ms=2_000,
+        )
+        assert [item.occurrence_id for item in delivered] == [reminder.occurrence_id]
+        return response
+
+    monkeypatch.setattr(transport, "post", post_then_deliver)
+    old, replacement = await sync.replace_reminder(
+        reminder.reminder_id, "new", None, None,
+    )
+    assert old.state == "delivered"
+    assert replacement.state == "scheduled"
+    old_record = await store.get_reminder_sync_record(reminder.occurrence_id)
+    assert old_record is not None and old_record.server_ack_revision == 2
     await store.close()
 
 
@@ -603,8 +830,8 @@ async def test_acknowledged_persisted_delivery_claim_rejects_cancellation(tmp_pa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("custody", ["prepared", "acknowledged", "claimed"])
-async def test_prepared_acknowledged_or_claimed_work_rejects_cancellation(
+@pytest.mark.parametrize("custody", ["prepared", "acknowledged"])
+async def test_prepared_or_acknowledged_work_rejects_cancellation(
     tmp_path, custody,
 ):
     transport = _RecordingTransport()
@@ -612,9 +839,7 @@ async def test_prepared_acknowledged_or_claimed_work_rejects_cancellation(
     reminder = await store.create_reminder(
         content="due", target="dm:peer", intended_at_ms=1_000,
     )
-    if custody == "claimed":
-        await store.claim_due_reminders(now_ms=2_000)
-    elif custody == "prepared":
+    if custody == "prepared":
         record = await store.get_reminder_sync_record(reminder.occurrence_id)
         assert record is not None
         await sync._ensure_envelope(record)
@@ -626,7 +851,7 @@ async def test_prepared_acknowledged_or_claimed_work_rejects_cancellation(
 
     retained = await store.get_reminder_sync_record(reminder.occurrence_id)
     assert retained is not None
-    assert retained.state == ("claimed" if custody == "claimed" else "scheduled")
+    assert retained.state == "scheduled"
     await store.close()
 
 
@@ -1555,6 +1780,18 @@ async def test_terminal_snapshot_suppresses_stale_local_schedule_without_event(t
         created_at_ms=500,
     )
     assert await sync.upload_pending_once() == 1
+    claim_id = "50c0a35a-7f24-4a9d-879a-f87ec418b790"
+    await store.persist_reminder_delivery_claim_id(
+        occurrence_id=reminder.occurrence_id,
+        revision=1,
+        claim_id=claim_id,
+    )
+    assert await store.acquire_reminder_delivery_claim(
+        occurrence_id=reminder.occurrence_id,
+        revision=1,
+        claim_id=claim_id,
+        lease_expires_at_ms=10_000,
+    )
     transport.rows = [_terminal_row(
         reminder_id=reminder.reminder_id,
         occurrence_id=reminder.occurrence_id,
@@ -1566,6 +1803,9 @@ async def test_terminal_snapshot_suppresses_stale_local_schedule_without_event(t
     assert (record.state, record.revision, record.server_ack_revision) == (
         "delivered", 2, 2,
     )
+    assert record.delivery_claim_id is None
+    assert not record.delivery_claim_acquired
+    assert record.delivery_claim_expires_at_ms is None
     assert await scheduler.process_due_once() == ()
     assert await store.get_message_by_envelope(
         f"reminder-occurrence:{reminder.occurrence_id}"
@@ -1575,7 +1815,7 @@ async def test_terminal_snapshot_suppresses_stale_local_schedule_without_event(t
 
 
 @pytest.mark.asyncio
-async def test_remote_cancellation_does_not_ack_local_delivery(tmp_path):
+async def test_remote_cancellation_acknowledges_but_preserves_local_delivery(tmp_path):
     _syncer, store, _scheduler, _keys = _sync(
         tmp_path,
         _RecordingTransport(),
@@ -1608,10 +1848,10 @@ async def test_remote_cancellation_does_not_ack_local_delivery(tmp_path):
     assert (record.state, record.revision, record.server_ack_revision) == (
         "delivered",
         2,
-        0,
+        2,
     )
     pending = await store.pending_reminder_sync_records(force=True)
-    assert [item.occurrence_id for item in pending] == [reminder.occurrence_id]
+    assert pending == ()
     await store.close()
 
 

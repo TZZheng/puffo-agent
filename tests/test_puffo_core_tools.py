@@ -468,11 +468,15 @@ async def test_reminder_tools_have_exact_semantic_schemas_and_live_dispatch():
             calls.append(("cancel", kwargs))
             return {**reminder, "state": "cancelled", "cancelled_at": "2026-08-02T11:01:00.000Z"}
 
+        async def replace_reminder(self, **kwargs):
+            calls.append(("replace", kwargs))
+            return {"cancelled": reminder, "replacement": {**reminder, "content": "new"}}
+
     cfg.inbox_runtime = Runtime()
     mcp = _build_tools(cfg)
     tools = {tool.name: tool for tool in await mcp.list_tools()}
     assert set(tools).issuperset({
-        "create_reminder", "list_reminders", "cancel_reminder",
+        "create_reminder", "list_reminders", "cancel_reminder", "replace_reminder",
     })
     assert set(tools["create_reminder"].inputSchema["properties"]) == {
         "content", "target", "intended_at",
@@ -483,12 +487,15 @@ async def test_reminder_tools_have_exact_semantic_schemas_and_live_dispatch():
     assert set(tools["cancel_reminder"].inputSchema["properties"]) == {
         "reminder_id",
     }
+    assert set(tools["replace_reminder"].inputSchema["properties"]) == {
+        "reminder_id", "content", "target", "intended_at",
+    }
     forbidden = {
         "recurrence", "provider", "server", "schedule_wake", "pause",
         "resume", "execute", "skip", "apologize", "reply", "silence",
         "state_machine", "actual_fire_at", "occurrence_id",
     }
-    for name in ("create_reminder", "list_reminders", "cancel_reminder"):
+    for name in ("create_reminder", "list_reminders", "cancel_reminder", "replace_reminder"):
         assert set(tools[name].inputSchema["properties"]).isdisjoint(forbidden)
 
     assert (await mcp.call_tool("create_reminder", {
@@ -502,6 +509,10 @@ async def test_reminder_tools_have_exact_semantic_schemas_and_live_dispatch():
         "reminder_id": "reminder-1",
     }))[1]
     assert cancelled["state"] == "cancelled"
+    replaced = (await mcp.call_tool("replace_reminder", {
+        "reminder_id": "reminder-1", "content": "new",
+    }))[1]
+    assert replaced["replacement"]["content"] == "new"
     assert calls == [
         ("create", {
             "content": "exact content", "target": "channel:sp:ch",
@@ -509,6 +520,10 @@ async def test_reminder_tools_have_exact_semantic_schemas_and_live_dispatch():
         }),
         ("list", {"state": "scheduled", "limit": 3}),
         ("cancel", {"reminder_id": "reminder-1"}),
+        ("replace", {
+            "reminder_id": "reminder-1", "content": "new",
+            "target": "", "intended_at": "",
+        }),
     ]
 
 
@@ -548,6 +563,10 @@ async def test_reminder_tools_fall_back_to_configured_loopback_rpc_client():
             calls.append(("cancel", kwargs))
             return cancelled
 
+        async def replace_reminder(self, **kwargs):
+            calls.append(("replace", kwargs))
+            return {"cancelled": cancelled, "replacement": scheduled}
+
     # No warm in-process runtime is available on the subprocess MCP path.
     cfg.inbox_runtime = None
     cfg.message_client = None
@@ -564,6 +583,9 @@ async def test_reminder_tools_fall_back_to_configured_loopback_rpc_client():
     assert (await mcp.call_tool("cancel_reminder", {
         "reminder_id": "reminder-1",
     }))[1] == cancelled
+    assert (await mcp.call_tool("replace_reminder", {
+        "reminder_id": "reminder-1", "intended_at": "2026-08-03T12:00:00Z",
+    }))[1] == {"cancelled": cancelled, "replacement": scheduled}
     assert calls == [
         ("create", {
             "content": "exact content", "target": "channel:sp:ch",
@@ -571,6 +593,10 @@ async def test_reminder_tools_fall_back_to_configured_loopback_rpc_client():
         }),
         ("list", {"state": "scheduled", "limit": 3}),
         ("cancel", {"reminder_id": "reminder-1"}),
+        ("replace", {
+            "reminder_id": "reminder-1", "content": "", "target": "",
+            "intended_at": "2026-08-03T12:00:00Z",
+        }),
     ]
 
 

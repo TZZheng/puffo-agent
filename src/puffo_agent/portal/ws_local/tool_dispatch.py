@@ -28,6 +28,7 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "create_reminder",
     "list_reminders",
     "cancel_reminder",
+    "replace_reminder",
     "get_user_info",
     "whoami",
     "get_post",

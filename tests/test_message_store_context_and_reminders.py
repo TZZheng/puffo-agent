@@ -568,15 +568,13 @@ async def test_reminder_restart_boundaries_and_cancellation_are_atomic(tmp_path,
         content="claimed cancel", target="channel:sp:ch", intended_at_ms=1,
     )
     await reopened.claim_due_reminders(now_ms=3_500)
-    with pytest.raises(LifecycleConflict):
-        await reopened.cancel_reminder(claimed_cancel.reminder_id)
-    assert [
-        item.reminder_id
-        for item in await reopened.deliver_due_reminders(now_ms=5_000)
-    ] == [claimed_cancel.reminder_id]
+    cancelled_claim = await reopened.cancel_reminder(claimed_cancel.reminder_id)
+    assert cancelled_claim.state == "cancelled"
+    assert cancelled_claim.actual_fire_at_ms is None
+    assert not await reopened.deliver_due_reminders(now_ms=5_000)
     assert await reopened.get_message_by_envelope(
         f"reminder-occurrence:{claimed_cancel.occurrence_id}"
-    ) is not None
+    ) is None
 
     delivered = await reopened.create_reminder(
         content="history stays", target="channel:sp:ch", intended_at_ms=1,
@@ -607,9 +605,15 @@ async def test_claimed_cancel_delivery_race_serializes_to_one_valid_terminal_sta
     event = await store.get_message_by_envelope(
         f"reminder-occurrence:{reminder.occurrence_id}"
     )
-    assert terminal.state == "delivered" and event is not None
-    assert len(delivered) == 1
-    assert isinstance(cancel, LifecycleConflict) or cancel.state == "delivered"
+    assert terminal.state in {"cancelled", "delivered"}
+    if terminal.state == "cancelled":
+        assert event is None
+        assert not delivered
+        assert cancel.state == "cancelled"
+    else:
+        assert event is not None
+        assert len(delivered) == 1
+        assert isinstance(cancel, LifecycleConflict) or cancel.state == "delivered"
     await store.close()
 
 

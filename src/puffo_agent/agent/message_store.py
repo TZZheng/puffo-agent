@@ -33,6 +33,7 @@ ReminderOccurrence = _models.ReminderOccurrence
 ReminderSyncRecord = _models.ReminderSyncRecord
 ReminderMaterializationResult = _models.ReminderMaterializationResult
 REMINDER_STATES = _models.REMINDER_STATES
+PUBLIC_REMINDER_STATES = _models.PUBLIC_REMINDER_STATES
 MAX_REMINDER_LIST_LIMIT = _models.MAX_REMINDER_LIST_LIMIT
 MAX_REMINDER_ENVELOPE_BYTES = _models.MAX_REMINDER_ENVELOPE_BYTES
 reminder_plaintext_envelope_size = _models.reminder_plaintext_envelope_size
