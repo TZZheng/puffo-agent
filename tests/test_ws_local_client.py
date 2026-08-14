@@ -320,6 +320,66 @@ async def test_end_command_is_forwarded(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_reused_session_does_not_replay_historical_commands(tmp_path: Path):
+    bundle_path = tmp_path / "agent.puffoagent"
+    bundle_path.write_bytes(b"x")
+    session_dir = tmp_path / "session"
+    session_dir.mkdir()
+    commands_path = session_dir / "commands.ndjson"
+    commands_path.write_text(
+        json.dumps({
+            "type": "tool_call",
+            "command_id": "stale",
+            "tool": "send_message",
+            "params": {"channel": "ch_x", "text": "must not replay"},
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    received: list[dict] = []
+    server_seen_close = asyncio.Event()
+
+    async def handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        async for msg in ws:
+            if msg.type != WSMsgType.TEXT:
+                break
+            frame = json.loads(msg.data)
+            received.append(frame)
+            if frame["type"] == "connect":
+                await ws.send_str(json.dumps({
+                    "type": "connected", "session_id": "s", "agent": {},
+                }))
+        server_seen_close.set()
+        return ws
+
+    runner, base = await _start_fake_daemon(handler)
+    try:
+        task = asyncio.create_task(run_attach(
+            bundle_path, "abc12345", daemon_url=base, session_dir=session_dir,
+        ))
+
+        events_path = session_dir / "events.ndjson"
+        for _ in range(50):
+            if events_path.exists() and '"type": "connected"' in events_path.read_text(
+                encoding="utf-8"
+            ):
+                break
+            await asyncio.sleep(0.05)
+        with commands_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"type": "detach"}) + "\n")
+
+        await asyncio.wait_for(server_seen_close.wait(), timeout=2.0)
+        await asyncio.wait_for(task, timeout=2.0)
+
+        assert [frame["type"] for frame in received] == ["connect"]
+        assert "must not replay" not in events_path.read_text(encoding="utf-8")
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_detach_command_closes_ws_and_exits(tmp_path: Path):
     bundle_path = tmp_path / "agent.puffoagent"
     bundle_path.write_bytes(b"x")
