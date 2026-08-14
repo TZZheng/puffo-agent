@@ -8,6 +8,7 @@ import pytest
 from aiohttp import web
 
 from puffo_agent.agent import send_coordinator as sc_mod
+from puffo_agent.agent.global_inbox_types import BaselineAdapter
 from puffo_agent.agent.send_coordinator import (
     CHANNEL_SEND_PATH,
     KEYLESS_CHANNEL_SEND_PATH,
@@ -19,6 +20,7 @@ from puffo_agent.crypto.http_client import HttpError
 from puffo_agent.crypto.http_client import PuffoCoreHttpClient
 from puffo_agent.crypto.primitives import KemKeyPair
 from puffo_agent.mcp.data_client import DataNotFound
+from puffo_agent.portal.workspace_layout import ensure_workspace_shared_link
 
 from .test_puffo_core_tools import _setup, _setup_keyless
 
@@ -85,6 +87,42 @@ async def coordinator_fixture(*, baseline=0, active=None):
     return coordinator, freshness, http
 
 
+def test_attachment_validation_allows_only_managed_shared_link(tmp_path):
+    workspace = tmp_path / "agents" / "alice" / "workspace"
+    shared = tmp_path / "shared"
+    ensure_workspace_shared_link(workspace, shared)
+    (shared / "evidence.txt").write_text("shared evidence", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("private", encoding="utf-8")
+    (workspace / "escape").symlink_to(outside, target_is_directory=True)
+
+    coordinator = SendCoordinator(
+        slug="alice",
+        keystore=SimpleNamespace(),
+        http_client=SimpleNamespace(),
+        data_client=SimpleNamespace(),
+        workspace=str(workspace),
+        shared_workspace=str(shared),
+    )
+    request = SemanticSendRequest(
+        destination="ch_test",
+        text="evidence",
+        attachment_paths=("shared/evidence.txt",),
+    )
+    assert coordinator._validate_attachment_targets(request) == [
+        (shared / "evidence.txt").resolve()
+    ]
+
+    escaped = SemanticSendRequest(
+        destination="ch_test",
+        text="secret",
+        attachment_paths=("escape/secret.txt",),
+    )
+    with pytest.raises(RuntimeError, match="escapes the workspace"):
+        coordinator._validate_attachment_targets(escaped)
+
+
 @pytest.mark.asyncio
 async def test_initial_send_anyway_fails_before_request_shape_is_built():
     coordinator, _, http = await coordinator_fixture(baseline=4, active=6)
@@ -109,22 +147,182 @@ async def test_baseline_invalid_fails_without_send(baseline):
     assert not [call for call in http.calls if call[0].startswith("POST")]
 
 
-@pytest.mark.asyncio
-async def test_missing_baseline_defaults_to_zero_and_active_turn_advances_seen():
-    coordinator, _, http = await coordinator_fixture(baseline=None, active=7)
-    result = await coordinator.send(
-        SemanticSendRequest(destination="ch_a", text="hello"),
-    )
-    assert result["state"] == "sent", result
-    body = [
-        body for method, path, body in http.calls
-        if method == "POST" and path == CHANNEL_SEND_PATH
-    ][-1]
-    assert body["freshness"] == {
-        "context_baseline_seq": 0,
-        "seen_seq": 7,
-        "mode": "require_current",
+async def _baseline_lifecycle_coordinator(lane):
+    if lane == "keyless":
+        cfg, http, store = _setup_keyless()
+    else:
+        cfg, http, store = _setup()
+    await store.mark_channel_space("ch_a", "sp_1")
+    device = KemKeyPair.generate()
+    http.responses["/spaces/sp_1/channels/ch_a/members"] = {
+        "members": [{"slug": "alice-1"}],
     }
+    http.responses["/certs/sync?slugs=alice-1"] = {
+        "entries": [{
+            "seq": 1,
+            "kind": "device_cert",
+            "cert": {
+                "device_id": "dev_a",
+                "kem_public_key": base64url_encode(device.public_key_bytes()),
+            },
+        }],
+        "has_more": False,
+    }
+    active = Freshness(active=None)
+    coordinator = SendCoordinator(
+        slug=cfg.slug,
+        keystore=cfg.keystore,
+        http_client=http,
+        data_client=store,
+        baseline_source=BaselineAdapter(store),
+        active_turn_source=active,
+    )
+    return coordinator, active, http, store
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("lane", "replay"),
+    [
+        ("native", False),
+        ("native", True),
+        ("keyless", False),
+        ("keyless", True),
+    ],
+    ids=["native-new", "native-replay", "keyless-new", "keyless-replay"],
+)
+async def test_null_baseline_lifecycle_preserves_none_and_persists_established(
+    lane, replay,
+):
+    coordinator, active, http, store = await _baseline_lifecycle_coordinator(lane)
+    bodies = []
+    sent_once = {"done": False}
+    send_path = CHANNEL_SEND_PATH if lane == "native" else KEYLESS_CHANNEL_SEND_PATH
+
+    async def commit(_path, body=None):
+        bodies.append((_path, body))
+        envelope_id = (
+            body["envelope"]["envelope_id"] if lane == "native" else "msg_keyless"
+        )
+        if not sent_once["done"]:
+            sent_once["done"] = True
+            return {
+                "state": "held",
+                "envelope_id": envelope_id,
+                "context_baseline_seq": body["freshness"]["context_baseline_seq"],
+                "seen_seq": body["freshness"]["seen_seq"],
+                "latest_seq": 3,
+                "latest_envelope_id": "msg_latest",
+            }
+        return {
+            "state": "sent",
+            "envelope_id": envelope_id,
+            "seq": 7,
+            "replay": replay,
+            "missing_devices": [],
+            "freshness": {
+                "mode": "require_current",
+                "context_baseline_seq": 5,
+                "seen_seq": 0,
+                "latest_seq_before_send": 5,
+            },
+        }
+
+    if lane == "native":
+        http.post = commit
+    else:
+        http.post_unsigned = commit
+
+    held = await coordinator.send(SemanticSendRequest(
+        destination="ch_a", text="probe",
+    ))
+    assert held["state"] == "held", held
+    null_body = [body for path, body in bodies if path == send_path][0]
+    assert null_body["freshness"]["context_baseline_seq"] is None
+    assert null_body["freshness"]["seen_seq"] == 0
+    assert await store.get_context_baseline("sp_1", "ch_a") is None
+
+    sent = await coordinator.send(SemanticSendRequest(
+        destination="ch_a", text="establish",
+    ))
+    assert sent["state"] == "sent", sent
+    assert sent["context_baseline_seq"] == 5
+    assert sent["seen_seq"] == 0
+    assert active.active == 7
+    established_body = [body for path, body in bodies if path == send_path][-1]
+    assert established_body["freshness"]["context_baseline_seq"] is None
+    assert established_body["freshness"]["seen_seq"] == 0
+    assert await store.get_context_baseline("sp_1", "ch_a") == 5
+
+    rebuilt = SendCoordinator(
+        slug=coordinator.slug,
+        keystore=coordinator.keystore,
+        http_client=http,
+        data_client=store,
+        baseline_source=BaselineAdapter(store),
+        active_turn_source=Freshness(active=5),
+    )
+    boundary = await rebuilt._resolve_send_boundary(
+        SemanticSendRequest(destination="ch_a", text="later"),
+        "sp_1",
+        "ch_a",
+        combined_error=True,
+    )
+    assert boundary.baseline == 5
+    assert boundary.seen_seq == 5
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["native", "keyless"])
+async def test_committed_send_reports_baseline_persistence_failure(lane):
+    coordinator, _active, http, store = await _baseline_lifecycle_coordinator(lane)
+
+    class FailingBaseline:
+        def __init__(self):
+            self.calls = 0
+
+        async def get_context_baseline_seq(self, _space_id, _channel_id):
+            return None
+
+        async def set_context_baseline_seq(self, _space_id, _channel_id, _seq):
+            self.calls += 1
+            raise RuntimeError("sqlite unavailable")
+
+    baseline = FailingBaseline()
+    coordinator.baseline_source = baseline
+
+    async def commit(_path, body=None):
+        envelope_id = (
+            body["envelope"]["envelope_id"] if lane == "native" else "msg_keyless"
+        )
+        return {
+            "state": "sent",
+            "envelope_id": envelope_id,
+            "seq": 7,
+            "replay": False,
+            "missing_devices": [],
+            "freshness": {
+                "mode": "require_current",
+                "context_baseline_seq": 5,
+                "seen_seq": 0,
+                "latest_seq_before_send": 5,
+            },
+        }
+
+    if lane == "native":
+        http.post = commit
+    else:
+        http.post_unsigned = commit
+
+    result = await coordinator.send(SemanticSendRequest(
+        destination="ch_a", text="already committed",
+    ))
+
+    assert result["state"] == "sent"
+    assert "local freshness baseline could not be saved" in result["note"]
+    assert baseline.calls == 2
+    await store.close()
 
 
 @pytest.mark.asyncio

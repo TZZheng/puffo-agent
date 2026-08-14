@@ -36,6 +36,7 @@ from .data_service import (
 )
 from .host_mcp_handler import HostMcpContext
 from .rpc_service import set_rpc_resolver, start_rpc_service, stop_rpc_service
+from .runtime_matrix import RUNTIME_CLI_DOCKER, RUNTIME_CLI_LOCAL
 from .state import (
     AgentConfig,
     DaemonConfig,
@@ -62,10 +63,15 @@ from .state import (
     refresh_session_flag_path,
     refresh_token_request_path,
     restart_flag_path,
+    shared_fs_dir,
     stop_request_path,
     stop_requested_for,
     write_daemon_pid,
     write_daemon_ready,
+)
+from .workspace_layout import (
+    AVAILABLE_SHARED_WORKSPACE_STATES,
+    prepare_workspace_shared_access,
 )
 from .worker import Worker
 
@@ -286,6 +292,18 @@ class Daemon:
         if cached is not None and (cached[0], cached[1]) == key:
             return cached[2]
         cfg = AgentConfig.load(agent_id)
+        shared_status = prepare_workspace_shared_access(
+            cfg.resolve_workspace_dir(),
+            shared_fs_dir(),
+            mounted=(cfg.runtime.kind or RUNTIME_CLI_LOCAL) == RUNTIME_CLI_DOCKER,
+        )
+        if shared_status not in AVAILABLE_SHARED_WORKSPACE_STATES:
+            logger.error(
+                "agent %s: shared workspace is %s; cross-Agent file handoffs "
+                "are unavailable",
+                agent_id,
+                shared_status,
+            )
         self._agent_cfg_cache[agent_id] = (st.st_mtime_ns, st.st_size, cfg)
         return cfg
 
@@ -1321,6 +1339,10 @@ async def run_daemon(
     daemon_cfg = DaemonConfig.load()
     pid = os.getpid()
     try:
+        # With no live daemon proven above, a leftover stop sentinel
+        # (old-CLI timestamp-only or stale JSON) must not kill the new
+        # process — clear it before publishing our own pid.
+        clear_stop_request()
         write_daemon_pid(pid)
         daemon = Daemon(daemon_cfg)
         loop = asyncio.get_running_loop()

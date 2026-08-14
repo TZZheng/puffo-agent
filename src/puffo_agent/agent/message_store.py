@@ -1449,6 +1449,102 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             await db.commit()
             return count
 
+    async def tombstone_gated_dm(
+        self,
+        envelope_id: str,
+        server_seq: int | None = None,
+    ) -> ReceiptResult:
+        """Discard the refused plaintext of exactly one correlated gated DM.
+
+        Envelope-and-optional-sequence sibling of the sender-wide
+        ``tombstone_gated_dms_from``, mirroring ``promote_gated_receipt`` on
+        the denial side: only the matching ``foreign_dm_gated`` receipt is
+        tombstoned with the same terminal placeholder, so envelope accounting
+        and redelivery dedupe keep working while the plaintext the operator
+        refused is gone. First exact transition is ``COMMITTED``; replay of
+        an already-denied receipt is ``IDEMPOTENT``; a missing, sequence-
+        mismatched, or otherwise incompatible receipt is ``CONFLICT``.
+        """
+        async with self._inbox_lock:
+            return await self._tombstone_gated_dm_unlocked(
+                envelope_id, server_seq
+            )
+
+    async def _tombstone_gated_dm_unlocked(
+        self,
+        envelope_id: str,
+        server_seq: int | None,
+    ) -> ReceiptResult:
+        db = await self._ensure_db()
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute(
+                "SELECT server_seq, receipt_disposition, processing_state, "
+                "content FROM messages WHERE envelope_id = ?",
+                (envelope_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None or (
+                server_seq is not None and row["server_seq"] != server_seq
+            ) or (
+                server_seq is None and row["server_seq"] is not None
+            ):
+                await db.rollback()
+                return ReceiptResult(
+                    ReceiptWriteStatus.CONFLICT,
+                    ReceiptDisposition.FOREIGN_DM_GATED,
+                    "gated receipt association mismatch",
+                    False,
+                )
+            denied = (
+                row["receipt_disposition"] == ReceiptDisposition.TERMINAL.value
+                and row["content"] == _encode_content(DENIED_DM_PLACEHOLDER)
+            )
+            if denied:
+                await db.rollback()
+                return ReceiptResult(
+                    ReceiptWriteStatus.IDEMPOTENT,
+                    ReceiptDisposition.TERMINAL,
+                    "foreign dm denied by operator",
+                    True,
+                )
+            if (
+                row["receipt_disposition"] != ReceiptDisposition.FOREIGN_DM_GATED.value
+                or row["processing_state"] is not None
+            ):
+                await db.rollback()
+                return ReceiptResult(
+                    ReceiptWriteStatus.CONFLICT,
+                    ReceiptDisposition.FOREIGN_DM_GATED,
+                    "receipt is not approval-gated",
+                    False,
+                )
+            await db.execute(
+                """UPDATE messages
+                   SET content = ?, content_type = 'text/plain',
+                       receipt_disposition = ?, receipt_reason = ?
+                   WHERE envelope_id = ? AND receipt_disposition = ?
+                     AND processing_state IS NULL AND server_seq IS ?""",
+                (
+                    _encode_content(DENIED_DM_PLACEHOLDER),
+                    ReceiptDisposition.TERMINAL.value,
+                    "foreign dm denied by operator",
+                    envelope_id,
+                    ReceiptDisposition.FOREIGN_DM_GATED.value,
+                    server_seq,
+                ),
+            )
+            await db.commit()
+            return ReceiptResult(
+                ReceiptWriteStatus.COMMITTED,
+                ReceiptDisposition.TERMINAL,
+                "foreign dm denied by operator",
+                True,
+            )
+        except Exception:
+            await db.rollback()
+            raise
+
     async def cleanup(self, retention_days: int = 90) -> int:
         async with self._inbox_lock:
             db = await self._ensure_db()

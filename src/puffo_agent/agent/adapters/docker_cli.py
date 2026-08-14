@@ -10,9 +10,9 @@ settings — seeded once from the operator's real ``~/.claude``). A private
 credential view is refreshed from the host before the per-agent Claude home
 is mounted into the container.
 
-A second bind-mount exposes ``~/.puffo-agent/shared/`` at
-``/workspace/.shared`` so all agents on this host can cooperate at
-the filesystem level.
+A second bind-mount exposes the Puffo-home ``shared/`` directory at
+``/workspace/shared`` so all agents on this host can cooperate at the
+filesystem level. ``/workspace/.shared`` remains as a compatibility alias.
 
 Lifecycle:
   - container: one per agent (``puffo-<id>``), started lazily,
@@ -46,6 +46,7 @@ from ...portal.state import (
     sync_host_mcp_servers,
     sync_host_skills,
 )
+from ...portal.workspace_layout import prepare_workspace_shared_access
 from .base import Adapter, TurnContext, TurnResult
 from ..context_controller import (
     ContextCapabilities,
@@ -70,14 +71,19 @@ def _puffo_agent_pkg_dir() -> Path:
 # Bump on Dockerfile changes so existing hosts rebuild without manual
 # image-tag pruning. ``_ensure_image`` only builds when the tag is
 # missing locally.
-DEFAULT_IMAGE = "puffo/agent-runtime:v18"
-CONTAINER_LAYOUT_VERSION = "18"
+DEFAULT_IMAGE = "puffo/agent-runtime:v19"
+CONTAINER_LAYOUT_VERSION = "21"
 
 # Pinned Claude Code CLI version baked into the image. Floating would
 # let an upstream release shift the stream-json protocol or
 # ``--permission-mode`` semantics under us; bump deliberately after
 # verification.
 CLAUDE_CODE_NPM_VERSION = "2.1.224"
+
+# Pinned Codex CLI version baked into the same image. The Driver talks
+# ``codex app-server`` JSON-RPC, whose frame shapes move between
+# releases, so the version is pinned and only bumped after verification.
+CODEX_NPM_VERSION = "0.147.0"
 
 DOCKER_COMMAND_TIMEOUT_SECONDS = 60.0
 DOCKER_BUILD_TIMEOUT_SECONDS = 900.0
@@ -102,6 +108,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \\
 
 RUN npm install -g @anthropic-ai/claude-code@__CLAUDE_CODE_VERSION__
 
+RUN npm install -g @openai/codex@__CODEX_CODE_VERSION__
+
 # Puffo MCP tools server deps. ``--break-system-packages`` is
 # required on Debian bookworm (PEP 668); acceptable since the
 # container is single-purpose and disposable. ``uv`` ships ``uvx``
@@ -124,6 +132,9 @@ CMD ["sh", "-c", "set -eu; mkdir -p /workspace/.puffo-agent; touch /workspace/.p
 """.replace(
     "__CLAUDE_CODE_VERSION__",
     CLAUDE_CODE_NPM_VERSION,
+).replace(
+    "__CODEX_CODE_VERSION__",
+    CODEX_NPM_VERSION,
 )
 
 
@@ -521,22 +532,7 @@ class DockerCLIAdapter(Adapter):
         the container doesn't exist, or ``None`` when Docker could not
         answer the probe.
         """
-        rc, out, _ = await _run_cmd(
-            [
-                self._docker_bin,
-                "container",
-                "ls",
-                "--all",
-                "--filter",
-                f"name=^/{self.container_name}$",
-                "--format",
-                "{{.State}}",
-            ],
-            check=False,
-        )
-        if rc != 0:
-            return None
-        return out.decode("utf-8", errors="replace").strip()
+        return await container_state(self._docker_bin, self.container_name)
 
     async def _install_desired(self) -> None:
         """Install container-compatible desired assets once per instance."""
@@ -742,61 +738,13 @@ class DockerCLIAdapter(Adapter):
         layout_marker.write_text(CONTAINER_LAYOUT_VERSION + "\n", encoding="utf-8")
 
     async def _ensure_image(self) -> None:
-        if await _image_exists_locally(self._docker_bin, self.image):
-            return
-        if self.image != DEFAULT_IMAGE:
-            raise RuntimeError(
-                f"docker image {self.image!r} not found locally. "
-                f"pull it (`docker pull {self.image}`) or clear "
-                "runtime.docker_image to use the bundled default."
-            )
-        # Daemon-wide lock — concurrent ``docker build -t <tag>``
-        # races in BuildKit's exporter and the loser crashes with
-        # "image already exists". First wins; others wait and re-check.
-        async with _BUILD_LOCK:
-            if await _image_exists_locally(self._docker_bin, self.image):
-                logger.info(
-                    "agent %s: image %s was built by another worker "
-                    "during our wait — skipping rebuild",
-                    self.agent_id,
-                    self.image,
-                )
-                return
-            logger.info(
-                "agent %s: building docker image %s (first use — this may take a few minutes)",
-                self.agent_id,
-                self.image,
-            )
-            await self._build_image()
-
-    async def _build_image(self) -> None:
-        from ..._proc import no_window_kwargs
-
-        proc = await asyncio.create_subprocess_exec(
-            self._docker_bin,
-            "build",
-            "-t",
-            self.image,
-            "-",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            **no_window_kwargs(),
+        await ensure_docker_image(
+            self._docker_bin, self.image, agent_id=self.agent_id
         )
-        stdout, _ = await _communicate_with_timeout(
-            proc,
-            input_data=DOCKERFILE.encode(),
-            timeout_seconds=DOCKER_BUILD_TIMEOUT_SECONDS,
-            operation="docker build",
-        )
-        if proc.returncode != 0:
-            tail = stdout.decode("utf-8", errors="replace")[-1500:]
-            raise RuntimeError(f"docker build failed:\n{tail}")
-        logger.info("agent %s: docker image %s built", self.agent_id, self.image)
 
     async def _start_container(self) -> None:
-        agent_claude_json = self._prepare_container_mounts()
-        command = self._container_run_command(agent_claude_json)
+        agent_claude_json, shared_status = self._prepare_container_mounts()
+        command = self._container_run_command(agent_claude_json, shared_status)
         self._add_optional_container_args(command)
         command.append(self.image)
         rc, _, stderr = await _run_cmd(command, check=False)
@@ -806,18 +754,22 @@ class DockerCLIAdapter(Adapter):
                 f"{stderr.decode('utf-8', errors='replace').strip()[:500]}"
             )
 
-    def _prepare_container_mounts(self) -> Path:
-        Path(self.workspace_dir).mkdir(parents=True, exist_ok=True)
+    def _prepare_container_mounts(self) -> tuple[Path, str]:
+        shared_status = prepare_workspace_shared_access(
+            Path(self.workspace_dir),
+            self.shared_fs_dir,
+            mounted=True,
+        )
         self.agent_home_dir.mkdir(parents=True, exist_ok=True)
         (self.agent_home_dir / ".claude").mkdir(parents=True, exist_ok=True)
         agent_claude_json = self.agent_home_dir / ".claude.json"
         agent_claude_json.touch(exist_ok=True)
-        self.shared_fs_dir.mkdir(parents=True, exist_ok=True)
-        return agent_claude_json
+        return agent_claude_json, shared_status
 
     def _container_run_command(
         self,
         agent_claude_json: Path,
+        shared_status: str,
     ) -> list[str]:
         return [
             self._docker_bin,
@@ -835,6 +787,12 @@ class DockerCLIAdapter(Adapter):
             # container's ephemeral fs and is lost on restart.
             "-v",
             f"{agent_claude_json}:/home/agent/.claude.json",
+            *(
+                ["-v", f"{self.shared_fs_dir}:/workspace/shared"]
+                if shared_status == "mounted"
+                else []
+            ),
+            # Compatibility for existing sessions and user-authored paths.
             "-v",
             f"{self.shared_fs_dir}:/workspace/.shared",
             "-v",
@@ -868,6 +826,90 @@ class DockerCLIAdapter(Adapter):
 # (right after an image-tag bump every cli-docker worker would
 # otherwise race BuildKit's exporter).
 _BUILD_LOCK = asyncio.Lock()
+
+
+async def container_state(docker_bin: str, container_name: str) -> str | None:
+    """Docker-reported container State.Status (``running``, ``exited``,
+    ``paused``, ``created``, ``dead``), ``""`` when the container doesn't
+    exist, or ``None`` when Docker could not answer the probe.
+    """
+    rc, out, _ = await _run_cmd(
+        [
+            docker_bin,
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            f"name=^/{container_name}$",
+            "--format",
+            "{{.State}}",
+        ],
+        check=False,
+    )
+    if rc != 0:
+        return None
+    return out.decode("utf-8", errors="replace").strip()
+
+
+async def ensure_docker_image(docker_bin: str, image: str, *, agent_id: str = "") -> None:
+    """Build the bundled image when ``image`` is missing locally.
+
+    Shared by the Claude Docker adapter and the Docker Codex runtime
+    owner. A non-default image must already exist (the operator pulled
+    or built it); only ``DEFAULT_IMAGE`` is ever built here.
+    """
+    if await _image_exists_locally(docker_bin, image):
+        return
+    if image != DEFAULT_IMAGE:
+        raise RuntimeError(
+            f"docker image {image!r} not found locally. "
+            f"pull it (`docker pull {image}`) or clear "
+            "runtime.docker_image to use the bundled default."
+        )
+    # Daemon-wide lock — concurrent ``docker build -t <tag>``
+    # races in BuildKit's exporter and the loser crashes with
+    # "image already exists". First wins; others wait and re-check.
+    async with _BUILD_LOCK:
+        if await _image_exists_locally(docker_bin, image):
+            logger.info(
+                "agent %s: image %s was built by another worker "
+                "during our wait — skipping rebuild",
+                agent_id,
+                image,
+            )
+            return
+        logger.info(
+            "agent %s: building docker image %s (first use — this may take a few minutes)",
+            agent_id,
+            image,
+        )
+        await _build_image(docker_bin, image, agent_id)
+
+
+async def _build_image(docker_bin: str, image: str, agent_id: str) -> None:
+    from ..._proc import no_window_kwargs
+
+    proc = await asyncio.create_subprocess_exec(
+        docker_bin,
+        "build",
+        "-t",
+        image,
+        "-",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        **no_window_kwargs(),
+    )
+    stdout, _ = await _communicate_with_timeout(
+        proc,
+        input_data=DOCKERFILE.encode(),
+        timeout_seconds=DOCKER_BUILD_TIMEOUT_SECONDS,
+        operation="docker build",
+    )
+    if proc.returncode != 0:
+        tail = stdout.decode("utf-8", errors="replace")[-1500:]
+        raise RuntimeError(f"docker build failed:\n{tail}")
+    logger.info("agent %s: docker image %s built", agent_id, image)
 
 
 def _probe_result(returncode: int) -> bool | None:

@@ -9,12 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import mimetypes
 import urllib.parse
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
@@ -34,10 +33,13 @@ from ..crypto.message import (
 from ..crypto.primitives import Ed25519KeyPair
 from .held_context import build_held_context_output
 from .message_projection import CONTEXT_VERSION
+from .send_models import SemanticSendRequest, SendResult
 from .send_response_validation import (
+    BASELINE_PERSISTENCE_WARNING,
     coordinator_config,
     http_error_detail,
     optional_response_int,
+    persist_baseline,
     validate_channel_response,
     validate_keyless_response,
 )
@@ -50,129 +52,6 @@ _KNOWN_ERROR_STATUSES = {400, 401, 403, 404, 405, 409, 413, 429, 500, 503}
 # Held evidence holds decrypted context, so retention is bounded even when a
 # turn is abandoned without any further coordinated send in that channel.
 _MAX_HELD_RECORDS = 8
-
-@dataclass(frozen=True)
-class SemanticSendRequest:
-    """The complete model-facing send contract (and nothing freshness-related)."""
-
-    destination: str
-    text: str = ""
-    attachment_paths: tuple[str, ...] = ()
-    caption: str = ""
-    root_id: str = ""
-    visibility_level: str = "default"
-    send_anyway: bool = False
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> SemanticSendRequest:
-        allowed = {
-            "destination",
-            "channel",
-            "text",
-            "attachment_paths",
-            "paths",
-            "caption",
-            "root_id",
-            "visibility_level",
-            "send_anyway",
-        }
-        unknown = set(value) - allowed
-        if unknown:
-            raise ValueError(f"unknown send field(s): {', '.join(sorted(unknown))}")
-        destination = value.get("destination", value.get("channel", ""))
-        paths = value.get("attachment_paths", value.get("paths", ())) or ()
-        if not isinstance(paths, (list, tuple)) or not all(
-            isinstance(item, str) for item in paths
-        ):
-            raise ValueError("attachment paths must be a list of strings")
-        return cls(
-            destination=str(destination or ""),
-            text=str(value.get("text") or ""),
-            attachment_paths=tuple(paths),
-            caption=str(value.get("caption") or ""),
-            root_id=str(value.get("root_id") or ""),
-            visibility_level=str(value.get("visibility_level") or "default"),
-            send_anyway=value.get("send_anyway", False) is True,
-        )
-
-    def to_rpc_dict(self) -> dict[str, Any]:
-        body: dict[str, Any] = {
-            "channel": self.destination,
-            "root_id": self.root_id,
-            "visibility_level": self.visibility_level,
-            "send_anyway": self.send_anyway,
-        }
-        if self.attachment_paths:
-            body["paths"] = list(self.attachment_paths)
-            body["caption"] = self.caption
-        else:
-            body["text"] = self.text
-        return body
-
-    def attempt_fingerprint(self) -> str:
-        """Identify the logical draft behind one send attempt.
-
-        ``send_anyway`` is excluded so an unchanged draft's reconsideration
-        retry keeps the fingerprint of the attempt that was held, while any
-        revised draft — different text, caption, attachments, thread root, or
-        visibility — gets a different one.
-        """
-        arguments = self.to_tool_arguments()
-        arguments.pop("send_anyway", None)
-        return hashlib.sha256(
-            json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
-
-    def to_tool_arguments(self) -> dict[str, Any]:
-        """Mirror the public model call without materializing omitted defaults."""
-        arguments: dict[str, Any] = {"channel": self.destination}
-        if self.attachment_paths:
-            arguments.update(
-                {
-                    "caption": self.caption,
-                    "paths": list(self.attachment_paths),
-                }
-            )
-        else:
-            arguments["text"] = self.text
-        if self.root_id:
-            arguments["root_id"] = self.root_id
-        if self.visibility_level != "default":
-            arguments["visibility_level"] = self.visibility_level
-        if self.send_anyway:
-            arguments["send_anyway"] = True
-        return arguments
-
-
-@dataclass
-class SendResult:
-    state: str
-    attempted: bool = True
-    envelope_id: Optional[str] = None
-    seq: Optional[int] = None
-    replay: Optional[bool] = None
-    devices_queued: Optional[int] = None
-    context_baseline_seq: Optional[int] = None
-    seen_seq: Optional[int] = None
-    latest_seq: Optional[int] = None
-    latest_envelope_id: Optional[str] = None
-    blocking_seq: Optional[int] = None
-    blocking_envelope_id: Optional[str] = None
-    blocking_sender_slug: Optional[str] = None
-    latest_seq_before_send: Optional[int] = None
-    mode: Optional[str] = None
-    missing_devices: list[str] = field(default_factory=list)
-    recovered_messages: list[dict[str, Any]] = field(default_factory=list)
-    error: Optional[str] = None
-    error_kind: Optional[str] = None
-    status: Optional[int] = None
-    note: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        data = asdict(self)
-        return {
-            key: value for key, value in data.items() if value not in (None, [], "")
-        }
 
 
 @dataclass
@@ -214,7 +93,7 @@ class _ReconsiderationDecision:
 
 @dataclass(frozen=True)
 class _ChannelSendBoundary:
-    baseline: int
+    baseline: int | None
     seen_seq: int
     held_key: tuple[str, str, str, str]
     attempt_fingerprint: str
@@ -243,6 +122,7 @@ class ContextBaselineSource(Protocol):
     async def get_context_baseline_seq(
         self, space_id: str, channel_id: str
     ) -> Optional[int]: ...
+    async def set_context_baseline_seq(self, space_id, channel_id, context_baseline_seq: int) -> None: ...
 
 
 @runtime_checkable
@@ -302,6 +182,7 @@ class SendCoordinator:
         http_client: Any,
         data_client: Any,
         workspace: str | None = None,
+        shared_workspace: str | None = None,
         baseline_source: ContextBaselineSource | Any | None = None,
         active_turn_source: ActiveTurnBoundarySource | Any | None = None,
         held_recovery_source: HeldRecoverySource | Any | None = None,
@@ -312,6 +193,7 @@ class SendCoordinator:
         self.http_client = http_client
         self.data_client = data_client
         self.workspace = workspace
+        self.shared_workspace = shared_workspace
         self.baseline_source = baseline_source
         self.active_turn_source = active_turn_source
         self.held_recovery_source = held_recovery_source
@@ -774,8 +656,18 @@ class SendCoordinator:
                 logger.exception(
                     "sent keyless message but could not clear held state"
                 )
+            baseline_saved = await persist_baseline(
+                self.baseline_source,
+                space_id,
+                channel_id,
+                boundary.baseline,
+                result.context_baseline_seq,
+            )
+            if not baseline_saved:
+                result.note = f"{result.note} {BASELINE_PERSISTENCE_WARNING}"
+            acknowledged = max(result.seen_seq or 0, result.context_baseline_seq or 0)
             if (
-                result.latest_seq_before_send == boundary.seen_seq
+                result.latest_seq_before_send == acknowledged
                 and result.seq is not None
             ):
                 try:
@@ -867,9 +759,7 @@ class SendCoordinator:
     ) -> _ChannelSendBoundary | dict[str, Any]:
         held_generation = self._held_generation  # read before any await
         baseline = await self._baseline(space_id, channel_id)
-        if baseline is None:
-            baseline = 0
-        baseline_invalid = (
+        baseline_invalid = baseline is not None and (
             isinstance(baseline, bool) or not isinstance(baseline, int) or baseline < 0
         )
         if baseline_invalid and not combined_error:
@@ -911,7 +801,7 @@ class SendCoordinator:
                 result["_reconsideration_audit"] = reconsideration.audit_fields()
                 return result
             active = reconsideration.admitted_seq
-        seen_seq = max(baseline, active if active is not None else baseline)
+        seen_seq = max(baseline or 0, active or 0)
         session_id, turn_id = self._turn_identity()
         return _ChannelSendBoundary(
             baseline=baseline,
@@ -1087,7 +977,17 @@ class SendCoordinator:
             logger.exception("sent message but could not clear held state")
         # A stale send_anyway may cross messages this turn has not seen. The
         # outbound is visible, but the boundary advances only without a gap.
-        if result.latest_seq_before_send == result.seen_seq:
+        baseline_saved = await persist_baseline(
+            self.baseline_source,
+            space_id,
+            channel_id,
+            boundary.baseline,
+            result.context_baseline_seq,
+        )
+        if not baseline_saved:
+            result.note = f"{result.note} {BASELINE_PERSISTENCE_WARNING}"
+        acknowledged = max(result.seen_seq or 0, result.context_baseline_seq or 0)
+        if result.latest_seq_before_send == acknowledged:
             try:
                 await self._advance(
                     space_id,
@@ -1457,6 +1357,9 @@ class SendCoordinator:
                 "send_message_with_attachments: too many files (> 10 cap)"
             )
         workspace = Path(self.workspace).resolve()
+        shared_workspace = (
+            Path(self.shared_workspace).resolve() if self.shared_workspace else None
+        )
         targets: list[Path] = []
         for raw in request.attachment_paths:
             rel = raw.strip()
@@ -1468,10 +1371,15 @@ class SendCoordinator:
             if rel_path.is_absolute():
                 raise RuntimeError(f"absolute paths not allowed ({rel!r})")
             target = (workspace / rel_path).resolve()
-            try:
-                target.relative_to(workspace)
-            except ValueError as exc:
-                raise RuntimeError(f"{rel!r} escapes the workspace") from exc
+            inside_workspace = target.is_relative_to(workspace)
+            inside_managed_shared = bool(
+                shared_workspace
+                and rel_path.parts
+                and rel_path.parts[0] == "shared"
+                and target.is_relative_to(shared_workspace)
+            )
+            if not (inside_workspace or inside_managed_shared):
+                raise RuntimeError(f"{rel!r} escapes the workspace")
             if not target.is_file():
                 raise RuntimeError(f"{rel!r} is not a file")
             if target.stat().st_size > 8 * 1024 * 1024:

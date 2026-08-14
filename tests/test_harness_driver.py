@@ -1416,6 +1416,42 @@ async def test_claude_driver_accepts_init_after_first_stream_input():
 
 
 @pytest.mark.asyncio
+async def test_claude_driver_prepends_normalized_launch_argv(monkeypatch):
+    """Regression-pin for the A1 gap: the launch argv must be the
+    normalized executable prefix (the Windows wrapper block) followed by
+    the untouched flags. On this host the real boundary passes the
+    executable through, so the wiring + ordering both stay pinned."""
+    import puffo_agent.agent.harness.claude_code_driver as driver_mod
+
+    def make_factory(captured):
+        def factory(args, _spec):
+            captured.extend(args)
+            proc = _FakeProcess()
+            proc.feed({
+                "type": "system", "subtype": "init",
+                "session_id": f"claude-{len(captured)}", "slash_commands": [],
+            })
+            return proc
+        return factory
+
+    posix = []
+    driver = ClaudeCodeCliDriver(make_factory(posix), replay_timeout=1)
+    await driver.open(RuntimeSpec("/workspace", executable="claude"))
+    await driver.close()
+    assert posix[:2] == ["claude", "-p"]
+
+    monkeypatch.setattr(
+        driver_mod, "normalize_launch_argv",
+        lambda executable: ["cmd.exe", "/c", executable + ".cmd"],
+    )
+    windows = []
+    driver = ClaudeCodeCliDriver(make_factory(windows), replay_timeout=1)
+    await driver.open(RuntimeSpec("/workspace", executable="claude"))
+    await driver.close()
+    assert windows[:4] == ["cmd.exe", "/c", "claude.cmd", "-p"]
+
+
+@pytest.mark.asyncio
 async def test_claude_driver_resume_flag_maps_to_resumed_system_init():
     captured = []
 
@@ -1713,3 +1749,251 @@ async def test_codex_child_environment_merges_over_process_environment(
     assert captured["env"]["CODEX_HOME"] == "/tmp/codex"
     assert captured["env"]["PUFFO_HARNESS_MARKER"] == "inherited"
     assert captured["env"]["PATH"] == os.environ["PATH"]
+
+
+def _token_telemetry_driver(provider):
+    holder: dict = {}
+
+    def codex_on_frame(frame):
+        proc = holder["proc"]
+        method = frame.get("method")
+        if method == "initialize":
+            proc.feed({"id": frame["id"], "result": {}})
+        elif method == "thread/start":
+            proc.feed({"id": frame["id"], "result": {"thread": {"id": "th_token"}}})
+        elif method == "turn/start":
+            proc.feed({"id": frame["id"], "result": {"turn": {"id": "turn_token"}}})
+
+    if provider in {"codex", "codex-absent"}:
+        proc = _FakeProcess(codex_on_frame)
+        holder["proc"] = proc
+        expected = (140, 100, 110) if provider == "codex" else (140, 100, None)
+        return proc, CodexAppServerDriver(lambda _spec: proc), expected
+
+    def claude_on_frame(frame):
+        if frame.get("type") == "user":
+            holder["proc"].feed({**frame, "isReplay": True})
+
+    proc = _FakeProcess(claude_on_frame)
+    proc.feed({
+        "type": "system", "subtype": "init",
+        "session_id": "claude-1", "slash_commands": [],
+    })
+    holder["proc"] = proc
+    return (
+        proc,
+        ClaudeCodeCliDriver(lambda *_args: proc, replay_timeout=1),
+        (40, 30, 80),
+    )
+
+
+def _feed_token_telemetry(provider, proc):
+    if provider in {"codex", "codex-absent"}:
+        base_last = {"inputTokens": 100, "cachedInputTokens": 60,
+                     "outputTokens": 40}
+        final_last = {"inputTokens": 150, "cachedInputTokens": 100,
+                      "outputTokens": 60}
+        if provider == "codex":
+            base_last = {**base_last, "totalTokens": 80}
+            final_last = {**final_last, "totalTokens": 110}
+        proc.feed({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {
+            "last": base_last,
+            "total": {"inputTokens": 500, "cachedInputTokens": 300,
+                      "outputTokens": 80},
+        }}})
+        proc.feed({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {
+            "last": final_last,
+            "total": {"inputTokens": 700, "cachedInputTokens": 400,
+                      "outputTokens": 140},
+        }}})
+        proc.feed({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+    else:
+        proc.feed({"type": "result", "subtype": "success", "usage": {
+            "input_tokens": 25,
+            "cache_creation_input_tokens": 15,
+            "cache_read_input_tokens": 40,
+            "output_tokens": 30,
+        }})
+
+
+def _reporter_emits(monkeypatch):
+    emits = []
+
+    async def fake_emit(agent_slug, event, payload):
+        emits.append((event, payload))
+
+    import puffo_agent.portal.control.reporter as reporter_mod
+
+    monkeypatch.setattr(
+        reporter_mod, "get_reporter", lambda: SimpleNamespace(emit=fake_emit)
+    )
+    return emits
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["codex", "codex-absent", "claude-code"])
+async def test_terminal_token_telemetry_reaches_turn_complete_current_context(
+    tmp_path, monkeypatch, provider,
+):
+    """Per-turn tokens must survive the Driver -> RuntimeManagerAdapter -> core
+    handoff and surface as ``turn_complete.current_context``; post-2.0 dropped
+    Codex ``last``/``total`` deltas, Claude cache semantics, and the whitelist.
+    """
+    proc, driver, expected = _token_telemetry_driver(provider)
+    emits = _reporter_emits(monkeypatch)
+    manager = RuntimeManager(
+        driver, RuntimeSpec(str(tmp_path)), session_ref=SessionRef("logical-session")
+    )
+    adapter = RuntimeManagerAdapter(manager)
+    await adapter.warm("system")
+    agent = PuffoAgent(
+        adapter, "system", str(tmp_path / "memory"),
+        workspace_dir=str(tmp_path), agent_id="agent",
+    )
+    agent.log.append({"role": "user", "content": "hello"})
+    task = asyncio.create_task(agent._run_turn_and_route("channel", "alice", None))
+    await _wait_until(lambda: bool(manager._turn_refs))
+    _feed_token_telemetry(provider, proc)
+    await asyncio.wait_for(task, timeout=5)
+    await _wait_until(lambda: len(emits) == 2)
+    turn_complete = {event: payload for event, payload in emits}["turn_complete"]
+    assert turn_complete["tokens"] == {
+        "input": expected[0], "output": expected[1],
+    }
+    if expected[2] is None:
+        assert "current_context" not in turn_complete
+    else:
+        assert turn_complete["current_context"] == expected[2]
+    await adapter.aclose()
+
+
+def _projection_event(type_, data, *, native=None):
+    return HarnessEvent.normalized(
+        type=type_, driver="codex",
+        session_ref=SessionRef("native-session"),
+        turn_ref=TurnRef("driver-turn"),
+        native_session_id="native-session", native_turn_id="native-turn",
+        data=data, native_payload=native,
+    )
+
+
+def _projection_events():
+    return [
+        _projection_event(
+            "turn.started", {},
+            native={"_puffo_internal": "frame", "secret": "NATIVE_FRAME_SECRET"},
+        ),
+        _projection_event("turn.assistant_delta",
+                          {"text": "first half ", "block_id": "block-1"}),
+        _projection_event("turn.assistant_delta",
+                          {"text": "second half", "block_id": "block-1"}),
+        _projection_event("turn.assistant_completed", {"block_id": "block-1"}),
+        _projection_event("turn.assistant_completed", {"block_id": "block-1"}),
+        _projection_event("turn.tool_started",
+                          {"tool_call_ref": "tool-1",
+                           "label": "mcp__puffo__read_inbox"},
+                          native={"_puffo_internal": "tool_result",
+                                  "arguments": {"secret_arg": "TOOL_ARG_SECRET"}}),
+        _projection_event("turn.tool_started",
+                          {"tool_call_ref": "tool-1",
+                           "label": "mcp__puffo__read_inbox"}),
+        _projection_event("turn.tool_completed",
+                          {"tool_call_ref": "tool-1", "label": "read_inbox",
+                           "outcome": "succeeded"},
+                          native={"_puffo_internal": "tool_result",
+                                  "result": "TOOL_RESULT_SECRET"}),
+        _projection_event("turn.reasoning", {"text": "REASONING_SECRET"},
+                          native={"reasoning": "COT_SECRET"}),
+        _projection_event("turn.assistant_delta",
+                          {"text": "[SILENT] do not surface",
+                           "block_id": "block-2"}),
+        _projection_event("turn.assistant_completed", {"block_id": "block-2"}),
+        _projection_event("turn.assistant_delta",
+                          {"text": "X" * 210 + "OVERBOUND_SECRET",
+                           "block_id": "block-3"}),
+        _projection_event("turn.assistant_completed", {"block_id": "block-3"}),
+        _projection_event("turn.completed", {"outcome": "succeeded"}),
+    ]
+
+
+async def _feed_projection_events(driver, events):
+    for event in events:
+        await driver.queue.put(event)
+
+
+def _build_projection_adapter(tmp_path, driver, monkeypatch):
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+    from puffo_agent.agent.harness.local_runtime import (
+        PreparedLocalRuntime,
+        build_local_runtime_adapter,
+    )
+
+    class _StubPreparer:
+        agent_id = "agent"
+
+    prepared = PreparedLocalRuntime(
+        harness_name="codex",
+        spec=RuntimeSpec(str(tmp_path)),
+        native_session_id="",
+        migration_source="fresh",
+        legacy_session_path=tmp_path / "legacy.json",
+        preparer=_StubPreparer(),
+        session_fingerprint="fp",
+    )
+    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    monkeypatch.setattr(local_runtime, "build_driver", lambda name: driver)
+    adapter = build_local_runtime_adapter(
+        prepared, outbox=outbox, logical_session_ref="logical-session"
+    )
+    return adapter, outbox
+
+
+@pytest.mark.asyncio
+async def test_local_sink_projects_only_bounded_safe_legacy_status(
+    tmp_path, monkeypatch,
+):
+    """The local runtime sink must emit only bounded ``assistant_text`` (once per
+    completed non-silent block) and label-only ``tool_use`` per normalized start,
+    never duplicates, post-terminal fragments, or native/argument/reasoning
+    material. Post-2.0 the sink emitted nothing; a native replay would leak.
+    """
+    from puffo_agent.agent.adapters.base import TurnContext
+
+    driver = _ToolResultDriver()
+    emits = _reporter_emits(monkeypatch)
+    adapter, outbox = _build_projection_adapter(tmp_path, driver, monkeypatch)
+    manager = adapter.manager
+    ctx = TurnContext(
+        system_prompt="system",
+        messages=[{"role": "user", "content": "hello"}],
+        workspace_dir=str(tmp_path),
+        claude_dir=str(tmp_path),
+        memory_dir=str(tmp_path / "memory"),
+    )
+    task = asyncio.create_task(adapter.run_turn(ctx))
+    await _wait_until(lambda: bool(manager._turn_refs))
+    await _feed_projection_events(driver, _projection_events())
+    await asyncio.wait_for(task, timeout=5)
+    await _feed_projection_events(driver, [
+        _projection_event("turn.assistant_delta",
+                          {"text": "STALE_TEXT", "block_id": "block-stale"}),
+        _projection_event("turn.assistant_completed", {"block_id": "block-stale"}),
+    ])
+    await _wait_until(lambda: driver.queue.empty())
+    await _wait_until(lambda: len(emits) == 3)
+    await asyncio.sleep(0.02)
+
+    assert emits == [
+        ("assistant_text", {"text": "first half second half"}),
+        ("tool_use", {"tool": "read_inbox"}),
+        ("assistant_text", {"text": "X" * 200}),
+    ]
+    serialized = "".join(json.dumps(payload) for _, payload in emits)
+    for sentinel in (
+        "NATIVE_FRAME_SECRET", "TOOL_ARG_SECRET", "TOOL_RESULT_SECRET",
+        "REASONING_SECRET", "COT_SECRET", "OVERBOUND_SECRET", "[SILENT]",
+        "STALE_TEXT",
+    ):
+        assert sentinel not in serialized
+    await adapter.aclose()
+    outbox.close()

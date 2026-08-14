@@ -308,16 +308,24 @@ async def test_end_turn_batch_swallows_http_error():
 
 
 @pytest.mark.asyncio
-async def test_begin_turn_skips_http_for_local_only_envelope():
-    """Daemon-minted synthetic envelopes (intro-prompt-...) have no
+@pytest.mark.parametrize(
+    "message_id",
+    [
+        "intro-prompt-ch_xxx-1778641626040",
+        "membership-joined-ch_xxx-agent_xxx-event_xxx",
+        "reminder-occurrence:occurrence_xxx",
+    ],
+)
+async def test_begin_turn_skips_http_for_local_only_envelope(message_id):
+    """Daemon-minted synthetic envelopes have no
     server-side row, so we skip ``/messages/<id>/processing/start``
     (which used to 404 + WARN per nudge) — but push an immediate busy
-    heartbeat so the agent shows in-progress while composing its intro,
+    heartbeat so the agent shows in-progress while composing,
     not idle until the next scheduled beat."""
     http = FakeHttp()
     rep = StatusReporter(http, heartbeat_interval_s=999)
 
-    run_id = await rep.begin_turn("intro-prompt-ch_xxx-1778641626040")
+    run_id = await rep.begin_turn(message_id)
 
     assert run_id.startswith("run_")
     # No per-message processing POST — just a busy heartbeat.
@@ -336,9 +344,11 @@ async def test_end_turn_skips_http_for_local_only_envelope():
     http = FakeHttp()
     rep = StatusReporter(http, heartbeat_interval_s=999)
     rep._current_status = "busy"
-    rep._current_message_id = "intro-prompt-ch_a-1"
+    rep._current_message_id = "membership-joined-ch_a-agent_a-event_a"
 
-    await rep.end_turn("intro-prompt-ch_a-1", "run_x", succeeded=True)
+    await rep.end_turn(
+        "membership-joined-ch_a-agent_a-event_a", "run_x", succeeded=True,
+    )
 
     # No /processing/end POST — just an idle heartbeat.
     assert not any("/processing/" in p for p, _ in http.calls)
@@ -380,7 +390,7 @@ async def test_end_turn_batch_all_local_only_skips_http():
 
     await rep.end_turn_batch([
         {"run_id": "run_a", "message_id": "intro-prompt-ch_a-1", "succeeded": True},
-        {"run_id": "run_b", "message_id": "intro-prompt-ch_b-1", "succeeded": True},
+        {"run_id": "run_b", "message_id": "reminder-occurrence:occ_b", "succeeded": True},
     ])
 
     assert not any("/processing/" in p for p, _ in http.calls)
@@ -621,6 +631,16 @@ async def test_keyless_end_turn_batch_emits_over_bridge():
         {"run_id": "run_a", "message_id": "msg_a", "succeeded": True},
     ])
     assert sender.calls[0]["status"] == "idle"
+
+    sender.calls.clear()
+    await rep.end_turn_batch([{
+        "run_id": "run_b",
+        "message_id": "msg_b",
+        "succeeded": False,
+        "error_text": "batch failed",
+    }])
+    assert sender.calls[0]["status"] == "error"
+    assert sender.calls[0]["error_text"] == "batch failed"
     assert http.calls == []
 
 

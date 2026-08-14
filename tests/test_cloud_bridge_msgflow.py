@@ -221,6 +221,7 @@ class FakeHttp:
             return self.responses[path]
         if path == "/v2/cloud-agents/agent-runtime/messages:send":
             freshness = body["freshness"]
+            request_baseline = freshness["context_baseline_seq"]
             return {
                 "state": "sent",
                 "envelope_id": "msg_bridgeack",
@@ -230,7 +231,9 @@ class FakeHttp:
                 "freshness": {
                     "mode": freshness["mode"],
                     "context_baseline_seq": (
-                        freshness["context_baseline_seq"]
+                        request_baseline
+                        if request_baseline is not None
+                        else freshness["seen_seq"]
                     ),
                     "seen_seq": freshness["seen_seq"],
                     "latest_seq_before_send": freshness["seen_seq"],
@@ -584,6 +587,7 @@ async def test_a_inbound_dm_frame_routes_as_dm(tmp_path):
         "plaintext": "ping",
     }])
     client = _bridge_client(tmp_path, bridge, db="dm.db")
+    client.auto_accept_dm = True
     done = asyncio.Event()
 
     await _drive_listen_until(client, done=done)

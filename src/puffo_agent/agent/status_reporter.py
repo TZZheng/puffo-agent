@@ -22,7 +22,11 @@ DEFAULT_HEARTBEAT_INTERVAL_S = 60.0
 
 # Synthetic local envelopes have no server row; /messages/<id>/processing/*
 # would 404, so skip the HTTP round-trip (the worker still tracks the run).
-_LOCAL_ONLY_ENVELOPE_PREFIXES = ("intro-prompt-",)
+_LOCAL_ONLY_ENVELOPE_PREFIXES = (
+    "intro-prompt-",
+    "membership-",
+    "reminder-occurrence:",
+)
 
 
 def _is_local_only_envelope(message_id: str) -> bool:
@@ -132,9 +136,9 @@ class StatusReporter:
         """Best-effort status refresh used after bridge reconnects."""
         await self._send_heartbeat()
 
-    async def begin_turn(self, message_id: str) -> str:
+    async def begin_turn(self, message_id: str, *, run_id: str | None = None) -> str:
         """Returns a ``run_id`` to pass back to ``end_turn``."""
-        run_id = f"run_{uuid.uuid4().hex}"
+        run_id = run_id or f"run_{uuid.uuid4().hex}"
         if self._keyless:
             # No signed /processing/* call for bridge agents (see __init__);
             # report "busy" over the bridge so the operator's Log gets the
@@ -221,10 +225,13 @@ class StatusReporter:
         if self._keyless:
             # Bridge agents: mirror the batch outcome into local status +
             # report it over the bridge (see __init__).
-            any_failed = any(not r["succeeded"] for r in runs)
-            self._current_status = "error" if any_failed else "idle"
+            failed = next((r for r in runs if not r["succeeded"]), None)
+            self._current_status = "error" if failed is not None else "idle"
             self._current_message_id = None
-            await self._emit_keyless(self._current_status, None, None)
+            error_text = None
+            if failed is not None and failed.get("error_text") is not None:
+                error_text = str(failed["error_text"])[:1024]
+            await self._emit_keyless(self._current_status, None, error_text)
             return
         payload_runs: list[dict[str, Any]] = []
         for r in runs:

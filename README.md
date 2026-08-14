@@ -73,9 +73,9 @@ pip install puffo-agent
 pip install puffo-agent==1.2.0
 ```
 
-The Agent Foundation `2.0.0a1` candidate is for staging validation and is
+The Agent Foundation `2.0.0a2` candidate is for staging validation and is
 published to TestPyPI only. See
-[`docs/RELEASE-CANDIDATE-2.0.0a1.md`](docs/RELEASE-CANDIDATE-2.0.0a1.md) for
+[`docs/RELEASE-CANDIDATE-2.0.0a2.md`](docs/RELEASE-CANDIDATE-2.0.0a2.md) for
 the install command, test scope, and stable-release TODOs.
 
 Both paths install the `puffo-agent` console script. The CLI's
@@ -145,7 +145,9 @@ entirely on disk:
     ├── messages.db              # message, Inbox, turn, reminder state
     ├── runtime_events.db        # bounded Runtime event outbox
     ├── runtime.json             # heartbeat / status (daemon-managed)
-    └── workspace/.puffo/inbox/  # decrypted incoming attachments
+    └── workspace/
+        ├── shared -> ../../../shared/ # cross-Agent files on this Puffo home
+        └── .puffo/inbox/              # decrypted incoming attachments
 ```
 
 ### 3.2 Network proxies

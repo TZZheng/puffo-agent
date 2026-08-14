@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -11,8 +12,18 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from . import worker as worker_module
-from .runtime_matrix import RUNTIME_CLI_DOCKER, RUNTIME_CLI_LOCAL
-from .state import agent_dir
+from .runtime_matrix import (
+    HARNESS_CODEX,
+    RUNTIME_CLI_DOCKER,
+    RUNTIME_CLI_LOCAL,
+    resolve_effective_harness,
+    resolve_effective_provider,
+)
+from .state import agent_dir, shared_fs_dir
+from .workspace_layout import (
+    AVAILABLE_SHARED_WORKSPACE_STATES,
+    prepare_workspace_shared_access,
+)
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -32,6 +43,7 @@ class WorkerRunPaths:
     workspace_path: str
     claude_path: str
     shared_path: Path
+    workspace_shared_status: str
     system_prompt: str
 
     @property
@@ -68,7 +80,7 @@ class WorkerRunServices:
 
 
 class _NoopStatusReporter:
-    async def begin_turn(self, _mid):
+    async def begin_turn(self, _mid, *, run_id=None):
         return None
 
     async def end_turn(self, *_args, **_kwargs):
@@ -85,6 +97,84 @@ class _NoopStatusReporter:
 
     def stop(self):
         return None
+
+
+class GlobalInboxStatusLifecycle:
+    """Mirror one durable Global Inbox turn into Server processing rows.
+
+    ``begin_turn`` fires once for the first admitted real message. Run ids are
+    derived from the durable turn and message identities, so crash recovery
+    reopens and settles the same Server row. Later active-union expansions do
+    not reopen rows. Terminal cleanup settles the exact active union in one
+    ``end_turn_batch`` with the same success/error result. State always resets
+    so the next turn cannot inherit runs.
+    """
+
+    def __init__(self, reporter) -> None:
+        self._reporter = reporter
+        self._began = False
+        self._turn_id: str | None = None
+
+    async def on_turn_active(
+        self, *, turn_id: str, message_ids: tuple[str, ...]
+    ) -> None:
+        if not message_ids:
+            return
+        if self._began:
+            if self._turn_id != turn_id:
+                raise RuntimeError("status lifecycle already owns another turn")
+            return
+        self._began = True
+        self._turn_id = turn_id
+        await self._reporter.begin_turn(
+            message_ids[0],
+            run_id=self._run_id(turn_id, message_ids[0]),
+        )
+
+    async def on_turn_terminal(
+        self,
+        *,
+        turn_id: str,
+        message_ids: tuple[str, ...],
+        succeeded: bool,
+        error_text: str | None,
+    ) -> None:
+        if self._began and self._turn_id != turn_id:
+            raise RuntimeError("status lifecycle terminal turn does not match")
+        runs = self._build_runs(turn_id, message_ids, succeeded, error_text)
+        try:
+            if runs:
+                await self._reporter.end_turn_batch(runs)
+        finally:
+            self.reset()
+
+    def _build_runs(
+        self,
+        turn_id: str,
+        message_ids: tuple[str, ...],
+        succeeded: bool,
+        error_text: str | None,
+    ) -> list[dict[str, Any]]:
+        runs: list[dict[str, Any]] = []
+        for index, message_id in enumerate(message_ids):
+            entry: dict[str, Any] = {
+                "run_id": self._run_id(turn_id, message_id),
+                "message_id": message_id,
+                "succeeded": succeeded,
+            }
+            if error_text is not None:
+                entry["error_text"] = error_text
+            runs.append(entry)
+        return runs
+
+    def reset(self) -> None:
+        self._began = False
+        self._turn_id = None
+
+    @staticmethod
+    def _run_id(turn_id: str, message_id: str) -> str:
+        identity = f"{turn_id}\0{message_id}".encode("utf-8")
+        return f"run_{hashlib.sha256(identity).hexdigest()[:32]}"
 
 
 class StandardWorkerRun:
@@ -114,7 +204,19 @@ class StandardWorkerRun:
         workspace_path = str(agent_cfg.resolve_workspace_dir())
         claude_path = str(agent_cfg.resolve_claude_dir())
         shared_path = worker_module.docker_shared_dir()
-        Path(workspace_path).mkdir(parents=True, exist_ok=True)
+        workspace_shared_status = prepare_workspace_shared_access(
+            Path(workspace_path),
+            shared_fs_dir(),
+            mounted=(agent_cfg.runtime.kind or RUNTIME_CLI_LOCAL)
+            == RUNTIME_CLI_DOCKER,
+        )
+        if workspace_shared_status not in AVAILABLE_SHARED_WORKSPACE_STATES:
+            logger.error(
+                "agent %s: shared workspace is %s; cross-Agent file handoffs "
+                "through workspace/shared are unavailable",
+                agent_id,
+                workspace_shared_status,
+            )
         worker_module._seed_claude_dir(Path(claude_path))
         system_prompt = worker_module._rebuild_managed_system_prompt(
             harness_name=effective_harness,
@@ -127,6 +229,7 @@ class StandardWorkerRun:
             role=agent_cfg.role,
             role_short=agent_cfg.role_short,
             puffo_handle=agent_cfg.puffo_core.slug,
+            workspace_shared_status=workspace_shared_status,
         )
         paths = WorkerRunPaths(
             agent_id=agent_id,
@@ -136,6 +239,7 @@ class StandardWorkerRun:
             workspace_path=workspace_path,
             claude_path=claude_path,
             shared_path=shared_path,
+            workspace_shared_status=workspace_shared_status,
             system_prompt=system_prompt,
         )
         self._remove_stale_managed_prompt(paths)
@@ -174,15 +278,44 @@ class StandardWorkerRun:
         self, paths: WorkerRunPaths, outbox_ref: list[Any]
     ) -> tuple[Any, str, Any]:
         worker = self.worker
-        if worker.agent_cfg.runtime.kind != RUNTIME_CLI_LOCAL:
+        kind = worker.agent_cfg.runtime.kind or RUNTIME_CLI_LOCAL
+        provider = resolve_effective_provider(
+            kind, worker.agent_cfg.runtime.provider
+        )
+        harness = resolve_effective_harness(
+            kind, provider, worker.agent_cfg.runtime.harness
+        )
+        if kind == RUNTIME_CLI_DOCKER and harness == HARNESS_CODEX:
+            return await self._prepare_driver_runtime(
+                paths,
+                outbox_ref,
+                worker_module.build_docker_codex_runtime(
+                    worker.daemon_cfg, worker.agent_cfg
+                ),
+            )
+        if kind != RUNTIME_CLI_LOCAL:
             worker._adapter = worker_module.build_docker_adapter(
                 worker.daemon_cfg, worker.agent_cfg
             )
             return None, "", None
-        from ..agent.harness.local_runtime import (
-            LocalRuntimePreparer,
-            build_local_runtime_adapter,
+        from ..agent.harness.local_runtime import LocalRuntimePreparer
+
+        return await self._prepare_driver_runtime(
+            paths,
+            outbox_ref,
+            LocalRuntimePreparer(worker.daemon_cfg, worker.agent_cfg),
         )
+
+    async def _prepare_driver_runtime(
+        self,
+        paths: WorkerRunPaths,
+        outbox_ref: list[Any],
+        preparer: Any,
+    ) -> tuple[Any, str, Any]:
+        """Prepare a Driver-backed runtime and bind it to the durable
+        outbox. Shared by host-local Claude/Codex and Docker Codex; the
+        Docker owner's exec transport and bounded container stop are wired
+        into the Driver here at the composition boundary."""
         from ..agent.runtime_event_outbox import (
             RuntimeEventOutbox,
             runtime_event_outbox_path,
@@ -193,7 +326,6 @@ class StandardWorkerRun:
         )
         outbox_ref[0] = outbox
         persisted = outbox.state()
-        preparer = LocalRuntimePreparer(worker.daemon_cfg, worker.agent_cfg)
         prepared = await preparer.prepare(
             system_prompt=paths.system_prompt,
             persisted_native_session_id=persisted.get("native_session_id", ""),
@@ -201,6 +333,32 @@ class StandardWorkerRun:
                 "session_fingerprint", ""
             ),
         )
+        try:
+            return await self._bind_driver_runtime(
+                outbox, prepared, persisted
+            )
+        except Exception:
+            # The Docker owner starts the per-agent container inside
+            # ``prepare``; if anything between that and adapter
+            # construction fails, the not-yet-wired preparer must stop it
+            # so partial initialization never orphans a running container.
+            await self._abort_docker_preparation(preparer)
+            raise
+
+    async def _bind_driver_runtime(
+        self,
+        outbox: Any,
+        prepared: Any,
+        persisted: dict[str, Any],
+    ) -> tuple[Any, str, Any]:
+        """Bind the prepared runtime to the durable outbox and the Runtime
+        Manager, injecting the Docker Codex Driver transport at the
+        composition boundary."""
+        worker = self.worker
+        from ..agent.harness.codex_driver import CodexAppServerDriver
+        from ..agent.harness.docker_runtime import DockerCodexPreparer
+        from ..agent.harness.local_runtime import build_local_runtime_adapter
+
         if prepared.discarded_persisted_session:
             session_ref = f"session_{uuid.uuid4().hex}"
             active_turn_ref = None
@@ -216,10 +374,40 @@ class StandardWorkerRun:
             native_session_id=prepared.native_session_id,
             session_fingerprint=prepared.session_fingerprint,
         )
+        driver = None
+        cleanup = None
+        if isinstance(preparer := prepared.preparer, DockerCodexPreparer):
+            driver = CodexAppServerDriver(
+                process_factory=preparer.process_factory
+            )
+            cleanup = preparer.aclose
         worker._adapter = build_local_runtime_adapter(
-            prepared, outbox=outbox, logical_session_ref=session_ref
+            prepared,
+            outbox=outbox,
+            logical_session_ref=session_ref,
+            driver=driver,
+            cleanup=cleanup,
         )
         return outbox, session_ref, prepared
+
+    async def _abort_docker_preparation(self, preparer: Any) -> None:
+        """Stop the Docker Codex container after a partial Driver assembly.
+
+        Only the Docker owner starts a container inside ``prepare``; the
+        host-local preparer has nothing to tear down.
+        """
+        from ..agent.harness.docker_runtime import DockerCodexPreparer
+
+        if not isinstance(preparer, DockerCodexPreparer):
+            return
+        try:
+            await preparer.aclose()
+        except Exception:
+            logger.exception(
+                "agent %s: failed to stop Docker Codex container after "
+                "preparation failure",
+                self.worker.agent_cfg.id,
+            )
 
     async def _initialize(self) -> WorkerRunContext | None:
         worker = self.worker
@@ -420,6 +608,7 @@ class StandardWorkerRun:
             role=worker.agent_cfg.role,
             role_short=worker.agent_cfg.role_short,
             puffo_handle=worker.agent_cfg.puffo_core.slug,
+            workspace_shared_status=paths.workspace_shared_status,
             puffo=context.puffo,
             adapter=worker._adapter,
             refresh_agent_flag=refresh_agent,
@@ -499,7 +688,7 @@ class StandardWorkerRun:
         run_global_turn.handle_global_inbox_retry = retry_global_turn
         return run_global_turn
 
-    def _build_global_runtime(self, context: WorkerRunContext):
+    def _build_global_runtime(self, context: WorkerRunContext, *, status_lifecycle=None):
         from ..agent.global_inbox_runtime import (
             ActiveBoundaryAdapter,
             BaselineAdapter,
@@ -521,6 +710,7 @@ class StandardWorkerRun:
             send_mode_keys=(paths.agent_id, client.slug),
             agent_id=paths.agent_id,
             runtime_event_outbox=context.runtime_event_outbox,
+            status_lifecycle=status_lifecycle,
         )
         coordinator = SendCoordinator(
             slug=client.slug,
@@ -528,6 +718,7 @@ class StandardWorkerRun:
             http_client=client.http,
             data_client=InProcessDataClient(client.store, client),
             workspace=paths.workspace_path,
+            shared_workspace=str(shared_fs_dir()),
             baseline_source=BaselineAdapter(client.store),
             active_turn_source=ActiveBoundaryAdapter(
                 client.store, global_runtime.active
@@ -594,7 +785,11 @@ class StandardWorkerRun:
     async def _start_services(self, context: WorkerRunContext) -> WorkerRunServices:
         worker = self.worker
         uploader = self._build_runtime_event_uploader(context)
-        global_runtime = self._build_global_runtime(context)
+        reporter = self._build_reporter(context.client)
+        global_runtime = self._build_global_runtime(
+            context,
+            status_lifecycle=GlobalInboxStatusLifecycle(reporter),
+        )
         reminder_sync = await self._prepare_reminder_sync(context, global_runtime)
         global_task = asyncio.ensure_future(global_runtime.run())
         reminder_task = None
@@ -602,7 +797,6 @@ class StandardWorkerRun:
             reminder_task = asyncio.ensure_future(
                 reminder_sync.run(request_snapshot_on_start=False)
             )
-        reporter = self._build_reporter(context.client)
         heartbeat_task = asyncio.ensure_future(self._heartbeat(context.paths.agent_id))
         status_task = asyncio.ensure_future(reporter.run_heartbeat_loop())
         watch_task = asyncio.ensure_future(

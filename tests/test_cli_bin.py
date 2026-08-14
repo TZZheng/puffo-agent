@@ -282,6 +282,85 @@ def test_hermes_bundle_paths_per_platform(platform_value, want_substr, monkeypat
     assert want_substr in first
 
 
+def test_windows_claude_bundle_paths_include_npm_global_shims(monkeypatch):
+    """Regression-pin for the A1 gap: the Windows Claude candidates must
+    list the npm-global ``%APPDATA%\\npm`` ``.exe``, ``.cmd``, ``.ps1``
+    shims in that order, or ``resolve_claude_bin`` never finds the shim
+    a fresh shell actually runs."""
+    monkeypatch.setattr(cli_bin.sys, "platform", "win32")
+    paths = [str(path).lower() for path in cli_bin._claude_bundle_paths()]
+    assert r"%appdata%\npm\claude.exe" in paths
+    assert r"%appdata%\npm\claude.cmd" in paths
+    assert r"%appdata%\npm\claude.ps1" in paths
+    assert paths.index(r"%appdata%\npm\claude.exe") < paths.index(
+        r"%appdata%\npm\claude.cmd"
+    ) < paths.index(r"%appdata%\npm\claude.ps1")
+
+
+@pytest.mark.parametrize(
+    ("platform_value", "executable", "siblings", "expected"),
+    [
+        # POSIX: the executable passes through untouched, whatever its shape.
+        ("darwin", "claude", (), ("claude",)),
+        ("linux", "claude", (), ("claude",)),
+        (
+            "linux",
+            r"C:\Program Files\Claude\claude.exe",
+            (),
+            (r"C:\Program Files\Claude\claude.exe",),
+        ),
+        # Windows: .exe sibling wins over every shim.
+        (
+            "win32", "claude",
+            ("claude.exe", "claude.cmd", "claude.bat", "claude.ps1"),
+            ("claude.exe",),
+        ),
+        # Windows: .cmd beats .bat and both run through cmd.exe /c.
+        (
+            "win32", "claude",
+            ("claude.bat", "claude.cmd"),
+            ("cmd.exe", "/c", "claude.cmd"),
+        ),
+        ("win32", "claude", ("claude.cmd",), ("cmd.exe", "/c", "claude.cmd")),
+        ("win32", "claude", ("claude.bat",), ("cmd.exe", "/c", "claude.bat")),
+        # Windows: .ps1 runs through powershell.exe -NoProfile -NonInteractive -File.
+        (
+            "win32", "claude",
+            ("claude.ps1",),
+            ("powershell.exe", "-NoProfile", "-NonInteractive", "-File", "claude.ps1"),
+        ),
+        # Windows: extensionless path with no sibling launches directly.
+        ("win32", "claude", (), ("claude",)),
+        # Windows: an explicit .exe path passes straight through.
+        ("win32", "claude.exe", (), ("claude.exe",)),
+        # Windows: paths with spaces stay single argv elements.
+        (
+            "win32",
+            os.path.join("Program Files", "Claude", "claude"),
+            (os.path.join("Program Files", "Claude", "claude.cmd"),),
+            (
+                "cmd.exe", "/c",
+                os.path.join("Program Files", "Claude", "claude.cmd"),
+            ),
+        ),
+    ],
+)
+def test_normalize_launch_argv(
+    platform_value, executable, siblings, expected, tmp_path, monkeypatch,
+):
+    """Regression-pin for the A1 gap: ``create_subprocess_exec`` cannot run
+    a Windows ``.cmd`` / ``.bat`` / ``.ps1`` shim directly, so the launch
+    argv must wrap it in the right interpreter. Sibling checks resolve
+    against the test cwd, so each case writes the sibling files it names."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli_bin.sys, "platform", platform_value)
+    for name in siblings:
+        path = tmp_path / Path(name)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    assert cli_bin.normalize_launch_argv(executable) == list(expected)
+
+
 # ── credential presence (UI 3-state status) ──────────────────────────
 
 

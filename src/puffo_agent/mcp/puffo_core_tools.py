@@ -290,6 +290,9 @@ class PuffoCoreToolsConfig:
     # safety-resolve LLM-supplied relative paths (no ``..`` escape,
     # no absolutes).
     workspace: Optional[str] = None
+    # Canonical target of the managed ``workspace/shared`` link. This is
+    # intentionally separate so arbitrary symlink escapes remain forbidden.
+    shared_workspace: Optional[str] = None
     # None when PUFFO_RPC_URL isn't set; install/sync tools surface
     # a clear error rather than touching operator files in-process.
     rpc_client: Optional[PuffoRpcClient] = None
@@ -325,6 +328,8 @@ async def _dispatch_semantic_send(
         try:
             if hasattr(coordinator, "workspace"):
                 coordinator.workspace = cfg.workspace
+            if hasattr(coordinator, "shared_workspace"):
+                coordinator.shared_workspace = cfg.shared_workspace
             result = await coordinator.send(request)
         except Exception as exc:
             return failed_result(
@@ -364,6 +369,7 @@ async def _dispatch_semantic_send(
             http_client=cfg.http_client,
             data_client=cfg.data_client,
             workspace=cfg.workspace,
+            shared_workspace=cfg.shared_workspace,
         )
         return await coordinator.send(request)
     return failed_result(

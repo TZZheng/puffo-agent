@@ -191,6 +191,7 @@ class KeylessFakeHttpClient:
             return self.responses[path]
         if path == "/v2/cloud-agents/agent-runtime/messages:send":
             freshness = body["freshness"]
+            request_baseline = freshness["context_baseline_seq"]
             return {
                 "state": "sent",
                 "envelope_id": "msg_keyless",
@@ -200,7 +201,9 @@ class KeylessFakeHttpClient:
                 "freshness": {
                     "mode": freshness["mode"],
                     "context_baseline_seq": (
-                        freshness["context_baseline_seq"]
+                        request_baseline
+                        if request_baseline is not None
+                        else freshness["seen_seq"]
                     ),
                     "seen_seq": freshness["seen_seq"],
                     "latest_seq_before_send": freshness["seen_seq"],

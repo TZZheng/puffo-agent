@@ -164,6 +164,7 @@ class HeldTransport:
                 "latest_seq": self.held_seq,
                 "latest_envelope_id": self.held_envelope_id,
             }
+        request_baseline = freshness["context_baseline_seq"]
         return {
             "state": "sent",
             "envelope_id": "send-anyway-result",
@@ -172,7 +173,11 @@ class HeldTransport:
             "missing_devices": [],
             "freshness": {
                 "mode": freshness["mode"],
-                "context_baseline_seq": freshness["context_baseline_seq"],
+                "context_baseline_seq": (
+                    request_baseline
+                    if request_baseline is not None
+                    else freshness["seen_seq"]
+                ),
                 "seen_seq": freshness["seen_seq"],
                 "latest_seq_before_send": freshness["seen_seq"],
             },
@@ -575,7 +580,7 @@ async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
     assert sent["state"] == "sent"
     assert len(h.transport.calls) == 2
     assert h.transport.calls[-1][1]["freshness"] == {
-        "context_baseline_seq": 0,
+        "context_baseline_seq": None,
         "seen_seq": 7,
         "mode": "send_anyway",
     }

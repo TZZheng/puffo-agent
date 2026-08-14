@@ -93,9 +93,7 @@ def agent_codex_user_dir(agent_id: str) -> Path:
 
 
 def shared_fs_dir() -> Path:
-    """Shared dir for cross-agent cooperation. Bind-mounted to
-    ``/workspace/.shared`` for cli-docker; referenced by absolute path
-    for cli-local agents."""
+    """Canonical host-wide directory exposed as ``workspace/shared``."""
     return home_dir() / "shared"
 
 
@@ -1125,21 +1123,55 @@ def stop_request_path() -> Path:
     return home_dir() / ".stop_requested"
 
 
-def read_stop_request_pid() -> int | None:
+def _classify_stop_request() -> tuple[str, int | None]:
+    """Classify the stop sentinel for the daemon stop boundary.
+
+    Returns ``("none", None)`` when the sentinel is absent,
+    ``("pid", pid)`` for the JSON PID sentinel the current CLI writes,
+    ``("legacy", None)`` for the timestamp-only scalar the pre-2.0 CLI
+    wrote, and ``("malformed", None)`` for content that is neither.
+    ``legacy`` and ``malformed`` are distinguished so the upgrade
+    boundary can clear a stale pre-start legacy file without treating
+    every corrupt file as a stop request.
+    """
     path = stop_request_path()
     if not path.exists():
-        return None
+        return "none", None
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        pid = payload.get("pid") if isinstance(payload, dict) else None
-        return int(pid) if pid is not None else None
-    except (OSError, TypeError, ValueError, json.JSONDecodeError):
-        # Timestamp-only sentinels from older versions are deliberately stale.
-        return None
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return "malformed", None
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return "malformed", None
+    if isinstance(payload, dict):
+        pid = payload.get("pid")
+        if pid is None:
+            return "malformed", None
+        try:
+            return "pid", int(pid)
+        except (TypeError, ValueError):
+            return "malformed", None
+    if isinstance(payload, (int, float)) and not isinstance(payload, bool):
+        return "legacy", None
+    return "malformed", None
+
+
+def read_stop_request_pid() -> int | None:
+    """PID targeted by a JSON stop sentinel, or None when absent or the
+    sentinel is not a JSON PID request (e.g. the timestamp-only legacy
+    format)."""
+    kind, pid = _classify_stop_request()
+    return pid if kind == "pid" else None
 
 
 def stop_requested_for(pid: int) -> bool:
-    return read_stop_request_pid() == pid
+    """True when a stop is requested for ``pid``: the JSON sentinel
+    carries exactly ``pid``, or the sentinel is a timestamp-only legacy
+    request, which targets whichever daemon is running."""
+    kind, target_pid = _classify_stop_request()
+    return (kind == "pid" and target_pid == pid) or kind == "legacy"
 
 
 def write_stop_request(pid: int | None = None) -> None:
@@ -1156,9 +1188,7 @@ def write_stop_request(pid: int | None = None) -> None:
     temporary.replace(path)
 
 
-def clear_stop_request(expected_pid: int | None = None) -> bool:
-    if expected_pid is not None and read_stop_request_pid() != expected_pid:
-        return False
+def _unlink_stop_request() -> bool:
     path = stop_request_path()
     try:
         path.unlink()
@@ -1167,6 +1197,26 @@ def clear_stop_request(expected_pid: int | None = None) -> bool:
         return False
     except OSError:
         return False
+
+
+def clear_stop_request(expected_pid: int | None = None) -> bool:
+    """Remove the stop sentinel.
+
+    JSON sentinels clear only when ``expected_pid`` matches their target
+    pid (exact PID matching is preserved); a timestamp-only legacy
+    sentinel targets whichever daemon is running, so it is removed
+    whenever the daemon would have accepted it. With no ``expected_pid``
+    (startup sweep) any stale file is removed so it cannot affect a
+    freshly started daemon.
+    """
+    kind, target_pid = _classify_stop_request()
+    if kind == "none":
+        return False
+    if kind == "malformed":
+        return _unlink_stop_request() if expected_pid is None else False
+    if kind == "pid" and expected_pid is not None and target_pid != expected_pid:
+        return False
+    return _unlink_stop_request()
 
 
 def refresh_token_request_path() -> Path:

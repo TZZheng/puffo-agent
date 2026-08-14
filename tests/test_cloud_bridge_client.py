@@ -141,7 +141,9 @@ async def test_send_send_correlates_ack_via_client_ref():
         consumer = asyncio.create_task(_drain(c))
         try:
             ack = await c.send_send(
-                plaintext="hi alice", recipient_slug="alice",
+                plaintext="hi alice",
+                recipient_slug="alice",
+                client_ref="stable-ref",
             )
         finally:
             await c.close()
@@ -152,7 +154,7 @@ async def test_send_send_correlates_ack_via_client_ref():
     sent = bridge_app.recv_send[0]
     assert sent["type"] == "send"
     assert sent["plaintext"] == "hi alice"
-    assert sent["client_ref"] == ack["client_ref"]
+    assert sent["client_ref"] == ack["client_ref"] == "stable-ref"
 
 
 @pytest.mark.asyncio
@@ -522,6 +524,112 @@ async def test_f3_send_list_spaces_timeout_discards_waiter_then_next_resolves():
         assert res["type"] == "spaces"
         assert res["spaces"] == [{"id": "sp_1"}]
         assert c._spaces_waiters.empty()
+    finally:
+        consumer.cancel()
+        try:
+            await consumer
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+# --------------------------------------------------------------------------
+# Keyless invitation bridge contract: list_invites FIFO routing, exact-
+# client_ref decide_invitation_result / error routing, timeout removal,
+# and close() waiter cleanup with BridgeClosed.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_invites_fifo_decision_correlation_and_close_cleanup():
+    """Guarded regression: invites resolves the FIFO waiter (never a dead
+    timed-out one), decide results/errors route by exact client_ref, and
+    close() fails every remaining waiter with BridgeClosed."""
+    c, ws = await _client_with_scripted_ws()
+    consumer = asyncio.create_task(_drain(c))
+    try:
+        async def _feed_when(ready, frame):
+            while not ready():
+                await asyncio.sleep(0)
+            ws.feed(frame)
+
+        # A timed-out waiter is pulled out of the FIFO so the next invites
+        # frame resolves the next call, not the dead future.
+        with pytest.raises(asyncio.TimeoutError):
+            await c.send_list_invites(timeout=0.05)
+        assert c._invites_waiters.empty()
+        res, _ = await asyncio.gather(
+            c.send_list_invites(timeout=2.0),
+            _feed_when(
+                lambda: not c._invites_waiters.empty(),
+                {"type": "invites", "invites": [{"invitation_event_id": "iv_1"}]},
+            ),
+        )
+        assert res["invites"] == [{"invitation_event_id": "iv_1"}]
+
+        # A decide result routes by exact client_ref.
+        result, _ = await asyncio.gather(
+            c.send_decide_invitation(
+                invitation_event_id="iv_1", decision="accept", client_ref="dec-1",
+            ),
+            _feed_when(
+                lambda: "dec-1" in c._decide_waiters,
+                {"type": "decide_invitation_result", "client_ref": "dec-1",
+                 "invitation_event_id": "iv_1", "decision": "accept",
+                 "outcome": "applied"},
+            ),
+        )
+        assert result["outcome"] == "applied"
+        assert c._decide_waiters == {}
+
+        # A correlated error routes to that waiter as a BridgeError.
+        with pytest.raises(BridgeError) as excinfo:
+            await asyncio.gather(
+                c.send_decide_invitation(
+                    invitation_event_id="iv_2", decision="reject", client_ref="dec-2",
+                ),
+                _feed_when(
+                    lambda: "dec-2" in c._decide_waiters,
+                    {"type": "error", "code": "NOT_FOUND", "message": "gone",
+                     "client_ref": "dec-2"},
+                ),
+            )
+        assert excinfo.value.code == "NOT_FOUND"
+        assert c._decide_waiters == {}
+
+        # Validation rejects a bad decision / blank ref before any frame.
+        for decision, ref in (("maybe", "dec-3"), ("accept", "  ")):
+            with pytest.raises(ValueError):
+                await c.send_decide_invitation(
+                    invitation_event_id="iv_3", decision=decision, client_ref=ref,
+                )
+
+        # close() fails every remaining waiter with a clean BridgeClosed.
+        async def _wait_pending():
+            await c.send_list_invites(timeout=10.0)
+
+        pending_task = asyncio.create_task(_wait_pending())
+        while c._invites_waiters.empty():
+            await asyncio.sleep(0)
+        await c.close()
+        with pytest.raises(BridgeClosed):
+            await pending_task
+        assert c._invites_waiters.empty()
+        assert c._decide_waiters == {}
+
+        # Outbound frames: exactly the four contract keys on decisions and
+        # nothing but type on list_invites.
+        assert [
+            frame for frame in ws.sent if frame.get("type") == "decide_invitation"
+        ] == [
+            {"type": "decide_invitation", "client_ref": "dec-1",
+             "invitation_event_id": "iv_1", "decision": "accept"},
+            {"type": "decide_invitation", "client_ref": "dec-2",
+             "invitation_event_id": "iv_2", "decision": "reject"},
+        ]
+        assert all(
+            set(frame) == {"type"} for frame in ws.sent
+            if frame.get("type") == "list_invites"
+        )
     finally:
         consumer.cancel()
         try:

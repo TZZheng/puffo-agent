@@ -9,13 +9,15 @@ those responsibilities belong to :mod:`codex_driver`,
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ...macos.keychain import is_macos
 from ...mcp.config import (
@@ -36,6 +38,7 @@ from ...portal.state import (
     cli_session_json_path,
     read_host_codex_mcp_servers,
     seed_claude_home,
+    shared_fs_dir,
     sync_host_claude_code_auth_view,
     sync_host_codex_auth_view,
     sync_host_enabled_plugins,
@@ -44,11 +47,19 @@ from ...portal.state import (
     sync_host_skills,
     strip_claude_api_key_from_settings,
 )
+from ...portal.workspace_layout import (
+    AVAILABLE_SHARED_WORKSPACE_STATES,
+    ensure_workspace_shared_link,
+)
 from ...portal.runtime_matrix import (
     resolve_effective_harness,
     resolve_effective_provider,
 )
-from ..adapters.base import anthropic_base_url_env
+from ..adapters.base import (
+    STATUS_PREVIEW_CHARS,
+    anthropic_base_url_env,
+    is_silent,
+)
 from ..adapters.desired_install import run_spawn_install
 from ..cli_bin import resolve_claude_bin, resolve_codex_bin
 from ..runtime_event_outbox import (
@@ -58,7 +69,14 @@ from ..runtime_event_outbox import (
 from ..runtime_events import RuntimeEventProjector, TrustedScope
 from ..shared_content import MEMORY_SECTION_HEADER
 from . import UnsupportedDriver, build_driver
-from .driver import HarnessEvent, RuntimeSpec, SessionRef, TurnRef
+from .driver import (
+    Driver,
+    HarnessEvent,
+    HarnessEventType,
+    RuntimeSpec,
+    SessionRef,
+    TurnRef,
+)
 from .runtime_manager import RuntimeManager, RuntimeManagerAdapter
 
 logger = logging.getLogger(__name__)
@@ -160,6 +178,82 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def compute_session_fingerprint(
+    *,
+    agent_cfg: AgentConfig,
+    harness_name: str,
+    provider: str,
+    spec: RuntimeSpec,
+) -> str:
+    """Fingerprint only inputs that make a native session incompatible.
+
+    Shared by the host-local and Docker runtime owners so a persisted
+    logical session stays comparable across restarts of the same runtime.
+    """
+    prompt_core = spec.system_prompt.split(MEMORY_SECTION_HEADER, 1)[0]
+    payload = {
+        "version": 1,
+        "harness": harness_name,
+        "provider": provider,
+        "model": spec.model,
+        "workspace": str(Path(spec.workspace_dir).resolve()),
+        "sandbox": spec.sandbox,
+        "permission_mode": spec.permission_mode,
+        "inference_level": agent_cfg.runtime.inference_level,
+        "llm_base_url": agent_cfg.runtime.llm_base_url.rstrip("/"),
+        "prompt_core_sha256": hashlib.sha256(
+            prompt_core.encode("utf-8")
+        ).hexdigest(),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return "v1:" + hashlib.sha256(encoded).hexdigest()
+
+
+def build_codex_gateway_provider(
+    *,
+    model: str,
+    llm_base_url: str,
+    api_key: str,
+) -> dict[str, str] | None:
+    """Return the LiteLLM / OpenAI-compatible gateway provider block.
+
+    ``None`` unless both a gateway URL and a virtual key are configured;
+    when present codex talks to ``base_url`` via the Responses API using
+    the bearer key in ``env_key`` instead of native ChatGPT OAuth.
+    """
+    if not (llm_base_url and api_key):
+        return None
+    base = llm_base_url.rstrip("/")
+    if not base.endswith("/v1"):
+        base += "/v1"
+    return {
+        "name": "litellm",
+        "display_name": "LiteLLM gateway",
+        "base_url": base,
+        "env_key": "OPENAI_API_KEY",
+        "model": model or "codex",
+        "wire_api": "responses",
+    }
+
+
+class RuntimePreparer(Protocol):
+    """Minimal contract a runtime owner satisfies to be bound into the
+    durable Runtime Manager by :func:`build_local_runtime_adapter`.
+
+    Both the host-local and the Docker Codex preparers implement it; the
+    Docker owner additionally exposes ``process_factory`` and ``aclose``
+    that the composition boundary wires into the Driver.
+    """
+
+    agent_id: str
+
+    async def refresh_spec(self, system_prompt: str) -> RuntimeSpec: ...
+
+    def session_fingerprint(self, spec: RuntimeSpec) -> str: ...
+
+
 @dataclass(slots=True)
 class PreparedLocalRuntime:
     harness_name: str
@@ -167,7 +261,7 @@ class PreparedLocalRuntime:
     native_session_id: str
     migration_source: str
     legacy_session_path: Path
-    preparer: LocalRuntimePreparer
+    preparer: RuntimePreparer
     session_fingerprint: str
     discarded_persisted_session: bool = False
 
@@ -278,31 +372,28 @@ class LocalRuntimePreparer:
 
     def session_fingerprint(self, spec: RuntimeSpec) -> str:
         """Fingerprint only inputs that make a native session incompatible."""
-        prompt_core = spec.system_prompt.split(MEMORY_SECTION_HEADER, 1)[0]
-        payload = {
-            "version": 1,
-            "harness": self.harness_name,
-            "provider": resolve_effective_provider(
+        return compute_session_fingerprint(
+            agent_cfg=self.agent_cfg,
+            harness_name=self.harness_name,
+            provider=resolve_effective_provider(
                 self.agent_cfg.runtime.kind or "cli-local",
                 self.agent_cfg.runtime.provider,
             ),
-            "model": spec.model,
-            "workspace": str(Path(spec.workspace_dir).resolve()),
-            "sandbox": spec.sandbox,
-            "permission_mode": spec.permission_mode,
-            "inference_level": self.agent_cfg.runtime.inference_level,
-            "llm_base_url": self.agent_cfg.runtime.llm_base_url.rstrip("/"),
-            "prompt_core_sha256": hashlib.sha256(
-                prompt_core.encode("utf-8")
-            ).hexdigest(),
-        }
-        encoded = json.dumps(
-            payload, sort_keys=True, separators=(",", ":")
-        ).encode("utf-8")
-        return "v1:" + hashlib.sha256(encoded).hexdigest()
+            spec=spec,
+        )
 
     async def refresh_spec(self, system_prompt: str) -> RuntimeSpec:
-        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        shared_status = ensure_workspace_shared_link(
+            self.workspace_dir,
+            shared_fs_dir(),
+        )
+        if shared_status not in AVAILABLE_SHARED_WORKSPACE_STATES:
+            logger.error(
+                "agent %s: shared workspace is %s; cross-Agent file handoffs "
+                "are unavailable",
+                self.agent_id,
+                shared_status,
+            )
         self.claude_dir.mkdir(parents=True, exist_ok=True)
         if self.harness_name == "claude-code":
             self._sync_claude_host_state()
@@ -328,6 +419,7 @@ class LocalRuntimePreparer:
             space_id=pc.space_id,
             keystore_dir=str(agent_dir(self.agent_id) / "keys"),
             workspace=str(self.workspace_dir),
+            shared_workspace=str(shared_fs_dir()),
             agent_id=self.agent_id,
             data_service_url=(
                 f"http://127.0.0.1:{self.daemon_cfg.data_service.port}"
@@ -557,20 +649,11 @@ class LocalRuntimePreparer:
         )
 
     def _codex_gateway_provider(self) -> dict[str, str] | None:
-        runtime = self.agent_cfg.runtime
-        if not (runtime.llm_base_url and runtime.api_key):
-            return None
-        base = runtime.llm_base_url.rstrip("/")
-        if not base.endswith("/v1"):
-            base += "/v1"
-        return {
-            "name": "litellm",
-            "display_name": "LiteLLM gateway",
-            "base_url": base,
-            "env_key": "OPENAI_API_KEY",
-            "model": self.model or "codex",
-            "wire_api": "responses",
-        }
+        return build_codex_gateway_provider(
+            model=self.model,
+            llm_base_url=self.agent_cfg.runtime.llm_base_url,
+            api_key=self.agent_cfg.runtime.api_key,
+        )
 
     def _ensure_codex_self_invoke(self, executable: str) -> None:
         if not is_macos():
@@ -643,14 +726,110 @@ class LocalRuntimePreparer:
         )
 
 
+def _event_kind(event: HarnessEvent) -> str:
+    return (
+        event.type.value
+        if isinstance(event.type, HarnessEventType)
+        else str(event.type)
+    )
+
+
+def _normalized_tool_label(label: str) -> str:
+    """Normalize an MCP-scoped tool label to its bare name for status."""
+    if label.startswith("mcp__") and "__" in label:
+        return label.rsplit("__", 1)[-1]
+    return label
+
+
+def _emit_status(agent_id: str, event: str, payload: dict[str, Any]) -> None:
+    from ...portal.control.reporter import get_reporter
+
+    asyncio.ensure_future(get_reporter().emit(agent_id, event, payload))
+
+
+class _LegacyStatusProjector:
+    """Turn-scoped pre-2.0 status projection from normalized Driver events.
+
+    Emits only the safe legacy surface: one bounded ``assistant_text`` per
+    completed assistant block unless the accumulated text is silent, and one
+    label-only ``tool_use`` per normalized tool start. It never reads the
+    native diagnostic payload, tool arguments or results, reasoning events, or
+    unknown provider frames; duplicate lifecycle events and post-terminal
+    fragments are ignored, and buffers are discarded at terminal, abandonment,
+    or runtime teardown.
+    """
+
+    def __init__(self, agent_id: str) -> None:
+        self._agent_id = agent_id
+        self._turn: str | None = None
+        self._block_buffers: dict[str, str] = {}
+        self._emitted_blocks: set[str] = set()
+        self._emitted_tools: set[str] = set()
+
+    def project(self, event: HarnessEvent) -> None:
+        kind = _event_kind(event)
+        turn = str(event.turn_ref.value) if event.turn_ref is not None else ""
+        if kind == "turn.started":
+            self._turn = turn
+            self._reset()
+            return
+        if kind in {"turn.completed", "turn.abandoned", "runtime.exited"}:
+            self._turn = None
+            self._reset()
+            return
+        if not turn or self._turn != turn:
+            return
+        data = event.data
+        if kind == "turn.assistant_delta":
+            text = data.get("text")
+            if isinstance(text, str):
+                block_id = str(data.get("block_id") or "")
+                buffer = self._block_buffers.get(block_id, "")
+                room = STATUS_PREVIEW_CHARS - len(buffer)
+                if room > 0:
+                    self._block_buffers[block_id] = buffer + text[:room]
+            return
+        if kind == "turn.assistant_completed":
+            block_id = str(data.get("block_id") or "")
+            if block_id in self._emitted_blocks:
+                return
+            self._emitted_blocks.add(block_id)
+            text = self._block_buffers.pop(block_id, "")
+            if text and not is_silent(text):
+                _emit_status(self._agent_id, "assistant_text", {"text": text})
+            return
+        if kind == "turn.tool_started":
+            ref = str(data.get("tool_call_ref") or "")
+            if ref in self._emitted_tools:
+                return
+            self._emitted_tools.add(ref)
+            label = _normalized_tool_label(str(data.get("label") or ""))
+            if label:
+                _emit_status(self._agent_id, "tool_use", {"tool": label})
+
+    def _reset(self) -> None:
+        self._block_buffers.clear()
+        self._emitted_blocks.clear()
+        self._emitted_tools.clear()
+
+
 def build_local_runtime_adapter(
     prepared: PreparedLocalRuntime,
     *,
     outbox: RuntimeEventOutbox,
     logical_session_ref: str,
+    driver: Driver | None = None,
+    cleanup: Callable[[], Awaitable[None]] | None = None,
 ) -> RuntimeManagerAdapter:
-    """Bind a prepared local Driver to the durable Runtime Manager."""
-    driver = build_driver(prepared.harness_name)
+    """Bind a prepared Driver runtime to the durable Runtime Manager.
+
+    ``driver`` defaults to the ratified Driver for ``prepared.harness_name``;
+    the Docker Codex composition injects ``CodexAppServerDriver`` with its
+    exec transport factory and passes ``cleanup`` (bounded container stop)
+    that runs after the manager closes.
+    """
+    if driver is None:
+        driver = build_driver(prepared.harness_name)
     if isinstance(driver, UnsupportedDriver):
         raise RuntimeError(driver.diagnostic)
     projector = RuntimeEventProjector(
@@ -659,6 +838,7 @@ def build_local_runtime_adapter(
         scope=TrustedScope(),
     )
     projecting_sink = RuntimeEventProjectingSink(outbox, projector)
+    legacy_projector = _LegacyStatusProjector(prepared.preparer.agent_id)
     manager: RuntimeManager
     session_fingerprint = [prepared.session_fingerprint]
 
@@ -684,6 +864,7 @@ def build_local_runtime_adapter(
         await outbox.arequire_turn_capacity(estimated_start_bytes=estimated)
 
     async def persist_event(event: HarnessEvent) -> None:
+        legacy_projector.project(event)
         logical_session = str(event.session_ref or manager.session_ref)
         projector.session_ref = logical_session
         await projecting_sink(event)
@@ -724,14 +905,18 @@ def build_local_runtime_adapter(
     return RuntimeManagerAdapter(
         manager,
         spec_reloader=reload_spec,
+        post_close=cleanup,
     )
 
 
 __all__ = [
     "LocalRuntimePreparer",
     "PreparedLocalRuntime",
+    "RuntimePreparer",
     "SUPPORTED_LOCAL_DRIVERS",
     "VALID_PERMISSION_MODES",
     "VALID_SANDBOX_MODES",
     "build_local_runtime_adapter",
+    "build_codex_gateway_provider",
+    "compute_session_fingerprint",
 ]

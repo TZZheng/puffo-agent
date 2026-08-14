@@ -36,9 +36,9 @@ A keyless agent cannot call subkey-signed routes. Gate *dispositions*
 are enforced locally in every case; gate *side effects* that need
 signed HTTP (allowlist writes, the operator approval prompt, the
 first-DM notice) are skipped with an explicit log line — a documented
-degrade, never a silent one. Where native has no gate either (no
-``operator_slug`` configured means nobody can approve), keyless matches
-native rather than inventing a stricter rule.
+degrade, never a silent one. A keyless foreign DM with no configured
+``operator_slug`` is retained fail-closed; native keeps its existing
+no-operator behavior.
 """
 
 from __future__ import annotations
@@ -63,6 +63,7 @@ class GateVerdict:
     disposition: ReceiptDisposition
     reason: str
     content: str | None = None
+    defer_ack: bool = False
 
 
 def signed_http_available(client: Any) -> bool:
@@ -186,10 +187,9 @@ async def foreign_dm_gate(
     """Hold a DM from an untrusted stranger until the operator approves.
 
     The server never applies this gate — it is entirely Agent-owned on
-    both transports. Keyless cannot send the approval prompt, so it
-    holds the DM gated instead of delivering it unapproved; the one
-    case where it declines to gate is the case native also declines,
-    namely no ``operator_slug`` to ask.
+    both transports. Keyless holds an untrusted DM gated until its local
+    approval control plane resolves it, including when no operator is
+    configured. The signed/native no-operator behavior remains unchanged.
     """
     if payload.envelope_kind != "dm":
         return None
@@ -220,14 +220,16 @@ async def foreign_dm_gate(
 
     if not signed:
         if not client.operator_slug:
-            # Native declines to gate for exactly this reason too: with
-            # no operator there is no one who could ever approve.
             client._log.warning(
                 "auto_accept_dm=False but no operator_slug configured; "
-                "delivering DM from %s without approval",
+                "holding keyless DM from %s fail-closed",
                 sender,
             )
-            return None
+            return GateVerdict(
+                gate="foreign_dm",
+                disposition=ReceiptDisposition.FOREIGN_DM_GATED,
+                reason="foreign dm gated (keyless: no operator configured)",
+            )
         client._log.info(
             "dm_gate: keyless transport cannot send the operator approval "
             "prompt for %s — holding the DM gated rather than delivering "

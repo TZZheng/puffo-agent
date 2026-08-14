@@ -91,10 +91,14 @@ class CloudBridgeClient:
         self._heartbeat_task: asyncio.Task | None = None
         # client_ref → Future for ack correlation (one ack per send).
         self._send_acks: dict[str, asyncio.Future] = {}
-        # FIFO of futures awaiting ack_result / spaces (no client_ref
-        # in the spec — only one in-flight at a time).
+        # FIFO of futures awaiting ack_result / spaces / invites (no
+        # client_ref in the spec — only one in-flight at a time).
         self._ack_result_waiters: asyncio.Queue[asyncio.Future] = asyncio.Queue()
         self._spaces_waiters: asyncio.Queue[asyncio.Future] = asyncio.Queue()
+        self._invites_waiters: asyncio.Queue[asyncio.Future] = asyncio.Queue()
+        # client_ref → Future for decide_invitation_result correlation
+        # (one result per decision send).
+        self._decide_waiters: dict[str, asyncio.Future] = {}
         self._connected_callbacks: list[Callable[[], Awaitable[None]]] = []
 
     def add_connected_callback(
@@ -182,52 +186,94 @@ class CloudBridgeClient:
                 )
                 continue
             kind = frame.get("type", "")
-            if kind == "ping":
-                # Server keepalive — no reply per spec §5.1.
+            if self._route_frame(kind, frame):
                 continue
-            if kind == "ack":
-                client_ref = frame.get("client_ref")
-                if client_ref and client_ref in self._send_acks:
-                    fut = self._send_acks.pop(client_ref)
-                    if not fut.done():
-                        fut.set_result(frame)
-                    continue
-                # Unsolicited ack (e.g. server-side resend / lost
-                # correlation) — surface it for diagnostics.
-                logger.debug(
-                    "cloud bridge: ack with unknown client_ref=%r",
-                    client_ref,
-                )
-                continue
-            if kind == "ack_result":
-                if not self._ack_result_waiters.empty():
-                    fut = self._ack_result_waiters.get_nowait()
-                    if not fut.done():
-                        fut.set_result(frame)
-                    continue
-                logger.debug("cloud bridge: ack_result with no waiter")
-                continue
-            if kind == "spaces":
-                if not self._spaces_waiters.empty():
-                    fut = self._spaces_waiters.get_nowait()
-                    if not fut.done():
-                        fut.set_result(frame)
-                    continue
-                logger.debug("cloud bridge: spaces with no waiter")
-                continue
-            if kind == "error" and frame.get("client_ref"):
-                # An error correlated to a send — route to that future
-                # as an exception.
-                client_ref = frame["client_ref"]
-                if client_ref in self._send_acks:
-                    fut = self._send_acks.pop(client_ref)
-                    if not fut.done():
-                        fut.set_exception(BridgeError(
-                            frame.get("code", "ERROR"),
-                            frame.get("message", ""),
-                        ))
-                    continue
             yield frame
+
+    def _route_frame(self, kind: str, frame: dict) -> bool:
+        """Route a correlated response/error frame to its waiter future.
+
+        Returns ``True`` when the frame was consumed by a waiter (or is a
+        swallowed keepalive / uncorrelated diagnostic), so ``frames()``
+        yields only message / pending_delivered / uncorrelated error
+        frames. Sync (no awaits) so it can't interleave with a concurrent
+        ``send_*`` popping or finally-cleaning the same waiter maps.
+        """
+        if kind == "ping":
+            # Server keepalive — no reply per spec §5.1.
+            return True
+        if kind == "ack":
+            client_ref = frame.get("client_ref")
+            if client_ref and client_ref in self._send_acks:
+                fut = self._send_acks.pop(client_ref)
+                if not fut.done():
+                    fut.set_result(frame)
+                return True
+            # Unsolicited ack (e.g. server-side resend / lost
+            # correlation) — surface it for diagnostics.
+            logger.debug(
+                "cloud bridge: ack with unknown client_ref=%r",
+                client_ref,
+            )
+            return True
+        if kind == "ack_result":
+            if not self._ack_result_waiters.empty():
+                fut = self._ack_result_waiters.get_nowait()
+                if not fut.done():
+                    fut.set_result(frame)
+                return True
+            logger.debug("cloud bridge: ack_result with no waiter")
+            return True
+        if kind == "spaces":
+            if not self._spaces_waiters.empty():
+                fut = self._spaces_waiters.get_nowait()
+                if not fut.done():
+                    fut.set_result(frame)
+                return True
+            logger.debug("cloud bridge: spaces with no waiter")
+            return True
+        if kind == "invites":
+            if not self._invites_waiters.empty():
+                fut = self._invites_waiters.get_nowait()
+                if not fut.done():
+                    fut.set_result(frame)
+                return True
+            logger.debug("cloud bridge: invites with no waiter")
+            return True
+        if kind == "decide_invitation_result":
+            client_ref = frame.get("client_ref")
+            if client_ref and client_ref in self._decide_waiters:
+                fut = self._decide_waiters.pop(client_ref)
+                if not fut.done():
+                    fut.set_result(frame)
+                return True
+            logger.debug(
+                "cloud bridge: decide_invitation_result with unknown "
+                "client_ref=%r",
+                client_ref,
+            )
+            return True
+        if kind == "error" and frame.get("client_ref"):
+            # An error correlated to a send — route to that future
+            # as an exception.
+            client_ref = frame["client_ref"]
+            if client_ref in self._send_acks:
+                fut = self._send_acks.pop(client_ref)
+                if not fut.done():
+                    fut.set_exception(BridgeError(
+                        frame.get("code", "ERROR"),
+                        frame.get("message", ""),
+                    ))
+                return True
+            if client_ref in self._decide_waiters:
+                fut = self._decide_waiters.pop(client_ref)
+                if not fut.done():
+                    fut.set_exception(BridgeError(
+                        frame.get("code", "ERROR"),
+                        frame.get("message", ""),
+                    ))
+                return True
+        return False
 
     async def _heartbeat_loop(self) -> None:
         while self._ws is not None and not self._ws.closed:
@@ -507,6 +553,7 @@ class CloudBridgeClient:
         reply_to_id: Optional[str] = None,
         thread_root_id: Optional[str] = None,
         attachments: Optional[list[dict]] = None,
+        client_ref: Optional[str] = None,
         timeout: float = 30.0,
     ) -> dict:
         # Pass EITHER recipient_slug (DM) OR space_id+channel_id
@@ -520,8 +567,18 @@ class CloudBridgeClient:
         # size_bytes? }); blobs were already uploaded keyless via
         # ``upload_blob``. Added only when non-empty so a plain send
         # stays byte-shape-identical to the pre-attachment frame.
+        # ``client_ref`` is the correlation id: a caller-supplied
+        # non-empty string is used verbatim for both the outbound frame
+        # and the waiter (the resumable approval flow sends a stable
+        # prompt ref), otherwise the existing ``r_<random>`` is generated.
+        # An empty / whitespace-only / non-string caller value fails before
+        # a frame is sent.
+        if client_ref is not None:
+            if not isinstance(client_ref, str) or not client_ref.strip():
+                raise ValueError(f"invalid client_ref: {client_ref!r}")
         ws = await self._require_ws()
-        client_ref = f"r_{uuid.uuid4().hex[:12]}"
+        if client_ref is None:
+            client_ref = f"r_{uuid.uuid4().hex[:12]}"
         frame: dict[str, Any] = {
             "type": "send",
             "plaintext": plaintext,
@@ -629,6 +686,64 @@ class CloudBridgeClient:
             self._discard_waiter(self._spaces_waiters, fut)
             raise
 
+    async def send_list_invites(self, *, timeout: float = 30.0) -> dict:
+        """Read this agent's authoritative pending invitations.
+
+        Sends exactly ``{"type": "list_invites"}`` and returns the
+        correlated ``invites`` frame (uncorrelated FIFO — the spec has
+        no ``client_ref`` for this request, so one in-flight at a time).
+        Shares the ``send_list_spaces`` send-before-wait, timeout,
+        cancellation, and ``BridgeClosed`` conventions.
+        """
+        ws = await self._require_ws()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        await self._invites_waiters.put(fut)
+        await ws.send_json({"type": "list_invites"})
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            self._discard_waiter(self._invites_waiters, fut)
+            raise
+
+    async def send_decide_invitation(
+        self,
+        *,
+        invitation_event_id: str,
+        decision: str,
+        client_ref: str,
+        timeout: float = 30.0,
+    ) -> dict:
+        """Submit the authenticated bridge Agent's invitation decision.
+
+        The frame carries exactly ``type``, ``client_ref``,
+        ``invitation_event_id``, and ``decision`` (``accept`` /
+        ``reject``) — no Agent slug, no signed payload, per the keyless
+        contract. ``client_ref`` is required and caller-supplied so the
+        resumable flow can retry with a stable ref. Returns the
+        correlated ``decide_invitation_result`` frame; a correlated
+        ``error`` frame raises ``BridgeError``; a timed-out or cancelled
+        waiter is removed so the next result is never misdelivered.
+        """
+        if not isinstance(invitation_event_id, str) or not invitation_event_id:
+            raise ValueError("invitation_event_id must be a non-empty string")
+        if decision not in {"accept", "reject"}:
+            raise ValueError(f"invalid decision: {decision!r}")
+        if not isinstance(client_ref, str) or not client_ref.strip():
+            raise ValueError(f"invalid client_ref: {client_ref!r}")
+        ws = await self._require_ws()
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._decide_waiters[client_ref] = fut
+        await ws.send_json({
+            "type": "decide_invitation",
+            "client_ref": client_ref,
+            "invitation_event_id": invitation_event_id,
+            "decision": decision,
+        })
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        finally:
+            self._decide_waiters.pop(client_ref, None)
+
     async def close(self) -> None:
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
@@ -656,3 +771,11 @@ class CloudBridgeClient:
             fut = self._spaces_waiters.get_nowait()
             if not fut.done():
                 fut.set_exception(BridgeClosed("WS closed"))
+        while not self._invites_waiters.empty():
+            fut = self._invites_waiters.get_nowait()
+            if not fut.done():
+                fut.set_exception(BridgeClosed("WS closed"))
+        for fut in list(self._decide_waiters.values()):
+            if not fut.done():
+                fut.set_exception(BridgeClosed("WS closed"))
+        self._decide_waiters.clear()

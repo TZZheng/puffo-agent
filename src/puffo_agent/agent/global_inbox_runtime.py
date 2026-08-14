@@ -16,7 +16,7 @@ import uuid
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Sequence
+from typing import Any, Awaitable, Callable, Protocol, Sequence
 
 from .context_controller import (
     AdmissionCandidate,
@@ -44,7 +44,7 @@ from .message_store import (
 from ._logging import log_runtime_event
 from .message_projection import CONTEXT_VERSION, format_message_group
 from .reminder_scheduler import ReminderScheduler
-from .shared_content import INBOX_RESPONSE_DECISION_CUE
+from .shared_content import INBOX_TURN_CUE
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ DEGRADED_RECOVERY_MAX_SECONDS = 300.0
 
 from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
-from .global_inbox_admission import InboxAdmissionMixin
+from .global_inbox_admission import InboxAdmissionMixin, InboxReadContext
 from .global_inbox_types import (
     ActiveBoundaryAdapter,
     ActiveExactUnion,
@@ -96,6 +96,7 @@ __all__ = [
     "SendAttemptState",
     "TrackingSendDelegate",
     "ToolResultAdmission",
+    "TurnStatusLifecycle",
     "await_listener_with_runtime",
     "conservative_token_estimate",
     "format_stored_message",
@@ -105,6 +106,30 @@ __all__ = [
 
 TurnRunner = Callable[[PlannedTurn], Awaitable[Any]]
 UnfitPolicy = Callable[..., bool | Awaitable[bool]]
+
+
+class TurnStatusLifecycle(Protocol):
+    """Optional worker-owned mirror of the active Global Inbox turn.
+
+    The runtime owns only the durable turn lifecycle; it notifies this
+    callback with immutable active-union snapshots so the worker can drive
+    Server processing-row status without moving status policy in here.
+    """
+
+    async def on_turn_active(
+        self, *, turn_id: str, message_ids: tuple[str, ...]
+    ) -> None:
+        """Report that the active union is (or has grown to) ``message_ids``."""
+
+    async def on_turn_terminal(
+        self,
+        *,
+        turn_id: str,
+        message_ids: tuple[str, ...],
+        succeeded: bool,
+        error_text: str | None,
+    ) -> None:
+        """Settle the exact active union in one terminal status batch."""
 
 
 class GlobalInboxRuntime(InboxAdmissionMixin):
@@ -133,6 +158,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         notice_delivery: InboxNoticeDelivery | None = None,
         runtime_event_outbox: Any | None = None,
         reminder_scheduler: ReminderScheduler | None = None,
+        status_lifecycle: TurnStatusLifecycle | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -179,6 +205,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             store=store,
             notify=self.notify,
         )
+        self.status_lifecycle = status_lifecycle
         self.send_delegate: TrackingSendDelegate | None = None
         self.held_recovery_source = HeldRecoverySource(
             self,
@@ -359,6 +386,12 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 message_count=len(run.message_ids),
                 outcome="requeued",
             )
+            await self._settle_recovered_status(
+                turn_id=run.turn_id,
+                message_ids=tuple(run.message_ids),
+                succeeded=False,
+                error_text="orphaned durable turn requeued at startup",
+            )
             recovered += 1
         return recovered
 
@@ -475,7 +508,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             "<global_inbox_notice>\n"
             + summary
             + "\n</global_inbox_notice>\n"
-            + INBOX_RESPONSE_DECISION_CUE
+            + INBOX_TURN_CUE
         )
         log_runtime_event(
             logger,
@@ -700,6 +733,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         self.active.routes[:] = list(planned.routes)
         if self.coordinator is not None:
             self.coordinator.provider_session_id = event.provider_session_id
+        await self._notify_status_active()
         log_runtime_event(
             logger,
             "turn.admitted",
@@ -725,6 +759,140 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 notice_generation=planned.notice_generation,
                 outcome="admitted",
             )
+
+    async def _notify_status_active(self) -> None:
+        """Expose the exact active union to the worker's status lifecycle.
+
+        Telemetry-only: a reporter failure must never break admission or
+        processing-state decisions, so the callback is shielded here.
+        """
+        if (
+            self.status_lifecycle is None
+            or not self.active.turn_id
+            or not self.active.message_ids
+        ):
+            return
+        try:
+            await self.status_lifecycle.on_turn_active(
+                turn_id=self.active.turn_id,
+                message_ids=tuple(self.active.message_ids),
+            )
+        except Exception:
+            logger.warning(
+                "agent %s: status lifecycle admission notify failed",
+                self.agent_id,
+                exc_info=True,
+            )
+
+    async def _notify_status_terminal(
+        self,
+        *,
+        terminal: bool,
+        succeeded: bool,
+        error_text: str | None,
+    ) -> None:
+        """Settle the exact active union before ``_finalize_process`` clears it.
+
+        Only a terminal turn settles status; the batch is built from the same
+        immutable snapshot the durable requeue/process just used.
+        """
+        if self.status_lifecycle is None or not terminal or not self.active.turn_id:
+            return
+        try:
+            await self.status_lifecycle.on_turn_terminal(
+                turn_id=self.active.turn_id,
+                message_ids=tuple(self.active.message_ids),
+                succeeded=succeeded,
+                error_text=error_text,
+            )
+        except Exception:
+            logger.warning(
+                "agent %s: status lifecycle terminal notify failed",
+                self.agent_id,
+                exc_info=True,
+            )
+
+    async def _settle_recovered_status(
+        self,
+        *,
+        turn_id: str,
+        message_ids: tuple[str, ...],
+        succeeded: bool,
+        error_text: str | None,
+    ) -> None:
+        """Reconstruct and settle a processing run after process restart."""
+        if self.status_lifecycle is None or not turn_id or not message_ids:
+            return
+        try:
+            await self.status_lifecycle.on_turn_active(
+                turn_id=turn_id,
+                message_ids=message_ids,
+            )
+        except Exception:
+            logger.warning(
+                "agent %s: recovered status lifecycle admission failed",
+                self.agent_id,
+                exc_info=True,
+            )
+        try:
+            await self.status_lifecycle.on_turn_terminal(
+                turn_id=turn_id,
+                message_ids=message_ids,
+                succeeded=succeeded,
+                error_text=error_text,
+            )
+        except Exception:
+            logger.warning(
+                "agent %s: recovered status lifecycle terminal notify failed",
+                self.agent_id,
+                exc_info=True,
+            )
+
+    async def _admit_inbox_read(
+        self,
+        context: InboxReadContext,
+        event: ProviderAdmissionEvent,
+        fired: list[bool],
+    ) -> None:
+        """Admit a mid-turn Inbox read, then expose the grown active union.
+
+        The durable admission and its processing-state decisions stay in the
+        implementation trait; this override only mirrors the post-admission
+        union into the worker's status lifecycle.
+        """
+        await super()._admit_inbox_read(context, event, fired)
+        await self._notify_status_active()
+
+    async def _admit_held_recovery(
+        self,
+        event: ProviderAdmissionEvent,
+        *,
+        fired: list[bool],
+        correlation_key: str,
+        active_turn_id: str,
+        provider_session_id: str,
+        evidence: Any,
+        evidence_key: tuple[str, str, str, str, int, str],
+        displayed_ids: tuple[str, ...],
+        space_id: str,
+        channel_id: str,
+        latest_seq: int,
+    ) -> None:
+        """Admit a held-send recovery, then expose the grown active union."""
+        await super()._admit_held_recovery(
+            event,
+            fired=fired,
+            correlation_key=correlation_key,
+            active_turn_id=active_turn_id,
+            provider_session_id=provider_session_id,
+            evidence=evidence,
+            evidence_key=evidence_key,
+            displayed_ids=displayed_ids,
+            space_id=space_id,
+            channel_id=channel_id,
+            latest_seq=latest_seq,
+        )
+        await self._notify_status_active()
 
     def _write_current_turn(self, planned: PlannedTurn) -> None:
         path = self.current_turn_path
@@ -1099,21 +1267,26 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 or any(item.is_encrypted for item in planned.items),
             )
             terminal = False
+            terminal_succeeded = False
+            terminal_error: str | None = None
             try:
                 await self._invoke_turn_with_retries(planned)
                 if self.active.turn_id == planned.turn_id:
                     await self._mark_active_processed(planned, process_started)
                     terminal = True
+                    terminal_succeeded = True
                 else:
                     self._degrade("provider returned without correlated admission")
             except asyncio.CancelledError:
                 await self._requeue_active_turn(planned, process_started, "cancelled")
                 terminal = True
+                terminal_error = "global inbox turn cancelled before completion"
                 raise
             except Exception as exc:
                 terminal = await self._requeue_active_turn(
                     planned, process_started, "provider_error"
                 )
+                terminal_error = f"{type(exc).__name__}: {exc}"
                 diagnostic = (
                     "turn failed and was requeued"
                     if terminal
@@ -1135,6 +1308,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                     outcome="requeued" if terminal else "degraded",
                 )
             finally:
+                await self._notify_status_terminal(
+                    terminal=terminal,
+                    succeeded=terminal_succeeded,
+                    error_text=terminal_error,
+                )
                 self._finalize_process(planned, terminal)
             await self._wake_remaining_pending()
             return True
@@ -1372,6 +1550,20 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         )
         self.health = RuntimeHealth(state, diagnostic)
         self._defer_requeued_recovery = defer_requeued_recovery and requeued
+        if activated:
+            await self._notify_status_terminal(
+                terminal=True,
+                succeeded=False,
+                error_text=diagnostic,
+            )
+        elif run is not None:
+            succeeded = run.state == ProcessingState.PROCESSED.value
+            await self._settle_recovered_status(
+                turn_id=run.turn_id,
+                message_ids=tuple(run.message_ids),
+                succeeded=succeeded,
+                error_text=None if succeeded else diagnostic,
+            )
         self._clear_terminal_turn()
         if requeued:
             self.notify()
@@ -1497,6 +1689,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             duration_ms=int((time.monotonic() - recovery_started) * 1000),
         )
         self.health = RuntimeHealth()
+        await self._notify_status_terminal(
+            terminal=True,
+            succeeded=True,
+            error_text=None,
+        )
         self._clear_terminal_turn()
         return True
 
@@ -1522,6 +1719,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             error_category="cancelled",
         )
         self.health = RuntimeHealth("degraded", "crash resume cancelled and requeued")
+        await self._notify_status_terminal(
+            terminal=True,
+            succeeded=False,
+            error_text="crash resume cancelled and requeued",
+        )
         self._clear_terminal_turn()
         self.notify()
 
@@ -1574,6 +1776,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 diagnostic="crash join identity, route, or target mismatch",
             )
         self._activate_recovery(planned, durable_ids, run.provider_session_id)
+        await self._notify_status_active()
         from . import send_mode
 
         # A resumed turn establishes the same send-mode facts ``process_once``

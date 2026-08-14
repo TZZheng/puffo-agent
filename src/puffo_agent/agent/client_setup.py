@@ -11,6 +11,7 @@ from ..limits import (
     MAX_INLINE_MESSAGE_CHARS,
     MESSAGE_SEGMENT_CHARS,
 )
+from ..portal.state import agent_dir
 from .client_support import AgentLogger, DeviceKeyCache
 from .contact_cache import ContactCache
 from .dm_approvals import load_pending_dm_approvals
@@ -64,6 +65,9 @@ def _transport_state(*, http_client: Any, bridge_client: Any) -> dict[str, Any]:
         "global_runtime": None,
         "_legacy_dm_peer": "",
         "_last_dm_sender": "",
+        # The connection-owned keyless invitation poller (see
+        # ``bridge_transport.listen_bridge``); one fresh task per connect.
+        "_keyless_invite_poll_task": None,
     }
 
 
@@ -80,6 +84,7 @@ def _membership_state(slug: str) -> dict[str, Any]:
         "_pending_leave_dms": {},
         "_gate_left_spaces": set(),
         "_pending_dm_approvals": load_pending_dm_approvals(slug),
+        "_keyless_dm_approval_lock": asyncio.Lock(),
         "_pending_command_permissions": {},
         "_timed_out_command_permissions": {},
     }
@@ -97,6 +102,75 @@ def _cache_state() -> dict[str, Any]:
         "_channel_name_cache": {},
         "_space_members": {},
     }
+
+
+def _keyless_contact_state_path(slug: str) -> Any:
+    """Per-Agent local contact state for a keyless transport.
+
+    A keyless agent can never hydrate the signed ``/allowlists`` and
+    ``/blocklists`` routes, so its ``ContactCache`` answers (and persists)
+    a small per-Agent JSON allow/block set instead. Signed clients never
+    pass a path and keep today's server-hydration / in-memory behavior.
+    """
+    return agent_dir(slug) / ".puffo-agent" / "keyless_contacts.json"
+
+
+def _contacts(
+    http_client: Any,
+    log: Any,
+    *,
+    slug: str,
+) -> ContactCache:
+    keyless = bool(getattr(http_client, "keyless", False))
+    return ContactCache(
+        http_client,
+        log,
+        local_state_path=_keyless_contact_state_path(slug) if keyless else None,
+    )
+
+
+def _bridge_invite_prompt_send(bridge: Any, operator_slug: str):
+    """The durable flow's DM-prompt lane over a real bridge transport.
+
+    A keyless bridge prompt is a plain ``send_send`` DM to the configured
+    operator — never a signed HTTP route. The returned correlated ack is the
+    flow's prompt identity, which the operator's threaded reply echoes back.
+    """
+
+    async def send(prompt: str, *, client_ref: str) -> dict:
+        return await bridge.send_send(
+            plaintext=prompt,
+            recipient_slug=operator_slug,
+            client_ref=client_ref,
+        )
+
+    return send
+
+
+def _keyless_invitation_flow(
+    *,
+    slug: str,
+    bridge_client: Any,
+    operator_slug: str,
+    auto_accept_space_invitations: bool,
+):
+    """Build exactly one invitation flow for a real keyless bridge client.
+
+    Native clients keep no flow and never touch the signed HTTP invitation
+    path. The flow loads its durable per-Agent invitation state here, so a
+    reconnect resumes the same records instead of minting a second flow.
+    """
+    if bridge_client is None:
+        return None
+    from .keyless_invitation_flow import KeylessInvitationFlow
+
+    return KeylessInvitationFlow(
+        slug=slug,
+        bridge=bridge_client,
+        operator_slug=operator_slug,
+        send_dm=_bridge_invite_prompt_send(bridge_client, operator_slug),
+        auto_accept_space_invitations=auto_accept_space_invitations,
+    )
 
 
 def initial_client_state(
@@ -143,5 +217,11 @@ def initial_client_state(
     state["_log"] = AgentLogger(
         logging.getLogger("puffo_agent.agent.puffo_core_client"), {"agent": slug}
     )
-    state["_contacts"] = ContactCache(http_client, state["_log"])
+    state["_contacts"] = _contacts(http_client, state["_log"], slug=slug)
+    state["_keyless_invitation_flow"] = _keyless_invitation_flow(
+        slug=slug,
+        bridge_client=bridge_client,
+        operator_slug=operator_slug,
+        auto_accept_space_invitations=auto_accept_space_invitations,
+    )
     return state

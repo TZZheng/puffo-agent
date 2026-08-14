@@ -11,6 +11,9 @@ This document freezes the release decisions and evidence expected after the
 Agent Foundation integration branch merges. It is intentionally narrower than
 the complete product roadmap.
 
+The ordered implementation and release backlog is tracked in
+[`roadmap/agent-foundation/STABLE-2.0-READINESS.md`](../roadmap/agent-foundation/STABLE-2.0-READINESS.md).
+
 ## Decisions
 
 1. Merge the Agent Foundation implementation to `main`, but publish it first as

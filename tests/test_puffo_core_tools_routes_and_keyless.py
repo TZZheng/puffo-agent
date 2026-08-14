@@ -1304,7 +1304,7 @@ async def test_keyless_send_message_channel_posts_unsigned():
     assert isinstance(body["client_ref"], str) and body["client_ref"]
     assert "client_request_id" not in body
     assert body["freshness"] == {
-        "context_baseline_seq": 0,
+        "context_baseline_seq": None,
         "seen_seq": 0,
         "mode": "require_current",
     }
