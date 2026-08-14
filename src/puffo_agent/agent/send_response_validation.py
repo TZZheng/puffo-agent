@@ -12,6 +12,10 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+BASELINE_PERSISTENCE_WARNING = (
+    "The message was committed, but the local freshness baseline could not be "
+    "saved; a later channel send may need to resynchronize context."
+)
 
 
 _LEGACY_HELD_RESPONSE_FIELDS = frozenset(
@@ -73,17 +77,32 @@ async def persist_baseline(
     channel_id: str,
     request_baseline: int | None,
     established: int | None,
-) -> None:
+) -> bool:
     """Persist a validated Server-established baseline from a null-baseline commit."""
     if request_baseline is not None or established is None:
-        return
-    try:
-        from .send_coordinator import _call_first
+        return True
+    from .send_coordinator import _call_first
 
-        await _call_first(source, ("set_context_baseline_seq",),
-                          space_id, channel_id, established)
-    except Exception:
-        logger.exception("persist baseline failed for %s/%s", space_id, channel_id)
+    last_error: Exception | None = None
+    for _attempt in range(2):
+        try:
+            await _call_first(
+                source,
+                ("set_context_baseline_seq",),
+                space_id,
+                channel_id,
+                established,
+            )
+            return True
+        except Exception as exc:
+            last_error = exc
+    logger.error(
+        "persist baseline failed after retry for %s/%s: %s",
+        space_id,
+        channel_id,
+        last_error,
+    )
+    return False
 
 
 def validate_keyless_response(raw: Any, request_body: Mapping[str, Any]) -> SendResult:

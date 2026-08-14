@@ -35,6 +35,7 @@ from .held_context import build_held_context_output
 from .message_projection import CONTEXT_VERSION
 from .send_models import SemanticSendRequest, SendResult
 from .send_response_validation import (
+    BASELINE_PERSISTENCE_WARNING,
     coordinator_config,
     http_error_detail,
     optional_response_int,
@@ -655,8 +656,15 @@ class SendCoordinator:
                 logger.exception(
                     "sent keyless message but could not clear held state"
                 )
-            await persist_baseline(self.baseline_source, space_id, channel_id,
-                                   boundary.baseline, result.context_baseline_seq)
+            baseline_saved = await persist_baseline(
+                self.baseline_source,
+                space_id,
+                channel_id,
+                boundary.baseline,
+                result.context_baseline_seq,
+            )
+            if not baseline_saved:
+                result.note = f"{result.note} {BASELINE_PERSISTENCE_WARNING}"
             acknowledged = max(result.seen_seq or 0, result.context_baseline_seq or 0)
             if (
                 result.latest_seq_before_send == acknowledged
@@ -969,8 +977,15 @@ class SendCoordinator:
             logger.exception("sent message but could not clear held state")
         # A stale send_anyway may cross messages this turn has not seen. The
         # outbound is visible, but the boundary advances only without a gap.
-        await persist_baseline(self.baseline_source, space_id, channel_id,
-                               boundary.baseline, result.context_baseline_seq)
+        baseline_saved = await persist_baseline(
+            self.baseline_source,
+            space_id,
+            channel_id,
+            boundary.baseline,
+            result.context_baseline_seq,
+        )
+        if not baseline_saved:
+            result.note = f"{result.note} {BASELINE_PERSISTENCE_WARNING}"
         acknowledged = max(result.seen_seq or 0, result.context_baseline_seq or 0)
         if result.latest_seq_before_send == acknowledged:
             try:

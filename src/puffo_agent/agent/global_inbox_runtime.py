@@ -116,12 +116,15 @@ class TurnStatusLifecycle(Protocol):
     Server processing-row status without moving status policy in here.
     """
 
-    async def on_turn_active(self, message_ids: tuple[str, ...]) -> None:
+    async def on_turn_active(
+        self, *, turn_id: str, message_ids: tuple[str, ...]
+    ) -> None:
         """Report that the active union is (or has grown to) ``message_ids``."""
 
     async def on_turn_terminal(
         self,
         *,
+        turn_id: str,
         message_ids: tuple[str, ...],
         succeeded: bool,
         error_text: str | None,
@@ -397,6 +400,12 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 mode="startup_orphan_recovery",
                 message_count=len(run.message_ids),
                 outcome="requeued",
+            )
+            await self._settle_recovered_status(
+                turn_id=run.turn_id,
+                message_ids=tuple(run.message_ids),
+                succeeded=False,
+                error_text="orphaned durable turn requeued at startup",
             )
             recovered += 1
         return recovered
@@ -772,11 +781,16 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         Telemetry-only: a reporter failure must never break admission or
         processing-state decisions, so the callback is shielded here.
         """
-        if self.status_lifecycle is None or not self.active.message_ids:
+        if (
+            self.status_lifecycle is None
+            or not self.active.turn_id
+            or not self.active.message_ids
+        ):
             return
         try:
             await self.status_lifecycle.on_turn_active(
-                tuple(self.active.message_ids)
+                turn_id=self.active.turn_id,
+                message_ids=tuple(self.active.message_ids),
             )
         except Exception:
             logger.warning(
@@ -797,10 +811,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         Only a terminal turn settles status; the batch is built from the same
         immutable snapshot the durable requeue/process just used.
         """
-        if self.status_lifecycle is None or not terminal:
+        if self.status_lifecycle is None or not terminal or not self.active.turn_id:
             return
         try:
             await self.status_lifecycle.on_turn_terminal(
+                turn_id=self.active.turn_id,
                 message_ids=tuple(self.active.message_ids),
                 succeeded=succeeded,
                 error_text=error_text,
@@ -808,6 +823,42 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         except Exception:
             logger.warning(
                 "agent %s: status lifecycle terminal notify failed",
+                self.agent_id,
+                exc_info=True,
+            )
+
+    async def _settle_recovered_status(
+        self,
+        *,
+        turn_id: str,
+        message_ids: tuple[str, ...],
+        succeeded: bool,
+        error_text: str | None,
+    ) -> None:
+        """Reconstruct and settle a processing run after process restart."""
+        if self.status_lifecycle is None or not turn_id or not message_ids:
+            return
+        try:
+            await self.status_lifecycle.on_turn_active(
+                turn_id=turn_id,
+                message_ids=message_ids,
+            )
+        except Exception:
+            logger.warning(
+                "agent %s: recovered status lifecycle admission failed",
+                self.agent_id,
+                exc_info=True,
+            )
+        try:
+            await self.status_lifecycle.on_turn_terminal(
+                turn_id=turn_id,
+                message_ids=message_ids,
+                succeeded=succeeded,
+                error_text=error_text,
+            )
+        except Exception:
+            logger.warning(
+                "agent %s: recovered status lifecycle terminal notify failed",
                 self.agent_id,
                 exc_info=True,
             )
@@ -1514,6 +1565,20 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         )
         self.health = RuntimeHealth(state, diagnostic)
         self._defer_requeued_recovery = defer_requeued_recovery and requeued
+        if activated:
+            await self._notify_status_terminal(
+                terminal=True,
+                succeeded=False,
+                error_text=diagnostic,
+            )
+        elif run is not None:
+            succeeded = run.state == ProcessingState.PROCESSED.value
+            await self._settle_recovered_status(
+                turn_id=run.turn_id,
+                message_ids=tuple(run.message_ids),
+                succeeded=succeeded,
+                error_text=None if succeeded else diagnostic,
+            )
         self._clear_terminal_turn()
         if requeued:
             self.notify()
@@ -1639,6 +1704,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             duration_ms=int((time.monotonic() - recovery_started) * 1000),
         )
         self.health = RuntimeHealth()
+        await self._notify_status_terminal(
+            terminal=True,
+            succeeded=True,
+            error_text=None,
+        )
         self._clear_terminal_turn()
         return True
 
@@ -1664,6 +1734,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             error_category="cancelled",
         )
         self.health = RuntimeHealth("degraded", "crash resume cancelled and requeued")
+        await self._notify_status_terminal(
+            terminal=True,
+            succeeded=False,
+            error_text="crash resume cancelled and requeued",
+        )
         self._clear_terminal_turn()
         self.notify()
 
@@ -1716,6 +1791,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 diagnostic="crash join identity, route, or target mismatch",
             )
         self._activate_recovery(planned, durable_ids, run.provider_session_id)
+        await self._notify_status_active()
         from . import send_mode
 
         # A resumed turn establishes the same send-mode facts ``process_once``

@@ -10,6 +10,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 SHARED_WORKSPACE_NAME = "shared"
+AVAILABLE_SHARED_WORKSPACE_STATES = frozenset({"created", "existing", "mounted"})
 
 
 def _same_location(left: Path, right: Path) -> bool:
@@ -55,6 +56,20 @@ def ensure_workspace_shared_link(workspace: Path, shared_root: Path) -> str:
         return "existing"
     if link.is_symlink():
         link.unlink()
+    elif link.is_dir():
+        # Docker creates an empty mountpoint when ``shared`` is bind-mounted
+        # below the workspace mount. Replacing that empty directory is safe and
+        # keeps a later Docker -> local runtime switch from becoming a false
+        # migration conflict.
+        try:
+            link.rmdir()
+        except OSError:
+            logger.warning(
+                "workspace shared path %s contains local data; preserving it "
+                "instead of replacing it with the Puffo shared workspace",
+                link,
+            )
+            return "conflict"
     elif link.exists():
         logger.warning(
             "workspace shared path %s already contains local data; preserving it "
@@ -77,3 +92,52 @@ def ensure_workspace_shared_link(workspace: Path, shared_root: Path) -> str:
         )
         return "unavailable"
     return "created"
+
+
+def prepare_workspace_shared_access(
+    workspace: Path,
+    shared_root: Path,
+    *,
+    mounted: bool = False,
+) -> str:
+    """Prepare one runtime's shared path and return its prompt-facing state.
+
+    Docker exposes the shared root with a bind mount, so it removes a prior
+    local-runtime symlink instead of mounting over it. Local runtimes use the
+    symlink. Existing real content is never hidden by either mode.
+    """
+    if not mounted:
+        return ensure_workspace_shared_link(workspace, shared_root)
+    workspace = workspace.expanduser()
+    workspace.mkdir(parents=True, exist_ok=True)
+    shared_root = shared_root.expanduser()
+    shared_existed = shared_root.exists()
+    shared_root.mkdir(parents=True, exist_ok=True)
+    if not shared_existed and os.name != "nt":
+        shared_root.chmod(0o700)
+
+    mountpoint = workspace / SHARED_WORKSPACE_NAME
+    if mountpoint.is_symlink():
+        mountpoint.unlink()
+    elif mountpoint.is_dir():
+        try:
+            next(mountpoint.iterdir())
+        except StopIteration:
+            pass
+        except OSError:
+            return "unavailable"
+        else:
+            logger.warning(
+                "workspace shared path %s contains local data; preserving it "
+                "instead of hiding it with the Puffo shared-workspace mount",
+                mountpoint,
+            )
+            return "conflict"
+    elif mountpoint.exists():
+        logger.warning(
+            "workspace shared path %s contains local data; preserving it "
+            "instead of hiding it with the Puffo shared-workspace mount",
+            mountpoint,
+        )
+        return "conflict"
+    return "mounted"

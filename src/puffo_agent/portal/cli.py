@@ -54,7 +54,10 @@ from .state import (
     write_refresh_token_request,
     write_stop_request,
 )
-from .workspace_layout import ensure_workspace_shared_link
+from .workspace_layout import (
+    AVAILABLE_SHARED_WORKSPACE_STATES,
+    prepare_workspace_shared_access,
+)
 
 DEFAULT_PROFILE = """# Agent Profile
 
@@ -83,6 +86,21 @@ question that invites a response. Stay silent when the conversation is
 between other people and you have nothing useful to add — output
 exactly `[SILENT]` to stay silent.
 """
+
+
+def _prepare_cli_shared_workspace(cfg: AgentConfig) -> str:
+    status = prepare_workspace_shared_access(
+        cfg.resolve_workspace_dir(),
+        shared_fs_dir(),
+        mounted=(cfg.runtime.kind or "cli-local") == "cli-docker",
+    )
+    if status not in AVAILABLE_SHARED_WORKSPACE_STATES:
+        print(
+            f"warning: shared workspace is {status}; cross-Agent file "
+            "handoffs through workspace/shared are unavailable",
+            file=sys.stderr,
+        )
+    return status
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,7 +553,7 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
         created_at=int(time.time()),
     )
     cfg.save()
-    ensure_workspace_shared_link(cfg.resolve_workspace_dir(), shared_fs_dir())
+    _prepare_cli_shared_workspace(cfg)
 
     from ..agent.memory import ensure_memory_tree, sync_profile_briefing
 
@@ -1538,6 +1556,7 @@ def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
             rc = 2
             continue
         try:
+            workspace_shared_status = _prepare_cli_shared_workspace(cfg)
             rebuild_agent_claude_md(
                 shared_dir=shared_dir,
                 profile_path=cfg.resolve_profile_path(),
@@ -1550,6 +1569,7 @@ def cmd_agent_reset_primer(args: argparse.Namespace) -> int:
                 role=cfg.role,
                 role_short=cfg.role_short,
                 puffo_handle=cfg.puffo_core.slug,
+                workspace_shared_status=workspace_shared_status,
             )
         except BriefingCompileError as exc:
             print(f"error: agent {agent_id!r}: {exc}", file=sys.stderr)

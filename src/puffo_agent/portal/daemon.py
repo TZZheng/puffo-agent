@@ -36,6 +36,7 @@ from .data_service import (
 )
 from .host_mcp_handler import HostMcpContext
 from .rpc_service import set_rpc_resolver, start_rpc_service, stop_rpc_service
+from .runtime_matrix import RUNTIME_CLI_DOCKER, RUNTIME_CLI_LOCAL
 from .state import (
     AgentConfig,
     DaemonConfig,
@@ -68,7 +69,10 @@ from .state import (
     write_daemon_pid,
     write_daemon_ready,
 )
-from .workspace_layout import ensure_workspace_shared_link
+from .workspace_layout import (
+    AVAILABLE_SHARED_WORKSPACE_STATES,
+    prepare_workspace_shared_access,
+)
 from .worker import Worker
 
 logger = logging.getLogger(__name__)
@@ -288,7 +292,18 @@ class Daemon:
         if cached is not None and (cached[0], cached[1]) == key:
             return cached[2]
         cfg = AgentConfig.load(agent_id)
-        ensure_workspace_shared_link(cfg.resolve_workspace_dir(), shared_fs_dir())
+        shared_status = prepare_workspace_shared_access(
+            cfg.resolve_workspace_dir(),
+            shared_fs_dir(),
+            mounted=(cfg.runtime.kind or RUNTIME_CLI_LOCAL) == RUNTIME_CLI_DOCKER,
+        )
+        if shared_status not in AVAILABLE_SHARED_WORKSPACE_STATES:
+            logger.error(
+                "agent %s: shared workspace is %s; cross-Agent file handoffs "
+                "are unavailable",
+                agent_id,
+                shared_status,
+            )
         self._agent_cfg_cache[agent_id] = (st.st_mtime_ns, st.st_size, cfg)
         return cfg
 

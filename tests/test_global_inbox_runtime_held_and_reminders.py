@@ -1141,11 +1141,21 @@ async def test_startup_recovers_orphaned_turn_without_crash_join(
             provider_session_id="provider-old",
         )
 
+    status_events = []
+
+    class StatusLifecycle:
+        async def on_turn_active(self, **event):
+            status_events.append(("active", event))
+
+        async def on_turn_terminal(self, **event):
+            status_events.append(("terminal", event))
+
     runtime = GlobalInboxRuntime(
         store=store,
         adapter=Adapter(),
         run_turn=lambda _planned: None,
         workspace=tmp_path,
+        status_lifecycle=StatusLifecycle(),
     )
     assert await runtime.recover_orphaned_turns() == 1
 
@@ -1157,6 +1167,11 @@ async def test_startup_recovers_orphaned_turn_without_crash_join(
     ]
     assert repaired.delivery_pending
     assert await store.get_active_turn_runs() == ()
+    if admitted:
+        assert [kind for kind, _event in status_events] == ["active", "terminal"]
+        assert status_events[-1][1]["succeeded"] is False
+    else:
+        assert status_events == []
     assert await runtime.recover_orphaned_turns() == 0
     await store.close()
 

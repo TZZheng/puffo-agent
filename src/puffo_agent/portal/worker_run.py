@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -19,7 +20,10 @@ from .runtime_matrix import (
     resolve_effective_provider,
 )
 from .state import agent_dir, shared_fs_dir
-from .workspace_layout import ensure_workspace_shared_link
+from .workspace_layout import (
+    AVAILABLE_SHARED_WORKSPACE_STATES,
+    prepare_workspace_shared_access,
+)
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -39,6 +43,7 @@ class WorkerRunPaths:
     workspace_path: str
     claude_path: str
     shared_path: Path
+    workspace_shared_status: str
     system_prompt: str
 
     @property
@@ -75,7 +80,7 @@ class WorkerRunServices:
 
 
 class _NoopStatusReporter:
-    async def begin_turn(self, _mid):
+    async def begin_turn(self, _mid, *, run_id=None):
         return None
 
     async def end_turn(self, *_args, **_kwargs):
@@ -97,33 +102,46 @@ class _NoopStatusReporter:
 class GlobalInboxStatusLifecycle:
     """Mirror one durable Global Inbox turn into Server processing rows.
 
-    ``begin_turn`` fires once for the first admitted real message and its run
-    id is retained; later active-union expansions reuse that lifecycle without
-    reopening rows. Terminal cleanup settles the exact active union in one
-    ``end_turn_batch``: the initial run id is reused for the first entry, every
-    additional entry mints a fresh run id, and the same success/error result is
-    applied to all. State always resets so the next turn cannot inherit runs.
+    ``begin_turn`` fires once for the first admitted real message. Run ids are
+    derived from the durable turn and message identities, so crash recovery
+    reopens and settles the same Server row. Later active-union expansions do
+    not reopen rows. Terminal cleanup settles the exact active union in one
+    ``end_turn_batch`` with the same success/error result. State always resets
+    so the next turn cannot inherit runs.
     """
 
     def __init__(self, reporter) -> None:
         self._reporter = reporter
         self._began = False
-        self._begin_run_id: str | None = None
+        self._turn_id: str | None = None
 
-    async def on_turn_active(self, message_ids: tuple[str, ...]) -> None:
-        if not message_ids or self._began:
+    async def on_turn_active(
+        self, *, turn_id: str, message_ids: tuple[str, ...]
+    ) -> None:
+        if not message_ids:
+            return
+        if self._began:
+            if self._turn_id != turn_id:
+                raise RuntimeError("status lifecycle already owns another turn")
             return
         self._began = True
-        self._begin_run_id = await self._reporter.begin_turn(message_ids[0])
+        self._turn_id = turn_id
+        await self._reporter.begin_turn(
+            message_ids[0],
+            run_id=self._run_id(turn_id, message_ids[0]),
+        )
 
     async def on_turn_terminal(
         self,
         *,
+        turn_id: str,
         message_ids: tuple[str, ...],
         succeeded: bool,
         error_text: str | None,
     ) -> None:
-        runs = self._build_runs(message_ids, succeeded, error_text) if self._began else []
+        if self._began and self._turn_id != turn_id:
+            raise RuntimeError("status lifecycle terminal turn does not match")
+        runs = self._build_runs(turn_id, message_ids, succeeded, error_text)
         try:
             if runs:
                 await self._reporter.end_turn_batch(runs)
@@ -132,6 +150,7 @@ class GlobalInboxStatusLifecycle:
 
     def _build_runs(
         self,
+        turn_id: str,
         message_ids: tuple[str, ...],
         succeeded: bool,
         error_text: str | None,
@@ -139,7 +158,7 @@ class GlobalInboxStatusLifecycle:
         runs: list[dict[str, Any]] = []
         for index, message_id in enumerate(message_ids):
             entry: dict[str, Any] = {
-                "run_id": self._begin_run_id if index == 0 else self._mint_run_id(),
+                "run_id": self._run_id(turn_id, message_id),
                 "message_id": message_id,
                 "succeeded": succeeded,
             }
@@ -150,11 +169,12 @@ class GlobalInboxStatusLifecycle:
 
     def reset(self) -> None:
         self._began = False
-        self._begin_run_id = None
+        self._turn_id = None
 
     @staticmethod
-    def _mint_run_id() -> str:
-        return f"run_{uuid.uuid4().hex}"
+    def _run_id(turn_id: str, message_id: str) -> str:
+        identity = f"{turn_id}\0{message_id}".encode("utf-8")
+        return f"run_{hashlib.sha256(identity).hexdigest()[:32]}"
 
 
 class StandardWorkerRun:
@@ -184,7 +204,19 @@ class StandardWorkerRun:
         workspace_path = str(agent_cfg.resolve_workspace_dir())
         claude_path = str(agent_cfg.resolve_claude_dir())
         shared_path = worker_module.docker_shared_dir()
-        ensure_workspace_shared_link(Path(workspace_path), shared_fs_dir())
+        workspace_shared_status = prepare_workspace_shared_access(
+            Path(workspace_path),
+            shared_fs_dir(),
+            mounted=(agent_cfg.runtime.kind or RUNTIME_CLI_LOCAL)
+            == RUNTIME_CLI_DOCKER,
+        )
+        if workspace_shared_status not in AVAILABLE_SHARED_WORKSPACE_STATES:
+            logger.error(
+                "agent %s: shared workspace is %s; cross-Agent file handoffs "
+                "through workspace/shared are unavailable",
+                agent_id,
+                workspace_shared_status,
+            )
         worker_module._seed_claude_dir(Path(claude_path))
         system_prompt = worker_module._rebuild_managed_system_prompt(
             harness_name=effective_harness,
@@ -197,6 +229,7 @@ class StandardWorkerRun:
             role=agent_cfg.role,
             role_short=agent_cfg.role_short,
             puffo_handle=agent_cfg.puffo_core.slug,
+            workspace_shared_status=workspace_shared_status,
         )
         paths = WorkerRunPaths(
             agent_id=agent_id,
@@ -206,6 +239,7 @@ class StandardWorkerRun:
             workspace_path=workspace_path,
             claude_path=claude_path,
             shared_path=shared_path,
+            workspace_shared_status=workspace_shared_status,
             system_prompt=system_prompt,
         )
         self._remove_stale_managed_prompt(paths)
@@ -574,6 +608,7 @@ class StandardWorkerRun:
             role=worker.agent_cfg.role,
             role_short=worker.agent_cfg.role_short,
             puffo_handle=worker.agent_cfg.puffo_core.slug,
+            workspace_shared_status=paths.workspace_shared_status,
             puffo=context.puffo,
             adapter=worker._adapter,
             refresh_agent_flag=refresh_agent,

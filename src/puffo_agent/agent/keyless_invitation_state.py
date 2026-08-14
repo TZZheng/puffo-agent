@@ -190,8 +190,10 @@ def save_keyless_invitations(
 ) -> None:
     """Atomically persist the whole invitation document.
 
-    Writes a sibling ``*.tmp`` file then ``os.replace`` over the target so
-    a crash mid-write never leaves a truncated document; raises ``OSError``
+    Writes a sibling ``*.tmp`` file then atomically replaces the target, so
+    readers do not observe an in-progress write during ordinary process
+    failure. This does not claim power-loss durability because neither the
+    temporary file nor its directory is explicitly fsynced. Raises ``OSError``
     on failure so the caller restores its in-memory mirror.
     """
     path = keyless_invitations_path(slug)
