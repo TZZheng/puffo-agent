@@ -6,6 +6,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a8] — 2026-08-15
+
+> Staging candidate for unified semantic conversation reads.
+
 ### Changed
 
 - **Inbox and history browsing now expose one semantic MCP tool.**
