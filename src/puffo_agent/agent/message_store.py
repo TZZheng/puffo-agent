@@ -269,6 +269,25 @@ CREATE INDEX IF NOT EXISTS idx_reminder_occurrences_due
 """
 
 
+def _history_order(
+    *,
+    column_prefix: str,
+    after_seq: int | None,
+    before_seq: int | None,
+    since_resolved: tuple[int, str] | None,
+    before_resolved: tuple[int, str] | None,
+) -> tuple[str, bool]:
+    """Return SQL ordering and whether the selected rows are already oldest-first."""
+    envelope = f"{column_prefix}envelope_id"
+    if after_seq is not None:
+        return f"{column_prefix}server_seq ASC, {envelope} ASC", True
+    if before_seq is not None:
+        return f"{column_prefix}server_seq DESC, {envelope} DESC", False
+    oldest_first = since_resolved is not None and before_resolved is None
+    direction = "ASC" if oldest_first else "DESC"
+    return f"{column_prefix}sent_at {direction}, {envelope} {direction}", oldest_first
+
+
 class MessageStore(ReminderStoreMixin, InboxStoreMixin):
     """Own all durable message, Inbox, and reminder state for one Agent."""
 
@@ -1283,21 +1302,13 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             clauses.append("m.server_seq IS NOT NULL AND m.server_seq < ?")
             params.append(int(before_seq))
         where = " AND ".join(clauses)
-        if after_seq is not None:
-            order = "m.server_seq ASC, m.envelope_id ASC"
-            selected_oldest_first = True
-        elif before_seq is not None:
-            order = "m.server_seq DESC, m.envelope_id DESC"
-            selected_oldest_first = False
-        else:
-            selected_oldest_first = (
-                since_resolved is not None and before_resolved is None
-            )
-            order = (
-                "m.sent_at ASC, m.envelope_id ASC"
-                if selected_oldest_first
-                else "m.sent_at DESC, m.envelope_id DESC"
-            )
+        order, selected_oldest_first = _history_order(
+            column_prefix="m.",
+            after_seq=after_seq,
+            before_seq=before_seq,
+            since_resolved=since_resolved,
+            before_resolved=before_resolved,
+        )
         sql = (
             "SELECT m.*, "
             "(SELECT COUNT(*) FROM messages r "
@@ -1368,21 +1379,13 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             clauses.append("server_seq IS NOT NULL AND server_seq < ?")
             params.append(int(before_seq))
         where = " AND ".join(clauses)
-        if after_seq is not None:
-            order = "server_seq ASC, envelope_id ASC"
-            selected_oldest_first = True
-        elif before_seq is not None:
-            order = "server_seq DESC, envelope_id DESC"
-            selected_oldest_first = False
-        else:
-            selected_oldest_first = (
-                since_resolved is not None and before_resolved is None
-            )
-            order = (
-                "sent_at ASC, envelope_id ASC"
-                if selected_oldest_first
-                else "sent_at DESC, envelope_id DESC"
-            )
+        order, selected_oldest_first = _history_order(
+            column_prefix="",
+            after_seq=after_seq,
+            before_seq=before_seq,
+            since_resolved=since_resolved,
+            before_resolved=before_resolved,
+        )
         sql = f"SELECT * FROM messages WHERE {where} ORDER BY {order} LIMIT ?"
         params.append(max(1, min(int(limit), 200)))
 

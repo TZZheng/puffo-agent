@@ -54,7 +54,7 @@ def _optional_non_negative(name: str, value: int) -> int | None:
     return parsed
 
 
-def register_channel_and_dm_history_tools(mcp: FastMCP, cfg: Any) -> None:
+def _register_channel_history_tool(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def get_channel_history(
         channel: str,
@@ -148,6 +148,8 @@ def register_channel_and_dm_history_tools(mcp: FastMCP, cfg: Any) -> None:
         )
         return f"{result}\n{receipt_marker}" if receipt_marker else result
 
+
+def _register_dm_history_tool(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def get_dm_history(
         peer: str,
@@ -172,6 +174,12 @@ def register_channel_and_dm_history_tools(mcp: FastMCP, cfg: Any) -> None:
         if not msgs:
             return "(no direct messages with that peer in the requested window)"
         return format_message_group(msgs, current_agent_aliases=(cfg.slug,))
+
+
+def register_channel_and_dm_history_tools(mcp: FastMCP, cfg: Any) -> None:
+    """Register channel and DM readers in their established order."""
+    _register_channel_history_tool(mcp, cfg)
+    _register_dm_history_tool(mcp, cfg)
 
 
 def register_thread_history_tools(mcp: FastMCP, cfg: Any) -> None:

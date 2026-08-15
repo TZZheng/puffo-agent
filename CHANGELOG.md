@@ -6,6 +6,17 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a6] — 2026-08-14
+
+> Corrected staging build for the A5 Inbox and history contract.
+
+### Changed
+
+- **History ordering and MCP registration now satisfy the repository's
+  structural limits.** Shared ordering policy is centralized, while channel
+  and DM tool registration remain behaviorally identical and retain their
+  established order.
+
 ## [2.0.0a5] — 2026-08-14
 
 > Staging candidate for daemon-owned Inbox turns and unambiguous history reads.
