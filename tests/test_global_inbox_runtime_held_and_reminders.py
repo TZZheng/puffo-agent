@@ -515,7 +515,7 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     assert "latest_seq=9" in initial.provider_input
     assert "context_version=1" in initial.provider_input
     assert "content_included=false" in initial.provider_input
-    assert 'read_tool="read_inbox"' in initial.provider_input
+    assert 'read_tool="read_messages"' in initial.provider_input
     assert "channel:sp-1:ch-1" in initial.provider_input
     assert "channel:sp-1:ch-1:thread:root-1" in initial.provider_input
     audience = ("[channel_audience context_version=1 human_count=1 "

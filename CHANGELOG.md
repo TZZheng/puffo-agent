@@ -6,6 +6,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Inbox and history browsing now expose one semantic MCP tool.**
+  `read_messages(view="pending" | "history")` replaces the overlapping Inbox,
+  channel, thread, and DM read tools. Both views use the same Puffo context
+  grammar and explicit older/newer window boundaries; pending admission and
+  history lookup remain distinct intents behind that interface.
+
 ## [2.0.0a7] — 2026-08-15
 
 > Staging candidate for session-aware Inbox turns and model-visible history

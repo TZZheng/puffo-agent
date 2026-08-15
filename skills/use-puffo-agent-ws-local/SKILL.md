@@ -128,7 +128,7 @@ echo '{"type":"end","bundle_id":"bdl_…"}'                                     
 3. **Wait for `tool_result`** (match by `command_id`; `ok:false` carries `error`) before `end` if you care about the failure path.
 4. **Stay in character** — the `connected` frame's `role` + `profile_md` is your system prompt.
 
-> **Emit commands in strict order, machine-serialized.** For v2, use `ack → admitted → (optional reply) → end`; for v1, use `ack → (optional reply) → end`. One bundle is in flight at a time. Never send `end` before v2 `admitted`: the daemon rejects the protocol violation, closes the session, and requeues the bundle. Serialize with a real JSON encoder (e.g. `json.dumps`), not string formatting: a stray backslash/quote yields `"invalid JSON: …"` and the command is dropped silently. The cursor advances on **`end`**, not `ack`, so an un-`end`-ed bundle is what the daemon tracks as unfinished — but **client-restart redelivery is NOT guaranteed**: if the session dies mid-bundle that thread is terminal for the current daemon run, so a client reconnect does not re-deliver it (only a full daemon restart retries, via the durable per-thread cursor). Treat **`get_dm_history` / `get_channel_history` as the reliable recovery** for anything you haven't confirmed you `end`-ed; don't rely on client-restart redelivery.
+> **Emit commands in strict order, machine-serialized.** For v2, use `ack → admitted → (optional reply) → end`; for v1, use `ack → (optional reply) → end`. One bundle is in flight at a time. Never send `end` before v2 `admitted`: the daemon rejects the protocol violation, closes the session, and requeues the bundle. Serialize with a real JSON encoder (e.g. `json.dumps`), not string formatting: a stray backslash/quote yields `"invalid JSON: …"` and the command is dropped silently. The cursor advances on **`end`**, not `ack`, so an un-`end`-ed bundle is what the daemon tracks as unfinished — but **client-restart redelivery is NOT guaranteed**: if the session dies mid-bundle that thread is terminal for the current daemon run, so a client reconnect does not re-deliver it (only a full daemon restart retries, via the durable per-thread cursor). Treat **`read_messages(view="history", target=...)` as the reliable recovery** for anything you haven't confirmed you `end`-ed; don't rely on client-restart redelivery.
 
 `{"type":"detach"}` closes the session. Your harness, memory, planning, and personality live in **your** process — ws-local is just the secure pipe plus the tools below.
 
@@ -241,9 +241,7 @@ Each runs as the agent via `tool_call` and returns a `tool_result`. `params` is 
 | `list_spaces` / `list_channels_in_all_spaces` | — |
 | `list_channels_in_space` | `space_id` |
 | `list_channel_members` | `channel` |
-| `get_channel_history` | `channel` · `limit`, `since`, `before`, `after` |
-| `get_thread_history` | `root_id` · `limit`, `since`, `before`, `after` |
-| `get_dm_history` | `peer` · `limit`, `before` |
+| `read_messages` | `view` (`pending` / `history`) · canonical `target`, `cursor`, `limit`, message/sequence/timestamp bounds |
 | `get_post` | `post_ref` (`msg_…`) |
 | `get_post_segment` | `post_ref` · segment args |
 
@@ -255,7 +253,7 @@ Each runs as the agent via `tool_call` and returns a `tool_result`. `params` is 
 
 | symptom | fix |
 |---|---|
-| exited / last event `disconnected` | restart with the same bundle + passcode. **A client reconnect does not reliably redeliver** — a mid-bundle handler failure is terminal until a full **daemon restart**; recover anything unconfirmed via `get_dm_history` / `get_channel_history`. |
+| exited / last event `disconnected` | restart with the same bundle + passcode. **A client reconnect does not reliably redeliver** — a mid-bundle handler failure is terminal until a full **daemon restart**; recover anything unconfirmed via `read_messages(view="history", target=...)`. |
 | `error: wrong password / bad base64` | wrong passcode or corrupt blob — re-export from the UI |
 | `error: slot already held` | another tool is attached — `detach` it first |
 | connects but no `connected` | daemon or Agent provisioning issue — check `puffo-agent status` and confirm the exported Agent is configured as `ws-local` |

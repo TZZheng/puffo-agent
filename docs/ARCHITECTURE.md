@@ -104,7 +104,7 @@ sequenceDiagram
     I->>I: coalesce and group by space + channel/thread/DM target
     I->>DB: create daemon-owned active turn
     I->>L: metadata-only Inbox notice
-    L->>M: read_inbox and optional history reads
+    L->>M: read_messages(view=pending) and optional view=history reads
     M->>DB: read pending page and move exact displayed rows to in_turn
     L->>M: zero or more send_message calls
     M->>C: semantic destination, body, thread, visibility, send_anyway
@@ -129,10 +129,10 @@ Important boundaries:
 
 - The transport pushes availability; the model does not poll the Server.
 - The Inbox notice is metadata, not a replay of every message. The model reads
-  exact pending rows through `read_inbox` and can page or inspect history as
-  needed.
+  exact pending rows through `read_messages(view="pending")`; the same tool's
+  history view supplies supplementary context without changing pending intent.
 - The daemon creates the local active turn before writing provider input.
-  `read_inbox` directly admits the returned rows into that turn; it has no
+  The pending view directly admits returned rows into that turn; it has no
   separate receipt, continuation callback, or model acknowledgement step.
 - Pending work can span spaces and targets in one provider turn. Each rendered
   message retains its target, Server sequence, timestamp, sender identity/type,
@@ -349,8 +349,8 @@ Use these entry points when tracing a change:
 ## 12. Invariants
 
 1. Inbound content is durably classified before transport acknowledgement.
-2. Only rows explicitly returned by `read_inbox` advance from pending into the
-   daemon-owned active turn and become visible to that turn.
+2. Only rows explicitly returned by `read_messages(view="pending")` advance
+   from pending into the daemon-owned active turn and become visible to it.
 3. Global Inbox turns serialize per Agent; target identity remains explicit.
 4. Freshness metadata is daemon-owned and never model-authored.
 5. A held send has no message, delivery, notification, or freshness side

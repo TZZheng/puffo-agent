@@ -119,7 +119,7 @@ def register_post_tools(mcp: FastMCP, cfg: Any) -> None:
         """Fetch one local message by envelope id.
 
         Returns the semantic target/row projection. See the managed
-        ``channel-history`` skill for supplementary-context guidance.
+        ``read-messages`` skill for supplementary-context guidance.
         """
         envelope_id = (post_ref or "").strip()
         if not envelope_id:

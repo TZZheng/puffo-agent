@@ -7,6 +7,11 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from ..agent.message_projection import format_inbox_read_result
+from ..agent.message_store_models import parse_inbox_target
+from .core_history_read_tools import (
+    read_history_messages,
+    read_messages_tool_arguments,
+)
 
 
 def _normalize_inbox_read_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -23,28 +28,76 @@ def _normalize_inbox_read_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def register_inbox_read_tool(mcp: FastMCP, cfg: Any) -> None:
+def register_message_read_tool(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
-    async def read_inbox(
+    async def read_messages(
+        view: str = "pending",
         target: str = "",
         cursor: str = "",
         limit: int = 50,
+        since_message_id: str = "",
+        after_seq: int | None = None,
+        before_seq: int | None = None,
+        after_timestamp_ms: int | None = None,
+        before_timestamp_ms: int | None = None,
     ) -> str:
-        """Read one pending Inbox page.
+        """Read one semantic conversation window.
 
-        target is an optional canonical target; cursor is the opaque next
-        cursor; limit is 1..50. The result is one semantic window containing
-        bounded earlier context and the exact pending page, with explicit
-        older/newer boundaries and the next cursor when another page exists.
-        See the managed ``read-inbox`` skill for interpretation and paging.
+        ``view='pending'`` drains pending Inbox work; target is optional and
+        cursor continues the returned snapshot. ``view='history'`` reads a
+        canonical DM/channel/thread target without changing pending intent and
+        accepts message, sequence, or timestamp bounds. ``limit`` bounds the
+        page size. Results use the same context/message grammar and explicit
+        older/newer window boundaries. See the managed ``read-messages`` skill
+        for paging semantics.
         """
-        arguments: dict[str, Any] = {}
+        if isinstance(limit, bool):
+            raise RuntimeError("limit must be an integer")
+        arguments = read_messages_tool_arguments(
+            view=view,
+            target=target,
+            cursor=cursor,
+            limit=limit,
+            since_message_id=since_message_id,
+            after_seq=after_seq,
+            before_seq=before_seq,
+            after_timestamp_ms=after_timestamp_ms,
+            before_timestamp_ms=before_timestamp_ms,
+        )
+        if view == "history":
+            if cursor:
+                raise RuntimeError("cursor is only valid when view='pending'")
+            return await read_history_messages(
+                cfg,
+                target=target,
+                limit=limit,
+                since_message_id=since_message_id,
+                after_seq=after_seq,
+                before_seq=before_seq,
+                after_timestamp_ms=after_timestamp_ms,
+                before_timestamp_ms=before_timestamp_ms,
+                tool_arguments=arguments,
+            )
+        if view != "pending":
+            raise RuntimeError("view must be 'pending' or 'history'")
+        if any(
+            value not in (None, "")
+            for value in (
+                since_message_id,
+                after_seq,
+                before_seq,
+                after_timestamp_ms,
+                before_timestamp_ms,
+            )
+        ):
+            raise RuntimeError(
+                "history bounds are only valid when view='history'"
+            )
         if target:
-            arguments["target"] = target
-        if cursor:
-            arguments["cursor"] = cursor
-        if limit != 50:
-            arguments["limit"] = limit
+            try:
+                parse_inbox_target(target)
+            except ValueError as exc:
+                raise RuntimeError(str(exc)) from None
         runtime = getattr(cfg, "inbox_runtime", None)
         if runtime is None:
             runtime = getattr(
@@ -177,6 +230,6 @@ def register_reminder_replace_tool(mcp: FastMCP, cfg: Any) -> None:
 
 def register_inbox_tools(mcp: FastMCP, cfg: Any) -> None:
     """Register Inbox and reminder tools in their established order."""
-    register_inbox_read_tool(mcp, cfg)
+    register_message_read_tool(mcp, cfg)
     register_reminder_tools(mcp, cfg)
     register_reminder_replace_tool(mcp, cfg)

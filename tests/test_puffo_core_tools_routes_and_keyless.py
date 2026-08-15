@@ -512,7 +512,7 @@ async def test_core_tools_registered():
     mcp = _build_tools(cfg)
     tool_names = {t.name for t in await mcp.list_tools()}
     expected = {
-        "whoami", "send_message", "get_channel_history",
+        "whoami", "send_message", "read_messages",
         "list_spaces", "list_channels_in_all_spaces",
         "list_channels_in_space", "list_channel_members",
         "get_user_info", "get_post", "send_message_with_attachments",
@@ -750,35 +750,40 @@ async def test_get_post_shows_is_encrypted():
 
 
 @pytest.mark.asyncio
-async def test_get_channel_history_tags_encryption():
+async def test_read_messages_channel_history_tags_encryption():
     cfg, _, ms = _setup()
     await _store_msg(ms, "msg_enc", is_encrypted=True)
     await _store_msg(ms, "msg_plain", is_encrypted=False)
-    result = await _call(_build_tools(cfg), "get_channel_history", {"channel": "ch_1"})
+    args = {"view": "history", "target": "channel:sp_test:ch_1"}
+    result = await _call(_build_tools(cfg), "read_messages", args)
     assert "encrypted=true" in result and "encrypted=false" in result
     page = await _call(
-        _build_tools(cfg), "get_channel_history", {"channel": "ch_1", "limit": 1}
+        _build_tools(cfg), "read_messages", {**args, "limit": 1}
     )
     assert 'returned_count=1 has_older=true has_newer=false' in page
 
 
 @pytest.mark.asyncio
-async def test_get_thread_history_tags_encryption():
+async def test_read_messages_thread_history_tags_encryption():
     cfg, _, ms = _setup()
     await _store_msg(ms, "msg_root", is_encrypted=True)
     await _store_msg(ms, "msg_reply", is_encrypted=False, thread_root_id="msg_root")
-    result = await _call(_build_tools(cfg), "get_thread_history", {"root_id": "msg_root"})
+    result = await _call(_build_tools(cfg), "read_messages", {
+        "view": "history", "target": "channel:sp_test:ch_1:thread:msg_root",
+    })
     assert "encrypted=false" in result
 
 
 @pytest.mark.asyncio
-async def test_get_thread_history_presents_root_and_replies_under_one_thread_target():
+async def test_read_messages_presents_root_and_replies_under_one_thread_target():
     cfg, _, ms = _setup()
     await _store_msg(ms, "msg_root", is_encrypted=True)
     await _store_msg(ms, "msg_reply", is_encrypted=False, thread_root_id="msg_root")
     root = await ms.get_message_by_envelope("msg_root")
     assert root is not None and not root.thread_root_id
-    result = await _call(_build_tools(cfg), "get_thread_history", {"root_id": "msg_root"})
+    result = await _call(_build_tools(cfg), "read_messages", {
+        "view": "history", "target": "channel:sp_test:ch_1:thread:msg_root",
+    })
     header = 'target_ref="channel:sp_test:ch_1:thread:msg_root"'
     assert result.count(header) == 1
     assert 'message_id="msg_root"' in result

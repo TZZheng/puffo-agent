@@ -249,6 +249,7 @@ def format_history_read_result(
     body: str,
     has_older: bool,
     has_newer: bool,
+    target_ref: str = "",
 ) -> str:
     """Frame a history projection with explicit Raft-style boundaries."""
     fields = [
@@ -275,6 +276,11 @@ def format_history_read_result(
     lines = [f"[window {' '.join(fields)}]"]
     if body:
         lines.append(body)
+    elif target_ref:
+        lines.extend((
+            f"## {target_label_from_ref(target_ref)}",
+            f"[messages context_version={CONTEXT_VERSION} message_count=0]",
+        ))
     lines.append(
         f"[end_window context_version={CONTEXT_VERSION} view=\"history\"]"
     )

@@ -436,8 +436,13 @@ async def test_model_visible_history_and_inbox_join_the_same_active_turn(
 ):
     h = boundary_harness
 
+    history_arguments = {
+        "view": "history",
+        "target": "channel:sp_1:ch-history",
+        "limit": 50,
+    }
     history_call = await h.mcp.call_tool(
-        "get_channel_history", {"channel": "ch-history", "limit": 50}
+        "read_messages", history_arguments
     )
     history_text = _tool_text(history_call)
     assert "history peer body" in history_text
@@ -454,8 +459,8 @@ async def test_model_visible_history_and_inbox_join_the_same_active_turn(
         r"(\[puffo:model-visible-read:[^]]+\])", history_text
     ).group(1)
     await h.emit_tool_result(
-        tool_name="get_channel_history",
-        arguments={"channel": "ch-history", "limit": 50},
+        tool_name="read_messages",
+        arguments=history_arguments,
         result=history_text,
     )
     await _wait_until(
@@ -472,7 +477,7 @@ async def test_model_visible_history_and_inbox_join_the_same_active_turn(
     assert h.runtime.active.visible_message_ids == ["history-peer"]
 
     inbox_call = await h.mcp.call_tool(
-        "read_inbox",
+        "read_messages",
         {"target": "channel:sp_1:ch-inbox", "limit": 1},
     )
     inbox_text = _tool_text(inbox_call)
@@ -555,7 +560,9 @@ async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
         "held-peer",
     ]
 
-    inbox_call = await h.mcp.call_tool("read_inbox", {"target": target, "limit": 1})
+    inbox_call = await h.mcp.call_tool(
+        "read_messages", {"target": target, "limit": 1}
+    )
     assert "[pending_messages context_version=1 message_count=0]" in _tool_text(
         inbox_call
     )
@@ -609,7 +616,12 @@ async def test_rpc_response_without_provider_completion_keeps_pending_and_unseen
 ):
     h = boundary_harness
     history_call = await h.mcp.call_tool(
-        "get_channel_history", {"channel": "ch-history", "limit": 50}
+        "read_messages",
+        {
+            "view": "history",
+            "target": "channel:sp_1:ch-history",
+            "limit": 50,
+        },
     )
     history_text = _tool_text(history_call)
     assert "history peer body" in history_text
@@ -629,29 +641,33 @@ async def test_real_provider_correlation_rejects_empty_failed_and_mismatched_res
     boundary_harness: BoundaryHarness,
 ):
     h = boundary_harness
+    arguments = {
+        "view": "history",
+        "target": "channel:sp_1:ch-history",
+        "limit": 50,
+    }
     history_call = await h.mcp.call_tool(
-        "get_channel_history", {"channel": "ch-history", "limit": 50}
+        "read_messages", arguments
     )
     history_text = _tool_text(history_call)
     receipt = re.search(
         r"(\[puffo:model-visible-read:[^]]+\])", history_text
     ).group(1)
-    arguments = {"channel": "ch-history", "limit": 50}
     wrong_receipt = "[puffo:model-visible-read:wrong-receipt-marker]"
     cases = [
         ("get_thread_history", arguments, history_text, "native-session", "native-turn", False),
-        ("get_channel_history", {"channel": "wrong"}, history_text, "native-session", "native-turn", False),
+        ("read_messages", {**arguments, "target": "channel:sp_1:wrong"}, history_text, "native-session", "native-turn", False),
         (
-            "get_channel_history",
+            "read_messages",
             arguments,
             f"history peer body\n{wrong_receipt}",
             "native-session",
             "native-turn",
             False,
         ),
-        ("get_channel_history", arguments, history_text, "native-session", "wrong-turn", False),
-        ("get_channel_history", arguments, history_text, "wrong-session", "native-turn", False),
-        ("get_channel_history", arguments, history_text, "native-session", "native-turn", True),
+        ("read_messages", arguments, history_text, "native-session", "wrong-turn", False),
+        ("read_messages", arguments, history_text, "wrong-session", "native-turn", False),
+        ("read_messages", arguments, history_text, "native-session", "native-turn", True),
     ]
     for tool_name, tool_args, result, session_id, turn_id, is_error in cases:
         await h.emit_tool_result(
@@ -681,7 +697,7 @@ async def test_real_provider_correlation_rejects_empty_failed_and_mismatched_res
         assert not h.transport.calls
 
     await h.emit_tool_result(
-        tool_name="get_channel_history",
+        tool_name="read_messages",
         arguments=arguments,
         result=history_text.replace(receipt, receipt),
     )
@@ -701,7 +717,7 @@ async def test_empty_or_failed_rpc_read_has_no_admission_receipt_or_lifecycle_ch
 ):
     h = boundary_harness
     empty = await h.mcp.call_tool(
-        "read_inbox",
+        "read_messages",
         {"target": "channel:sp_1:does-not-exist", "limit": 1},
     )
     empty_text = _tool_text(empty)

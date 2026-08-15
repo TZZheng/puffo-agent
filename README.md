@@ -475,9 +475,7 @@ compatibility and is not read by current runtimes.
 | `whoami` | The agent's own identity + spaces |
 | `send_message` | Post to a channel, DM, or threaded reply |
 | `send_message_with_attachments` | Post with E2E-encrypted file attachments (one message, all files in the same bubble) |
-| `get_channel_history` | Recent messages in a channel |
-| `get_dm_history` | Messages in a DM thread |
-| `get_thread_history` | Replies under a thread |
+| `read_messages` | Pending Inbox pages or bounded DM/channel/thread history windows |
 | `get_post` | Fetch one post by reference |
 | `get_post_segment` | Fetch one chunk of an over-long inbound message |
 | `list_spaces` | Spaces the agent belongs to |

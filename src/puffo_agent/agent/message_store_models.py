@@ -306,7 +306,7 @@ def reminder_time_to_rfc3339(value: int) -> str:
     )
 
 
-def parse_reminder_target(target: str) -> tuple[str, str, str, str]:
+def parse_inbox_target(target: str) -> tuple[str, str, str, str]:
     """Validate and decompose a canonical local Inbox target.
 
     Returns ``(kind, space_id, channel_id, thread_root_id_or_peer)``.  The
@@ -335,7 +335,15 @@ def parse_reminder_target(target: str) -> tuple[str, str, str, str]:
         and valid_segment(parts[4])
     ):
         return ("channel", parts[1], parts[2], parts[4])
-    raise ValueError("invalid reminder target")
+    raise ValueError(
+        "target must be dm:<peer>, channel:<space_id>:<channel_id>, or "
+        "channel:<space_id>:<channel_id>:thread:<root_id>"
+    )
+
+
+def parse_reminder_target(target: str) -> tuple[str, str, str, str]:
+    """Backward-compatible reminder name for the shared target parser."""
+    return parse_inbox_target(target)
 
 
 class LifecycleConflict(Exception):

@@ -85,7 +85,8 @@ async def _resolve_channel_space(cfg: Any, channel_id: str) -> str:
                 f"start with 'ch_'). If it's a user slug, prepend "
                 f"'@' to DM them: send_message(channel='@{channel_id}', "
                 f"...); to read a DM conversation use "
-                f"get_dm_history(peer='{channel_id}'). To find a "
+                f"read_messages(view='history', target='dm:{channel_id}'). "
+                f"To find a "
                 f"channel id, call list_channels_in_all_spaces."
             )
         raise RuntimeError(
@@ -118,7 +119,8 @@ async def _stage_model_visible_messages(
     tool_arguments: dict[str, object],
 ) -> str:
     """Stage the highest channel watermark returned to the provider."""
-    # Same backend order ``read_inbox`` uses: in-process tools (ws-local) hold
+    # Same backend order the pending ``read_messages`` view uses: in-process
+    # tools (ws-local) hold
     # a live runtime and never an rpc_client, and ``GlobalInboxRuntime`` and
     # ``PuffoRpcClient`` expose ``stage_model_visible_read`` with the identical
     # keyword signature, so the call site below is shared.

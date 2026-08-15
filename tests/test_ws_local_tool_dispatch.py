@@ -26,7 +26,7 @@ def test_allowed_tools_are_the_send_read_and_membership_tools():
         "send_message",
         "send_message_with_attachments",
         # read / navigation
-        "read_inbox",
+        "read_messages",
         # durable Agent-local reminders
         "create_reminder",
         "list_reminders",
@@ -36,9 +36,6 @@ def test_allowed_tools_are_the_send_read_and_membership_tools():
         "whoami",
         "get_post",
         "get_post_segment",
-        "get_channel_history",
-        "get_dm_history",
-        "get_thread_history",
         "list_channel_members",
         "list_spaces",
         "list_channels_in_space",
@@ -105,7 +102,11 @@ async def test_build_dispatch_subset_filter_drops_unknown_names():
 def test_ws_local_semantic_tool_signatures_expose_no_internal_controls():
     dispatch = build_dispatch(MagicMock())
     expected = {
-        "read_inbox": {"target", "cursor", "limit"},
+        "read_messages": {
+            "view", "target", "cursor", "limit", "since_message_id",
+            "after_seq", "before_seq", "after_timestamp_ms",
+            "before_timestamp_ms",
+        },
         "create_reminder": {"content", "target", "intended_at"},
         "list_reminders": {"state", "limit"},
         "cancel_reminder": {"reminder_id"},
@@ -133,7 +134,7 @@ def test_ws_local_semantic_tool_signatures_expose_no_internal_controls():
 
 
 @pytest.mark.asyncio
-async def test_ws_local_read_inbox_uses_live_runtime_and_preserves_correlation():
+async def test_ws_local_read_messages_pending_uses_live_runtime():
     from puffo_agent.mcp.puffo_core_tools import PuffoCoreToolsConfig
 
     calls = []
@@ -158,8 +159,16 @@ async def test_ws_local_read_inbox_uses_live_runtime_and_preserves_correlation()
         inbox_runtime=Runtime(),
     )
     dispatch = build_dispatch(cfg)
-    result = await dispatch["read_inbox"](
-        target="channel:sp:ch", cursor="", limit=7
+    result = await dispatch["read_messages"](
+        view="pending",
+        target="channel:sp:ch",
+        cursor="",
+        limit=7,
+        since_message_id="",
+        after_seq=None,
+        before_seq=None,
+        after_timestamp_ms=None,
+        before_timestamp_ms=None,
     )
     assert '[window context_version=1 view="pending"' in result
     assert "[pending_messages context_version=1 message_count=1]" in result

@@ -457,6 +457,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         more_pending: bool,
         pending_targets: tuple[tuple[str, ...], ...],
     ) -> str:
+        """Serialize the internal ws-local route summary, never model prose."""
         return json.dumps(
             {
                 "version": 2,
@@ -550,7 +551,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             ),
             default=None,
         )
-        summary = format_inbox_notice(
+        notice_summary = format_inbox_notice(
             generation=notice.generation,
             changed_message_count=len(notice_items),
             total_pending_message_count=total_pending_count,
@@ -560,11 +561,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 audiences,
             ),
             latest_seq=latest_seq,
-            read_tool="read_inbox",
+            read_tool="read_messages",
         )
         provider_input = (
             "<global_inbox_notice>\n"
-            + summary
+            + notice_summary
             + "\n</global_inbox_notice>\n"
             + INBOX_TURN_CUE
         )
@@ -588,7 +589,12 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             routes=(),
             targets=tuple(targets),
             pending_targets=tuple(targets),
-            target_summary=summary,
+            target_summary=self._target_summary(
+                tuple(targets),
+                len(notice_items),
+                more_pending=True,
+                pending_targets=tuple(targets),
+            ),
             formatted_blocks=(),
             provider_input=provider_input,
             formatted_tokens=0,

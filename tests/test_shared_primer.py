@@ -65,7 +65,7 @@ def test_standing_prompt_is_compact_and_identity_is_compiled_once():
 def test_standing_prompt_owns_communication_policy_and_retains_contract():
     primer = " ".join(DEFAULT_SHARED_CLAUDE_MD.split())
     for phrase in (
-        "<global_inbox_notice>", "content_included=false", "read_inbox",
+        "<global_inbox_notice>", "content_included=false", "read_messages",
         "context_version=1", "target_ref", "sender_identity", "sender_type",
         "An `@slug` identity is unique", "send_message",
         "A metadata-only notice means unread content exists",
@@ -91,8 +91,7 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
     ):
         assert absent not in DEFAULT_SHARED_CLAUDE_MD
 
-    read = DEFAULT_SKILLS["read-inbox"][1]
-    history = DEFAULT_SKILLS["channel-history"][1]
+    read = DEFAULT_SKILLS["read-messages"][1]
     post = DEFAULT_SKILLS["get-post"][1]
     send = DEFAULT_SKILLS["send-message"][1]
     for phrase in (
@@ -101,17 +100,14 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
         "[event]", "body",
     ):
         assert phrase in read
-    for text in (history, post):
-        assert "read-inbox" in text
+    assert "read-messages" in post
     normalized_read = " ".join(read.split())
     assert "pending_messages" in read and "earlier_context" in read
     assert "has_older" in read and "has_newer" in read
-    assert "strictly earlier" in normalized_read
-    assert "canonical pending-work view" in read
-    assert "standing communication guidance" in normalized_read
+    assert "bounded" in normalized_read
+    assert "pending" in read and "history" in read
     assert "decide-response" not in DEFAULT_SKILLS
     assert "originating request and conversation intent" not in DEFAULT_SHARED_CLAUDE_MD
-    assert "canonical view of pending work" in " ".join(history.split())
     assert "canonical view of pending work" in " ".join(post.split())
     normalized_send = " ".join(send.lower().split())
     for phrase in (
@@ -119,7 +115,7 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
         "visible_draft_basis", "new_channel_context", "context_ready",
         "dynamic `guidance`", "injected only when a draft is actually held",
         "sequence watermark alone is not semantic context",
-        "preserve the `read_inbox` target by default",
+        "preserve the `read_messages` target by default",
         'omit it for `target_type="channel"`',
         'pass the supplied `thread_root_id` for `target_type="thread"`',
     ):
@@ -199,7 +195,7 @@ def test_harnesses_discover_managed_skills_with_correct_tool_names():
     assert "mcp__puffo__" not in codex
     assert "send_message" in codex
     ensure_shared_primer(root / "shared")
-    for skill_id in ("read-inbox", "send-message"):
+    for skill_id in ("read-messages", "send-message"):
         claude_skill = root / "workspace" / ".claude" / "skills" / skill_id / "SKILL.md"
         codex_skill = root / "workspace" / ".agents" / "skills" / skill_id / "SKILL.md"
         for skill in (claude_skill, codex_skill):
@@ -213,10 +209,10 @@ def test_managed_refresh_rewrites_stale_skill():
     root = _tmp()
     shared = root / "shared"
     ensure_shared_primer(shared)
-    skill = shared / "skills" / "read-inbox" / "SKILL.md"
+    skill = shared / "skills" / "read-messages" / "SKILL.md"
     skill.write_text("stale", encoding="utf-8")
     actions = dict(ensure_shared_primer(shared))
-    assert actions["skills/read-inbox/SKILL.md"] == "updated"
+    assert actions["skills/read-messages/SKILL.md"] == "updated"
     assert "earlier_context" in skill.read_text(encoding="utf-8")
 
     removed = shared / "skills" / "decide-response"

@@ -135,6 +135,8 @@ _MODEL_VISIBLE_READ_BODY_KEYS = frozenset({
     "visible_message_ids",
 })
 _MODEL_VISIBLE_READ_TOOLS = frozenset({
+    "read_messages",
+    # Rolling-upgrade compatibility for an older MCP subprocess.
     "get_channel_history",
     "get_thread_history",
     "get_post",

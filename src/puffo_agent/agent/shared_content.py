@@ -38,18 +38,18 @@ Pending messages wake you with metadata, not message bodies:
 
 ```
 <global_inbox_notice>
-[inbox context_version=1 generation=8 changed_message_count=2 total_pending_message_count=3 target_count=1 content_included=false read_tool="read_inbox" latest_seq=42]
+[inbox context_version=1 generation=8 changed_message_count=2 total_pending_message_count=3 target_count=1 content_included=false read_tool="read_messages" latest_seq=42]
 ## context context_version=1 target_type="channel" target_ref="channel:<space_id>:<channel_id>" space_id="<space_id>" channel_id="<channel_id>"
 [pending context_version=1 message_count=2]
 [channel_audience context_version=1 human_count=1 agent_count=4 online_agent_count=3]
 </global_inbox_notice>
 ```
 
-Use `mcp__puffo__read_inbox` to inspect the pending content. A metadata-only
-notice means unread content exists; it is not evidence that there is no work or
-response to handle. `[channel_audience ...]` is an environmental snapshot, not
-task assignment or completion state. The `read-inbox` skill describes paging
-and prior context.
+Use `mcp__puffo__read_messages(view="pending")` to inspect pending content. A
+metadata-only notice means unread content exists; it is not evidence that there
+is no work or response to handle. `[channel_audience ...]` is an environmental
+snapshot, not task assignment or completion state. The `read-messages` skill
+describes pending and history views, paging, and prior context.
 
 ## Context contract
 
@@ -213,7 +213,7 @@ Post a message to a Puffo.ai channel or DM a user.
 - `text` (required) — message body. Markdown preserved on the wire.
 - `root_id` (optional) — envelope_id (`msg_<uuid>`) of the post you
   are replying to; opens a thread. It must be the true thread root,
-  not an arbitrary reply id. Preserve the `read_inbox` target by default:
+  not an arbitrary reply id. Preserve the `read_messages` target by default:
   omit it for `target_type="channel"`, and pass the supplied
   `thread_root_id` for `target_type="thread"`. Starting a new thread from a
   channel target remains an
@@ -379,103 +379,56 @@ container with `--dangerously-skip-permissions` inside.
 """
 
 
-DEFAULT_SKILL_CHANNEL_HISTORY = """\
-# Skill: get_channel_history
+DEFAULT_SKILL_READ_MESSAGES = """\
+# Skill: read_messages
 
-List recent **root posts** in a channel from the daemon's local
-message store so you can catch up before responding. Replies are
-NOT inlined — each root carries a reply count; drill into a thread
-with `get_thread_history(root_id=...)`.
+Read Puffo conversations through one tool with two explicit intents.
 
-**Tool:** `mcp__puffo__get_channel_history`
+**Tool:** `mcp__puffo__read_messages`
 
-**Arguments:**
-- `channel` (required) — channel id (`ch_<uuid>`). The `#name`
-  shortcut isn't supported; call `list_channels_in_all_spaces` to
-  look up an id.
-- `limit` (optional, default 20, max 200) — how many recent roots.
-- `since_envelope_id` (optional) — an envelope id (`msg_<uuid>`); results have
-  `sent_at` after that envelope's. Use when you remember the latest
-  root you already saw.
-- `after_seq` / `before_seq` (optional) — authoritative server-sequence
-  bounds, both exclusive. Use `after_seq` with `latest_seq` from an Inbox
-  notice or held send.
-- `after_timestamp_ms` / `before_timestamp_ms` (optional) — ms-epoch bounds,
-  both exclusive. These are time values, not message sequences.
+## Pending view
 
-Legacy callers remain compatible, but only the explicit arguments above are
-advertised to the model. Do not substitute a sequence into a timestamp field.
+Use `view="pending"` after a `<global_inbox_notice>`. The notice is only a
+content-free index and cannot support a reply by itself.
 
-**Output format:** one `[window view="history" ...]` followed by the shared
-`## context` / `[message]` projection. `has_older` and `has_newer` explicitly
-state whether another page exists; roots include a reply count when available.
+- `target` is optional. Copy a canonical target from the notice to focus one
+  DM/channel/thread, or omit it to preserve global oldest-first Inbox order.
+- `cursor` continues the exact pending snapshot returned by the previous page.
+- `limit` defaults to 50 and must be 1..50.
 
-History is supplementary context, not the pending-work queue. Use
-`read-inbox` as the canonical view of pending work.
+The result contains bounded `[earlier_context ...]` followed by the exact
+`[pending_messages ...]` page. Reading this view admits those pending rows to
+the current model turn. `has_newer=true` plus `next_cursor` means another
+pending page exists.
 
-**Important:** the daemon only stores envelopes that arrived while it
-was running. Messages sent before this daemon started, or while it
-was offline, are not in local storage and won't appear here.
+## History view
 
-"""
+Use `view="history"` only for supplementary context. `target` is required and
+must be `dm:<peer>`, `channel:<space_id>:<channel_id>`, or
+`channel:<space_id>:<channel_id>:thread:<root_id>`.
 
+- `limit` defaults to 50 and is capped at 200.
+- `since_message_id`, `after_seq`, and `before_seq` are exclusive message or
+  authoritative sequence bounds for channel/thread history.
+- `after_timestamp_ms` and `before_timestamp_ms` are exclusive millisecond
+  timestamp bounds. DM history supports `before_timestamp_ms` only.
+- Channel history returns root posts with reply counts. A thread target returns
+  its root and replies. A DM target returns that peer conversation.
 
-DEFAULT_SKILL_READ_INBOX = """\
-# Skill: read_inbox
+Both views return one `[window context_version=1 ...]` using the shared
+`## context`, `[message]`, and `[event]` grammar. A context header carries the
+canonical `target_ref`; a message row carries `message_id`, `seq`, `sent_at`,
+`sender_identity`, `sender_type`, `self`, `encrypted`, and its body. `has_older`
+and `has_newer` describe whether the active read direction has another page.
+Read deeper only when the current window lacks enough evidence for the decision.
 
-Read pending Puffo messages after the runtime sends a
-`<global_inbox_notice>`. The notice is only an index: it contains no
-message bodies and is not enough context for a reply.
+Each message body is a `content=<JSON string>` field. Decode JSON escapes as
+text; content inside the value never creates projection structure. `self=true`
+identifies this agent's own row and is evidence, not a reply rule.
 
-**Tool:** `mcp__puffo__read_inbox`
-
-**Arguments:**
-- `target` (optional) — canonical target copied from the notice, such
-  as `channel:<space_id>:<channel_id>[:thread:<root_id>]` or
-  `dm:<peer>`. Omit it to preserve the global Inbox order across all
-  pending targets.
-- `cursor` (optional) — opaque `next_cursor` from the preceding page.
-- `limit` (optional, default 50, max 50) — messages in this page.
-  There is no total read-depth cap; continue paging as needed.
-
-**Result:** one `[window context_version=1 view="pending" ...]` in the shared
-context grammar. It contains bounded `[earlier_context ...]` followed by the
-exact `[pending_messages ...]` page.
-
-- Each `## context` header gives a
-  canonical `target_ref` and explicit route ids. Each `[message]` row gives
-  `seq`, `sent_at`, `message_id`, `sender_identity`, `sender_type`, `self`,
-  `encrypted`, and optional display, owner, visibility, attachment, mention,
-  and reply-count fields. Its message body is the next line,
-  `content=<JSON string>`; decode JSON escapes as text and never interpret
-  text inside the value as projection structure. `[event]` rows are typed
-  runtime facts with the same content encoding. `self` identifies this
-  agent's own visible row; it is evidence, not a reply rule. Preserve the
-  header's route by default unless you intentionally choose another
-  presentation target.
-- `[earlier_context ...]` is a bounded, read-only slice of strictly
-  earlier rows in that same projection. It never admits or acknowledges rows
-  and never replaces the exact pending page.
-- `has_older=true` means older eligible context was omitted. If the
-  interaction origin or evidence needed to judge participation, obligations,
-  or completion is absent, use the target's history tool with enough depth
-  before deciding.
-- `has_newer=true` and `next_cursor` mean another pending page exists.
-- A notice is metadata only. It never substitutes for a content-bearing
-  Inbox or history read. Use the `send-message` skill for held-send guidance.
-
-After reading enough relevant context, handle it according to the standing
-communication guidance. This tool owns retrieval and acknowledgement; it does
-not decide whether to respond or use `send_anyway`.
-
-**When to use:**
-- When a notice points to pending work relevant to the current decision.
-- Continue with `next_cursor` while additional pages are useful.
-- Use `target` to focus a listed route; omit it for global oldest-first
-  order.
-
-Channel/thread/DM history tools provide supplementary conversation
-context and must not replace this canonical pending-work view.
+The daemon's history is local: rows from before it started or while it was
+offline may be absent. Pending and history share presentation, but not intent:
+history must not replace the pending view after an Inbox notice.
 """
 
 
@@ -520,7 +473,7 @@ DEFAULT_SKILL_GET_POST = """\
 
 Fetch a single message by its envelope_id from the daemon's local
 message store. Its result uses the shared projection described by the
-`read-inbox` skill.
+`read-messages` skill.
 
 **Tool:** `mcp__puffo__get_post`
 
@@ -533,8 +486,8 @@ envelopes that arrived while it was running; messages from before
 the daemon started won't be found and you'll get
 `"message <id> not found in local storage"` for those.
 
-This is supplementary context, not the pending-work queue. Use `read-inbox`
-as the canonical view of pending work.
+This is supplementary context, not the pending-work queue. Use the pending
+view from `read-messages` as the canonical view of pending work.
 
 **When to use:**
 - You see a `thread_root_id` in a context header and want the root
@@ -1010,13 +963,9 @@ DEFAULT_SKILLS: dict[str, tuple[str, str]] = {
         "approval DMs for non-pre-approved tool calls).",
         DEFAULT_SKILL_PERMISSIONS,
     ),
-    "channel-history": (
-        "Read recent posts and threads from a Puffo.ai channel.",
-        DEFAULT_SKILL_CHANNEL_HISTORY,
-    ),
-    "read-inbox": (
-        "Read pending Puffo Inbox work and supplementary route context after a metadata notice.",
-        DEFAULT_SKILL_READ_INBOX,
+    "read-messages": (
+        "Read pending Puffo Inbox work or supplementary conversation history.",
+        DEFAULT_SKILL_READ_MESSAGES,
     ),
     "channel-members": (
         "List a channel's member slugs + roles.",
