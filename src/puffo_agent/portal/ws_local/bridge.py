@@ -227,15 +227,27 @@ class WsLocalBridge:
 
     async def on_dead(self, reason: str) -> None:
         self._dead_reason = reason
-        if self._runtime is not None and self._runtime.active.turn_id:
-            await self._runtime.store.requeue_messages(
-                tuple(self._runtime.active.message_ids),
-                turn_id=self._runtime.active.turn_id,
-            )
-            self._runtime.active.clear()
-            self._runtime.notify()
         if self._waiter is not None and not self._waiter.done():
             self._waiter.set_exception(BridgeClosed(reason))
+        if self._runtime is not None and self._runtime.active.turn_id:
+            async with self._runtime._turn_state_lock:
+                active = self._runtime.active
+                if active.message_ids:
+                    await self._runtime.store.requeue_messages(
+                        tuple(active.message_ids),
+                        turn_id=active.turn_id,
+                    )
+                else:
+                    await self._runtime.store.finalize_empty_turn(
+                        turn_id=active.turn_id,
+                        state="requeued",
+                    )
+                await self._runtime.store.release_notice_delivery(
+                    active.provider_session_id,
+                    tuple(active.notice_message_ids),
+                )
+                self._runtime.active.clear()
+            self._runtime.notify()
 
     async def dispatch_planned(self, session, planned) -> None:
         if self._dead_reason is not None:

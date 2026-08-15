@@ -1385,6 +1385,42 @@ async def test_read_inbox_byte_guard_admits_only_the_returned_page(
 
 
 @pytest.mark.asyncio
+async def test_read_inbox_rejects_a_page_fetched_for_a_finished_turn(tmp_path):
+    store = await make_store(tmp_path)
+    await receipt(store, "late-page", 1)
+    read_started = asyncio.Event()
+    continue_read = asyncio.Event()
+    original_read = store.read_inbox_page
+
+    async def delayed_read(**kwargs):
+        read_started.set()
+        await continue_read.wait()
+        return await original_read(**kwargs)
+
+    store.read_inbox_page = delayed_read
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.active.turn_id = "turn-a"
+    runtime.active.provider_session_id = "provider-1"
+    runtime.active.provider_turn_id = "provider-turn-a"
+    reading = asyncio.create_task(runtime.read_inbox(limit=1))
+    await read_started.wait()
+    runtime.active.turn_id = "turn-b"
+    runtime.active.provider_turn_id = "provider-turn-b"
+    continue_read.set()
+
+    with pytest.raises(RuntimeError, match="crossed the active provider turn"):
+        await reading
+    assert [row.envelope_id for row in await store.get_pending()] == ["late-page"]
+    assert runtime.active.message_ids == []
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_read_inbox_admits_exact_page_directly(
     tmp_path, caplog,
 ):

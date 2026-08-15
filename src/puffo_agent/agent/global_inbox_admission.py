@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
@@ -19,7 +20,7 @@ from .global_inbox_types import (
     PlannedTurn,
     route_for,
 )
-from .inbox_scheduler import MAX_FORMATTED_BYTES
+from .inbox_scheduler import MAX_FORMATTED_BYTES, NoticeDeliveryCapability
 from .message_projection import CONTEXT_VERSION
 from .message_store import (
     PRIOR_CONTEXT_MAX_BYTES,
@@ -379,6 +380,68 @@ class InboxAdmissionMixin:
                 wrapper_overhead_bytes=0,
             )
         )
+
+    def _schedule_busy_notice(self) -> None:
+        """Coalesce new ingress into the active native turn when supported."""
+        turn_id = self.active.turn_id
+        if (
+            not turn_id
+            or self.notice_delivery.capability
+            is NoticeDeliveryCapability.NEXT_TURN
+        ):
+            return
+        self._busy_notice_dirty = True
+        if self._busy_notice_task is not None and not self._busy_notice_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._busy_notice_task = loop.create_task(
+            self._deliver_busy_notices(turn_id),
+            name=f"inbox-notice-{turn_id}",
+        )
+
+    async def _deliver_busy_notices(self, turn_id: str) -> None:
+        """Deliver only changed Inbox identities, with bounded error retries."""
+        current = asyncio.current_task()
+        attempts = 0
+        try:
+            await asyncio.sleep(self._busy_notice_delay_seconds)
+            while not self._stopping and self.active.turn_id == turn_id:
+                self._busy_notice_dirty = False
+                try:
+                    await self.offer_busy_notice(turn_id=turn_id)
+                    attempts = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    attempts += 1
+                    log_runtime_event(
+                        logger,
+                        "notice.deferred",
+                        level=logging.WARNING,
+                        agent_id=self.agent_id,
+                        turn_id=turn_id,
+                        provider_session_id=self.active.provider_session_id,
+                        attempt=attempts,
+                        error_category="provider_delivery",
+                        error_type=type(exc).__name__,
+                        outcome="retry" if attempts < 2 else "next_turn",
+                    )
+                    if attempts >= 2:
+                        return
+                    self._busy_notice_dirty = True
+                    await asyncio.sleep(
+                        min(self._busy_notice_delay_seconds, float(attempts))
+                    )
+                    continue
+                if not self._busy_notice_dirty:
+                    return
+                await asyncio.sleep(self._busy_notice_delay_seconds)
+        finally:
+            if self._busy_notice_task is current:
+                self._busy_notice_task = None
 
     async def offer_busy_notice(self, *, turn_id: str) -> bool:
         """Offer metadata-only work to the named active Turn when safe."""
@@ -851,12 +914,26 @@ class InboxAdmissionMixin:
         prior: PriorContextProjection,
         *,
         snapshot_generation: int,
+        requesting_turn_id: str,
+        requesting_provider_session_id: str | None,
+        requesting_provider_turn_id: str | None,
     ) -> None:
         """Move the exact returned page into the daemon's active local turn."""
         async with self._turn_state_lock:
-            turn_id = self.active.turn_id
-            if not turn_id:
-                raise RuntimeError("no active daemon turn for Inbox read")
+            if (
+                self.active.turn_id != requesting_turn_id
+                or (
+                    requesting_provider_session_id is not None
+                    and self.active.provider_session_id
+                    != requesting_provider_session_id
+                )
+                or (
+                    requesting_provider_turn_id is not None
+                    and self.active.provider_turn_id != requesting_provider_turn_id
+                )
+            ):
+                raise RuntimeError("Inbox read crossed the active provider turn")
+            turn_id = requesting_turn_id
             provider_session_id = self.active.provider_session_id
             provider_turn_id = self.active.provider_turn_id
             ids = tuple(item.envelope_id for item in projection.selected)
@@ -925,7 +1002,10 @@ class InboxAdmissionMixin:
     ) -> dict[str, Any]:
         """Return one page and directly admit it to the active daemon turn."""
         del tool_arguments
-        if not self.active.turn_id:
+        requesting_turn_id = self.active.turn_id
+        requesting_provider_session_id = self.active.provider_session_id
+        requesting_provider_turn_id = self.active.provider_turn_id
+        if not requesting_turn_id:
             raise RuntimeError("no active daemon turn for Inbox read")
         page = await self.store.read_inbox_page(
             target=target, cursor=cursor, limit=limit
@@ -937,6 +1017,9 @@ class InboxAdmissionMixin:
                 projection,
                 prior,
                 snapshot_generation=page.snapshot_generation,
+                requesting_turn_id=requesting_turn_id,
+                requesting_provider_session_id=requesting_provider_session_id,
+                requesting_provider_turn_id=requesting_provider_turn_id,
             )
         return {
             "context_version": CONTEXT_VERSION,

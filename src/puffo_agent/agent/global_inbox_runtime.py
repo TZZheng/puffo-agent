@@ -251,68 +251,6 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         self.coalescer.notify()
         self._schedule_busy_notice()
 
-    def _schedule_busy_notice(self) -> None:
-        """Coalesce new ingress into the active native turn when supported."""
-        turn_id = self.active.turn_id
-        if (
-            not turn_id
-            or self.notice_delivery.capability
-            is NoticeDeliveryCapability.NEXT_TURN
-        ):
-            return
-        self._busy_notice_dirty = True
-        if self._busy_notice_task is not None and not self._busy_notice_task.done():
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        self._busy_notice_task = loop.create_task(
-            self._deliver_busy_notices(turn_id),
-            name=f"inbox-notice-{turn_id}",
-        )
-
-    async def _deliver_busy_notices(self, turn_id: str) -> None:
-        """Deliver only changed Inbox identities, with bounded error retries."""
-        current = asyncio.current_task()
-        attempts = 0
-        try:
-            await asyncio.sleep(self._busy_notice_delay_seconds)
-            while not self._stopping and self.active.turn_id == turn_id:
-                self._busy_notice_dirty = False
-                try:
-                    await self.offer_busy_notice(turn_id=turn_id)
-                    attempts = 0
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    attempts += 1
-                    log_runtime_event(
-                        logger,
-                        "notice.deferred",
-                        level=logging.WARNING,
-                        agent_id=self.agent_id,
-                        turn_id=turn_id,
-                        provider_session_id=self.active.provider_session_id,
-                        attempt=attempts,
-                        error_category="provider_delivery",
-                        error_type=type(exc).__name__,
-                        outcome="retry" if attempts < 2 else "next_turn",
-                    )
-                    if attempts >= 2:
-                        return
-                    self._busy_notice_dirty = True
-                    await asyncio.sleep(
-                        min(self._busy_notice_delay_seconds, float(attempts))
-                    )
-                    continue
-                if not self._busy_notice_dirty:
-                    return
-                await asyncio.sleep(self._busy_notice_delay_seconds)
-        finally:
-            if self._busy_notice_task is current:
-                self._busy_notice_task = None
-
     async def create_reminder(
         self,
         *,
@@ -1399,7 +1337,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 self.health = RuntimeHealth()
                 return False
             self.attempts.reset()
-            await self._start_local_turn(planned)
+            async with self._turn_state_lock:
+                await self._start_local_turn(planned)
             self.adapter.register_admission_callback(
                 lambda event: self._admit(planned, event),
                 planned.planning_cycle_key,
@@ -1418,20 +1357,25 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             try:
                 await self._invoke_turn_with_retries(planned)
                 if self.active.turn_id == planned.turn_id:
-                    await self._mark_active_processed(planned, process_started)
+                    async with self._turn_state_lock:
+                        await self._mark_active_processed(planned, process_started)
                     terminal = True
                     terminal_succeeded = True
                 else:
                     self._degrade("provider returned without correlated admission")
             except asyncio.CancelledError:
-                await self._requeue_active_turn(planned, process_started, "cancelled")
+                async with self._turn_state_lock:
+                    await self._requeue_active_turn(
+                        planned, process_started, "cancelled"
+                    )
                 terminal = True
                 terminal_error = "global inbox turn cancelled before completion"
                 raise
             except Exception as exc:
-                terminal = await self._requeue_active_turn(
-                    planned, process_started, "provider_error"
-                )
+                async with self._turn_state_lock:
+                    terminal = await self._requeue_active_turn(
+                        planned, process_started, "provider_error"
+                    )
                 terminal_error = f"{type(exc).__name__}: {exc}"
                 diagnostic = (
                     "turn failed and was requeued"
@@ -1686,14 +1630,15 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         defer_requeued_recovery: bool = False,
         activated: bool = False,
     ) -> bool:
-        requeued = await self._requeue_recovery_run(
-            raw,
-            run,
-            durable_ids,
-            recovery_started,
-            state,
-            activated=activated,
-        )
+        async with self._turn_state_lock:
+            requeued = await self._requeue_recovery_run(
+                raw,
+                run,
+                durable_ids,
+                recovery_started,
+                state,
+                activated=activated,
+            )
         self.health = RuntimeHealth(state, diagnostic)
         self._defer_requeued_recovery = defer_requeued_recovery and requeued
         if activated:
@@ -1970,9 +1915,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                     defer_requeued_recovery=True,
                     activated=True,
                 )
-            return await self._complete_recovery(turn_id, recovery_started)
+            async with self._turn_state_lock:
+                return await self._complete_recovery(turn_id, recovery_started)
         except asyncio.CancelledError:
-            await self._cancel_recovery(turn_id, recovery_started)
+            async with self._turn_state_lock:
+                await self._cancel_recovery(turn_id, recovery_started)
             raise
         except Exception as exc:
             return await self._unwind_recovery(

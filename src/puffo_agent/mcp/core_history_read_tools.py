@@ -31,11 +31,11 @@ def _resolve_text_alias(
 
 def _resolve_int_alias(
     explicit_name: str,
-    explicit_value: int,
+    explicit_value: int | None,
     legacy_name: str,
     legacy_value: int,
 ) -> int | None:
-    explicit = int(explicit_value) if explicit_value else None
+    explicit = int(explicit_value) if explicit_value is not None else None
     legacy = int(legacy_value) if legacy_value else None
     if explicit is not None and legacy is not None and explicit != legacy:
         raise RuntimeError(
@@ -47,8 +47,8 @@ def _resolve_int_alias(
     return value
 
 
-def _optional_non_negative(name: str, value: int) -> int | None:
-    parsed = int(value) if value else None
+def _optional_non_negative(name: str, value: int | None) -> int | None:
+    parsed = int(value) if value is not None else None
     if parsed is not None and parsed < 0:
         raise RuntimeError(f"{name} must be non-negative")
     return parsed
@@ -60,10 +60,10 @@ def _register_channel_history_tool(mcp: FastMCP, cfg: Any) -> None:
         channel: str,
         limit: int = 20,
         since_envelope_id: str = "",
-        after_seq: int = 0,
-        before_seq: int = 0,
-        after_timestamp_ms: int = 0,
-        before_timestamp_ms: int = 0,
+        after_seq: int | None = None,
+        before_seq: int | None = None,
+        after_timestamp_ms: int | None = None,
+        before_timestamp_ms: int | None = None,
         since: str = "",
         after: int = 0,
         before: int = 0,
@@ -119,13 +119,13 @@ def _register_channel_history_tool(mcp: FastMCP, cfg: Any) -> None:
             tool_arguments["limit"] = limit
         if since_envelope_id:
             tool_arguments["since_envelope_id"] = since_envelope_id
-        if after_seq:
+        if after_seq is not None:
             tool_arguments["after_seq"] = after_seq
-        if before_seq:
+        if before_seq is not None:
             tool_arguments["before_seq"] = before_seq
-        if after_timestamp_ms:
+        if after_timestamp_ms is not None:
             tool_arguments["after_timestamp_ms"] = after_timestamp_ms
-        if before_timestamp_ms:
+        if before_timestamp_ms is not None:
             tool_arguments["before_timestamp_ms"] = before_timestamp_ms
         if since:
             tool_arguments["since"] = since
@@ -188,10 +188,10 @@ def register_thread_history_tools(mcp: FastMCP, cfg: Any) -> None:
         root_id: str,
         limit: int = 50,
         since_envelope_id: str = "",
-        after_seq: int = 0,
-        before_seq: int = 0,
-        after_timestamp_ms: int = 0,
-        before_timestamp_ms: int = 0,
+        after_seq: int | None = None,
+        before_seq: int | None = None,
+        after_timestamp_ms: int | None = None,
+        before_timestamp_ms: int | None = None,
         since: str = "",
         after: int = 0,
         before: int = 0,
@@ -235,13 +235,13 @@ def register_thread_history_tools(mcp: FastMCP, cfg: Any) -> None:
             tool_arguments["limit"] = limit
         if since_envelope_id:
             tool_arguments["since_envelope_id"] = since_envelope_id
-        if after_seq:
+        if after_seq is not None:
             tool_arguments["after_seq"] = after_seq
-        if before_seq:
+        if before_seq is not None:
             tool_arguments["before_seq"] = before_seq
-        if after_timestamp_ms:
+        if after_timestamp_ms is not None:
             tool_arguments["after_timestamp_ms"] = after_timestamp_ms
-        if before_timestamp_ms:
+        if before_timestamp_ms is not None:
             tool_arguments["before_timestamp_ms"] = before_timestamp_ms
         if since:
             tool_arguments["since"] = since

@@ -1602,10 +1602,16 @@ async def test_get_channel_history_explicit_seq_and_legacy_timestamp_bounds():
         "get_channel_history",
         {"channel": "ch_bounds", "after": base},
     )
+    before_zero = await _call(
+        mcp,
+        "get_channel_history",
+        {"channel": "ch_bounds", "before_seq": 0},
+    )
 
     assert "env_second" in by_seq and "env_first" not in by_seq
     assert "env_second" in by_legacy_timestamp
     assert "env_first" not in by_legacy_timestamp
+    assert "no root posts" in before_zero
     await ms.close()
 
 
