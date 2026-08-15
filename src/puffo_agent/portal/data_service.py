@@ -229,7 +229,8 @@ async def list_channel_roots(request: web.Request) -> web.Response:
     flat ``messages/recent`` view for agents that want to see what
     conversations exist without dragging every reply into context.
     Query params: ``channel`` (required), ``limit``, ``since`` (an
-    envelope_id), ``before`` (ms-epoch), ``after`` (ms-epoch)."""
+    envelope_id), ``before`` / ``after`` (legacy ms-epoch bounds), and
+    explicit ``before_seq`` / ``after_seq`` server-sequence bounds."""
     agent_id = request.match_info["agent_id"]
     channel_id = request.query.get("channel", "")
     if not channel_id:
@@ -245,6 +246,14 @@ async def list_channel_roots(request: web.Request) -> web.Response:
     after_ts, err = _parse_int_param(request.query.get("after"), "after")
     if err is not None:
         return err
+    before_seq, err = _parse_int_param(
+        request.query.get("before_seq"), "before_seq"
+    )
+    if err is not None:
+        return err
+    after_seq, err = _parse_int_param(request.query.get("after_seq"), "after_seq")
+    if err is not None:
+        return err
     since = request.query.get("since") or None
     limit = max(1, min(limit or 20, 200))
     store = await _store_for(request.app, agent_id)
@@ -257,6 +266,8 @@ async def list_channel_roots(request: web.Request) -> web.Response:
             since_envelope_id=since,
             before_ts=before_ts,
             after_ts=after_ts,
+            before_seq=before_seq,
+            after_seq=after_seq,
         )
     except DataNotFound:
         return web.json_response(
@@ -280,8 +291,9 @@ async def list_channel_roots(request: web.Request) -> web.Response:
 
 async def list_thread_messages(request: web.Request) -> web.Response:
     """Messages in a thread (the root + every reply), filtered by
-    optional ``since`` (envelope_id), ``before`` / ``after`` (ms-
-    epoch). Returned oldest-first up to ``limit``."""
+    optional ``since`` (envelope_id), legacy ``before`` / ``after``
+    timestamps, or explicit ``before_seq`` / ``after_seq`` bounds. Returned
+    oldest-first up to ``limit``."""
     agent_id = request.match_info["agent_id"]
     root_id = request.match_info["root_id"]
     limit, err = _parse_int_param(request.query.get("limit", "50"), "limit")
@@ -291,6 +303,14 @@ async def list_thread_messages(request: web.Request) -> web.Response:
     if err is not None:
         return err
     after_ts, err = _parse_int_param(request.query.get("after"), "after")
+    if err is not None:
+        return err
+    before_seq, err = _parse_int_param(
+        request.query.get("before_seq"), "before_seq"
+    )
+    if err is not None:
+        return err
+    after_seq, err = _parse_int_param(request.query.get("after_seq"), "after_seq")
     if err is not None:
         return err
     since = request.query.get("since") or None
@@ -305,6 +325,8 @@ async def list_thread_messages(request: web.Request) -> web.Response:
             since_envelope_id=since,
             before_ts=before_ts,
             after_ts=after_ts,
+            before_seq=before_seq,
+            after_seq=after_seq,
         )
     except DataNotFound:
         return web.json_response(

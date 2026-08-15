@@ -6,9 +6,6 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
-from ..agent.context_controller import MODEL_VISIBLE_READ_RECEIPT_PREFIX
-
-
 def register_inbox_read_tool(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def read_inbox(
@@ -49,11 +46,6 @@ def register_inbox_read_tool(mcp: FastMCP, cfg: Any) -> None:
             )
         else:
             raise RuntimeError("global Inbox runtime is unavailable")
-        receipt = result.pop("correlation_receipt", "")
-        if receipt:
-            result["admission_receipt"] = (
-                f"[{MODEL_VISIBLE_READ_RECEIPT_PREFIX}{receipt}]"
-            )
         return result
 
 

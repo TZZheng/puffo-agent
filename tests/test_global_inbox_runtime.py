@@ -966,7 +966,7 @@ async def test_global_notice_turns_are_ephemeral_to_the_agent_log(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pre_admission_failure_leaves_pending_without_self_retry(
+async def test_provider_start_failure_requeues_local_turn_without_busy_retry(
     tmp_path, caplog,
 ):
     caplog.set_level(logging.INFO)
@@ -988,7 +988,7 @@ async def test_pre_admission_failure_leaves_pending_without_self_retry(
     assert not await runtime.process_once()
     assert calls == 1
     assert runtime.health == RuntimeHealth(
-        "degraded", "turn failed before durable admission"
+        "degraded", "turn failed and was requeued"
     )
     assert runtime._degraded is True
     assert [m.envelope_id for m in await store.get_pending()] == ["m1"]
@@ -998,7 +998,7 @@ async def test_pre_admission_failure_leaves_pending_without_self_retry(
     ]
     assert len(failures) == 1
     assert failures[0]["error_type"] == "RuntimeError"
-    assert failures[0]["outcome"] == "degraded"
+    assert failures[0]["outcome"] == "requeued"
     await store.close()
 
 
@@ -1259,6 +1259,7 @@ async def test_initial_admission_visibility_is_exact_deduplicated_and_memory_onl
         target_summary="", formatted_blocks=(), provider_input="", formatted_tokens=0,
         wrapper_overhead_tokens=0, formatted_bytes=0, wrapper_overhead_bytes=0,
     )
+    await runtime._start_local_turn(planned)
     await runtime._admit(planned, ProviderAdmissionEvent(
         planning_cycle_key="initial-visible-key", provider_session_id="provider-1",
         provider_turn_id="provider-turn", admitted_at=datetime.now(timezone.utc),
@@ -1522,7 +1523,7 @@ async def test_driver_recovery_abandons_before_exact_union_replacement(tmp_path)
     )
     planned = await seed.plan_pending()
     assert planned is not None
-    seed._write_current_turn(planned)
+    await seed._start_local_turn(planned)
     seed_adapter.register_admission_callback(
         lambda event: seed._admit(planned, event),
         planned.planning_cycle_key,
@@ -1530,7 +1531,6 @@ async def test_driver_recovery_abandons_before_exact_union_replacement(tmp_path)
     await seed_adapter.admit()
     page = await seed.read_inbox(limit=2, tool_arguments={"limit": 2})
     assert len(page["messages"]) == 2
-    await seed_adapter.admit_continuation()
     persisted = json.loads(seed.current_turn_path.read_text(encoding="utf-8"))
     assert persisted["message_ids"] == ["first", "second"]
 
@@ -1735,7 +1735,7 @@ async def test_admission_retry_auth_unsafe_or_exhaustion_requeues(
 
 
 @pytest.mark.asyncio
-async def test_silence_without_correlated_admission_degrades_without_self_wake(
+async def test_success_without_inbox_read_leaves_messages_pending(
     tmp_path,
 ):
     store = await make_store(tmp_path)
@@ -1752,7 +1752,7 @@ async def test_silence_without_correlated_admission_degrades_without_self_wake(
         store=store, adapter=adapter, run_turn=run, workspace=tmp_path,
     )
     await runtime.process_once()
-    assert runtime.health.state == "degraded"
+    assert runtime.health.state == "idle"
     assert [row.envelope_id for row in await store.get_pending()] == ["silent"]
     assert calls == 1
     assert not runtime.current_turn_path.exists()

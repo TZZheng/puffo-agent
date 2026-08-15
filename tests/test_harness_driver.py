@@ -761,8 +761,7 @@ async def _read_metadata_pages(runtime, proc, provider):
             cursor=cursor, limit=1, tool_arguments=arguments,
         )
         assert len(page["messages"]) == 1
-        marker = f"[puffo:model-visible-read:{page['correlation_receipt']}]"
-        _feed_metadata_result(proc, provider, page_number, arguments, marker)
+        _feed_metadata_result(proc, provider, page_number, arguments, "read complete")
         admitted.append(f"message-{page_number}")
 
         def admission_is_persisted():
@@ -1347,8 +1346,8 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
     started = await driver.start_turn(TurnInput(
         "hello\r\nworld", client_correlation_id="replay-1"
     ))
-    assert started.accepted and started.delivery == "replay_acknowledged"
-    assert started.replay_id == "replay-1"
+    assert started.accepted and started.delivery == "stdin_written"
+    assert started.replay_id == ""
     await _next_matching(stream, "turn.started")
     await _next_matching(stream, "turn.assistant_delta")
     await _next_matching(stream, "turn.tool_started")
@@ -1475,7 +1474,7 @@ async def test_claude_driver_resume_flag_maps_to_resumed_system_init():
 
 
 @pytest.mark.asyncio
-async def test_claude_driver_pre_replay_process_loss_is_ambiguous():
+async def test_claude_driver_stdin_delivery_does_not_wait_for_replay():
     holder = {}
 
     def factory(_args, _spec):
@@ -1492,8 +1491,8 @@ async def test_claude_driver_pre_replay_process_loss_is_ambiguous():
     driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
     await driver.open(RuntimeSpec("/workspace"))
     receipt = await driver.start_turn(TurnInput("accepted maybe"))
-    assert not receipt.accepted
-    assert receipt.delivery == "ambiguous_at_least_once"
+    assert receipt.accepted
+    assert receipt.delivery == "stdin_written"
     await driver.close()
 
 

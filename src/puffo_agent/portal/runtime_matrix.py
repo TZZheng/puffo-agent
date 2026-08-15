@@ -8,12 +8,10 @@ are bound to one provider (``claude-code`` → anthropic, ``gemini-cli``
 Supported today: ``cli-local`` with ``claude-code`` or ``codex``,
 ``cli-docker`` with ``claude-code`` or ``codex``, and ``ws-local``
 (external tool, no internal engine). ``hermes`` and ``gemini-cli``
-remain design-only — no runtime accepts them, because their provider
-admission happens after MCP execution and they cannot correlate a
-concrete ``read_inbox`` tool result, so they cannot complete the
-metadata-notified Inbox contract. They stay enumerated here so a
-persisted agent.yml carrying one fails with that explicit diagnostic
-instead of a misleading "unknown harness".
+remain design-only — no runtime accepts them because their Driver and
+operational contracts have not been implemented and verified. They stay
+enumerated here so a persisted agent.yml carrying one fails with that explicit
+diagnostic instead of a misleading "unknown harness".
 """
 
 from __future__ import annotations

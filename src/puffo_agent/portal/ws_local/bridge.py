@@ -26,9 +26,9 @@ from .session import V2_CAPABILITIES
 
 # Both model-visible-read producers are legitimate and their key names are
 # consumed as-is by the RPC/host-mcp path: ``stage_held_send_result`` returns
-# ``tool_result_admission``; the ``read_inbox`` / ``get_post_segment`` tool
-# wrappers return ``admission_receipt``. The bridge is the one consumer that
-# must accept either, or a read admission can never be correlated.
+# ``tool_result_admission``; bounded history/post readers such as
+# ``get_post_segment`` return ``admission_receipt``. The bridge accepts either
+# private marker shape for continuations that still require provider proof.
 _ADMISSION_MARKER_KEYS = ("tool_result_admission", "admission_receipt")
 
 

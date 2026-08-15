@@ -4,14 +4,12 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from puffo_agent.agent.context_controller import (
     DecisionOutcome,
-    ProviderAdmissionEvent,
 )
 from puffo_agent.agent.global_inbox_runtime import (
     ActiveBoundaryAdapter,
@@ -180,34 +178,12 @@ async def test_repeated_held_sync_proof_returns_stable_local_semantic_context(
 
 
 @pytest.mark.asyncio
-async def test_notice_then_correlated_read_admits_and_processes_exact_page(tmp_path):
+async def test_notice_read_directly_admits_and_processes_exact_page(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "pull-1", 1)
     await receipt(store, "pull-2", 2)
 
-    class PullAdapter(Adapter):
-        def __init__(self):
-            super().__init__()
-            self.continuation = None
-            self.continuation_key = ""
-
-        def register_continuation_callback(
-            self, callback, planning_cycle_key, **_kwargs
-        ):
-            self.continuation = callback
-            self.continuation_key = planning_cycle_key
-
-        async def admit_continuation(self):
-            callback, self.continuation = self.continuation, None
-            await callback(ProviderAdmissionEvent(
-                planning_cycle_key=self.continuation_key,
-                provider_session_id=self.session,
-                provider_turn_id="provider-turn",
-                tool_call_id="tool-1",
-                admitted_at=datetime.now(timezone.utc),
-            ))
-
-    adapter = PullAdapter()
+    adapter = Adapter()
 
     async def run(planned):
         assert "text-pull" not in planned.provider_input
@@ -217,11 +193,9 @@ async def test_notice_then_correlated_read_admits_and_processes_exact_page(tmp_p
         page = await runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
         assert len(page["messages"]) == 1
         assert [row.envelope_id for row in await store.get_pending()] == [
-            "pull-1", "pull-2"
+            "pull-2"
         ]
-        await adapter.admit_continuation()
         assert runtime.active.visible_message_ids == ["pull-1"]
-        assert [row.envelope_id for row in await store.get_pending()] == ["pull-2"]
 
     runtime = GlobalInboxRuntime(
         store=store, adapter=adapter, run_turn=run, workspace=tmp_path
@@ -423,36 +397,13 @@ async def test_correlated_read_processes_sequence_less_local_runtime_event(tmp_p
         intro_channel_id="ch-1",
     )
 
-    class PullAdapter(Adapter):
-        def __init__(self):
-            super().__init__()
-            self.continuation = None
-            self.continuation_key = ""
-
-        def register_continuation_callback(
-            self, callback, planning_cycle_key, **_kwargs
-        ):
-            self.continuation = callback
-            self.continuation_key = planning_cycle_key
-
-        async def admit_continuation(self):
-            callback, self.continuation = self.continuation, None
-            await callback(ProviderAdmissionEvent(
-                planning_cycle_key=self.continuation_key,
-                provider_session_id=self.session,
-                provider_turn_id="provider-turn",
-                tool_call_id="tool-local",
-                admitted_at=datetime.now(timezone.utc),
-            ))
-
-    adapter = PullAdapter()
+    adapter = Adapter()
 
     async def run(planned):
         await adapter.admit()
         page = await runtime.read_inbox(limit=50, tool_arguments={})
         assert len(page["messages"]) == 1
         assert "introduce yourself" in page["messages"][0]
-        await adapter.admit_continuation()
         route = runtime.resolve_active_send_route(
             "ch-1", {"root_id": ""}, {}
         )
@@ -1184,26 +1135,6 @@ async def test_one_turn_reads_two_targets_sends_twice_and_processes_exact_union(
     await receipt(store, "target-a", 1, channel="ch-a")
     await receipt(store, "target-b", 2, channel="ch-b")
 
-    class MultiReadAdapter(Adapter):
-        def __init__(self):
-            super().__init__()
-            self.continuations = {}
-
-        def register_continuation_callback(
-            self, callback, planning_cycle_key, **_metadata
-        ):
-            self.continuations[planning_cycle_key] = callback
-
-        async def admit_key(self, key):
-            callback = self.continuations.pop(key)
-            await callback(ProviderAdmissionEvent(
-                planning_cycle_key=key,
-                provider_session_id=self.session,
-                provider_turn_id="provider-turn",
-                tool_call_id=f"tool-{key}",
-                admitted_at=datetime.now(timezone.utc),
-            ))
-
     class Coordinator:
         def __init__(self):
             self.calls = []
@@ -1217,7 +1148,7 @@ async def test_one_turn_reads_two_targets_sends_twice_and_processes_exact_union(
                 "seq": 10 + len(self.calls),
             }
 
-    adapter = MultiReadAdapter()
+    adapter = Adapter()
     coordinator = Coordinator()
 
     async def run(_planned):
@@ -1232,8 +1163,6 @@ async def test_one_turn_reads_two_targets_sends_twice_and_processes_exact_union(
                 },
             )
             assert len(page["messages"]) == 1
-            key = next(iter(adapter.continuations))
-            await adapter.admit_key(key)
             route = runtime.resolve_active_send_route(
                 channel, {"destination": channel}, {}
             )
@@ -1277,24 +1206,6 @@ async def test_zero_send_notice_turn_can_succeed_without_output(tmp_path):
         page = await runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
         assert page["messages"]
         # No send is attempted; the Turn still completes its exact union.
-        callback = adapter.continuation
-        await callback(ProviderAdmissionEvent(
-            planning_cycle_key=adapter.continuation_key,
-            provider_session_id=adapter.session,
-            provider_turn_id="provider-turn",
-            tool_call_id="tool-zero",
-            admitted_at=datetime.now(timezone.utc),
-        ))
-
-    # Add only the continuation seam used by read_inbox to the simple adapter.
-    adapter.continuation = None
-    adapter.continuation_key = ""
-
-    def register(callback, planning_cycle_key, **_metadata):
-        adapter.continuation = callback
-        adapter.continuation_key = planning_cycle_key
-
-    adapter.register_continuation_callback = register
     runtime = GlobalInboxRuntime(
         store=store,
         adapter=adapter,
@@ -1415,7 +1326,7 @@ async def test_transient_provider_failure_self_recovers_after_backoff_without_in
 
 
 @pytest.mark.asyncio
-async def test_read_inbox_byte_guard_repaginates_without_lifecycle_mutation(
+async def test_read_inbox_byte_guard_admits_only_the_returned_page(
     tmp_path,
 ):
     store = await make_store(tmp_path)
@@ -1451,16 +1362,16 @@ async def test_read_inbox_byte_guard_repaginates_without_lifecycle_mutation(
         "has_more",
         "remaining_count",
         "snapshot_generation",
-        "correlation_receipt",
     }
     assert [row.envelope_id for row in await store.get_pending()] == [
-        "guard-1", "guard-2"
+        "guard-2"
     ]
+    assert runtime.active.message_ids == ["guard-1"]
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_read_inbox_admits_exact_page_at_runtime_tool_return(
+async def test_read_inbox_admits_exact_page_directly(
     tmp_path, caplog,
 ):
     caplog.set_level(
@@ -1498,10 +1409,10 @@ async def test_read_inbox_admits_exact_page_at_runtime_tool_return(
         if event["event"].startswith("inbox.read")
     ]
     assert [event["event"] for event in inbox_events] == [
-        "inbox.read_staged", "inbox.read_admitted",
+        "inbox.read_admitted",
     ]
-    assert inbox_events[0]["outcome"] == "tool_return"
-    assert inbox_events[1]["provider_turn_id"] == (
+    assert inbox_events[0]["outcome"] == "in_turn"
+    assert inbox_events[0]["provider_turn_id"] == (
         "provider-turn-tool-return"
     )
     await store.close()
@@ -1528,22 +1439,6 @@ class _CrashAfterBoundary(RuntimeError):
     pass
 
 
-class _CrashCorrelatingAdapter(Adapter):
-    def register_continuation_callback(
-        self, callback, planning_cycle_key, **_metadata
-    ):
-        self.continuation = callback
-        self.continuation_key = planning_cycle_key
-
-    async def admit_continuation(self, tool_call_id):
-        callback, self.continuation = self.continuation, None
-        await callback(ProviderAdmissionEvent(
-            planning_cycle_key=self.continuation_key,
-            provider_session_id=self.session, provider_turn_id="native-turn",
-            tool_call_id=tool_call_id, admitted_at=datetime.now(timezone.utc),
-        ))
-
-
 async def _seed_crash_join_turn(tmp_path, message_count):
     store = await make_store(tmp_path)
     for seq in range(1, message_count + 1):
@@ -1553,7 +1448,7 @@ async def _seed_crash_join_turn(tmp_path, message_count):
         "logical-turn", session_ref="logical-session",
         native_session_id="provider-1",
     )
-    adapter = _CrashCorrelatingAdapter()
+    adapter = Adapter()
     seed = GlobalInboxRuntime(
         store=store, adapter=adapter, run_turn=lambda _planned: None,
         workspace=tmp_path, agent_id="agent", runtime_event_outbox=outbox,
@@ -1569,7 +1464,6 @@ async def _seed_crash_join_turn(tmp_path, message_count):
             tool_arguments={"cursor": cursor, "limit": 1},
         )
         assert len(page["messages"]) == 1
-        await adapter.admit_continuation(f"tool-{page_number + 1}")
         admitted.append(f"page-{page_number + 1}")
         persisted = json.loads(seed.current_turn_path.read_text())
         assert persisted["message_ids"] == admitted

@@ -147,7 +147,6 @@ async def test_ws_local_read_inbox_uses_live_runtime_and_preserves_correlation()
                 "has_more": False,
                 "remaining_count": 0,
                 "snapshot_generation": 3,
-                "correlation_receipt": "receipt-3",
             }
 
     cfg = PuffoCoreToolsConfig(
@@ -168,7 +167,6 @@ async def test_ws_local_read_inbox_uses_live_runtime_and_preserves_correlation()
         "has_more": False,
         "remaining_count": 0,
         "snapshot_generation": 3,
-        "admission_receipt": "[puffo:model-visible-read:receipt-3]",
     }
     assert calls == [{
         "target": "channel:sp:ch",

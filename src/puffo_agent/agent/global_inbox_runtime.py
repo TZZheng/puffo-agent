@@ -56,7 +56,7 @@ DEGRADED_RECOVERY_MAX_SECONDS = 300.0
 
 from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
-from .global_inbox_admission import InboxAdmissionMixin, InboxReadContext
+from .global_inbox_admission import InboxAdmissionMixin
 from .global_inbox_types import (
     ActiveBoundaryAdapter,
     ActiveExactUnion,
@@ -182,6 +182,10 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             tuple[str, str, str, str, int, str], HeldAdmissionEvidence
         ] = {}
         self._boundary = asyncio.Lock()
+        # Provider binding and direct Inbox admission can race on the first
+        # turn of a newly opened harness session. Both mutate the same durable
+        # turn owner and in-memory exact union, so they share one short lock.
+        self._turn_state_lock = asyncio.Lock()
         self._stopping = False
         self._degraded = False
         self._degraded_until: float | None = None
@@ -720,48 +724,42 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         )
         return replacement.candidate if replacement else previous
 
-    async def _admit(self, planned: PlannedTurn, event: ProviderAdmissionEvent) -> None:
-        if event.planning_cycle_key != planned.planning_cycle_key:
-            raise RuntimeError("provider admission did not correlate to planned turn")
-        # Durable Inbox recovery is keyed by the provider session.  Stateless
-        # local adapters must not create a run that can never be authenticated
-        # on recovery (or expose identity-required MCP history tools).
-        if not event.provider_session_id:
-            raise RuntimeError("provider does not support durable Inbox admission")
+    async def _start_local_turn(self, planned: PlannedTurn) -> None:
+        """Persist the daemon-owned turn before any provider input is written."""
+        provider_session_id = self.adapter.get_provider_session_id()
         if planned.message_ids:
             run = await self.store.admit_messages(
                 planned.message_ids,
                 turn_id=planned.turn_id,
-                provider_session_id=event.provider_session_id,
+                provider_session_id=provider_session_id,
             )
         else:
             run = await self.store.start_turn(
                 turn_id=planned.turn_id,
-                provider_session_id=event.provider_session_id,
+                provider_session_id=provider_session_id,
                 notice_generation=planned.notice_generation,
             )
         self.active.turn_id = run.turn_id
         self.active.message_ids[:] = list(run.message_ids)
         await self._add_visible_message_ids(list(run.message_ids))
-        self.active.provider_session_id = event.provider_session_id
-        self.active.provider_turn_id = event.provider_turn_id
+        self.active.provider_session_id = provider_session_id
+        self.active.provider_turn_id = None
         self.active.routes[:] = list(planned.routes)
         if self.coordinator is not None:
-            self.coordinator.provider_session_id = event.provider_session_id
+            self.coordinator.provider_session_id = provider_session_id
+        self._write_current_turn(planned)
         await self._notify_status_active()
         log_runtime_event(
             logger,
             "turn.admitted",
-            level=logging.DEBUG,
             agent_id=self.agent_id,
             turn_id=run.turn_id,
-            batch_id=event.planning_cycle_key,
-            provider_session_id=event.provider_session_id,
-            provider_turn_id=event.provider_turn_id,
-            correlation_key=event.planning_cycle_key,
-            envelope_id=run.message_ids[0] if len(run.message_ids) == 1 else None,
+            batch_id=planned.planning_cycle_key,
+            provider_session_id=provider_session_id,
+            notice_generation=planned.notice_generation,
             state=run.state,
             message_count=len(run.message_ids),
+            outcome="local_active",
         )
         if planned.notice_generation:
             log_runtime_event(
@@ -769,11 +767,50 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 "notice.admitted",
                 agent_id=self.agent_id,
                 turn_id=run.turn_id,
-                provider_session_id=event.provider_session_id,
-                provider_turn_id=event.provider_turn_id,
+                provider_session_id=provider_session_id,
                 notice_generation=planned.notice_generation,
-                outcome="admitted",
+                outcome="claimed",
             )
+
+    async def _admit(self, planned: PlannedTurn, event: ProviderAdmissionEvent) -> None:
+        """Bind provider identity to the already-active daemon turn."""
+        if event.planning_cycle_key != planned.planning_cycle_key:
+            raise RuntimeError("provider admission did not correlate to planned turn")
+        async with self._turn_state_lock:
+            if self.active.turn_id != planned.turn_id:
+                raise RuntimeError("provider admission crossed the active turn")
+            previous_session_id = self.active.provider_session_id
+            provider_session_id = event.provider_session_id or previous_session_id
+            if provider_session_id != previous_session_id:
+                await self.store.transfer_turn_session(
+                    planned.turn_id,
+                    from_provider_session_id=previous_session_id,
+                    to_provider_session_id=provider_session_id,
+                )
+            self.active.provider_session_id = provider_session_id
+            self.active.provider_turn_id = event.provider_turn_id
+            if self.coordinator is not None:
+                self.coordinator.provider_session_id = provider_session_id
+            self._write_current_turn(planned)
+        log_runtime_event(
+            logger,
+            "turn.admitted",
+            level=logging.DEBUG,
+            agent_id=self.agent_id,
+            turn_id=planned.turn_id,
+            batch_id=event.planning_cycle_key,
+            provider_session_id=provider_session_id,
+            provider_turn_id=event.provider_turn_id,
+            correlation_key=event.planning_cycle_key,
+            envelope_id=(
+                self.active.message_ids[0]
+                if len(self.active.message_ids) == 1
+                else None
+            ),
+            state=ProcessingState.IN_TURN.value,
+            message_count=len(self.active.message_ids),
+            outcome="bound",
+        )
 
     async def _notify_status_active(self) -> None:
         """Expose the exact active union to the worker's status lifecycle.
@@ -863,21 +900,6 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 exc_info=True,
             )
 
-    async def _admit_inbox_read(
-        self,
-        context: InboxReadContext,
-        event: ProviderAdmissionEvent,
-        fired: list[bool],
-    ) -> None:
-        """Admit a mid-turn Inbox read, then expose the grown active union.
-
-        The durable admission and its processing-state decisions stay in the
-        implementation trait; this override only mirrors the post-admission
-        union into the worker's status lifecycle.
-        """
-        await super()._admit_inbox_read(context, event, fired)
-        await self._notify_status_active()
-
     async def _admit_held_recovery(
         self,
         event: ProviderAdmissionEvent,
@@ -912,12 +934,25 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
     def _write_current_turn(self, planned: PlannedTurn) -> None:
         path = self.current_turn_path
         path.parent.mkdir(parents=True, exist_ok=True)
+        use_active = self.active.turn_id == planned.turn_id and (
+            bool(self.active.message_ids) or not planned.message_ids
+        )
+        message_ids = (
+            tuple(self.active.message_ids) if use_active else planned.message_ids
+        )
+        routes = tuple(self.active.routes) if use_active else planned.routes
+        targets: list[tuple[str, ...]] = []
+        for route in routes:
+            if route.target not in targets:
+                targets.append(route.target)
+        if not targets:
+            targets.extend(planned.targets)
         body: dict[str, Any] = {
             "version": CURRENT_TURN_VERSION,
             "turn_id": planned.turn_id,
-            "message_ids": list(planned.message_ids),
-            "targets": [list(target) for target in planned.targets],
-            "routes": [asdict(route) for route in planned.routes],
+            "message_ids": list(message_ids),
+            "targets": [list(target) for target in targets],
+            "routes": [asdict(route) for route in routes],
             "provider_session_id": self.active.provider_session_id,
             "provider_turn_id": self.active.provider_turn_id,
         }
@@ -930,11 +965,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                     "native_session_id": outbox_state.get("native_session_id", ""),
                 }
             )
-        if len(planned.targets) == 1 and planned.routes:
-            route = planned.routes[0]
+        if len(targets) == 1 and routes and message_ids:
+            route = routes[0]
             body["channel_id"] = route.channel_id
             body["root_id"] = route.thread_root_id
-            body["triggering_post_id"] = planned.message_ids[0]
+            body["triggering_post_id"] = message_ids[0]
         temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
             with temp.open("w", encoding="utf-8") as handle:
@@ -1267,8 +1302,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             if not await self._notice_is_current(planned):
                 self.health = RuntimeHealth()
                 return False
-            self._write_current_turn(planned)
             self.attempts.reset()
+            await self._start_local_turn(planned)
             self.adapter.register_admission_callback(
                 lambda event: self._admit(planned, event),
                 planned.planning_cycle_key,
@@ -1305,7 +1340,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 diagnostic = (
                     "turn failed and was requeued"
                     if terminal
-                    else "turn failed before durable admission"
+                    else "turn failed outside the active durable turn"
                 )
                 self._degrade(diagnostic)
                 log_runtime_event(
@@ -1341,35 +1376,28 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
     async def _admit_retry_attempt(
         self, planned: PlannedTurn, event: ProviderAdmissionEvent
     ) -> None:
-        """Correlate a real retry turn without re-admitting the durable union."""
+        """Bind a retry provider turn without re-admitting its durable union."""
         if (
             event.planning_cycle_key != planned.planning_cycle_key
             or self.active.turn_id != planned.turn_id
         ):
             raise RuntimeError("provider retry admission crossed the active turn")
-        # Same durable-admission rule as ``_admit``: a session-less provider
-        # cannot own recoverable Inbox rows.
-        if not event.provider_session_id:
-            raise RuntimeError("provider does not support durable Inbox admission")
-        transferred = event.provider_session_id != self.active.provider_session_id
-        if transferred:
-            # A replacement session received the rebuilt exact bodies as its
-            # fallback payload; durable ownership must move with them, in one
-            # atomic transition, before any row of this turn can be completed.
-            # A conflict here raises out of the admission callback, so the turn
-            # fails into the ordinary requeue instead of finalizing.
-            await self.store.transfer_turn_session(
-                planned.turn_id,
-                from_provider_session_id=self.active.provider_session_id,
-                to_provider_session_id=event.provider_session_id,
-            )
-        self.active.provider_session_id = event.provider_session_id
-        self.active.provider_turn_id = event.provider_turn_id
-        if self.coordinator is not None:
-            self.coordinator.provider_session_id = event.provider_session_id
-        if transferred:
-            # Keep the crash join pointing at the session that now owns the
-            # turn, so a restart resumes instead of unwinding on stale identity.
+        async with self._turn_state_lock:
+            previous_session_id = self.active.provider_session_id
+            provider_session_id = event.provider_session_id or previous_session_id
+            transferred = provider_session_id != previous_session_id
+            if transferred:
+                # A replacement session received the rebuilt exact bodies as
+                # its fallback payload; durable ownership follows atomically.
+                await self.store.transfer_turn_session(
+                    planned.turn_id,
+                    from_provider_session_id=previous_session_id,
+                    to_provider_session_id=provider_session_id,
+                )
+            self.active.provider_session_id = provider_session_id
+            self.active.provider_turn_id = event.provider_turn_id
+            if self.coordinator is not None:
+                self.coordinator.provider_session_id = provider_session_id
             self._write_current_turn(planned)
 
     def _clear_terminal_turn(self) -> None:

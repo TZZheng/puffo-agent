@@ -205,11 +205,13 @@ class DataClient:
         since_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
+        before_seq: int | None = None,
+        after_seq: int | None = None,
     ) -> list[ChannelRootDict]:
         """Root posts in ``channel_id`` with reply counts. Filters:
         ``since_envelope_id`` (results have ``sent_at >`` that
-        envelope's ``sent_at``), ``before_ts`` / ``after_ts``
-        (ms-epoch bounds).
+        envelope's ``sent_at``), explicit ms-epoch bounds, and explicit
+        authoritative server-sequence bounds.
         """
         path = (
             f"/v1/data/{urllib.parse.quote(self.agent_id, safe='')}"
@@ -225,6 +227,10 @@ class DataClient:
             params["before"] = str(before_ts)
         if after_ts is not None:
             params["after"] = str(after_ts)
+        if before_seq is not None:
+            params["before_seq"] = str(before_seq)
+        if after_seq is not None:
+            params["after_seq"] = str(after_seq)
         session = await self._get_session()
         try:
             async with session.get(
@@ -259,6 +265,8 @@ class DataClient:
         since_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
+        before_seq: int | None = None,
+        after_seq: int | None = None,
     ) -> list[StoredMessageDict]:
         """Root + every reply in the thread anchored at ``root_id``.
         Same filters as ``get_channel_roots``."""
@@ -273,6 +281,10 @@ class DataClient:
             params["before"] = str(before_ts)
         if after_ts is not None:
             params["after"] = str(after_ts)
+        if before_seq is not None:
+            params["before_seq"] = str(before_seq)
+        if after_seq is not None:
+            params["after_seq"] = str(after_seq)
         session = await self._get_session()
         try:
             async with session.get(

@@ -177,33 +177,27 @@ class InboxStoreMixin:
         generation: int,
         provider_session_id: str | None,
     ) -> bool:
-        return (
-            not isinstance(generation, bool)
-            and isinstance(generation, int)
-            and isinstance(provider_session_id, str)
-            and bool(provider_session_id)
-        )
+        del provider_session_id
+        return not isinstance(generation, bool) and isinstance(generation, int)
 
     async def _mark_notice_delivered_unlocked(
         self,
         db: aiosqlite.Connection,
         generation: int,
-        provider_session_id: str,
+        provider_session_id: str | None,
     ) -> bool:
-        """Persist one native acceptance while the caller owns the write lock."""
+        """Claim one notice generation while the caller owns the write lock."""
         cursor = await db.execute(
             "UPDATE inbox_notice_state "
             "SET last_delivered_generation = ?, "
             "last_delivered_provider_session_id = ? "
             "WHERE singleton = 1 AND generation = ? AND pending_count > 0 "
-            "AND NOT (last_delivered_generation = ? "
-            "AND last_delivered_provider_session_id IS ?)",
+            "AND last_delivered_generation != ?",
             (
                 generation,
                 provider_session_id,
                 generation,
                 generation,
-                provider_session_id,
             ),
         )
         return cursor.rowcount == 1
@@ -213,16 +207,13 @@ class InboxStoreMixin:
         generation: int,
         provider_session_id: str | None,
     ) -> bool:
-        """Record a notice only after its native provider accepts it.
+        """Claim a pending notice generation for one daemon-owned turn.
 
-        Acceptance is deduplicated by ``(generation, provider_session_id)``.
-        The same pending generation may therefore be rediscovered once by a
-        replacement session, while a resumed session never receives its own
-        accepted notice again.
+        The provider session is retained as optional diagnostic metadata for
+        existing databases. It is not part of notice deduplication.
         """
         if not self._valid_notice_acceptance(generation, provider_session_id):
             return False
-        assert isinstance(provider_session_id, str)
         async with self._inbox_lock:
             db = await self._ensure_db()
             await db.execute("BEGIN IMMEDIATE")
@@ -565,30 +556,27 @@ class InboxStoreMixin:
         started_at: int | None = None,
         notice_generation: int | None = None,
     ) -> TurnRun:
-        """Create an active Turn, atomically accepting a notice when present."""
+        """Create an active Turn, atomically claiming a notice when present."""
         if not turn_id:
             raise LifecycleConflict("turn ID is required")
         if notice_generation is not None and not self._valid_notice_acceptance(
             notice_generation,
             provider_session_id,
         ):
-            raise LifecycleConflict(
-                "notice acceptance requires a generation and provider session"
-            )
+            raise LifecycleConflict("notice claim requires a valid generation")
         async with self._inbox_lock:
             db = await self._ensure_db()
             started = started_at if started_at is not None else int(self._now_ms())
             try:
                 await db.execute("BEGIN IMMEDIATE")
                 if notice_generation is not None:
-                    assert isinstance(provider_session_id, str)
                     if not await self._mark_notice_delivered_unlocked(
                         db,
                         notice_generation,
                         provider_session_id,
                     ):
                         raise LifecycleConflict(
-                            "Inbox notice is stale or already accepted by this session"
+                            "Inbox notice is stale or already claimed"
                         )
                 await db.execute(
                     "INSERT INTO turn_runs(turn_id, provider_session_id, state, "

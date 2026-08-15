@@ -6,6 +6,29 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a5] — 2026-08-14
+
+> Staging candidate for daemon-owned Inbox turns and unambiguous history reads.
+
+### Changed
+
+- **Global Inbox turns now start locally before provider input.** A
+  `read_inbox` call directly moves the exact returned pending rows into that
+  active turn; successful turns process them and failed or interrupted turns
+  return them to pending. There is no second model-to-daemon Inbox ACK.
+- **Claude replay is telemetry rather than a delivery gate.** Writing the
+  provider input establishes delivery, while replay events can still enrich
+  provider session and turn diagnostics without delaying the turn lifecycle.
+- **History pagination uses explicit units.** Channel and thread readers now
+  expose envelope, server-sequence, and millisecond timestamp bounds under
+  distinct names. The former short names remain as compatibility aliases.
+
+### Fixed
+
+- **Inbox admission no longer depends on provider-specific tool-result
+  correlation.** Native, Docker, and external harnesses share the same durable
+  daemon-owned pending, in-turn, processed, and retry lifecycle.
+
 ## [2.0.0a4] — 2026-08-12
 
 > Staging candidate for the complete one-shot Reminder lifecycle.

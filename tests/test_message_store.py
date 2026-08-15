@@ -535,6 +535,32 @@ async def test_channel_roots_before_and_after_ts():
     await store.close()
 
 
+@pytest.mark.asyncio
+async def test_channel_and_thread_history_sequence_bounds():
+    store = _temp_store()
+    await store.open()
+    rows = [
+        (11, _channel_payload("root", sent_at=100)),
+        (12, _channel_payload("reply_1", sent_at=200, thread_root_id="root")),
+        (13, _channel_payload("reply_2", sent_at=300, thread_root_id="root")),
+        (14, _channel_payload("later_root", sent_at=400)),
+    ]
+    for seq, payload in rows:
+        await store.store_receipt(
+            payload,
+            server_seq=seq,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="test",
+        )
+
+    roots = await store.get_channel_roots("ch_1", after_seq=11, before_seq=15)
+    thread = await store.get_thread_messages("root", after_seq=11, before_seq=14)
+
+    assert [row.message.envelope_id for row in roots] == ["later_root"]
+    assert [row.envelope_id for row in thread] == ["reply_1", "reply_2"]
+    await store.close()
+
+
 # ── get_thread_messages ───────────────────────────────────────────
 
 
@@ -1439,8 +1465,7 @@ async def test_durable_notice_deadline_is_fixed_and_survives_reopen(tmp_path):
     later = await store.get_notice_state()
     assert later.first_pending_deadline_ms == 4_000
     assert later.generation > first.generation
-    # A transport that learns its native session only from acceptance may
-    # still offer an unaccepted generation once.
+    # Notice scheduling is daemon-owned and independent of provider identity.
     assert later.is_due_for(None)
     await store.close()
 
@@ -1451,9 +1476,8 @@ async def test_durable_notice_deadline_is_fixed_and_survives_reopen(tmp_path):
     assert accepted.last_delivered_provider_session_id == "provider-1"
     assert not accepted.is_due_for("provider-1")
     assert not accepted.is_due_for(None)
-    assert accepted.is_due_for("provider-2")
+    assert not accepted.is_due_for("provider-2")
     assert not await reopened.mark_notice_delivered(later.generation, "provider-1")
-    assert await reopened.mark_notice_delivered(later.generation, "provider-2")
     assert not await reopened.mark_notice_delivered(later.generation, "provider-2")
     await reopened.close()
 
@@ -1496,15 +1520,12 @@ async def test_notice_state_session_migration_preserves_baseline_row(tmp_path):
         state.last_delivered_generation,
         state.last_delivered_provider_session_id,
     ) == (7, 3, 4321, 7, None)
-    assert state.is_due_for("replacement-session")
+    assert not state.is_due_for("replacement-session")
     db = await store._ensure_db()
     async with db.execute("PRAGMA table_info(inbox_notice_state)") as cursor:
         columns = {row["name"] for row in await cursor.fetchall()}
     assert "last_delivered_provider_session_id" in columns
-    assert await store.mark_notice_delivered(7, "replacement-session")
-    assert (await store.get_notice_state()).last_delivered_provider_session_id == (
-        "replacement-session"
-    )
+    assert not await store.mark_notice_delivered(7, "replacement-session")
     await store.close()
 
 
@@ -1568,7 +1589,7 @@ async def test_successful_empty_notice_turn_keeps_same_session_suppressed(
     assert state.last_delivered_generation == due.generation
     assert state.last_delivered_provider_session_id == "provider-1"
     assert not state.is_due_for("provider-1")
-    assert state.is_due_for("provider-2")
+    assert not state.is_due_for("provider-2")
     assert await store.get_active_turn_runs() == ()
     await store.close()
 

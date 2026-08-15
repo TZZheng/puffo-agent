@@ -386,7 +386,6 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
                 "has_more": True,
                 "remaining_count": 72,
                 "snapshot_generation": 9,
-                "correlation_receipt": "receipt-9",
             }
 
     cfg.inbox_runtime = Runtime()
@@ -414,7 +413,6 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
         "has_more": True,
         "remaining_count": 72,
         "snapshot_generation": 9,
-        "admission_receipt": "[puffo:model-visible-read:receipt-9]",
     }
     assert calls == [{
         "target": "channel:sp_1:ch_1",
@@ -1565,6 +1563,49 @@ async def test_get_channel_history_empty_window():
         {"channel": "ch_seen", "since": "env_root"},
     )
     assert "no root posts" in result
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_get_channel_history_explicit_seq_and_legacy_timestamp_bounds():
+    cfg, _, ms = _setup()
+    await ms.open()
+    base = _now_ms()
+    for seq, env_id, sent_at in (
+        (11, "env_first", base),
+        (12, "env_second", base + 1_000),
+    ):
+        await ms.store_receipt(
+            {
+                "envelope_id": env_id,
+                "envelope_kind": "channel",
+                "sender_slug": "alice-0001",
+                "channel_id": "ch_bounds",
+                "space_id": "sp_test",
+                "content_type": "text/plain",
+                "content": env_id,
+                "sent_at": sent_at,
+            },
+            server_seq=seq,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="test",
+        )
+    mcp = _build_tools(cfg)
+
+    by_seq = await _call(
+        mcp,
+        "get_channel_history",
+        {"channel": "ch_bounds", "after_seq": 11},
+    )
+    by_legacy_timestamp = await _call(
+        mcp,
+        "get_channel_history",
+        {"channel": "ch_bounds", "after": base},
+    )
+
+    assert "env_second" in by_seq and "env_first" not in by_seq
+    assert "env_second" in by_legacy_timestamp
+    assert "env_first" not in by_legacy_timestamp
     await ms.close()
 
 

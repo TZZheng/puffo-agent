@@ -341,7 +341,6 @@ def _build_batch_runtime(
     async def run_turn(planned: Any) -> None:
         await adapter.admit_initial()
         page = await runtime.read_inbox(limit=50)
-        await adapter.admit_only_continuation()
         rows = await store.get_in_turn_messages(planned.turn_id, adapter.session_id)
         targets_seen: list[tuple[str, ...]] = []
         for row in rows:

@@ -12,11 +12,9 @@ transition before any row can be marked processed.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 
 import pytest
 
-from puffo_agent.agent.context_controller import ProviderAdmissionEvent
 from puffo_agent.agent.core import AgentAPIError
 from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
 from puffo_agent.agent.message_store import LifecycleConflict, ProcessingState
@@ -30,27 +28,7 @@ BODY = "the exact admitted body a replacement session must receive"
 
 
 class _RetrySessionAdapter(Adapter):
-    """Correlate a notice admission, a ``read_inbox`` result, and a retry."""
-
-    def __init__(self):
-        super().__init__()
-        self.continuation = None
-        self.continuation_key = ""
-
-    def register_continuation_callback(self, callback, planning_cycle_key, **_kwargs):
-        self.continuation = callback
-        self.continuation_key = planning_cycle_key
-
-    async def admit_continuation(self, provider_turn_id):
-        callback, self.continuation = self.continuation, None
-        assert callback is not None
-        await callback(ProviderAdmissionEvent(
-            planning_cycle_key=self.continuation_key,
-            provider_session_id=self.session,
-            provider_turn_id=provider_turn_id,
-            tool_call_id=f"read-{provider_turn_id}",
-            admitted_at=datetime.now(timezone.utc),
-        ))
+    """Correlate the initial provider turn and its replacement retry."""
 
 
 class _ReadThenRetryRunner:
@@ -75,7 +53,6 @@ class _ReadThenRetryRunner:
         page = await self.runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
         assert len(page["messages"]) == 1
         self.read_bodies.append(page["messages"][0])
-        await self.adapter.admit_continuation(provider_turn_id="provider-read-1")
         raise AgentAPIError("rate limit", is_auth=False)
 
     async def handle_global_inbox_retry(self, planned):

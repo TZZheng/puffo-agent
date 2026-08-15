@@ -54,6 +54,8 @@ class InProcessDataClient:
         since_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
+        before_seq: int | None = None,
+        after_seq: int | None = None,
     ) -> list[ChannelRoot]:
         return await self._store.get_channel_roots(
             channel_id=channel_id,
@@ -61,6 +63,8 @@ class InProcessDataClient:
             since_envelope_id=since_envelope_id,
             before_ts=before_ts,
             after_ts=after_ts,
+            before_seq=before_seq,
+            after_seq=after_seq,
         )
 
     async def get_dm_history(
@@ -75,6 +79,8 @@ class InProcessDataClient:
         since_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
+        before_seq: int | None = None,
+        after_seq: int | None = None,
     ) -> list[StoredMessage]:
         return await self._store.get_thread_messages(
             root_id=root_id,
@@ -82,6 +88,8 @@ class InProcessDataClient:
             since_envelope_id=since_envelope_id,
             before_ts=before_ts,
             after_ts=after_ts,
+            before_seq=before_seq,
+            after_seq=after_seq,
         )
 
     async def get_message_by_envelope(self, envelope_id: str) -> Any:

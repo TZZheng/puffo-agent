@@ -1,10 +1,8 @@
 """Prior-context delivery helpers for the global inbox runtime test suites."""
 
 import json
-from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from puffo_agent.agent.context_controller import ProviderAdmissionEvent
 from puffo_agent.agent.global_inbox_runtime import (
     GlobalInboxRuntime,
     TrackingSendDelegate,
@@ -33,26 +31,7 @@ class _PriorProviderRecorder:
 
 
 class _PriorProviderAdapter(Adapter):
-    def __init__(self):
-        super().__init__()
-        self.continuation = None
-        self.continuation_key = ""
-        self.continuation_calls = []
-
-    def register_continuation_callback(self, callback, planning_cycle_key, **_kwargs):
-        self.continuation = callback
-        self.continuation_key = planning_cycle_key
-
-    async def admit_continuation(self, provider_turn_id):
-        callback, self.continuation = self.continuation, None
-        assert callback is not None
-        self.continuation_calls.append(self.continuation_key)
-        await callback(ProviderAdmissionEvent(
-            planning_cycle_key=self.continuation_key,
-            provider_session_id=self.session, provider_turn_id=provider_turn_id,
-            tool_call_id=f"read-{provider_turn_id}",
-            admitted_at=datetime.now(timezone.utc),
-        ))
+    pass
 
 
 class _PriorServerTransport:
@@ -97,9 +76,8 @@ def _prior_runtime(tmp_path, store, bodies):
         assert set(page) == {
             "context_version", "messages", "prior_context",
             "prior_context_has_more", "next_cursor", "has_more",
-            "remaining_count", "snapshot_generation", "correlation_receipt",
+            "remaining_count", "snapshot_generation",
         }
-        await adapter.admit_continuation(provider_turn_id=f"provider-read-{turn_number}")
         provider_inputs.append({
             "fresh_notice": planned.provider_input, "read_inbox_result": page,
         })
@@ -168,7 +146,6 @@ async def _assert_second_prior_turn(store, runtime, adapter, provider_inputs, be
     future = await store.get_message_by_envelope("future-pending")
     assert peer is not None and peer.processing_state is ProcessingState.PROCESSED
     assert future is not None and future.processing_state is ProcessingState.PENDING
-    assert len(adapter.continuation_calls) == 2
     second = provider_inputs[1]["read_inbox_result"]
     prior_blocks = second["prior_context"]
     messages = [projection_metadata(block) for block in second["messages"]]

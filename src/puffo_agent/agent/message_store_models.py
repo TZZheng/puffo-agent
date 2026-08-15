@@ -105,36 +105,21 @@ class InboxNoticeState:
 
     @property
     def delivery_pending(self) -> bool:
-        """Whether the current generation lacks a session-aware acceptance.
-
-        New scheduling must use :meth:`is_due_for`, because one accepted
-        generation is suppressed only for the native provider session that
-        accepted it.  This compatibility projection remains useful to receipt
-        callers that only need to know whether a new generation exists.
-        """
-        return self.pending_count > 0 and (
-            self.generation != self.last_delivered_generation
-            or not self.last_delivered_provider_session_id
+        """Whether the daemon has not claimed the current notice generation."""
+        return (
+            self.pending_count > 0
+            and self.generation != self.last_delivered_generation
         )
 
     def is_due_for(self, provider_session_id: str | None) -> bool:
-        """Return whether this session needs one metadata-only notice.
+        """Return whether the daemon should start one turn for this generation.
 
-        Some provider transports learn their native session id only in the
-        acceptance receipt for their first offered turn.  Before that receipt,
-        a notice is due only when this generation has no session-aware
-        acceptance at all.  Once an accepting session is durable, an unknown
-        session must remain suppressed rather than recreating an equivalent
-        notice loop.
+        ``provider_session_id`` remains accepted for source compatibility, but
+        provider identity no longer controls Inbox scheduling. The daemon owns
+        the local turn before a harness sees its notice.
         """
-        if self.pending_count <= 0:
-            return False
-        if not provider_session_id:
-            return self.delivery_pending
-        return (
-            self.generation != self.last_delivered_generation
-            or provider_session_id != self.last_delivered_provider_session_id
-        )
+        del provider_session_id
+        return self.delivery_pending
 
 
 @dataclass(frozen=True)

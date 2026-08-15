@@ -102,9 +102,10 @@ sequenceDiagram
     T-->>S: delivery ACK when the decision permits it
     DB->>I: notify pending work
     I->>I: coalesce and group by space + channel/thread/DM target
+    I->>DB: create daemon-owned active turn
     I->>L: metadata-only Inbox notice
     L->>M: read_inbox and optional history reads
-    M->>DB: admit exact displayed rows to the active turn
+    M->>DB: read pending page and move exact displayed rows to in_turn
     L->>M: zero or more send_message calls
     M->>C: semantic destination, body, thread, visibility, send_anyway
     C->>S: coordinated channel send
@@ -116,6 +117,12 @@ sequenceDiagram
         C-->>L: draft + exact target + recovered context + guidance
         L->>M: revise, wait/remind, stay silent, or explicitly send_anyway
     end
+    L-->>I: provider turn result
+    alt provider turn succeeded
+        I->>DB: move in_turn rows to processed
+    else failed, cancelled, or interrupted
+        I->>DB: move in_turn rows back to pending
+    end
 ```
 
 Important boundaries:
@@ -124,6 +131,9 @@ Important boundaries:
 - The Inbox notice is metadata, not a replay of every message. The model reads
   exact pending rows through `read_inbox` and can page or inspect history as
   needed.
+- The daemon creates the local active turn before writing provider input.
+  `read_inbox` directly admits the returned rows into that turn; it has no
+  separate receipt, continuation callback, or model acknowledgement step.
 - Pending work can span spaces and targets in one provider turn. Each rendered
   message retains its target, Server sequence, timestamp, sender identity/type,
   thread metadata, visibility, and encryption tag.
@@ -324,8 +334,8 @@ Use these entry points when tracing a change:
 ## 12. Invariants
 
 1. Inbound content is durably classified before transport acknowledgement.
-2. Only rows explicitly admitted across a provider boundary advance active-turn
-   visibility.
+2. Only rows explicitly returned by `read_inbox` advance from pending into the
+   daemon-owned active turn and become visible to that turn.
 3. Global Inbox turns serialize per Agent; target identity remains explicit.
 4. Freshness metadata is daemon-owned and never model-authored.
 5. A held send has no message, delivery, notification, or freshness side

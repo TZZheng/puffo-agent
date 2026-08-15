@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -432,7 +431,7 @@ async def boundary_harness(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_real_rpc_history_and_inbox_admission_wait_for_provider_completion(
+async def test_history_waits_for_provider_proof_but_inbox_admits_on_read(
     boundary_harness: BoundaryHarness,
 ):
     h = boundary_harness
@@ -474,26 +473,9 @@ async def test_real_rpc_history_and_inbox_admission_wait_for_provider_completion
     )
     inbox_page = inbox_call[1]
     assert "inbox peer body" in inbox_page["messages"][0]
-    assert inbox_page["admission_receipt"].startswith(
-        "[puffo:model-visible-read:"
-    )
+    assert "admission_receipt" not in inbox_page
     inbox_row = await h.store.get_message_by_envelope("inbox-peer")
     assert inbox_row is not None
-    assert inbox_row.processing_state is ProcessingState.PENDING
-    assert h.runtime.active.visible_message_ids == ["history-peer"]
-    assert await h.active_boundary("ch-inbox") is None
-
-    await h.emit_tool_result(
-        tool_name="read_inbox",
-        arguments={"target": "channel:sp_1:ch-inbox", "limit": 1},
-        result=json.dumps(inbox_page),
-    )
-    await _wait_until(
-        lambda: h.runtime.active.through_by_channel.get(
-            ("sp_1", "ch-inbox")
-        ) == 3
-    )
-    inbox_row = await h.store.get_message_by_envelope("inbox-peer")
     assert inbox_row.processing_state is ProcessingState.IN_TURN
     assert await h.active_boundary("ch-inbox") == 3
     assert h.runtime.active.message_ids == ["inbox-peer"]

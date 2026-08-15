@@ -277,11 +277,14 @@ async def test_channel_roots_200_for_seen_channel() -> None:
     app = ds.build_app(ds.DataServiceConfig())
     async with TestClient(TestServer(app)) as client:
         resp = await client.get(
-            "/v1/data/agent-roots-ok/channels/roots?channel=ch_1"
+            "/v1/data/agent-roots-ok/channels/roots",
+            params={"channel": "ch_1", "after_seq": "11"},
         )
         assert resp.status == 200
         body = await resp.json()
-        assert "roots" in body
+        assert [
+            root["message"]["envelope_id"] for root in body["roots"]
+        ] == ["msg_bbb"]
 
 
 @pytest.mark.asyncio

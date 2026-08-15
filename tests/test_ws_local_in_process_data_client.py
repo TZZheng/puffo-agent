@@ -43,12 +43,22 @@ async def test_lookup_channel_space_forwards():
 async def test_get_channel_roots_forwards_kwargs():
     client, store, _ = _make_client()
     await client.get_channel_roots(
-        "ch_42", limit=50, since_envelope_id="msg_x",
-        before_ts=10, after_ts=5,
+        "ch_42",
+        limit=50,
+        since_envelope_id="msg_x",
+        before_ts=10,
+        after_ts=5,
+        before_seq=12,
+        after_seq=6,
     )
     store.get_channel_roots.assert_awaited_once_with(
-        channel_id="ch_42", limit=50, since_envelope_id="msg_x",
-        before_ts=10, after_ts=5,
+        channel_id="ch_42",
+        limit=50,
+        since_envelope_id="msg_x",
+        before_ts=10,
+        after_ts=5,
+        before_seq=12,
+        after_seq=6,
     )
 
 
@@ -65,12 +75,22 @@ async def test_get_dm_history_forwards():
 async def test_get_thread_messages_forwards_kwargs():
     client, store, _ = _make_client()
     await client.get_thread_messages(
-        "msg_root", limit=10, since_envelope_id=None,
-        before_ts=None, after_ts=None,
+        "msg_root",
+        limit=10,
+        since_envelope_id=None,
+        before_ts=None,
+        after_ts=None,
+        before_seq=None,
+        after_seq=6,
     )
     store.get_thread_messages.assert_awaited_once_with(
-        root_id="msg_root", limit=10, since_envelope_id=None,
-        before_ts=None, after_ts=None,
+        root_id="msg_root",
+        limit=10,
+        since_envelope_id=None,
+        before_ts=None,
+        after_ts=None,
+        before_seq=None,
+        after_seq=6,
     )
 
 

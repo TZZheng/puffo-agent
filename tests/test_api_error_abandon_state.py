@@ -37,7 +37,10 @@ class Adapter:
 
     async def admit(self):
         await self.callback(ProviderAdmissionEvent(
-            self.key, "session", "provider-turn", datetime.now(timezone.utc)
+            planning_cycle_key=self.key,
+            provider_session_id="session",
+            provider_turn_id="provider-turn",
+            admitted_at=datetime.now(timezone.utc),
         ))
 
 

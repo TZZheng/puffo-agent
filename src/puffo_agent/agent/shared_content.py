@@ -385,10 +385,17 @@ with `get_thread_history(root_id=...)`.
   shortcut isn't supported; call `list_channels_in_all_spaces` to
   look up an id.
 - `limit` (optional, default 20, max 200) — how many recent roots.
-- `since` (optional) — an envelope_id (`msg_<uuid>`); results have
+- `since_envelope_id` (optional) — an envelope id (`msg_<uuid>`); results have
   `sent_at` after that envelope's. Use when you remember the latest
   root you already saw.
-- `after` / `before` (optional) — ms-epoch bounds, both exclusive.
+- `after_seq` / `before_seq` (optional) — authoritative server-sequence
+  bounds, both exclusive. Use `after_seq` with `latest_seq` from an Inbox
+  notice or held send.
+- `after_timestamp_ms` / `before_timestamp_ms` (optional) — ms-epoch bounds,
+  both exclusive. These are time values, not message sequences.
+
+The old `since`, `after`, and `before` names remain temporary compatibility
+aliases. Avoid them in new calls; legacy `after` / `before` mean timestamps.
 
 **Output format:** use the shared projection described by the `read-inbox`
 skill (plus a reply count for roots when available).

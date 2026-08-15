@@ -4,13 +4,11 @@ import asyncio
 import json
 import logging
 import sqlite3
-from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from puffo_agent.agent._logging import log_runtime_event
-from puffo_agent.agent.context_controller import ProviderAdmissionEvent
 from puffo_agent.agent.global_inbox_runtime import (
     GlobalInboxRuntime,
     SendAttemptState,
@@ -127,29 +125,6 @@ def _production_trace_payload(sentinels):
     )
 
 
-class _CorrelatingAdapter(Adapter):
-    def __init__(self):
-        super().__init__()
-        self.continuation = None
-        self.continuation_key = ""
-
-    def register_continuation_callback(
-        self, callback, planning_cycle_key, **_metadata
-    ):
-        self.continuation = callback
-        self.continuation_key = planning_cycle_key
-
-    async def admit_continuation(self):
-        callback, self.continuation = self.continuation, None
-        await callback(ProviderAdmissionEvent(
-            planning_cycle_key=self.continuation_key,
-            provider_session_id=self.session,
-            provider_turn_id="trace-provider-turn",
-            tool_call_id="trace-tool-call",
-            admitted_at=datetime.now(timezone.utc),
-        ))
-
-
 class _TraceCoordinator:
     def __init__(self, sentinels):
         self.provider_session_id = None
@@ -167,7 +142,7 @@ class _TraceCoordinator:
 
 
 async def _run_production_trace(tmp_path, store, client, sentinels):
-    adapter = _CorrelatingAdapter()
+    adapter = Adapter()
     coordinator = _TraceCoordinator(sentinels)
 
     async def run(_planned):
@@ -177,7 +152,6 @@ async def _run_production_trace(tmp_path, store, client, sentinels):
             tool_arguments={"limit": 1, "ignored": sentinels[7]},
         )
         assert page["messages"]
-        await adapter.admit_continuation()
         result = await runtime.send_delegate.send({
             "destination": "ch-1",
             "text": f"{sentinels[0]} {sentinels[4]}",
@@ -202,7 +176,8 @@ def _assert_production_trace(records, sentinels):
     events = [record["event"] for record in records]
     required = [
         "inbox.received", "inbox.persisted", "notice.armed", "notice.due",
-        "notice.admitted", "inbox.read_staged", "inbox.row_in_turn",
+        "turn.admitted", "notice.admitted", "inbox.row_in_turn",
+        "inbox.read_admitted",
         "send.attempted", "send.committed", "inbox.row_processed",
         "turn.finalized",
     ]
