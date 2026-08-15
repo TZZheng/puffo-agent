@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from puffo_agent.agent.channel_audience import ChannelAudience
 from puffo_agent.agent.context_controller import (
     DecisionOutcome,
 )
@@ -27,6 +28,7 @@ from puffo_agent.agent.inbox_scheduler import (
 from puffo_agent.agent.message_store import (
     MessageStore,
     ProcessingState,
+    ReceiptDisposition,
     StoredMessage,
 )
 from puffo_agent.agent.reminder_sync import (
@@ -454,6 +456,23 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     attachment = "attachment-content-sentinel"
     store = await make_store(tmp_path)
     await receipt(store, "notice-1", 8, content=f"{plaintext}:{attachment}")
+    await store.store_receipt(
+        {
+            "envelope_id": "notice-thread",
+            "envelope_kind": "channel",
+            "sender_slug": "alice",
+            "channel_id": "ch-1",
+            "space_id": "sp-1",
+            "thread_root_id": "root-1",
+            "content": "thread-notice-sentinel",
+            "content_type": "text/plain",
+            "sent_at": 9,
+            "is_encrypted": True,
+        },
+        server_seq=9,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
 
     class BusyAdapter(Adapter):
         def __init__(self):
@@ -466,12 +485,19 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
             return self.accept
 
     adapter = BusyAdapter()
+    audience_reads = []
+
+    async def load_audience(space_id, channel_id):
+        audience_reads.append((space_id, channel_id))
+        return ChannelAudience(4, 1, 3)
+
     runtime = GlobalInboxRuntime(
         store=store,
         adapter=adapter,
         run_turn=lambda _planned: None,
         workspace=tmp_path,
         notice_delivery=InboxNoticeDelivery(NoticeDeliveryCapability.DIRECT),
+        channel_audience_loader=load_audience,
     )
     initial = await runtime.plan_pending()
     assert initial is not None
@@ -483,18 +509,25 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     assert initial.message_ids == ()
     assert initial.formatted_blocks == ()
     assert '"generation":' in initial.provider_input
-    assert '"changed_message_count":1' in initial.provider_input
-    assert '"total_pending_messages":1' in initial.provider_input
-    assert '"latest_seq":8' in initial.provider_input
-    assert '"version":4' in initial.provider_input
+    assert '"changed_message_count":2' in initial.provider_input
+    assert '"total_pending_messages":2' in initial.provider_input
+    assert '"latest_seq":9' in initial.provider_input
+    assert '"version":5' in initial.provider_input
     assert '"content_included":false' in initial.provider_input
     assert '"read_tool":"read_inbox"' in initial.provider_input
     assert "channel:sp-1:ch-1" in initial.provider_input
+    assert "channel:sp-1:ch-1:thread:root-1" in initial.provider_input
+    assert '"audience":{"agents":4,"online_agents":3,"humans":1}' in (
+        initial.provider_input
+    )
+    assert initial.provider_input.count('"audience":') == 2
+    assert audience_reads == [("sp-1", "ch-1")]
     assert initial.provider_input.endswith(INBOX_TURN_CUE)
     assert "respond" in initial.provider_input
     assert "decide-response" not in initial.provider_input
     assert plaintext not in initial_serialized
     assert attachment not in initial_serialized
+    assert "thread-notice-sentinel" not in initial_serialized
 
     await store.start_turn(
         turn_id="active-turn",

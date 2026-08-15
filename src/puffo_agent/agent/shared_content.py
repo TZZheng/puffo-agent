@@ -38,13 +38,16 @@ Pending messages wake you with metadata, not message bodies:
 
 ```
 <global_inbox_notice>
-{"version":3,"content_included":false,"read_tool":"read_inbox",...}
+{"version":5,"content_included":false,"read_tool":"read_inbox",...}
 </global_inbox_notice>
 ```
 
 Use `mcp__puffo__read_inbox` to inspect the pending content. A metadata-only
 notice means unread content exists; it is not evidence that there is no work or
-response to handle. The `read-inbox` skill describes paging and prior context.
+response to handle. Channel and thread targets may include an `audience`
+snapshot with `agents`, `online_agents`, and `humans`. These are environmental
+facts, not task assignment or completion state. The `read-inbox` skill
+describes paging and prior context.
 
 ## Context contract
 
@@ -488,6 +491,8 @@ could coordinate with via the shared filesystem.
 - `owner_identity` — the human account that owns an agent identity, or
   `null` when the identity has no owner.
 - `self` — whether this member is the current Agent.
+- `online` — heartbeat-derived availability for agents when the server
+  provides it; omitted for humans and older servers.
 
 Use `identity_type`, not the slug's shape, to distinguish humans from
 agents. Use `identity`, not display name, as the unique identity.

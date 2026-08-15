@@ -18,6 +18,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, Sequence
 
+from .channel_audience import (
+    ChannelAudienceLoader,
+    load_channel_audiences,
+    project_notice_targets,
+)
 from .context_controller import (
     AdmissionCandidate,
     ContextController,
@@ -160,6 +165,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         runtime_event_outbox: Any | None = None,
         reminder_scheduler: ReminderScheduler | None = None,
         status_lifecycle: TurnStatusLifecycle | None = None,
+        channel_audience_loader: ChannelAudienceLoader | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -215,6 +221,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             notify=self.notify,
         )
         self.status_lifecycle = status_lifecycle
+        self.channel_audience_loader = channel_audience_loader
         self.send_delegate: TrackingSendDelegate | None = None
         self.held_recovery_source = HeldRecoverySource(
             self,
@@ -514,12 +521,23 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         routes = tuple(route_for(item) for item in notice_items)
         targets: list[tuple[str, ...]] = []
         normalized_counts: dict[str, int] = {}
+        target_channels: dict[str, tuple[str, str]] = {}
         for route in routes:
             if route.target not in targets:
                 targets.append(route.target)
-        for item in notice_items:
+        for item, route in zip(notice_items, routes, strict=True):
             projection = self.store.target_projection(item)
             normalized_counts[projection] = normalized_counts.get(projection, 0) + 1
+            if route.kind in {"channel", "thread"}:
+                target_channels.setdefault(
+                    projection,
+                    (route.space_id, route.channel_id),
+                )
+        audiences = await load_channel_audiences(
+            self.channel_audience_loader,
+            target_channels.values(),
+            log=logger,
+        )
         latest_seq = max(
             (
                 item.server_seq
@@ -530,16 +548,17 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         )
         summary = json.dumps(
             {
-                "version": 4,
+                "version": 5,
                 "content_included": False,
                 "read_tool": "read_inbox",
                 "generation": notice.generation,
                 "changed_message_count": len(notice_items),
                 "total_pending_messages": total_pending_count,
-                "targets": [
-                    {"target": target, "count": count}
-                    for target, count in normalized_counts.items()
-                ],
+                "targets": project_notice_targets(
+                    normalized_counts,
+                    target_channels,
+                    audiences,
+                ),
                 "latest_seq": latest_seq,
             },
             separators=(",", ":"),

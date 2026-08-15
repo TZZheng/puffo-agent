@@ -1220,6 +1220,7 @@ async def test_keyless_list_channel_members_uses_private_channel_roster():
     assert members["@alice-0001"]["identity_type"] == "human"
     assert members["@agent-0001"]["role"] == "member"
     assert members["@agent-0001"]["owner_identity"] == "@alice-0001"
+    assert "online" not in members["@agent-0001"]
     assert (
         "GET_UNSIGNED", "/v2/cloud-agents/spaces/sp_test/channels/ch_abc/members", None,
     ) in http.calls

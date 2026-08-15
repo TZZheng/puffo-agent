@@ -1891,6 +1891,7 @@ async def test_list_channel_members():
                 "role": "member",
                 "identity_type": "agent",
                 "owner_slug": "alice-0001",
+                "online": True,
             },
         ]
     }
@@ -1918,6 +1919,7 @@ async def test_list_channel_members():
     assert members["@agent-0001"]["identity_type"] == "agent"
     assert members["@agent-0001"]["owner_identity"] == "@alice-0001"
     assert members["@agent-0001"]["self"] is True
+    assert members["@agent-0001"]["online"] is True
 
 
 @pytest.mark.asyncio
