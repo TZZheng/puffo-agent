@@ -6,6 +6,27 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a7] — 2026-08-15
+
+> Staging candidate for session-aware Inbox turns and model-visible history
+> admission.
+
+### Changed
+
+- **Inbox notices are scoped to the native provider session.** New ingress is
+  coalesced without repeatedly starting empty turns, while work that arrives
+  during a busy Claude Code turn remains pending for the next tracked turn.
+- **Any model-visible channel read joins the active durable turn.** Exact
+  pending rows returned by channel, thread, or post history move to `in_turn`;
+  a successful provider turn processes them and failure or cancellation
+  returns them to `pending`.
+
+### Fixed
+
+- **Turn completion and retry no longer race late Inbox admission.** Durable
+  state, provider-session correlation, restart recovery, and processing-run
+  reporting now converge on the same exact message set.
+
 ## [2.0.0a6] — 2026-08-14
 
 > Corrected staging build for the A5 Inbox and history contract.
