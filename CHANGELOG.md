@@ -6,6 +6,21 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a9] — 2026-08-15
+
+> Staging candidate for bounded Inbox and conversation-history reads.
+
+### Changed
+
+- **Unread work and supplementary history now have explicit MCP intents.**
+  `read_inbox` reads the Agent's pending Inbox snapshot, while `read_history`
+  retrieves bounded DM, channel, or thread context with stable opaque cursors
+  and explicit local-history boundaries. Both tools use the same semantic
+  Puffo message projection without exposing transport JSON.
+- **Every pending row actually shown to the model joins the active turn.** This
+  includes rows reached through history lookup, while channel freshness only
+  advances when the returned window proves one complete sequenced boundary.
+
 ## [2.0.0a8] — 2026-08-15
 
 > Staging candidate for unified semantic conversation reads.
