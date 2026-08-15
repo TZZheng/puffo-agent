@@ -756,6 +756,10 @@ async def test_get_channel_history_tags_encryption():
     await _store_msg(ms, "msg_plain", is_encrypted=False)
     result = await _call(_build_tools(cfg), "get_channel_history", {"channel": "ch_1"})
     assert "encrypted=true" in result and "encrypted=false" in result
+    page = await _call(
+        _build_tools(cfg), "get_channel_history", {"channel": "ch_1", "limit": 1}
+    )
+    assert 'returned_count=1 has_older=true has_newer=false' in page
 
 
 @pytest.mark.asyncio

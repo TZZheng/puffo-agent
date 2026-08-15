@@ -6,19 +6,36 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
+from ..agent.message_projection import format_inbox_read_result
+
+
+def _normalize_inbox_read_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the pre-window RPC shape during rolling local upgrades."""
+    return {
+        "context_version": int(result.get("context_version", 1)),
+        "messages": result["messages"],
+        "prior_context": result.get("prior_context", ()),
+        "prior_context_has_more": bool(result.get("prior_context_has_more", False)),
+        "next_cursor": result["next_cursor"],
+        "has_more": result["has_more"],
+        "remaining_count": result["remaining_count"],
+        "snapshot_generation": result["snapshot_generation"],
+    }
+
+
 def register_inbox_read_tool(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def read_inbox(
         target: str = "",
         cursor: str = "",
         limit: int = 50,
-    ) -> dict[str, Any]:
+    ) -> str:
         """Read one pending Inbox page.
 
         target is an optional canonical target; cursor is the opaque next
-        cursor; limit is 1..50. Results contain ``messages``, bounded
-        read-only ``prior_context``, ``prior_context_has_more``,
-        ``next_cursor``, and ``has_more``.
+        cursor; limit is 1..50. The result is one semantic window containing
+        bounded earlier context and the exact pending page, with explicit
+        older/newer boundaries and the next cursor when another page exists.
         See the managed ``read-inbox`` skill for interpretation and paging.
         """
         arguments: dict[str, Any] = {}
@@ -46,7 +63,7 @@ def register_inbox_read_tool(mcp: FastMCP, cfg: Any) -> None:
             )
         else:
             raise RuntimeError("global Inbox runtime is unavailable")
-        return result
+        return format_inbox_read_result(_normalize_inbox_read_result(result))
 
 
 def register_reminder_tools(mcp: FastMCP, cfg: Any) -> None:

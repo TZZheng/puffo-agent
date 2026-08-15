@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic.json_schema import SkipJsonSchema
 
 from ..agent.message_projection import (
+    format_history_read_result,
     format_message_group,
 )
 from .data_client import DataNotFound
@@ -55,6 +56,60 @@ def _optional_non_negative(name: str, value: int | None) -> int | None:
     return parsed
 
 
+def _bounded_window(
+    rows: list[Any],
+    *,
+    limit: int,
+    reads_forward: bool,
+) -> tuple[list[Any], bool, bool]:
+    """Trim one look-ahead row and report paging direction explicitly."""
+    has_more = len(rows) > limit
+    if reads_forward:
+        return rows[:limit], False, has_more
+    return rows[-limit:], has_more, False
+
+
+def _reads_forward(
+    *,
+    since_envelope_id: str,
+    after_seq: int | None,
+    after_timestamp_ms: int | None,
+) -> bool:
+    return bool(
+        since_envelope_id or after_seq is not None or after_timestamp_ms is not None
+    )
+
+
+def _history_tool_arguments(
+    *,
+    target_name: str,
+    target_value: str,
+    limit: int,
+    default_limit: int,
+    since_envelope_id: str,
+    after_seq: int | None,
+    before_seq: int | None,
+    after_timestamp_ms: int | None,
+    before_timestamp_ms: int | None,
+    since: str,
+    after: int,
+    before: int,
+) -> dict[str, object]:
+    arguments: dict[str, object] = {target_name: target_value}
+    values = {
+        "since_envelope_id": since_envelope_id,
+        "after_seq": after_seq,
+        "before_seq": before_seq,
+        "after_timestamp_ms": after_timestamp_ms,
+        "before_timestamp_ms": before_timestamp_ms,
+    }
+    if limit != default_limit:
+        arguments["limit"] = limit
+    arguments.update({key: value for key, value in values.items() if value not in (None, "")})
+    arguments.update({key: value for key, value in (("since", since), ("after", after), ("before", before)) if value})
+    return arguments
+
+
 def _register_channel_history_tool(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def get_channel_history(
@@ -79,6 +134,7 @@ def _register_channel_history_tool(mcp: FastMCP, cfg: Any) -> None:
         counts; use ``get_thread_history`` for replies.
         """
         limit = max(1, min(int(limit), 200))
+        fetch_limit = limit + 1
         resolved_since = _resolve_text_alias(
             "since_envelope_id", since_envelope_id, "since", since
         )
@@ -103,7 +159,7 @@ def _register_channel_history_tool(mcp: FastMCP, cfg: Any) -> None:
         try:
             roots = await cfg.data_client.get_channel_roots(
                 channel_id,
-                limit=limit,
+                limit=fetch_limit,
                 since_envelope_id=resolved_since or None,
                 before_ts=resolved_before_ts,
                 after_ts=resolved_after_ts,
@@ -112,39 +168,43 @@ def _register_channel_history_tool(mcp: FastMCP, cfg: Any) -> None:
             )
         except DataNotFound:
             return f"(no such channel: {channel_id})"
-        if not roots:
-            return "(no root posts in the requested window)"
-        tool_arguments: dict[str, object] = {"channel": channel}
-        if limit != 20:
-            tool_arguments["limit"] = limit
-        if since_envelope_id:
-            tool_arguments["since_envelope_id"] = since_envelope_id
-        if after_seq is not None:
-            tool_arguments["after_seq"] = after_seq
-        if before_seq is not None:
-            tool_arguments["before_seq"] = before_seq
-        if after_timestamp_ms is not None:
-            tool_arguments["after_timestamp_ms"] = after_timestamp_ms
-        if before_timestamp_ms is not None:
-            tool_arguments["before_timestamp_ms"] = before_timestamp_ms
-        if since:
-            tool_arguments["since"] = since
-        if after:
-            tool_arguments["after"] = after
-        if before:
-            tool_arguments["before"] = before
+        roots, has_older, has_newer = _bounded_window(
+            roots,
+            limit=limit,
+            reads_forward=_reads_forward(
+                since_envelope_id=resolved_since,
+                after_seq=after_seq,
+                after_timestamp_ms=resolved_after_ts,
+            ),
+        )
+        tool_arguments = _history_tool_arguments(
+            target_name="channel", target_value=channel,
+            limit=limit, default_limit=20,
+            since_envelope_id=since_envelope_id,
+            after_seq=after_seq, before_seq=before_seq,
+            after_timestamp_ms=after_timestamp_ms,
+            before_timestamp_ms=before_timestamp_ms,
+            since=since, after=after, before=before,
+        )
         receipt_marker = await _stage_model_visible_messages(
             cfg,
             [entry.message for entry in roots],
             tool_name="get_channel_history",
             tool_arguments=tool_arguments,
         )
-        result = format_message_group(
-            [entry.message for entry in roots],
+        messages = [entry.message for entry in roots]
+        body = format_message_group(
+            messages,
             current_agent_aliases=(cfg.slug,),
             reply_counts={
                 entry.message.envelope_id: entry.reply_count for entry in roots
             },
+        )
+        result = format_history_read_result(
+            messages,
+            body=body,
+            has_older=has_older,
+            has_newer=has_newer,
         )
         return f"{result}\n{receipt_marker}" if receipt_marker else result
 
@@ -168,12 +228,21 @@ def _register_dm_history_tool(mcp: FastMCP, cfg: Any) -> None:
             raise RuntimeError("pass the peer's slug to read DM history.")
         msgs = await cfg.data_client.get_dm_history(
             peer_slug,
-            limit=limit,
+            limit=limit + 1,
             before=int(before) if before else None,
         )
-        if not msgs:
-            return "(no direct messages with that peer in the requested window)"
-        return format_message_group(msgs, current_agent_aliases=(cfg.slug,))
+        msgs, has_older, has_newer = _bounded_window(
+            msgs,
+            limit=limit,
+            reads_forward=False,
+        )
+        body = format_message_group(msgs, current_agent_aliases=(cfg.slug,))
+        return format_history_read_result(
+            msgs,
+            body=body,
+            has_older=has_older,
+            has_newer=has_newer,
+        )
 
 
 def register_channel_and_dm_history_tools(mcp: FastMCP, cfg: Any) -> None:
@@ -206,6 +275,7 @@ def register_thread_history_tools(mcp: FastMCP, cfg: Any) -> None:
         if not root_id.strip():
             raise RuntimeError("root_id required")
         limit = max(1, min(int(limit), 200))
+        fetch_limit = limit + 1
         resolved_since = _resolve_text_alias(
             "since_envelope_id", since_envelope_id, "since", since
         )
@@ -218,7 +288,7 @@ def register_thread_history_tools(mcp: FastMCP, cfg: Any) -> None:
         try:
             msgs = await cfg.data_client.get_thread_messages(
                 root_id.strip(),
-                limit=limit,
+                limit=fetch_limit,
                 since_envelope_id=resolved_since or None,
                 before_ts=resolved_before_ts,
                 after_ts=resolved_after_ts,
@@ -227,37 +297,40 @@ def register_thread_history_tools(mcp: FastMCP, cfg: Any) -> None:
             )
         except DataNotFound:
             return f"(no such thread: {root_id.strip()})"
-        if not msgs:
-            return "(no messages in this thread for the requested window)"
-        tool_arguments = {"root_id": root_id}
-        if limit != 50:
-            tool_arguments["limit"] = limit
-        if since_envelope_id:
-            tool_arguments["since_envelope_id"] = since_envelope_id
-        if after_seq is not None:
-            tool_arguments["after_seq"] = after_seq
-        if before_seq is not None:
-            tool_arguments["before_seq"] = before_seq
-        if after_timestamp_ms is not None:
-            tool_arguments["after_timestamp_ms"] = after_timestamp_ms
-        if before_timestamp_ms is not None:
-            tool_arguments["before_timestamp_ms"] = before_timestamp_ms
-        if since:
-            tool_arguments["since"] = since
-        if after:
-            tool_arguments["after"] = after
-        if before:
-            tool_arguments["before"] = before
+        msgs, has_older, has_newer = _bounded_window(
+            msgs,
+            limit=limit,
+            reads_forward=_reads_forward(
+                since_envelope_id=resolved_since,
+                after_seq=after_seq,
+                after_timestamp_ms=resolved_after_ts,
+            ),
+        )
+        tool_arguments = _history_tool_arguments(
+            target_name="root_id", target_value=root_id,
+            limit=limit, default_limit=50,
+            since_envelope_id=since_envelope_id,
+            after_seq=after_seq, before_seq=before_seq,
+            after_timestamp_ms=after_timestamp_ms,
+            before_timestamp_ms=before_timestamp_ms,
+            since=since, after=after, before=before,
+        )
         receipt_marker = await _stage_model_visible_messages(
             cfg,
             msgs,
             tool_name="get_thread_history",
             tool_arguments=tool_arguments,
         )
-        result = format_message_group(
+        body = format_message_group(
             msgs,
             current_agent_aliases=(cfg.slug,),
             thread_root_id=root_id.strip(),
+        )
+        result = format_history_read_result(
+            msgs,
+            body=body,
+            has_older=has_older,
+            has_newer=has_newer,
         )
         return f"{result}\n{receipt_marker}" if receipt_marker else result
 

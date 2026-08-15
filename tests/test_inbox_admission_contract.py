@@ -475,9 +475,9 @@ async def test_model_visible_history_and_inbox_join_the_same_active_turn(
         "read_inbox",
         {"target": "channel:sp_1:ch-inbox", "limit": 1},
     )
-    inbox_page = inbox_call[1]
-    assert "inbox peer body" in inbox_page["messages"][0]
-    assert "admission_receipt" not in inbox_page
+    inbox_text = _tool_text(inbox_call)
+    assert "inbox peer body" in inbox_text
+    assert "admission_receipt" not in inbox_text
     inbox_row = await h.store.get_message_by_envelope("inbox-peer")
     assert inbox_row is not None
     assert inbox_row.processing_state is ProcessingState.IN_TURN
@@ -556,7 +556,9 @@ async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
     ]
 
     inbox_call = await h.mcp.call_tool("read_inbox", {"target": target, "limit": 1})
-    assert inbox_call[1]["messages"] == []
+    assert "[pending_messages context_version=1 message_count=0]" in _tool_text(
+        inbox_call
+    )
 
     sent_call = await h.mcp.call_tool(
         "send_message",
@@ -702,9 +704,9 @@ async def test_empty_or_failed_rpc_read_has_no_admission_receipt_or_lifecycle_ch
         "read_inbox",
         {"target": "channel:sp_1:does-not-exist", "limit": 1},
     )
-    empty_page = empty[1]
-    assert empty_page["messages"] == []
-    assert "admission_receipt" not in empty_page
+    empty_text = _tool_text(empty)
+    assert "[pending_messages context_version=1 message_count=0]" in empty_text
+    assert "admission_receipt" not in empty_text
     assert await h.active_boundary("ch-inbox") is None
 
     await h.emit_tool_result(

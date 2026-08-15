@@ -187,7 +187,8 @@ async def list_dm_history(request: web.Request) -> web.Response:
             {"error": "peer query param required"}, status=400,
         )
     try:
-        limit = max(1, min(int(request.query.get("limit", "20")), 200))
+        # History MCP reads one private look-ahead row for page boundaries.
+        limit = max(1, min(int(request.query.get("limit", "20")), 201))
         before_raw = request.query.get("before")
         before = int(before_raw) if before_raw else None
     except ValueError:
@@ -255,7 +256,7 @@ async def list_channel_roots(request: web.Request) -> web.Response:
     if err is not None:
         return err
     since = request.query.get("since") or None
-    limit = max(1, min(limit or 20, 200))
+    limit = max(1, min(limit or 20, 201))
     store = await _store_for(request.app, agent_id)
     if store is None:
         return web.json_response({"error": "agent db not found"}, status=404)
@@ -314,7 +315,7 @@ async def list_thread_messages(request: web.Request) -> web.Response:
     if err is not None:
         return err
     since = request.query.get("since") or None
-    limit = max(1, min(limit or 50, 200))
+    limit = max(1, min(limit or 50, 201))
     store = await _store_for(request.app, agent_id)
     if store is None:
         return web.json_response({"error": "agent db not found"}, status=404)

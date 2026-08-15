@@ -1319,7 +1319,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             " WHERE r.thread_root_id = m.envelope_id) AS reply_count "
             f"FROM messages m WHERE {where} ORDER BY {order} LIMIT ?"
         )
-        params.append(max(1, min(int(limit), 200)))
+        params.append(max(1, min(int(limit), 201)))
 
         async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
@@ -1391,7 +1391,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             before_resolved=before_resolved,
         )
         sql = f"SELECT * FROM messages WHERE {where} ORDER BY {order} LIMIT ?"
-        params.append(max(1, min(int(limit), 200)))
+        params.append(max(1, min(int(limit), 201)))
 
         async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()

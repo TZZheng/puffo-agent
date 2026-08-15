@@ -48,7 +48,11 @@ from .message_store import (
     StoredMessage,
 )
 from ._logging import log_runtime_event
-from .message_projection import CONTEXT_VERSION, format_message_group
+from .message_projection import (
+    CONTEXT_VERSION,
+    format_inbox_notice,
+    format_message_group,
+)
 from .reminder_scheduler import ReminderScheduler
 from .shared_content import INBOX_TURN_CUE
 
@@ -546,22 +550,17 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             ),
             default=None,
         )
-        summary = json.dumps(
-            {
-                "version": 5,
-                "content_included": False,
-                "read_tool": "read_inbox",
-                "generation": notice.generation,
-                "changed_message_count": len(notice_items),
-                "total_pending_messages": total_pending_count,
-                "targets": project_notice_targets(
-                    normalized_counts,
-                    target_channels,
-                    audiences,
-                ),
-                "latest_seq": latest_seq,
-            },
-            separators=(",", ":"),
+        summary = format_inbox_notice(
+            generation=notice.generation,
+            changed_message_count=len(notice_items),
+            total_pending_message_count=total_pending_count,
+            targets=project_notice_targets(
+                normalized_counts,
+                target_channels,
+                audiences,
+            ),
+            latest_seq=latest_seq,
+            read_tool="read_inbox",
         )
         provider_input = (
             "<global_inbox_notice>\n"

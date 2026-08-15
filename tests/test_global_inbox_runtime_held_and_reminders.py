@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from types import SimpleNamespace
 
@@ -508,19 +509,19 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     })
     assert initial.message_ids == ()
     assert initial.formatted_blocks == ()
-    assert '"generation":' in initial.provider_input
-    assert '"changed_message_count":2' in initial.provider_input
-    assert '"total_pending_messages":2' in initial.provider_input
-    assert '"latest_seq":9' in initial.provider_input
-    assert '"version":5' in initial.provider_input
-    assert '"content_included":false' in initial.provider_input
-    assert '"read_tool":"read_inbox"' in initial.provider_input
+    assert "generation=" in initial.provider_input
+    assert "changed_message_count=2" in initial.provider_input
+    assert "total_pending_message_count=2" in initial.provider_input
+    assert "latest_seq=9" in initial.provider_input
+    assert "context_version=1" in initial.provider_input
+    assert "content_included=false" in initial.provider_input
+    assert 'read_tool="read_inbox"' in initial.provider_input
     assert "channel:sp-1:ch-1" in initial.provider_input
     assert "channel:sp-1:ch-1:thread:root-1" in initial.provider_input
-    assert '"audience":{"agents":4,"online_agents":3,"humans":1}' in (
-        initial.provider_input
-    )
-    assert initial.provider_input.count('"audience":') == 2
+    audience = ("[channel_audience context_version=1 human_count=1 "
+                "agent_count=4 online_agent_count=3]")
+    assert audience in initial.provider_input
+    assert initial.provider_input.count("[channel_audience ") == 2
     assert audience_reads == [("sp-1", "ch-1")]
     assert initial.provider_input.endswith(INBOX_TURN_CUE)
     assert "respond" in initial.provider_input
@@ -628,9 +629,8 @@ async def test_notice_restart_suppresses_same_session_and_rediscovers_replacemen
 ):
     def described_pending(provider_input):
         """Return the notice body without its per-delivery generation."""
-        summary = json.loads(provider_input.split("\n", 2)[1])
-        summary.pop("generation")
-        return summary
+        notice = provider_input.split("</global_inbox_notice>", 1)[0]
+        return re.sub(r" generation=\d+", "", notice)
 
     store = await make_store(tmp_path)
     await receipt(store, "session-notice", 10)
@@ -710,12 +710,10 @@ async def test_mixed_message_and_due_reminder_share_one_notice_read_and_turn(tmp
     async def run(planned):
         assert ordinary_body not in planned.provider_input
         assert "exact Agent-authored reminder content" not in planned.provider_input
-        summary = json.loads(
-            planned.provider_input.split("\n", 2)[1]
-        )
-        assert summary["changed_message_count"] == 2
-        assert summary["total_pending_messages"] == 2
-        assert summary["targets"] == [{"target": "channel:sp-1:ch-1", "count": 2}]
+        assert "changed_message_count=2" in planned.provider_input
+        assert "total_pending_message_count=2" in planned.provider_input
+        assert 'target_ref="channel:sp-1:ch-1"' in planned.provider_input
+        assert "[pending context_version=1 message_count=2]" in planned.provider_input
         await adapter.admit()
         observed["page"] = await runtime.read_inbox(limit=50)
         observed["ids"] = tuple(runtime.active.message_ids)
@@ -894,13 +892,13 @@ async def test_different_target_reminder_still_uses_one_global_notice_and_turn(t
         turns += 1
         assert ordinary_body not in planned.provider_input
         assert "exact content for the second target" not in planned.provider_input
-        summary = json.loads(planned.provider_input.split("\n", 2)[1])
-        assert summary["changed_message_count"] == 2
-        assert summary["total_pending_messages"] == 2
-        assert summary["targets"] == [
-            {"target": "channel:sp-1:ch-1", "count": 1},
-            {"target": "channel:sp-1:ch-2", "count": 1},
-        ]
+        assert "changed_message_count=2" in planned.provider_input
+        assert "total_pending_message_count=2" in planned.provider_input
+        assert planned.provider_input.count(
+            "[pending context_version=1 message_count=1]"
+        ) == 2
+        assert 'target_ref="channel:sp-1:ch-1"' in planned.provider_input
+        assert 'target_ref="channel:sp-1:ch-2"' in planned.provider_input
         await adapter.admit()
         observed["page"] = await runtime.read_inbox(limit=50)
         observed["ids"] = tuple(runtime.active.message_ids)
@@ -1017,8 +1015,8 @@ async def test_changed_pending_generation_replaces_accepted_notice_without_losin
 
     assert len(notices) == 2
     assert notices[0] != notices[1]
-    assert '"changed_message_count":1' in notices[1]
-    assert '"total_pending_messages":2' in notices[1]
+    assert "changed_message_count=1" in notices[1]
+    assert "total_pending_message_count=2" in notices[1]
     assert first_body not in notices[1]
     assert second_body not in notices[1]
     assert [row.envelope_id for row in await store.get_pending()] == [

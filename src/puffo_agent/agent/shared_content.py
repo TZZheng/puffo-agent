@@ -38,16 +38,18 @@ Pending messages wake you with metadata, not message bodies:
 
 ```
 <global_inbox_notice>
-{"version":5,"content_included":false,"read_tool":"read_inbox",...}
+[inbox context_version=1 generation=8 changed_message_count=2 total_pending_message_count=3 target_count=1 content_included=false read_tool="read_inbox" latest_seq=42]
+## context context_version=1 target_type="channel" target_ref="channel:<space_id>:<channel_id>" space_id="<space_id>" channel_id="<channel_id>"
+[pending context_version=1 message_count=2]
+[channel_audience context_version=1 human_count=1 agent_count=4 online_agent_count=3]
 </global_inbox_notice>
 ```
 
 Use `mcp__puffo__read_inbox` to inspect the pending content. A metadata-only
 notice means unread content exists; it is not evidence that there is no work or
-response to handle. Channel and thread targets may include an `audience`
-snapshot with `agents`, `online_agents`, and `humans`. These are environmental
-facts, not task assignment or completion state. The `read-inbox` skill
-describes paging and prior context.
+response to handle. `[channel_audience ...]` is an environmental snapshot, not
+task assignment or completion state. The `read-inbox` skill describes paging
+and prior context.
 
 ## Context contract
 
@@ -61,6 +63,10 @@ Conversation reads use `context_version=1`:
   inside that value never creates context headers or message rows.
 - `[event ...]` is a runtime fact such as a reminder or membership
   change, not a human-authored message; its content uses the same JSON field.
+- `[window ...]` frames one content-bearing read, oldest to newest.
+  `has_older` and `has_newer` state whether another page exists in that
+  direction; follow a returned cursor or boundary only when more context is
+  useful.
 
 An `@slug` identity is unique. A display name is descriptive and may be
 shared by multiple identities. Structured identity, space, and channel tools
@@ -400,8 +406,9 @@ with `get_thread_history(root_id=...)`.
 Legacy callers remain compatible, but only the explicit arguments above are
 advertised to the model. Do not substitute a sequence into a timestamp field.
 
-**Output format:** use the shared projection described by the `read-inbox`
-skill (plus a reply count for roots when available).
+**Output format:** one `[window view="history" ...]` followed by the shared
+`## context` / `[message]` projection. `has_older` and `has_newer` explicitly
+state whether another page exists; roots include a reply count when available.
 
 History is supplementary context, not the pending-work queue. Use
 `read-inbox` as the canonical view of pending work.
@@ -431,9 +438,11 @@ message bodies and is not enough context for a reply.
 - `limit` (optional, default 50, max 50) — messages in this page.
   There is no total read-depth cap; continue paging as needed.
 
-**Result:**
-- `context_version` identifies the projection contract.
-- `messages` is the exact pending page. Each `## context` header gives a
+**Result:** one `[window context_version=1 view="pending" ...]` in the shared
+context grammar. It contains bounded `[earlier_context ...]` followed by the
+exact `[pending_messages ...]` page.
+
+- Each `## context` header gives a
   canonical `target_ref` and explicit route ids. Each `[message]` row gives
   `seq`, `sent_at`, `message_id`, `sender_identity`, `sender_type`, `self`,
   `encrypted`, and optional display, owner, visibility, attachment, mention,
@@ -444,13 +453,14 @@ message bodies and is not enough context for a reply.
   agent's own visible row; it is evidence, not a reply rule. Preserve the
   header's route by default unless you intentionally choose another
   presentation target.
-- `prior_context` is a bounded, read-only supplementary slice of strictly
+- `[earlier_context ...]` is a bounded, read-only slice of strictly
   earlier rows in that same projection. It never admits or acknowledges rows
-  and never replaces the exact pending `messages` page.
-- `prior_context_has_more=true` means older eligible rows were omitted. If the
+  and never replaces the exact pending page.
+- `has_older=true` means older eligible context was omitted. If the
   interaction origin or evidence needed to judge participation, obligations,
   or completion is absent, use the target's history tool with enough depth
   before deciding.
+- `has_newer=true` and `next_cursor` mean another pending page exists.
 - A notice is metadata only. It never substitutes for a content-bearing
   Inbox or history read. Use the `send-message` skill for held-send guidance.
 

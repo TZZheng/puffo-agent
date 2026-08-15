@@ -161,13 +161,9 @@ async def test_ws_local_read_inbox_uses_live_runtime_and_preserves_correlation()
     result = await dispatch["read_inbox"](
         target="channel:sp:ch", cursor="", limit=7
     )
-    assert result == {
-        "messages": ["whole"],
-        "next_cursor": "",
-        "has_more": False,
-        "remaining_count": 0,
-        "snapshot_generation": 3,
-    }
+    assert '[window context_version=1 view="pending"' in result
+    assert "[pending_messages context_version=1 message_count=1]" in result
+    assert "whole" in result
     assert calls == [{
         "target": "channel:sp:ch",
         "cursor": "",

@@ -54,6 +54,10 @@ def _annotation(label: str, value: Any) -> str:
     return f" {label}={_quoted(value)}" if value not in (None, "") else ""
 
 
+def _bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
 def message_text(message: Any) -> str:
     content = _value(message, "content", "")
     if isinstance(content, Mapping):
@@ -129,6 +133,152 @@ def target_label(
     if target_type == "thread":
         header += f" thread_root_id={_quoted(effective_thread_root_id)}"
     return header
+
+
+def target_label_from_ref(target_ref: str) -> str:
+    """Project a canonical target ref without requiring a stored message."""
+    parts = str(target_ref or "").split(":")
+    if len(parts) == 2 and parts[0] == "dm" and parts[1]:
+        return (
+            f"context context_version={CONTEXT_VERSION} "
+            f"target_type=\"dm\" target_ref={_quoted(target_ref)} "
+            f"peer_identity={_quoted('@' + parts[1].lstrip('@'))}"
+        )
+    if len(parts) in {3, 5} and parts[0] == "channel":
+        target_type = (
+            "thread" if len(parts) == 5 and parts[3] == "thread" else "channel"
+        )
+        fields = [
+            f"context context_version={CONTEXT_VERSION}",
+            f"target_type={_quoted(target_type)}",
+            f"target_ref={_quoted(target_ref)}",
+            f"space_id={_quoted(parts[1])}",
+            f"channel_id={_quoted(parts[2])}",
+        ]
+        if target_type == "thread":
+            fields.append(f"thread_root_id={_quoted(parts[4])}")
+        return " ".join(fields)
+    return (
+        f"context context_version={CONTEXT_VERSION} "
+        f"target_type=\"unknown\" target_ref={_quoted(target_ref)}"
+    )
+
+
+def format_inbox_notice(
+    *,
+    generation: int,
+    changed_message_count: int,
+    total_pending_message_count: int,
+    targets: Sequence[Mapping[str, Any]],
+    latest_seq: int | None,
+    read_tool: str,
+) -> str:
+    """Render a content-free notice in the shared conversation grammar."""
+    fields = [
+        f"context_version={CONTEXT_VERSION}",
+        f"generation={int(generation)}",
+        f"changed_message_count={int(changed_message_count)}",
+        f"total_pending_message_count={int(total_pending_message_count)}",
+        f"target_count={len(targets)}",
+        "content_included=false",
+        f"read_tool={_quoted(read_tool)}",
+        f"latest_seq={latest_seq if latest_seq is not None else 'null'}",
+    ]
+    lines = [f"[inbox {' '.join(fields)}]"]
+    for row in targets:
+        target_ref = str(row["target"])
+        lines.append(f"## {target_label_from_ref(target_ref)}")
+        lines.append(
+            f"[pending context_version={CONTEXT_VERSION} "
+            f"message_count={int(row['count'])}]"
+        )
+        audience = row.get("audience")
+        if isinstance(audience, Mapping):
+            audience_fields = [
+                f"context_version={CONTEXT_VERSION}",
+                f"human_count={int(audience['humans'])}",
+                f"agent_count={int(audience['agents'])}",
+            ]
+            if "online_agents" in audience:
+                audience_fields.append(
+                    f"online_agent_count={int(audience['online_agents'])}"
+                )
+            lines.append(f"[channel_audience {' '.join(audience_fields)}]")
+    return "\n".join(lines)
+
+
+def format_inbox_read_result(result: Mapping[str, Any]) -> str:
+    """Hide the internal page transport behind one semantic read window."""
+    messages = tuple(str(block) for block in result["messages"])
+    prior_context = tuple(str(block) for block in result["prior_context"])
+    next_cursor = result["next_cursor"]
+    fields = [
+        f"context_version={int(result['context_version'])}",
+        "view=\"pending\"",
+        "order=\"oldest_to_newest\"",
+        f"returned_count={len(prior_context) + len(messages)}",
+        f"earlier_context_count={len(prior_context)}",
+        f"pending_message_count={len(messages)}",
+        f"has_older={_bool(bool(result['prior_context_has_more']))}",
+        f"has_newer={_bool(bool(result['has_more']))}",
+        f"remaining_pending_count={int(result['remaining_count'])}",
+        f"snapshot_generation={int(result['snapshot_generation'])}",
+    ]
+    if next_cursor:
+        fields.append(f"next_cursor={_quoted(next_cursor)}")
+    lines = [f"[window {' '.join(fields)}]"]
+    lines.append(
+        f"[earlier_context context_version={CONTEXT_VERSION} "
+        f"message_count={len(prior_context)}]"
+    )
+    lines.extend(prior_context)
+    lines.append(
+        f"[pending_messages context_version={CONTEXT_VERSION} "
+        f"message_count={len(messages)}]"
+    )
+    lines.extend(messages)
+    lines.append(
+        f"[end_window context_version={CONTEXT_VERSION} view=\"pending\"]"
+    )
+    return "\n".join(lines)
+
+
+def format_history_read_result(
+    messages: Sequence[Any],
+    *,
+    body: str,
+    has_older: bool,
+    has_newer: bool,
+) -> str:
+    """Frame a history projection with explicit Raft-style boundaries."""
+    fields = [
+        f"context_version={CONTEXT_VERSION}",
+        "view=\"history\"",
+        "order=\"oldest_to_newest\"",
+        f"returned_count={len(messages)}",
+        f"has_older={_bool(has_older)}",
+        f"has_newer={_bool(has_newer)}",
+    ]
+    if messages:
+        oldest = messages[0]
+        newest = messages[-1]
+        oldest_seq = _value(oldest, "server_seq", None)
+        newest_seq = _value(newest, "server_seq", None)
+        if isinstance(oldest_seq, int) and not isinstance(oldest_seq, bool):
+            fields.append(f"oldest_seq={oldest_seq}")
+        if isinstance(newest_seq, int) and not isinstance(newest_seq, bool):
+            fields.append(f"newest_seq={newest_seq}")
+        fields.extend((
+            f"oldest_message_id={_quoted(_value(oldest, 'envelope_id', 'unknown'))}",
+            f"newest_message_id={_quoted(_value(newest, 'envelope_id', 'unknown'))}",
+        ))
+    lines = [f"[window {' '.join(fields)}]"]
+    if body:
+        lines.append(body)
+    lines.append(
+        f"[end_window context_version={CONTEXT_VERSION} view=\"history\"]"
+    )
+    return "\n".join(lines)
 
 
 def sender_type(message: Any, *, current_agent_aliases: Sequence[str] = ()) -> str:

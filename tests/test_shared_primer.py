@@ -65,7 +65,7 @@ def test_standing_prompt_is_compact_and_identity_is_compiled_once():
 def test_standing_prompt_owns_communication_policy_and_retains_contract():
     primer = " ".join(DEFAULT_SHARED_CLAUDE_MD.split())
     for phrase in (
-        "<global_inbox_notice>", '"content_included":false', "read_inbox",
+        "<global_inbox_notice>", "content_included=false", "read_inbox",
         "context_version=1", "target_ref", "sender_identity", "sender_type",
         "An `@slug` identity is unique", "send_message",
         "A metadata-only notice means unread content exists",
@@ -104,8 +104,8 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
     for text in (history, post):
         assert "read-inbox" in text
     normalized_read = " ".join(read.split())
-    assert "messages" in read and "prior_context" in read
-    assert "prior_context_has_more" in read
+    assert "pending_messages" in read and "earlier_context" in read
+    assert "has_older" in read and "has_newer" in read
     assert "strictly earlier" in normalized_read
     assert "canonical pending-work view" in read
     assert "standing communication guidance" in normalized_read
@@ -217,7 +217,7 @@ def test_managed_refresh_rewrites_stale_skill():
     skill.write_text("stale", encoding="utf-8")
     actions = dict(ensure_shared_primer(shared))
     assert actions["skills/read-inbox/SKILL.md"] == "updated"
-    assert "prior_context" in skill.read_text(encoding="utf-8")
+    assert "earlier_context" in skill.read_text(encoding="utf-8")
 
     removed = shared / "skills" / "decide-response"
     removed.mkdir()
