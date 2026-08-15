@@ -34,6 +34,7 @@ from puffo_agent.agent.global_inbox_runtime import (
 )
 from puffo_agent.agent.message_store import (
     MessageStore,
+    ProcessingState,
     ReceiptDisposition,
     ReceiptResult,
     ReceiptWriteStatus,
@@ -1135,7 +1136,7 @@ class _ContinuationAdapter(Adapter):
         ))
 
 
-def _visible_read_runtime(store, tmp_path):
+async def _visible_read_runtime(store, tmp_path):
     adapter = _ContinuationAdapter()
     runtime = GlobalInboxRuntime(
         store=store,
@@ -1146,6 +1147,10 @@ def _visible_read_runtime(store, tmp_path):
     runtime.active.turn_id = "turn"
     runtime.active.provider_session_id = "provider-1"
     runtime.active.provider_turn_id = "provider-turn"
+    await store.start_turn(
+        turn_id="turn",
+        provider_session_id="provider-1",
+    )
     runtime.active.routes[:] = [
         MessageRoute("history-2", "channel", "sp-1", "ch-1"),
     ]
@@ -1173,6 +1178,10 @@ async def _stage_visible_read(runtime, boundary, adapter, caplog):
 
 async def _admit_and_assert_visible_read(runtime, boundary, adapter, caplog):
     await adapter.admit_continuation()
+    assert runtime.active.message_ids == ["history-2"]
+    row = await runtime.store.get_message_by_envelope("history-2")
+    assert row is not None
+    assert row.processing_turn_id == "turn"
     assert runtime.active.visible_message_ids == ["history-2"]
     assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 2
     await adapter.admit_continuation()
@@ -1234,7 +1243,7 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
     caplog.set_level(logging.DEBUG, logger="puffo_agent.agent.global_inbox_runtime")
     store = await make_store(tmp_path)
     await receipt(store, "history-2", 2)
-    adapter, runtime, boundary = _visible_read_runtime(store, tmp_path)
+    adapter, runtime, boundary = await _visible_read_runtime(store, tmp_path)
     await _stage_visible_read(runtime, boundary, adapter, caplog)
     await _admit_and_assert_visible_read(runtime, boundary, adapter, caplog)
     await _assert_visible_read_send_correlation(runtime, boundary, caplog)
@@ -1338,6 +1347,10 @@ async def test_model_visible_read_admits_at_runtime_tool_return(tmp_path, caplog
     runtime.active.turn_id = "turn-tool-return"
     runtime.active.provider_session_id = adapter.session
     runtime.active.provider_turn_id = "provider-turn-tool-return"
+    await store.start_turn(
+        turn_id="turn-tool-return",
+        provider_session_id=adapter.session,
+    )
 
     result = await runtime.stage_model_visible_read(
         space_id="sp-1",
@@ -1350,6 +1363,9 @@ async def test_model_visible_read_admits_at_runtime_tool_return(tmp_path, caplog
     )
 
     assert result["state"] == "admitted"
+    row = await store.get_message_by_envelope("history-tool-return")
+    assert row is not None
+    assert row.processing_state is ProcessingState.IN_TURN
     assert runtime.active.through_by_channel[("sp-1", "ch-1")] == 7
     assert runtime.active.visible_message_ids == ["history-tool-return"]
     history_events = [

@@ -107,12 +107,12 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
     assert "messages" in read and "prior_context" in read
     assert "prior_context_has_more" in read
     assert "strictly earlier" in normalized_read
-    assert "do not acknowledge pending Inbox rows" in read
+    assert "canonical pending-work view" in read
     assert "standing communication guidance" in normalized_read
     assert "decide-response" not in DEFAULT_SKILLS
     assert "originating request and conversation intent" not in DEFAULT_SHARED_CLAUDE_MD
-    assert "does not acknowledge pending Inbox work" in " ".join(history.split())
-    assert "does not acknowledge pending Inbox work" in " ".join(post.split())
+    assert "canonical view of pending work" in " ".join(history.split())
+    assert "canonical view of pending work" in " ".join(post.split())
     normalized_send = " ".join(send.lower().split())
     for phrase in (
         'state="held"', "unchanged `draft`", "draft boundary/latest pair",

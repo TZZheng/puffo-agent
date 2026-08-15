@@ -190,7 +190,7 @@ async def test_ws_local_bridge_accepts_history_admission_receipt_key():
 
 
 @pytest.mark.asyncio
-async def test_ws_local_history_callback_updates_visible_registry_only_after_admission(
+async def test_ws_local_history_callback_admits_visible_pending_after_correlation(
     tmp_path,
 ):
     from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
@@ -249,10 +249,10 @@ async def test_ws_local_history_callback_updates_visible_registry_only_after_adm
         tool_name="get_post", tool_arguments={"channel": "ch-1", "seq": 4},
     )
     assert runtime.active.visible_message_ids == ["ws-history"]
-    assert runtime.active.message_ids == []
+    assert runtime.active.message_ids == ["ws-history"]
     assert runtime.active.through_by_channel == {("sp-1", "ch-1"): 4}
     assert (await store.get_message_by_envelope("ws-history")).processing_state == (
-        ProcessingState.PENDING.value
+        ProcessingState.IN_TURN.value
     )
     with pytest.raises(RuntimeError, match="correlation failed"):
         await adapter.emit_admission(turn_id="turn-1", correlation_key=receipt)
@@ -277,7 +277,7 @@ async def test_ws_local_history_callback_updates_visible_registry_only_after_adm
     assert runtime.active.visible_message_ids == ["ws-history"]
     assert runtime.active.through_by_channel == {("sp-1", "ch-1"): 4}
     assert (await store.get_message_by_envelope("ws-history")).processing_state == (
-        ProcessingState.PENDING.value
+        ProcessingState.IN_TURN.value
     )
     await store.close()
 

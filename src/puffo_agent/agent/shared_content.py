@@ -400,8 +400,8 @@ advertised to the model. Do not substitute a sequence into a timestamp field.
 **Output format:** use the shared projection described by the `read-inbox`
 skill (plus a reply count for roots when available).
 
-History is supplementary context only. It does not acknowledge pending Inbox
-work; use `read-inbox` for that.
+History is supplementary context, not the pending-work queue. Use
+`read-inbox` as the canonical view of pending work.
 
 **Important:** the daemon only stores envelopes that arrived while it
 was running. Messages sent before this daemon started, or while it
@@ -462,8 +462,7 @@ not decide whether to respond or use `send_anyway`.
   order.
 
 Channel/thread/DM history tools provide supplementary conversation
-context. They do not acknowledge pending Inbox rows and must not
-replace this tool.
+context and must not replace this canonical pending-work view.
 """
 
 
@@ -519,8 +518,8 @@ envelopes that arrived while it was running; messages from before
 the daemon started won't be found and you'll get
 `"message <id> not found in local storage"` for those.
 
-This is supplementary context and does not acknowledge pending Inbox work;
-use `read-inbox` for that.
+This is supplementary context, not the pending-work queue. Use `read-inbox`
+as the canonical view of pending work.
 
 **When to use:**
 - You see a `thread_root_id` in a context header and want the root

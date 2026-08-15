@@ -431,7 +431,7 @@ async def boundary_harness(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_history_waits_for_provider_proof_but_inbox_admits_on_read(
+async def test_model_visible_history_and_inbox_join_the_same_active_turn(
     boundary_harness: BoundaryHarness,
 ):
     h = boundary_harness
@@ -465,6 +465,10 @@ async def test_history_waits_for_provider_proof_but_inbox_admits_on_read(
     )
     assert history_receipt in history_text
     assert await h.active_boundary("ch-history") == 2
+    history_row = await h.store.get_message_by_envelope("history-peer")
+    assert history_row is not None
+    assert history_row.processing_state is ProcessingState.IN_TURN
+    assert h.runtime.active.message_ids == ["history-peer"]
     assert h.runtime.active.visible_message_ids == ["history-peer"]
 
     inbox_call = await h.mcp.call_tool(
@@ -478,7 +482,7 @@ async def test_history_waits_for_provider_proof_but_inbox_admits_on_read(
     assert inbox_row is not None
     assert inbox_row.processing_state is ProcessingState.IN_TURN
     assert await h.active_boundary("ch-inbox") == 3
-    assert h.runtime.active.message_ids == ["inbox-peer"]
+    assert h.runtime.active.message_ids == ["history-peer", "inbox-peer"]
     assert h.runtime.active.visible_message_ids == ["history-peer", "inbox-peer"]
 
     await h.finish()

@@ -360,7 +360,7 @@ class InboxAdmissionMixin:
         return result
 
     def _write_active_current_turn(self) -> None:
-        """Atomically persist the exact active union after held admission."""
+        """Atomically persist the exact union after a mid-turn admission."""
         targets = tuple(dict.fromkeys(route.target for route in self.active.routes))
         self._write_current_turn(
             PlannedTurn(
@@ -680,32 +680,83 @@ class InboxAdmissionMixin:
     ) -> None:
         if fired[0] or event.planning_cycle_key != context.correlation_key:
             return
-        if (
-            self.active.turn_id != context.active_turn_id
-            or self.active.provider_session_id != context.provider_session_id
-            or event.provider_session_id != context.provider_session_id
-        ):
-            raise RuntimeError(
-                "model-visible read admission crossed the active provider turn"
-            )
-        fired[0] = True
+        admitted_rows: tuple[StoredMessage, ...] = ()
         try:
-            await self._add_visible_message_ids(
-                context.visible_ids,
-                space_id=context.space_id,
-                channel_id=context.channel_id,
-                through_seq=context.through_seq,
-            )
-            await ActiveBoundaryAdapter(
-                self.store, self.active
-            ).advance_active_turn_through_seq(
-                context.space_id,
-                context.channel_id,
-                context.through_seq,
-            )
+            async with self._turn_state_lock:
+                if (
+                    self.active.turn_id != context.active_turn_id
+                    or self.active.provider_session_id
+                    != context.provider_session_id
+                    or event.provider_session_id != context.provider_session_id
+                ):
+                    raise RuntimeError(
+                        "model-visible read admission crossed the active provider turn"
+                    )
+                fired[0] = True
+                visible_rows_list: list[StoredMessage | None] = []
+                for envelope_id in context.visible_ids:
+                    visible_rows_list.append(
+                        await self.store.get_message_by_envelope(envelope_id)
+                    )
+                visible_rows = tuple(visible_rows_list)
+                admitted_rows = tuple(
+                    row
+                    for row in visible_rows
+                    if row is not None
+                    and row.processing_state is ProcessingState.PENDING
+                    and row.receipt_disposition
+                    in {
+                        ReceiptDisposition.ELIGIBLE,
+                        ReceiptDisposition.LOCAL_RUNTIME,
+                    }
+                )
+                if admitted_rows:
+                    self._raise_send_mode_for(admitted_rows)
+                    await self.store.admit_messages(
+                        (row.envelope_id for row in admitted_rows),
+                        turn_id=context.active_turn_id,
+                        provider_session_id=context.provider_session_id,
+                    )
+                    durable_rows = await self.store.get_in_turn_messages(
+                        context.active_turn_id,
+                        context.provider_session_id,
+                    )
+                    self.active.message_ids[:] = [
+                        row.envelope_id for row in durable_rows
+                    ]
+                    self.active.routes[:] = [route_for(row) for row in durable_rows]
+                    self._write_active_current_turn()
+                await self._add_visible_message_ids(
+                    context.visible_ids,
+                    space_id=context.space_id,
+                    channel_id=context.channel_id,
+                    through_seq=context.through_seq,
+                )
+                await ActiveBoundaryAdapter(
+                    self.store, self.active
+                ).advance_active_turn_through_seq(
+                    context.space_id,
+                    context.channel_id,
+                    context.through_seq,
+                )
         except Exception:
             self._log_visible_read(context, "admission_failed", event=event)
             raise
+        if admitted_rows:
+            for row in admitted_rows:
+                log_runtime_event(
+                    logger,
+                    "inbox.row_in_turn",
+                    agent_id=self.agent_id,
+                    turn_id=context.active_turn_id,
+                    provider_session_id=context.provider_session_id,
+                    provider_turn_id=event.provider_turn_id,
+                    message_id=row.envelope_id,
+                    server_seq=row.server_seq,
+                    target=self.store.target_projection(row),
+                    outcome="history_visible",
+                )
+            await self._notify_status_active()
         self._log_visible_read(
             context,
             "admitted",
