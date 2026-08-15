@@ -22,7 +22,6 @@ from .driver import (
     Driver,
     HarnessEvent,
     HarnessEventType,
-    InputReceipt,
     PermissionDecision,
     PermissionRef,
     ProtocolDiagnostics,
@@ -50,7 +49,7 @@ def claude_capabilities(compact_advertised: bool = False) -> DriverCapabilities:
     return DriverCapabilities(
         session_resume=True,
         inflight_turn_recovery=False,
-        steer=SteerCapability.GATED,
+        steer=SteerCapability.NONE,
         cancel=CancelCapability.NONE,
         context_status=ContextStatusCapability.PULL,
         compact=(
@@ -63,7 +62,10 @@ def claude_capabilities(compact_advertised: bool = False) -> DriverCapabilities:
 
 
 class ClaudeCodeCliDriver(Driver):
-    static_steer_capability = SteerCapability.GATED
+    # A second stream-json user frame is queued as another Claude native Turn.
+    # It is not an admission into the active Puffo Turn, even when written just
+    # after a tool result, so the scheduler must deliver it through next-turn.
+    static_steer_capability = SteerCapability.NONE
 
     def __init__(
         self,
@@ -99,12 +101,6 @@ class ClaudeCodeCliDriver(Driver):
         self._context_requests: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self._context_usage_supported: bool | None = None
         self._context = ContextStatus(stale=True)
-        self._gated_input_ready = False
-        self._pending_gated_input: tuple[
-            TurnRef,
-            TurnInput,
-            asyncio.Future[InputReceipt],
-        ] | None = None
 
     async def open(
         self, spec: RuntimeSpec, resume: SessionRef | None = None
@@ -183,7 +179,6 @@ class ClaudeCodeCliDriver(Driver):
             raise RuntimeError("one turn is already active")
         local = TurnRef(f"turn_{uuid.uuid4().hex}")
         replay_uuid = input.client_correlation_id or str(uuid.uuid4())
-        self._gated_input_ready = False
         self._active = local
         self._pending_content = _normalize_content(input.content)
         self._pending_uuid = replay_uuid
@@ -218,25 +213,7 @@ class ClaudeCodeCliDriver(Driver):
         )
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput):
-        if turn != self._active or not self._active.value:
-            raise RuntimeError("stale or foreign turn reference")
-        if self._pending_gated_input is not None:
-            raise RuntimeError("one gated input is already pending")
-        if self._gated_input_ready:
-            return await self._write_gated_input(turn, input)
-        future: asyncio.Future[InputReceipt] = (
-            asyncio.get_running_loop().create_future()
-        )
-        self._pending_gated_input = (turn, input, future)
-        try:
-            return await asyncio.shield(future)
-        except asyncio.CancelledError:
-            if self._pending_gated_input is not None:
-                _, _, current = self._pending_gated_input
-                if current is future:
-                    self._pending_gated_input = None
-            future.cancel()
-            raise
+        return UnsupportedCapability("steer")
 
     async def cancel_turn(self, turn: TurnRef):
         return UnsupportedCapability("cancel")
@@ -346,7 +323,6 @@ class ClaudeCodeCliDriver(Driver):
         self._pending_content = ""
         self._pending_uuid = ""
         self._tool_calls.clear()
-        self._reset_gated_state()
         await self._events.put(None)
 
     def _prepare_reopen(self) -> None:
@@ -360,7 +336,6 @@ class ClaudeCodeCliDriver(Driver):
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         self._tool_calls.clear()
-        self._reset_gated_state()
         self._compact_advertised = False
         self._resumed = False
         self._init_commands = ()
@@ -382,69 +357,6 @@ class ClaudeCodeCliDriver(Driver):
         self._init = None
         self._clear_pending_replay()
         self._context_requests.clear()
-        self._settle_gated_input(False, message)
-
-    def _reset_gated_state(self) -> None:
-        self._gated_input_ready = False
-        self._pending_gated_input = None
-
-    def _settle_gated_input(self, accepted: bool, delivery: str) -> None:
-        pending, self._pending_gated_input = self._pending_gated_input, None
-        if pending is None:
-            return
-        turn, input, future = pending
-        if not future.done():
-            future.set_result(
-                InputReceipt(
-                    accepted,
-                    turn,
-                    input.client_correlation_id,
-                    delivery=delivery,
-                )
-            )
-
-    async def _write_gated_input(
-        self,
-        turn: TurnRef,
-        input: TurnInput,
-    ) -> InputReceipt:
-        replay_uuid = input.client_correlation_id or str(uuid.uuid4())
-        frame = {
-            "type": "user",
-            "session_id": self._native_session_id,
-            "parent_tool_use_id": None,
-            "uuid": replay_uuid,
-            "message": {
-                "role": "user",
-                "content": [{"type": "text", "text": input.content}],
-            },
-        }
-        await self._write(frame)
-        self._gated_input_ready = False
-        return InputReceipt(
-            True,
-            turn,
-            input.client_correlation_id,
-            delivery="gated_boundary",
-        )
-
-    async def _flush_gated_input(self) -> None:
-        if not self._active.value:
-            return
-        self._gated_input_ready = True
-        pending = self._pending_gated_input
-        if pending is None:
-            return
-        turn, input, future = pending
-        self._pending_gated_input = None
-        try:
-            receipt = await self._write_gated_input(turn, input)
-        except Exception as exc:
-            if not future.done():
-                future.set_exception(exc)
-        else:
-            if not future.done():
-                future.set_result(receipt)
 
     def _clear_pending_replay(self) -> None:
         pending = self._pending_replay
@@ -522,8 +434,6 @@ class ClaudeCodeCliDriver(Driver):
                 turn_ref=self._active if self._active.value else None,
                 native_payload=frame,
             )
-            if subtype == "compact_boundary":
-                await self._flush_gated_input()
             return
         await self._emit(
             HarnessEventType.SESSION_UPDATED,
@@ -588,7 +498,6 @@ class ClaudeCodeCliDriver(Driver):
         )
 
     async def _handle_assistant(self, frame: dict[str, Any]) -> None:
-        self._gated_input_ready = False
         if not self._active.value:
             await self._emit(
                 HarnessEventType.SESSION_UPDATED,
@@ -641,7 +550,6 @@ class ClaudeCodeCliDriver(Driver):
     async def _emit_tool_started(
         self, frame: dict[str, Any], block: dict[str, Any]
     ) -> None:
-        self._gated_input_ready = False
         tool_call_id = str(block.get("id") or "")
         arguments = block.get("input") or {}
         self._tool_calls[tool_call_id] = (
@@ -667,7 +575,6 @@ class ClaudeCodeCliDriver(Driver):
         self, frame: dict[str, Any], block: dict[str, Any]
     ) -> None:
         tool_call_id = str(block.get("tool_use_id") or "")
-        known_tool_call = tool_call_id in self._tool_calls
         tool_name, arguments = self._tool_calls.pop(tool_call_id, ("", {}))
         await self._emit(
             HarnessEventType.TOOL_COMPLETED,
@@ -686,8 +593,6 @@ class ClaudeCodeCliDriver(Driver):
                 "is_error": bool(block.get("is_error")),
             },
         )
-        if known_tool_call and not self._tool_calls:
-            await self._flush_gated_input()
 
     async def _handle_result(self, frame: dict[str, Any], subtype: str) -> None:
         if not self._active.value:
@@ -715,8 +620,6 @@ class ClaudeCodeCliDriver(Driver):
             },
             native_payload=frame,
         )
-        self._settle_gated_input(False, "next_turn")
-        self._gated_input_ready = False
         self._clear_pending_replay()
         self._active, self._active_native_turn_id = TurnRef(""), ""
         # A `tool_use` whose `tool_result` never arrives would otherwise keep

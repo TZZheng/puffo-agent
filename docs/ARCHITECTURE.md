@@ -212,9 +212,12 @@ failures. Provider-native diagnostics stay opaque and are not serialized.
 are rejected by the current runtime matrix.
 
 Codex accepts active-turn Inbox deltas through native `turn/steer`. Claude Code
-accepts them only at a stream-json tool-result or compaction boundary; if no such
-boundary occurs, the durable delta remains for the next turn. Drivers without a
-safe capability always use that next-turn path.
+stream-json accepts another user frame, but even one written immediately after
+a tool result is queued as a separate Claude native turn; an arbitrary busy-time
+write can also interrupt the current request. Puffo therefore does not report
+that write as admission into the active logical turn. Its durable delta remains
+pending until the current terminal event, then starts as a separately tracked
+turn.
 
 ## 6. Durable State
 

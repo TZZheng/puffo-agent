@@ -1591,6 +1591,17 @@ async def test_get_channel_history_explicit_seq_and_legacy_timestamp_bounds():
             reason="test",
         )
     mcp = _build_tools(cfg)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    for tool_name in ("get_channel_history", "get_thread_history"):
+        properties = tools[tool_name].inputSchema["properties"]
+        assert {"since", "after", "before"}.isdisjoint(properties)
+        assert {
+            "since_envelope_id",
+            "after_seq",
+            "before_seq",
+            "after_timestamp_ms",
+            "before_timestamp_ms",
+        }.issubset(properties)
 
     by_seq = await _call(
         mcp,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from pydantic.json_schema import SkipJsonSchema
 
 from ..agent.message_projection import (
     format_message_group,
@@ -64,19 +65,18 @@ def _register_channel_history_tool(mcp: FastMCP, cfg: Any) -> None:
         before_seq: int | None = None,
         after_timestamp_ms: int | None = None,
         before_timestamp_ms: int | None = None,
-        since: str = "",
-        after: int = 0,
-        before: int = 0,
+        since: SkipJsonSchema[str] = "",
+        after: SkipJsonSchema[int] = 0,
+        before: SkipJsonSchema[int] = 0,
     ) -> str:
         """List local channel root posts.
 
         ``channel`` is ``ch_<uuid>``. Prefer the explicitly named
         ``since_envelope_id``, ``after_seq`` / ``before_seq``, and
-        ``after_timestamp_ms`` / ``before_timestamp_ms`` filters. The shorter
-        ``since``, ``after``, and ``before`` names are deprecated compatibility
-        aliases; legacy ``after`` / ``before`` values are ms-epoch timestamps,
-        never message sequences. Results are semantic target/row projection
-        groups with root reply counts; use ``get_thread_history`` for replies.
+        ``after_timestamp_ms`` / ``before_timestamp_ms`` filters. Hidden legacy
+        aliases remain accepted for compatibility but are not advertised to the
+        model. Results are semantic target/row projection groups with root reply
+        counts; use ``get_thread_history`` for replies.
         """
         limit = max(1, min(int(limit), 200))
         resolved_since = _resolve_text_alias(
@@ -192,17 +192,16 @@ def register_thread_history_tools(mcp: FastMCP, cfg: Any) -> None:
         before_seq: int | None = None,
         after_timestamp_ms: int | None = None,
         before_timestamp_ms: int | None = None,
-        since: str = "",
-        after: int = 0,
-        before: int = 0,
+        since: SkipJsonSchema[str] = "",
+        after: SkipJsonSchema[int] = 0,
+        before: SkipJsonSchema[int] = 0,
     ) -> str:
         """List a local thread's root and replies, oldest first.
 
         ``root_id`` is the root envelope id. Prefer the explicitly named
-        envelope, sequence, or ms-epoch timestamp filters. ``since``, ``after``,
-        and ``before`` remain deprecated aliases; legacy numeric bounds are
-        timestamps, never message sequences. Results use the semantic
-        target/row projection.
+        envelope, sequence, or ms-epoch timestamp filters. Hidden legacy aliases
+        remain accepted for compatibility but are not advertised to the model.
+        Results use the semantic target/row projection.
         """
         if not root_id.strip():
             raise RuntimeError("root_id required")

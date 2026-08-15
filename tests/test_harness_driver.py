@@ -227,7 +227,7 @@ def test_claude_effective_capabilities():
     compact = claude_capabilities(True)
     assert baseline.session_resume is True
     assert baseline.inflight_turn_recovery is False
-    assert (baseline.steer, baseline.cancel) == ("gated", "none")
+    assert (baseline.steer, baseline.cancel) == ("none", "none")
     assert baseline.context_status == "pull"
     assert baseline.compact == "none"
     assert compact.compact == "session_command"
@@ -1339,11 +1339,9 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
     await _next_matching(stream, "turn.started")
     await _next_matching(stream, "turn.assistant_delta")
     await _next_matching(stream, "turn.tool_started")
-    steered = asyncio.create_task(
-        driver.steer_turn(started.turn_ref, TurnInput("inbox delta"))
-    )
-    await asyncio.sleep(0)
-    assert not steered.done()
+    steered = await driver.steer_turn(started.turn_ref, TurnInput("inbox delta"))
+    assert isinstance(steered, UnsupportedCapability)
+    assert steered.capability == "steer"
     holder["proc"].feed({
         "type": "user", "message": {"content": [{
             "type": "tool_result", "tool_use_id": "tool-claude",
@@ -1358,7 +1356,7 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
     }
     assert "arguments" not in tool_completed.data
     assert "result" not in tool_completed.data
-    assert (await steered).delivery == "gated_boundary"
+    assert len(holder["proc"].stdin.writes) == 1
     holder["proc"].feed({"type": "result", "subtype": "success", "usage": {}})
     holder["proc"].feed({"type": "rate_limit_event", "secret": "not-public"})
     await _next_matching(stream, "turn.completed")

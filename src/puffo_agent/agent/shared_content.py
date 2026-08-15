@@ -394,8 +394,8 @@ with `get_thread_history(root_id=...)`.
 - `after_timestamp_ms` / `before_timestamp_ms` (optional) — ms-epoch bounds,
   both exclusive. These are time values, not message sequences.
 
-The old `since`, `after`, and `before` names remain temporary compatibility
-aliases. Avoid them in new calls; legacy `after` / `before` mean timestamps.
+Legacy callers remain compatible, but only the explicit arguments above are
+advertised to the model. Do not substitute a sequence into a timestamp field.
 
 **Output format:** use the shared projection described by the `read-inbox`
 skill (plus a reply count for roots when available).
