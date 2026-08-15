@@ -1255,8 +1255,8 @@ class InboxStoreMixin:
                     break
                 state = row["processing_state"]
                 # A history tool's just-admitted watermark is model-visible
-                # even though it is not moved into the Inbox turn.  It is
-                # still bounded by every earlier locally-known blocker.
+                # and belongs to this turn when it was pending. It is still
+                # bounded by every earlier locally-known blocker.
                 is_candidate = candidate_seq is not None and sequence == candidate_seq
                 is_visible = row["model_visible_at"] is not None or is_candidate
                 is_this_turn = row["processing_turn_id"] == turn_id
