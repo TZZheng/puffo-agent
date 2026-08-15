@@ -380,15 +380,18 @@ class InboxAdmissionMixin:
             )
         )
 
-    def note_input_ready(self, turn_id: str) -> None:
-        self.notice_delivery.note_input_ready(turn_id)
-
     async def offer_busy_notice(self, *, turn_id: str) -> bool:
         """Offer metadata-only work to the named active Turn when safe."""
-        if turn_id != self.active.turn_id:
+        provider_session_id = self.active.provider_session_id
+        provider_turn_id = self.active.provider_turn_id
+        if (
+            turn_id != self.active.turn_id
+            or not provider_session_id
+            or not provider_turn_id
+        ):
             return False
         planned = await self.plan_pending(
-            provider_session_id=self.active.provider_session_id,
+            provider_session_id=provider_session_id,
         )
         if planned is None:
             return False
@@ -400,12 +403,13 @@ class InboxAdmissionMixin:
         planned = decision.candidate.payload
         if not isinstance(planned, PlannedTurn):
             return False
-        offer = getattr(self.adapter, "offer_inbox_notice", None)
-        if not callable(offer):
-            return False
-
         async def deliver() -> bool:
-            return bool(await offer(turn_id, planned.provider_input))
+            return bool(
+                await self.adapter.offer_inbox_notice(
+                    provider_turn_id,
+                    planned.provider_input,
+                )
+            )
 
         accepted = await self.notice_delivery.offer(
             named_turn_id=turn_id,
@@ -414,10 +418,23 @@ class InboxAdmissionMixin:
         )
         if not accepted:
             return False
-        return await self.store.mark_notice_delivered(
+        recorded = await self.store.mark_notice_delivered(
             planned.notice_generation,
-            self.active.provider_session_id,
+            provider_session_id,
+            planned.notice_message_ids,
+            turn_id=turn_id,
         )
+        if (
+            recorded
+            and self.active.turn_id == turn_id
+            and self.active.provider_session_id == provider_session_id
+            and self.active.provider_turn_id == provider_turn_id
+        ):
+            known = set(self.active.notice_message_ids)
+            self.active.notice_message_ids.extend(
+                item for item in planned.notice_message_ids if item not in known
+            )
+        return recorded
 
     def resolve_active_send_route(
         self,

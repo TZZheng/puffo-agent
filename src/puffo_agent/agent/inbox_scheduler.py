@@ -28,18 +28,13 @@ class NoticeDeliveryCapability(str, Enum):
 
 
 class InboxNoticeDelivery:
-    """Inbox-owned busy-input gate; provider implementations stay outside it."""
+    """Validate active-turn delivery; providers own their native safe boundary."""
 
     def __init__(
         self,
         capability: NoticeDeliveryCapability | str = NoticeDeliveryCapability.NEXT_TURN,
     ) -> None:
         self.capability = NoticeDeliveryCapability(capability)
-        self._input_ready_turn = ""
-
-    def note_input_ready(self, turn_id: str) -> None:
-        if turn_id:
-            self._input_ready_turn = turn_id
 
     async def offer(
         self,
@@ -52,16 +47,9 @@ class InboxNoticeDelivery:
             return False
         if self.capability is NoticeDeliveryCapability.NEXT_TURN:
             return False
-        if (
-            self.capability is NoticeDeliveryCapability.GATED
-            and self._input_ready_turn != named_turn_id
-        ):
-            return False
         result = deliver()
         if inspect.isawaitable(result):
             result = await result
-        if self.capability is NoticeDeliveryCapability.GATED:
-            self._input_ready_turn = ""
         return result is True
 
 

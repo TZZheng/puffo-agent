@@ -24,6 +24,8 @@ from .message_store_models import (
     _now_ms,
 )
 
+_SQLITE_ID_BATCH_SIZE = 500
+
 
 class InboxStoreMixin:
     """Implementation trait for the single ``MessageStore`` state owner.
@@ -133,22 +135,40 @@ class InboxStoreMixin:
         deadline = old["first_pending_deadline_ms"]
         if pending_count == 0:
             deadline = None
+            await db.execute("DELETE FROM inbox_notice_contributions")
         elif old_count == 0:
             started = (
                 int(activated_at) if activated_at is not None else int(self._now_ms())
             )
             deadline = started + self.NOTICE_WINDOW_MS
         await db.execute(
+            "DELETE FROM inbox_notice_contributions WHERE envelope_id NOT IN "
+            "(SELECT envelope_id FROM messages WHERE processing_state = ?)",
+            (ProcessingState.PENDING.value,),
+        )
+        delivered_generation = int(old["last_delivered_generation"])
+        delivered_session = old["last_delivered_provider_session_id"]
+        if delivered_session and pending_count > 0:
+            async with db.execute(
+                "SELECT COUNT(*) FROM inbox_notice_contributions "
+                "WHERE provider_session_id = ?",
+                (delivered_session,),
+            ) as cursor:
+                contributed = int((await cursor.fetchone())[0])
+            if contributed == pending_count:
+                delivered_generation = generation
+        await db.execute(
             "UPDATE inbox_notice_state SET generation = ?, pending_count = ?, "
-            "first_pending_deadline_ms = ? WHERE singleton = 1",
-            (generation, pending_count, deadline),
+            "first_pending_deadline_ms = ?, last_delivered_generation = ? "
+            "WHERE singleton = 1",
+            (generation, pending_count, deadline, delivered_generation),
         )
         return InboxNoticeState(
             generation,
             pending_count,
             int(deadline) if deadline is not None else None,
-            int(old["last_delivered_generation"]),
-            old["last_delivered_provider_session_id"],
+            delivered_generation,
+            delivered_session,
         )
 
     async def get_notice_state(self) -> InboxNoticeState:
@@ -177,54 +197,192 @@ class InboxStoreMixin:
         generation: int,
         provider_session_id: str | None,
     ) -> bool:
-        del provider_session_id
-        return not isinstance(generation, bool) and isinstance(generation, int)
+        return (
+            not isinstance(generation, bool)
+            and isinstance(generation, int)
+            and generation >= 0
+            and isinstance(provider_session_id, str)
+            and bool(provider_session_id)
+        )
+
+    async def get_notice_snapshot(
+        self,
+        provider_session_id: str | None,
+    ) -> tuple[InboxNoticeState, tuple[StoredMessage, ...]]:
+        """Read notice metadata and its session delta from one locked snapshot."""
+        async with self._inbox_lock:
+            pending = await self._get_pending_unlocked()
+            state = await self._notice_state_unlocked()
+            if not provider_session_id or not pending:
+                return state, pending
+            if state.last_delivered_provider_session_id != provider_session_id:
+                return state, pending
+            db = await self._ensure_db()
+            async with db.execute(
+                "SELECT envelope_id FROM inbox_notice_contributions "
+                "WHERE provider_session_id = ?",
+                (provider_session_id,),
+            ) as cursor:
+                contributed = {row["envelope_id"] for row in await cursor.fetchall()}
+            return state, tuple(
+                item for item in pending if item.envelope_id not in contributed
+            )
+
+    async def get_notice_candidates(
+        self,
+        provider_session_id: str | None,
+    ) -> tuple[StoredMessage, ...]:
+        """Return pending rows not yet mentioned to this provider session."""
+        _state, candidates = await self.get_notice_snapshot(provider_session_id)
+        return candidates
 
     async def _mark_notice_delivered_unlocked(
         self,
         db: aiosqlite.Connection,
         generation: int,
-        provider_session_id: str | None,
+        provider_session_id: str,
+        message_ids: tuple[str, ...],
+        *,
+        turn_id: str | None = None,
     ) -> bool:
-        """Claim one notice generation while the caller owns the write lock."""
-        cursor = await db.execute(
-            "UPDATE inbox_notice_state "
-            "SET last_delivered_generation = ?, "
-            "last_delivered_provider_session_id = ? "
-            "WHERE singleton = 1 AND generation = ? AND pending_count > 0 "
-            "AND last_delivered_generation != ?",
-            (
-                generation,
-                provider_session_id,
-                generation,
-                generation,
-            ),
+        """Record exact pending identities after one native delivery succeeds."""
+        if not message_ids:
+            return False
+        if turn_id is not None:
+            async with db.execute(
+                "SELECT 1 FROM turn_runs WHERE turn_id = ? AND state = ? "
+                "AND provider_session_id = ?",
+                (turn_id, ProcessingState.IN_TURN.value, provider_session_id),
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return False
+        state = await self._notice_state_unlocked()
+        if generation > state.generation or state.pending_count <= 0:
+            return False
+        pending_ids: list[str] = []
+        for offset in range(0, len(message_ids), _SQLITE_ID_BATCH_SIZE):
+            batch = message_ids[offset : offset + _SQLITE_ID_BATCH_SIZE]
+            placeholders = ",".join("?" for _ in batch)
+            async with db.execute(
+                f"SELECT envelope_id FROM messages "
+                f"WHERE envelope_id IN ({placeholders}) AND processing_state = ?",
+                (*batch, ProcessingState.PENDING.value),
+            ) as cursor:
+                pending_ids.extend(row["envelope_id"] for row in await cursor.fetchall())
+        if not pending_ids:
+            return False
+        if state.last_delivered_provider_session_id != provider_session_id:
+            await db.execute("DELETE FROM inbox_notice_contributions")
+        before = db.total_changes
+        await db.executemany(
+            "INSERT OR IGNORE INTO inbox_notice_contributions "
+            "(envelope_id, provider_session_id) VALUES (?, ?)",
+            ((envelope_id, provider_session_id) for envelope_id in pending_ids),
         )
-        return cursor.rowcount == 1
+        changed = db.total_changes > before
+        async with db.execute(
+            "SELECT COUNT(*) FROM inbox_notice_contributions "
+            "WHERE provider_session_id = ?",
+            (provider_session_id,),
+        ) as cursor:
+            contributed = int((await cursor.fetchone())[0])
+        delivered_generation = (
+            state.generation
+            if contributed == state.pending_count
+            else min(generation, max(0, state.generation - 1))
+        )
+        await db.execute(
+            "UPDATE inbox_notice_state SET last_delivered_generation = ?, "
+            "last_delivered_provider_session_id = ? WHERE singleton = 1",
+            (delivered_generation, provider_session_id),
+        )
+        return changed
 
     async def mark_notice_delivered(
         self,
         generation: int,
         provider_session_id: str | None,
+        message_ids: Iterable[str] | None = None,
+        *,
+        turn_id: str | None = None,
     ) -> bool:
-        """Claim a pending notice generation for one daemon-owned turn.
-
-        The provider session is retained as optional diagnostic metadata for
-        existing databases. It is not part of notice deduplication.
-        """
+        """Record the exact pending identities accepted by one native session."""
         if not self._valid_notice_acceptance(generation, provider_session_id):
+            return False
+        assert isinstance(provider_session_id, str)
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                ids = (
+                    tuple(message_ids)
+                    if message_ids is not None
+                    else tuple(
+                        item.envelope_id for item in await self._get_pending_unlocked()
+                    )
+                )
+                if not ids or len(ids) != len(set(ids)):
+                    await db.rollback()
+                    return False
+                accepted = await self._mark_notice_delivered_unlocked(
+                    db,
+                    generation,
+                    provider_session_id,
+                    ids,
+                    turn_id=turn_id,
+                )
+                await db.commit()
+                return accepted
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def release_notice_delivery(
+        self,
+        provider_session_id: str | None,
+        message_ids: Iterable[str] | None = None,
+    ) -> bool:
+        """Release native-delivery evidence after a transport or runtime failure."""
+        if not provider_session_id:
             return False
         async with self._inbox_lock:
             db = await self._ensure_db()
             await db.execute("BEGIN IMMEDIATE")
             try:
-                accepted = await self._mark_notice_delivered_unlocked(
-                    db,
-                    generation,
-                    provider_session_id,
-                )
+                state = await self._notice_state_unlocked()
+                if state.last_delivered_provider_session_id != provider_session_id:
+                    await db.rollback()
+                    return False
+                if message_ids is None:
+                    cursor = await db.execute(
+                        "DELETE FROM inbox_notice_contributions "
+                        "WHERE provider_session_id = ?",
+                        (provider_session_id,),
+                    )
+                    deleted = cursor.rowcount
+                else:
+                    ids = tuple(message_ids)
+                    if not ids or len(ids) != len(set(ids)):
+                        await db.rollback()
+                        return False
+                    deleted = 0
+                    for offset in range(0, len(ids), _SQLITE_ID_BATCH_SIZE):
+                        batch = ids[offset : offset + _SQLITE_ID_BATCH_SIZE]
+                        placeholders = ",".join("?" for _ in batch)
+                        cursor = await db.execute(
+                            "DELETE FROM inbox_notice_contributions "
+                            f"WHERE provider_session_id = ? AND envelope_id IN ({placeholders})",
+                            (provider_session_id, *batch),
+                        )
+                        deleted += cursor.rowcount
+                if deleted:
+                    await db.execute(
+                        "UPDATE inbox_notice_state SET last_delivered_generation = "
+                        "CASE WHEN generation = 0 THEN 0 ELSE generation - 1 END "
+                        "WHERE singleton = 1",
+                    )
                 await db.commit()
-                return accepted
+                return bool(deleted)
             except Exception:
                 await db.rollback()
                 raise
@@ -555,25 +713,32 @@ class InboxStoreMixin:
         provider_session_id: str | None,
         started_at: int | None = None,
         notice_generation: int | None = None,
+        notice_message_ids: Iterable[str] = (),
     ) -> TurnRun:
         """Create an active Turn, atomically claiming a notice when present."""
         if not turn_id:
             raise LifecycleConflict("turn ID is required")
-        if notice_generation is not None and not self._valid_notice_acceptance(
-            notice_generation,
-            provider_session_id,
-        ):
-            raise LifecycleConflict("notice claim requires a valid generation")
+        notice_ids = tuple(notice_message_ids)
+        if notice_generation is not None:
+            if (
+                isinstance(notice_generation, bool)
+                or not isinstance(notice_generation, int)
+                or notice_generation < 0
+                or not notice_ids
+                or len(notice_ids) != len(set(notice_ids))
+            ):
+                raise LifecycleConflict("notice claim requires valid message IDs")
         async with self._inbox_lock:
             db = await self._ensure_db()
             started = started_at if started_at is not None else int(self._now_ms())
             try:
                 await db.execute("BEGIN IMMEDIATE")
-                if notice_generation is not None:
+                if notice_generation is not None and provider_session_id:
                     if not await self._mark_notice_delivered_unlocked(
                         db,
                         notice_generation,
                         provider_session_id,
+                        notice_ids,
                     ):
                         raise LifecycleConflict(
                             "Inbox notice is stale or already claimed"
@@ -601,7 +766,6 @@ class InboxStoreMixin:
         *,
         turn_id: str,
         state: str = ProcessingState.PROCESSED.value,
-        rearm_notice: bool = False,
     ) -> TurnRun:
         """Finalize a notice Turn which admitted no Inbox rows."""
         if state not in (ProcessingState.PROCESSED.value, "requeued"):
@@ -625,19 +789,6 @@ class InboxStoreMixin:
                 )
                 if cursor.rowcount != 1:
                     raise LifecycleConflict("Turn is not active and empty")
-                if rearm_notice:
-                    # A notice is delivery metadata, not an Inbox ACK. If the
-                    # Turn admitted no rows, create a fresh delivery generation
-                    # for the unchanged pending set so work cannot become
-                    # stranded after an ignored tool call, failure, or restart.
-                    await db.execute(
-                        "UPDATE inbox_notice_state "
-                        "SET generation = generation + 1, "
-                        "first_pending_deadline_ms = ? "
-                        "WHERE singleton = 1 AND pending_count > 0 "
-                        "AND generation = last_delivered_generation",
-                        (completed + self.NOTICE_WINDOW_MS,),
-                    )
                 await db.commit()
             except Exception:
                 await db.rollback()

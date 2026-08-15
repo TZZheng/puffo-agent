@@ -944,6 +944,35 @@ class RuntimeManagerAdapter(Adapter):
         )
         return value or None
 
+    def inbox_notice_delivery_capability(self) -> str:
+        capabilities = (
+            self.manager.opened.capabilities
+            if self.manager.opened is not None
+            else None
+        )
+        steer = (
+            capabilities.steer
+            if capabilities is not None
+            else getattr(self.manager.driver, "static_steer_capability", "none")
+        )
+        value = getattr(steer, "value", steer)
+        if value == "current_turn":
+            return "direct"
+        if value == "gated":
+            return "gated"
+        return "next_turn"
+
+    async def offer_inbox_notice(
+        self,
+        provider_turn_id: str,
+        provider_input: str,
+    ) -> bool:
+        active = self.manager.active_turn_ref
+        if active is None or self.manager.native_turn_id != provider_turn_id:
+            return False
+        receipt = await self.manager.steer_turn(active, TurnInput(provider_input))
+        return not isinstance(receipt, UnsupportedCapability) and receipt.accepted
+
     async def get_context_snapshot(self) -> ContextSnapshot:
         status = await self.manager.context_status()
         if isinstance(status, UnsupportedCapability):

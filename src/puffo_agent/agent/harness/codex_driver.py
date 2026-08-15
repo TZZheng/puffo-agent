@@ -186,6 +186,8 @@ def _permission_response(
 
 
 class CodexAppServerDriver(Driver):
+    static_steer_capability = SteerCapability.CURRENT_TURN
+
     def __init__(
         self,
         process_factory: Callable[[RuntimeSpec], Any] | None = None,

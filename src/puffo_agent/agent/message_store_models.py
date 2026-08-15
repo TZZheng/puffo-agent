@@ -105,21 +105,22 @@ class InboxNoticeState:
 
     @property
     def delivery_pending(self) -> bool:
-        """Whether the daemon has not claimed the current notice generation."""
-        return (
-            self.pending_count > 0
-            and self.generation != self.last_delivered_generation
+        """Whether the current generation lacks a session-aware delivery."""
+        return self.pending_count > 0 and (
+            self.generation != self.last_delivered_generation
+            or not self.last_delivered_provider_session_id
         )
 
     def is_due_for(self, provider_session_id: str | None) -> bool:
-        """Return whether the daemon should start one turn for this generation.
-
-        ``provider_session_id`` remains accepted for source compatibility, but
-        provider identity no longer controls Inbox scheduling. The daemon owns
-        the local turn before a harness sees its notice.
-        """
-        del provider_session_id
-        return self.delivery_pending
+        """Return whether this provider session needs Inbox discovery."""
+        if self.pending_count <= 0:
+            return False
+        if not provider_session_id:
+            return self.delivery_pending
+        return (
+            self.generation != self.last_delivered_generation
+            or provider_session_id != self.last_delivered_provider_session_id
+        )
 
 
 @dataclass(frozen=True)

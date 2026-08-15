@@ -483,9 +483,10 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     assert initial.message_ids == ()
     assert initial.formatted_blocks == ()
     assert '"generation":' in initial.provider_input
-    assert '"message_count":1' in initial.provider_input
+    assert '"changed_message_count":1' in initial.provider_input
+    assert '"total_pending_messages":1' in initial.provider_input
     assert '"latest_seq":8' in initial.provider_input
-    assert '"version":3' in initial.provider_input
+    assert '"version":4' in initial.provider_input
     assert '"content_included":false' in initial.provider_input
     assert '"read_tool":"read_inbox"' in initial.provider_input
     assert "channel:sp-1:ch-1" in initial.provider_input
@@ -495,13 +496,22 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     assert plaintext not in initial_serialized
     assert attachment not in initial_serialized
 
+    await store.start_turn(
+        turn_id="active-turn",
+        provider_session_id="provider-1",
+    )
     runtime.active.turn_id = "active-turn"
     runtime.active.provider_session_id = "provider-1"
-    assert await runtime.offer_busy_notice(turn_id="active-turn")
+    runtime.active.provider_turn_id = "provider-turn-1"
+    runtime._busy_notice_delay_seconds = 0
+    runtime.notify()
+    assert runtime._busy_notice_task is not None
+    await runtime._busy_notice_task
     busy_serialized = json.dumps(adapter.offers)
     assert plaintext not in busy_serialized
     assert attachment not in busy_serialized
     state = await store.get_notice_state()
+    assert adapter.offers[0][0] == "provider-turn-1"
     assert state.last_delivered_generation == state.generation
     assert state.last_delivered_provider_session_id == "provider-1"
     assert not state.is_due_for("provider-1")
@@ -526,6 +536,7 @@ async def test_rejected_or_stale_busy_notice_retains_generation(tmp_path):
     )
     runtime.active.turn_id = "active-turn"
     runtime.active.provider_session_id = "provider-1"
+    runtime.active.provider_turn_id = "provider-turn-1"
     before = await store.get_notice_state()
     assert not await runtime.offer_busy_notice(turn_id="stale-turn")
     assert not await runtime.offer_busy_notice(turn_id="active-turn")
@@ -540,14 +551,10 @@ async def test_rejected_or_stale_busy_notice_retains_generation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_notice_turn_without_correlated_read_rearms_for_same_session(
+async def test_empty_notice_turn_does_not_retry_unchanged_work_for_same_session(
     tmp_path,
 ):
-    """Durable pending work is re-notified on the same warm provider session.
-
-    A Turn that admitted no rows is not an Inbox ACK, so the unchanged pending
-    set must not stay suppressed until unrelated ingress arrives.
-    """
+    """An empty successful Turn is a provider defer, not a retry timer."""
     store = await make_store(tmp_path)
     await receipt(store, "notice-unread", 10)
     adapter = Adapter()
@@ -572,18 +579,18 @@ async def test_notice_turn_without_correlated_read_rearms_for_same_session(
     assert [row.envelope_id for row in await store.get_pending()] == [
         "notice-unread"
     ]
-    assert after.generation == before.generation + 1
+    assert after.generation == before.generation
     assert after.last_delivered_generation == before.generation
     assert after.last_delivered_provider_session_id == adapter.session
-    assert after.is_due_for(adapter.session)
-    assert await runtime.process_once()
-    assert calls == 2
+    assert not after.is_due_for(adapter.session)
+    assert not await runtime.process_once()
+    assert calls == 1
     assert runtime._degraded is False
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_notice_restart_redelivers_same_session_and_rediscovers_once_for_replacement(
+async def test_notice_restart_suppresses_same_session_and_rediscovers_replacement(
     tmp_path,
 ):
     def described_pending(provider_input):
@@ -609,9 +616,7 @@ async def test_notice_restart_redelivers_same_session_and_rediscovers_once_for_r
     )
     assert await first.process_once()
     accepted = await store.get_notice_state()
-    # The Turn admitted no rows, so the same session stays eligible for a
-    # redelivery rather than stranding the still-pending row.
-    assert accepted.is_due_for(first_adapter.session)
+    assert not accepted.is_due_for(first_adapter.session)
     assert len(first_calls) == 1
 
     resumed_calls = []
@@ -626,9 +631,8 @@ async def test_notice_restart_redelivers_same_session_and_rediscovers_once_for_r
         run_turn=resumed_run,
         workspace=tmp_path,
     )
-    assert await resumed.process_once()
-    assert len(resumed_calls) == 1
-    assert described_pending(resumed_calls[0]) == described_pending(first_calls[0])
+    assert not await resumed.process_once()
+    assert resumed_calls == []
 
     replacement_adapter = Adapter()
     replacement_adapter.session = "provider-2"
@@ -676,7 +680,8 @@ async def test_mixed_message_and_due_reminder_share_one_notice_read_and_turn(tmp
         summary = json.loads(
             planned.provider_input.split("\n", 2)[1]
         )
-        assert summary["message_count"] == 2
+        assert summary["changed_message_count"] == 2
+        assert summary["total_pending_messages"] == 2
         assert summary["targets"] == [{"target": "channel:sp-1:ch-1", "count": 2}]
         await adapter.admit()
         observed["page"] = await runtime.read_inbox(limit=50)
@@ -857,7 +862,8 @@ async def test_different_target_reminder_still_uses_one_global_notice_and_turn(t
         assert ordinary_body not in planned.provider_input
         assert "exact content for the second target" not in planned.provider_input
         summary = json.loads(planned.provider_input.split("\n", 2)[1])
-        assert summary["message_count"] == 2
+        assert summary["changed_message_count"] == 2
+        assert summary["total_pending_messages"] == 2
         assert summary["targets"] == [
             {"target": "channel:sp-1:ch-1", "count": 1},
             {"target": "channel:sp-1:ch-2", "count": 1},
@@ -962,22 +968,24 @@ async def test_changed_pending_generation_replaces_accepted_notice_without_losin
     )
     assert await runtime.process_once()
     accepted = await store.get_notice_state()
-    # Neither Turn admits a read, so each empty Turn re-arms delivery for the
-    # unchanged pending set instead of suppressing it.
-    assert accepted.is_due_for(adapter.session)
+    assert not accepted.is_due_for(adapter.session)
 
     await receipt(store, "second-unread", 11, content=second_body)
     changed = await store.get_notice_state()
     assert changed.generation == accepted.generation + 1
     assert changed.is_due_for(adapter.session)
+    assert [row.envelope_id for row in await store.get_notice_candidates(adapter.session)] == [
+        "second-unread"
+    ]
     assert await runtime.process_once()
     final = await store.get_notice_state()
-    assert final.generation == changed.generation + 1
-    assert final.is_due_for(adapter.session)
+    assert final.generation == changed.generation
+    assert not final.is_due_for(adapter.session)
 
     assert len(notices) == 2
     assert notices[0] != notices[1]
-    assert '"message_count":2' in notices[1]
+    assert '"changed_message_count":1' in notices[1]
+    assert '"total_pending_messages":2' in notices[1]
     assert first_body not in notices[1]
     assert second_body not in notices[1]
     assert [row.envelope_id for row in await store.get_pending()] == [
@@ -988,7 +996,7 @@ async def test_changed_pending_generation_replaces_accepted_notice_without_losin
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal", ["provider_failure", "cancellation"])
-async def test_accepted_empty_notice_rearms_after_non_success_terminal(
+async def test_failed_empty_notice_releases_delivery_for_retry(
     tmp_path, terminal,
 ):
     store = await make_store(tmp_path)
@@ -1019,9 +1027,9 @@ async def test_accepted_empty_notice_rearms_after_non_success_terminal(
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    rearmed = await store.get_notice_state()
-    assert rearmed.generation == before.generation + 1
-    assert rearmed.is_due_for(adapter.session)
+    released = await store.get_notice_state()
+    assert released.generation == before.generation
+    assert released.is_due_for(adapter.session)
     assert [row.envelope_id for row in await store.get_pending()] == [
         f"{terminal}-notice",
     ]
@@ -1029,7 +1037,7 @@ async def test_accepted_empty_notice_rearms_after_non_success_terminal(
 
 
 @pytest.mark.asyncio
-async def test_crash_recovery_requeues_empty_notice_turn_and_rearms_delivery(tmp_path):
+async def test_crash_recovery_requeues_empty_notice_turn_and_releases_delivery(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "notice-crash", 11)
     adapter = Adapter()
@@ -1063,8 +1071,8 @@ async def test_crash_recovery_requeues_empty_notice_turn_and_rearms_delivery(tmp
     assert [row.envelope_id for row in await store.get_pending()] == [
         "notice-crash"
     ]
-    assert after.generation == before.generation + 1
-    assert after.last_delivered_generation == before.generation
+    assert after.generation == before.generation
+    assert after.last_delivered_generation < before.generation
     assert after.delivery_pending
     assert not recovered.current_turn_path.exists()
     await store.close()
@@ -1078,6 +1086,7 @@ async def test_startup_recovers_orphaned_turn_without_crash_join(
 ):
     store = await make_store(tmp_path)
     await receipt(store, "orphan-pending", 12)
+    await receipt(store, "orphan-tail", 13)
     notice = await store.get_notice_state()
     assert await store.mark_notice_delivered(notice.generation, "provider-old")
     if admitted:
@@ -1114,8 +1123,13 @@ async def test_startup_recovers_orphaned_turn_without_crash_join(
     repaired = await store.get_notice_state()
     assert run is not None and run.state == "requeued"
     assert [row.envelope_id for row in await store.get_pending()] == [
-        "orphan-pending"
+        "orphan-pending",
+        "orphan-tail",
     ]
+    assert [
+        row.envelope_id
+        for row in await store.get_notice_candidates("provider-old")
+    ] == ["orphan-pending", "orphan-tail"]
     assert repaired.delivery_pending
     assert await store.get_active_turn_runs() == ()
     if admitted:

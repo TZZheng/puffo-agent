@@ -232,6 +232,10 @@ INSERT OR IGNORE INTO inbox_notice_state(
     singleton, generation, pending_count, first_pending_deadline_ms,
     last_delivered_generation
 ) VALUES (1, 0, 0, NULL, 0);
+CREATE TABLE IF NOT EXISTS inbox_notice_contributions (
+    envelope_id TEXT PRIMARY KEY,
+    provider_session_id TEXT NOT NULL
+);
 
 -- One row is both the immutable one-shot reminder intent and its only
 -- occurrence. This table intentionally represents a single trigger only.

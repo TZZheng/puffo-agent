@@ -140,6 +140,13 @@ Important boundaries:
 - One `GlobalInboxRuntime` owns one serial provider boundary per Agent. New
   arrivals can be steered only when the active Driver exposes a safe steering
   capability; otherwise they remain durable for the next turn.
+- The three-second window coalesces newly changed pending IDs. It is not a retry
+  interval for an unchanged unread set. A successful notice turn that performs
+  no Inbox read is a normal provider defer and does not immediately run again.
+- Notice delivery records the exact pending IDs contributed to the current
+  native provider session. Later arrivals produce a delta notice; a replacement
+  session rediscovers the remaining pending set once. Provider failure or crash
+  recovery releases the affected delivery evidence so it can be retried.
 - Plain assistant output is suppressed for Global Inbox turns. Chat output must
   use `send_message`, so routing is explicit and one turn may send to several
   targets.
@@ -203,6 +210,11 @@ failures. Provider-native diagnostics stay opaque and are not serialized.
 
 `cli-sandbox` is reserved. Hermes and Gemini remain named design candidates but
 are rejected by the current runtime matrix.
+
+Codex accepts active-turn Inbox deltas through native `turn/steer`. Claude Code
+accepts them only at a stream-json tool-result or compaction boundary; if no such
+boundary occurs, the durable delta remains for the next turn. Drivers without a
+safe capability always use that next-turn path.
 
 ## 6. Durable State
 

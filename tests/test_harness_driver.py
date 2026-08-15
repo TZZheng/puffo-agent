@@ -227,7 +227,7 @@ def test_claude_effective_capabilities():
     compact = claude_capabilities(True)
     assert baseline.session_resume is True
     assert baseline.inflight_turn_recovery is False
-    assert baseline.steer == baseline.cancel == "none"
+    assert (baseline.steer, baseline.cancel) == ("gated", "none")
     assert baseline.context_status == "pull"
     assert baseline.compact == "none"
     assert compact.compact == "session_command"
@@ -1264,10 +1264,6 @@ async def _assert_claude_unsupported_calls_write_nothing(
     driver, started, process,
 ):
     assert isinstance(
-        await driver.steer_turn(started.turn_ref, TurnInput("x")),
-        UnsupportedCapability,
-    )
-    assert isinstance(
         await driver.cancel_turn(started.turn_ref), UnsupportedCapability
     )
     before = len(process.stdin.writes)
@@ -1303,7 +1299,7 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
                     },
                 })
                 return
-            if frame.get("uuid"):
+            if frame.get("uuid") == "replay-1":
                 proc.feed({
                     **frame, "isReplay": True,
                     "message": {"role": "user", "content": [
@@ -1318,16 +1314,8 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
                             "type": "tool_use", "id": "tool-claude",
                             "name": "read_inbox", "input": {"limit": 1},
                         },
-                    ]},
+                        ]},
                 })
-                proc.feed({
-                    "type": "user", "message": {"content": [{
-                        "type": "tool_result", "tool_use_id": "tool-claude",
-                        "content": "[puffo:model-visible-read:receipt-claude]",
-                    }]},
-                })
-                proc.feed({"type": "result", "subtype": "success", "usage": {}})
-                proc.feed({"type": "rate_limit_event", "secret": "not-public"})
 
         proc = _FakeProcess(on_frame)
         holder["proc"] = proc
@@ -1351,6 +1339,17 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
     await _next_matching(stream, "turn.started")
     await _next_matching(stream, "turn.assistant_delta")
     await _next_matching(stream, "turn.tool_started")
+    steered = asyncio.create_task(
+        driver.steer_turn(started.turn_ref, TurnInput("inbox delta"))
+    )
+    await asyncio.sleep(0)
+    assert not steered.done()
+    holder["proc"].feed({
+        "type": "user", "message": {"content": [{
+            "type": "tool_result", "tool_use_id": "tool-claude",
+            "content": "[puffo:model-visible-read:receipt-claude]",
+        }]},
+    })
     tool_completed = await _next_matching(stream, "turn.tool_completed")
     assert tool_completed.data == {
         "tool_call_ref": "tool-claude",
@@ -1359,6 +1358,9 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
     }
     assert "arguments" not in tool_completed.data
     assert "result" not in tool_completed.data
+    assert (await steered).delivery == "gated_boundary"
+    holder["proc"].feed({"type": "result", "subtype": "success", "usage": {}})
+    holder["proc"].feed({"type": "rate_limit_event", "secret": "not-public"})
     await _next_matching(stream, "turn.completed")
     trailing = await _next_matching(stream, "session.updated")
     assert trailing.turn_ref is None

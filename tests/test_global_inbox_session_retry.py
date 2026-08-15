@@ -157,6 +157,38 @@ async def test_failed_session_transition_processes_nothing(tmp_path):
     await store.close()
 
 
+@pytest.mark.asyncio
+async def test_empty_notice_retry_moves_delivery_to_replacement_session(tmp_path):
+    """A successful replacement must not wake again for the same notice IDs."""
+    store = await make_store(tmp_path)
+    await receipt(store, "unread-row", 1)
+    adapter = _RetrySessionAdapter()
+
+    class Runner:
+        async def __call__(self, _planned):
+            await adapter.admit(session=SESSION_A, provider_turn_id="turn-1")
+            raise AgentAPIError("rate limit", is_auth=False)
+
+        async def handle_global_inbox_retry(self, _planned):
+            adapter.session = SESSION_B
+            await adapter.admit(session=SESSION_B, provider_turn_id="turn-2")
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=Runner(),
+        workspace=tmp_path,
+        retry_sleep=lambda _delay: asyncio.sleep(0),
+    )
+
+    assert await runtime.process_once()
+    state = await store.get_notice_state()
+    assert state.last_delivered_provider_session_id == SESSION_B
+    assert not await store.get_notice_candidates(SESSION_B)
+    assert not await runtime.process_once()
+    await store.close()
+
+
 async def _seed_transfer_store(tmp_path):
     store = await make_store(tmp_path)
     for index, envelope_id in enumerate(("row-1", "row-2", "row-3"), start=1):

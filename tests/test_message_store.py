@@ -1476,9 +1476,10 @@ async def test_durable_notice_deadline_is_fixed_and_survives_reopen(tmp_path):
     assert accepted.last_delivered_provider_session_id == "provider-1"
     assert not accepted.is_due_for("provider-1")
     assert not accepted.is_due_for(None)
-    assert not accepted.is_due_for("provider-2")
+    assert accepted.is_due_for("provider-2")
     assert not await reopened.mark_notice_delivered(later.generation, "provider-1")
-    assert not await reopened.mark_notice_delivered(later.generation, "provider-2")
+    assert await reopened.mark_notice_delivered(later.generation, "provider-2")
+    assert not await reopened.get_notice_candidates("provider-2")
     await reopened.close()
 
 
@@ -1520,7 +1521,7 @@ async def test_notice_state_session_migration_preserves_baseline_row(tmp_path):
         state.last_delivered_generation,
         state.last_delivered_provider_session_id,
     ) == (7, 3, 4321, 7, None)
-    assert not state.is_due_for("replacement-session")
+    assert state.is_due_for("replacement-session")
     db = await store._ensure_db()
     async with db.execute("PRAGMA table_info(inbox_notice_state)") as cursor:
         columns = {row["name"] for row in await cursor.fetchall()}
@@ -1530,36 +1531,34 @@ async def test_notice_state_session_migration_preserves_baseline_row(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_empty_notice_turn_rearms_unchanged_pending_work_atomically(tmp_path):
-    now = [1_000]
-    store = MessageStore(tmp_path / "notice-rearm.db", now_ms=lambda: now[0])
+async def test_failed_notice_delivery_releases_exact_contribution(tmp_path):
+    store = MessageStore(tmp_path / "notice-release.db")
     await store.store_receipt(
-        _channel_payload("notice-pending"),
+        _channel_payload("notice-first"),
         server_seq=1,
         disposition=ReceiptDisposition.ELIGIBLE,
         reason="test",
     )
-    delivered = await store.get_notice_state()
-    assert await store.mark_notice_delivered(delivered.generation, "provider-1")
-    await store.start_turn(
-        turn_id="empty-notice-turn",
-        provider_session_id="provider-1",
+    await store.store_receipt(
+        _channel_payload("notice-second"),
+        server_seq=2,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
     )
-
-    now[0] = 2_000
-    run = await store.finalize_empty_turn(
-        turn_id="empty-notice-turn",
-        state="requeued",
-        rearm_notice=True,
+    state = await store.get_notice_state()
+    assert await store.mark_notice_delivered(
+        state.generation,
+        "provider-1",
+        ["notice-first"],
     )
-    rearmed = await store.get_notice_state()
-
-    assert run.state == "requeued"
-    assert rearmed.pending_count == 1
-    assert rearmed.generation == delivered.generation + 1
-    assert rearmed.last_delivered_generation == delivered.generation
-    assert rearmed.first_pending_deadline_ms == 5_000
-    assert rearmed.delivery_pending
+    assert [row.envelope_id for row in await store.get_notice_candidates("provider-1")] == [
+        "notice-second"
+    ]
+    assert await store.release_notice_delivery("provider-1", ["notice-first"])
+    assert [row.envelope_id for row in await store.get_notice_candidates("provider-1")] == [
+        "notice-first",
+        "notice-second",
+    ]
     await store.close()
 
 
@@ -1579,6 +1578,7 @@ async def test_successful_empty_notice_turn_keeps_same_session_suppressed(
         turn_id="empty-success-turn",
         provider_session_id="provider-1",
         notice_generation=due.generation,
+        notice_message_ids=["notice-empty-success"],
     )
     run = await store.finalize_empty_turn(turn_id="empty-success-turn")
     state = await store.get_notice_state()
@@ -1589,8 +1589,25 @@ async def test_successful_empty_notice_turn_keeps_same_session_suppressed(
     assert state.last_delivered_generation == due.generation
     assert state.last_delivered_provider_session_id == "provider-1"
     assert not state.is_due_for("provider-1")
-    assert not state.is_due_for("provider-2")
+    assert state.is_due_for("provider-2")
     assert await store.get_active_turn_runs() == ()
+    await store.store_receipt(
+        _channel_payload("notice-after-terminal"),
+        server_seq=2,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    changed = await store.get_notice_state()
+    assert not await store.mark_notice_delivered(
+        changed.generation,
+        "provider-1",
+        ["notice-after-terminal"],
+        turn_id="empty-success-turn",
+    )
+    assert [
+        row.envelope_id
+        for row in await store.get_notice_candidates("provider-1")
+    ] == ["notice-after-terminal"]
     await store.close()
 
 
