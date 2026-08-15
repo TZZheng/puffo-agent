@@ -104,8 +104,8 @@ sequenceDiagram
     I->>I: coalesce and group by space + channel/thread/DM target
     I->>DB: create daemon-owned active turn
     I->>L: metadata-only Inbox notice
-    L->>M: read_messages(view=pending) and optional view=history reads
-    M->>DB: read pending page and move exact displayed rows to in_turn
+    L->>M: read_inbox and optional read_history calls
+    M->>DB: return one bounded window; admit any displayed pending rows
     L->>M: zero or more send_message calls
     M->>C: semantic destination, body, thread, visibility, send_anyway
     C->>S: coordinated channel send
@@ -129,8 +129,8 @@ Important boundaries:
 
 - The transport pushes availability; the model does not poll the Server.
 - The Inbox notice is metadata, not a replay of every message. The model reads
-  exact pending rows through `read_messages(view="pending")`; the same tool's
-  history view supplies supplementary context without changing pending intent.
+  exact pending rows through `read_inbox`; `read_history` supplies earlier
+  local conversation context through the same semantic projection.
 - The daemon creates the local active turn before writing provider input.
   The pending view directly admits returned rows into that turn; it has no
   separate receipt, continuation callback, or model acknowledgement step.
@@ -349,8 +349,8 @@ Use these entry points when tracing a change:
 ## 12. Invariants
 
 1. Inbound content is durably classified before transport acknowledgement.
-2. Only rows explicitly returned by `read_messages(view="pending")` advance
-   from pending into the daemon-owned active turn and become visible to it.
+2. A pending row advances into the daemon-owned active turn only when it is
+   explicitly returned to the provider by `read_inbox` or `read_history`.
 3. Global Inbox turns serialize per Agent; target identity remains explicit.
 4. Freshness metadata is daemon-owned and never model-authored.
 5. A held send has no message, delivery, notification, or freshness side

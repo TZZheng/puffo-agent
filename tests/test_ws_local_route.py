@@ -57,7 +57,7 @@ async def test_ws_local_adapter_requires_exact_read_admission_correlation():
     adapter.register_continuation_callback(
         callback,
         "inbox-read-key",
-        tool_names=("read_messages",),
+        tool_names=("read_inbox",),
         tool_arguments={"limit": 7},
         correlation_receipt="read-receipt",
     )
@@ -77,12 +77,12 @@ async def test_ws_local_adapter_requires_exact_read_admission_correlation():
     with pytest.raises(RuntimeError, match="argument correlation failed"):
         await adapter.emit_admission(
             turn_id="turn-1", correlation_key="read-receipt",
-            tool_name="read_messages", tool_arguments={"limit": 8},
+            tool_name="read_inbox", tool_arguments={"limit": 8},
         )
     assert seen == []
     await adapter.emit_admission(
         turn_id="turn-1", correlation_key="read-receipt",
-        tool_name="read_messages", tool_arguments={"limit": 7},
+        tool_name="read_inbox", tool_arguments={"limit": 7},
     )
     assert len(seen) == 1
     assert seen[0].planning_cycle_key == "inbox-read-key"
@@ -412,7 +412,7 @@ async def test_full_attach_flow_v1_peer_receives_single_root_bundle_and_can_send
 
     Covers the documented v1 guarantee in both directions: the peer is
     scheduled and delivered a frozen single-root batch off the owned runtime
-    (it used to receive nothing at all), its pending ``read_messages`` is admitted
+    (it used to receive nothing at all), its pending ``read_inbox`` is admitted
     without any ``admitted`` frame (v1 has none), and ``send_message``
     reaches a real SendCoordinator (it used to fail closed with
     ``coordinator_unavailable``).
@@ -464,7 +464,7 @@ async def test_full_attach_flow_v1_peer_receives_single_root_bundle_and_can_send
 
     # The notice read directly admits the returned rows to the active turn.
     transport.feed({"type": "tool_call", "command_id": "cmd_0",
-                    "tool": "read_messages", "params": {}})
+                    "tool": "read_inbox", "params": {}})
     read = await _poll(lambda: _ready(transport.by_type("tool_result")))
     assert read[0]["ok"] is True
     assert "admission_receipt" not in read[0]["result"]

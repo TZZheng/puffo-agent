@@ -8,7 +8,7 @@ it via ``host.docker.internal`` → host's 127.0.0.1."""
 from __future__ import annotations
 
 import logging
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from aiohttp import web
 
@@ -135,13 +135,42 @@ _MODEL_VISIBLE_READ_BODY_KEYS = frozenset({
     "visible_message_ids",
 })
 _MODEL_VISIBLE_READ_TOOLS = frozenset({
+    "read_history",
+    # Rolling-upgrade compatibility for older MCP subprocesses.
     "read_messages",
-    # Rolling-upgrade compatibility for an older MCP subprocess.
     "get_channel_history",
     "get_thread_history",
     "get_post",
     "get_post_segment",
 })
+
+
+def _validate_model_visible_boundary(
+    body: dict[str, Any],
+) -> web.Response | None:
+    keys = ("space_id", "channel_id", "through_seq", "through_envelope_id")
+    present = sum(key in body for key in keys)
+    if present not in {0, len(keys)}:
+        return web.json_response(
+            {"error": "model-visible channel watermark is incomplete"}, status=400,
+        )
+    if not present:
+        return None
+    for key in ("space_id", "channel_id", "through_envelope_id"):
+        if not isinstance(body.get(key), str) or not body[key].strip():
+            return web.json_response(
+                {"error": f"{key} is required"}, status=400,
+            )
+    through_seq = body.get("through_seq")
+    if (
+        not isinstance(through_seq, int)
+        or isinstance(through_seq, bool)
+        or through_seq < 0
+    ):
+        return web.json_response(
+            {"error": "through_seq must be a non-negative integer"}, status=400,
+        )
+    return None
 
 
 async def send_message_route(request: web.Request) -> web.Response:
@@ -220,7 +249,7 @@ async def send_message_route(request: web.Request) -> web.Response:
 
 
 async def stage_model_visible_read_route(request: web.Request) -> web.Response:
-    """Stage a trusted local-history watermark for provider admission."""
+    """Stage exact model-visible rows and an optional channel watermark."""
     agent_id = request.match_info["agent_id"]
     try:
         body = await request.json()
@@ -239,25 +268,13 @@ async def stage_model_visible_read_route(request: web.Request) -> web.Response:
             },
             status=400,
         )
-    for key in (
-        "space_id",
-        "channel_id",
-        "through_envelope_id",
-        "tool_name",
-    ):
-        if not isinstance(body.get(key), str) or not body[key].strip():
-            return web.json_response(
-                {"error": f"{key} is required"}, status=400,
-            )
-    if (
-        not isinstance(body.get("through_seq"), int)
-        or isinstance(body["through_seq"], bool)
-        or body["through_seq"] < 0
-    ):
+    if not isinstance(body.get("tool_name"), str) or not body["tool_name"].strip():
         return web.json_response(
-            {"error": "through_seq must be a non-negative integer"},
-            status=400,
+            {"error": "tool_name is required"}, status=400,
         )
+    boundary_error = _validate_model_visible_boundary(body)
+    if boundary_error is not None:
+        return boundary_error
     if body["tool_name"] not in _MODEL_VISIBLE_READ_TOOLS:
         return web.json_response(
             {"error": "tool_name is not a model-visible message read"},
@@ -299,10 +316,10 @@ async def stage_model_visible_read_route(request: web.Request) -> web.Response:
     try:
         result = await host_mcp_handler.stage_model_visible_read(
             ctx,
-            space_id=body["space_id"],
-            channel_id=body["channel_id"],
-            through_seq=body["through_seq"],
-            through_envelope_id=body["through_envelope_id"],
+            space_id=body.get("space_id"),
+            channel_id=body.get("channel_id"),
+            through_seq=body.get("through_seq"),
+            through_envelope_id=body.get("through_envelope_id"),
             tool_name=body["tool_name"],
             tool_arguments=tool_arguments,
             visible_message_ids=visible_message_ids,

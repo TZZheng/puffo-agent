@@ -23,8 +23,6 @@ from .global_inbox_types import (
 from .inbox_scheduler import MAX_FORMATTED_BYTES, NoticeDeliveryCapability
 from .message_projection import CONTEXT_VERSION
 from .message_store import (
-    PRIOR_CONTEXT_MAX_BYTES,
-    PRIOR_CONTEXT_MAX_ITEMS,
     ProcessingState,
     ReceiptDisposition,
     StoredMessage,
@@ -39,10 +37,10 @@ logger = logging.getLogger("puffo_agent.agent.global_inbox_runtime")
 class VisibleReadContext:
     active_turn_id: str
     provider_session_id: str
-    space_id: str
-    channel_id: str
-    through_seq: int
-    through_envelope_id: str
+    space_id: str | None
+    channel_id: str | None
+    through_seq: int | None
+    through_envelope_id: str | None
     visible_ids: tuple[str, ...]
     correlation_key: str
     correlation_receipt: str
@@ -55,13 +53,6 @@ class InboxPageProjection:
     next_cursor: str | None
     has_more: bool
     remaining_count: int
-
-
-@dataclass(frozen=True)
-class PriorContextProjection:
-    blocks: tuple[str, ...]
-    message_ids: tuple[str, ...]
-    has_more: bool
 
 
 class InboxAdmissionMixin:
@@ -576,42 +567,57 @@ class InboxAdmissionMixin:
     async def _prepare_visible_read(
         self,
         *,
-        space_id: str,
-        channel_id: str,
-        through_seq: int,
-        through_envelope_id: str,
+        space_id: str | None,
+        channel_id: str | None,
+        through_seq: int | None,
+        through_envelope_id: str | None,
         visible_message_ids: list[str] | None,
     ) -> VisibleReadContext:
-        if through_seq < 0:
-            raise RuntimeError("model-visible read sequence must be non-negative")
-        row = await self.store.get_message_by_envelope(through_envelope_id)
-        if (
-            row is None
-            or row.server_seq != through_seq
-            or row.space_id != space_id
-            or row.channel_id != channel_id
-            or row.envelope_kind == "dm"
-        ):
-            log_runtime_event(
-                logger,
-                "history.read_staged",
-                level=logging.DEBUG,
-                agent_id=self.agent_id,
-                turn_id=self.active.turn_id,
-                provider_session_id=self.active.provider_session_id,
-                envelope_id=through_envelope_id,
-                space_id=space_id,
-                channel_id=channel_id,
-                latest_seq=through_seq,
-                state=(
-                    "dm_unsupported"
-                    if row is not None and row.envelope_kind == "dm"
-                    else "invalid_watermark"
-                ),
+        visible_ids = list(
+            visible_message_ids
+            or ([through_envelope_id] if through_envelope_id else ())
+        )
+        if not visible_ids:
+            raise RuntimeError("model-visible read requires visible message IDs")
+        boundary = (space_id, channel_id, through_seq, through_envelope_id)
+        has_boundary = all(value not in (None, "") for value in boundary)
+        if any(value not in (None, "") for value in boundary) and not has_boundary:
+            raise RuntimeError("model-visible channel watermark is incomplete")
+        if has_boundary:
+            if (
+                isinstance(through_seq, bool)
+                or not isinstance(through_seq, int)
+                or through_seq < 0
+            ):
+                raise RuntimeError(
+                    "model-visible read sequence must be non-negative"
+                )
+            row = await self.store.get_message_by_envelope(
+                str(through_envelope_id)
             )
-            raise RuntimeError(
-                "model-visible read watermark does not match local storage"
-            )
+            if (
+                row is None
+                or row.server_seq != through_seq
+                or row.space_id != space_id
+                or row.channel_id != channel_id
+                or row.envelope_kind == "dm"
+            ):
+                log_runtime_event(
+                    logger,
+                    "history.read_staged",
+                    level=logging.DEBUG,
+                    agent_id=self.agent_id,
+                    turn_id=self.active.turn_id,
+                    provider_session_id=self.active.provider_session_id,
+                    envelope_id=through_envelope_id,
+                    space_id=space_id,
+                    channel_id=channel_id,
+                    latest_seq=through_seq,
+                    state="invalid_watermark",
+                )
+                raise RuntimeError(
+                    "model-visible read watermark does not match local storage"
+                )
         active_turn_id = self.active.turn_id
         provider_session_id = self.active.provider_session_id
         if not active_turn_id or not provider_session_id:
@@ -627,21 +633,22 @@ class InboxAdmissionMixin:
                 state="no_active_turn",
             )
             raise RuntimeError("no active provider turn for model-visible read")
-        visible_ids = list(visible_message_ids or ())
         await self._add_visible_message_ids(
             visible_ids,
-            space_id=space_id,
-            channel_id=channel_id,
-            through_seq=through_seq,
+            space_id=space_id if has_boundary else None,
+            channel_id=channel_id if has_boundary else None,
+            through_seq=through_seq if has_boundary else None,
             mutate=False,
         )
         return VisibleReadContext(
             active_turn_id=active_turn_id,
             provider_session_id=provider_session_id,
-            space_id=space_id,
-            channel_id=channel_id,
-            through_seq=through_seq,
-            through_envelope_id=through_envelope_id,
+            space_id=str(space_id) if has_boundary else None,
+            channel_id=str(channel_id) if has_boundary else None,
+            through_seq=through_seq if has_boundary else None,
+            through_envelope_id=(
+                str(through_envelope_id) if has_boundary else None
+            ),
             visible_ids=tuple(visible_ids),
             correlation_key=f"visible_read_{uuid.uuid4().hex}",
             correlation_receipt=uuid.uuid4().hex,
@@ -732,13 +739,18 @@ class InboxAdmissionMixin:
                     channel_id=context.channel_id,
                     through_seq=context.through_seq,
                 )
-                await ActiveBoundaryAdapter(
-                    self.store, self.active
-                ).advance_active_turn_through_seq(
-                    context.space_id,
-                    context.channel_id,
-                    context.through_seq,
-                )
+                if (
+                    context.space_id is not None
+                    and context.channel_id is not None
+                    and context.through_seq is not None
+                ):
+                    await ActiveBoundaryAdapter(
+                        self.store, self.active
+                    ).advance_active_turn_through_seq(
+                        context.space_id,
+                        context.channel_id,
+                        context.through_seq,
+                    )
         except Exception:
             self._log_visible_read(context, "admission_failed", event=event)
             raise
@@ -803,15 +815,15 @@ class InboxAdmissionMixin:
     async def stage_model_visible_read(
         self,
         *,
-        space_id: str,
-        channel_id: str,
-        through_seq: int,
-        through_envelope_id: str,
         tool_name: str,
         tool_arguments: Mapping[str, Any],
         visible_message_ids: list[str] | None = None,
+        space_id: str | None = None,
+        channel_id: str | None = None,
+        through_seq: int | None = None,
+        through_envelope_id: str | None = None,
     ) -> dict[str, Any]:
-        """Advance freshness at the adapter's proven model-visible boundary."""
+        """Admit exact model-visible rows and any proven channel boundary."""
         context = await self._prepare_visible_read(
             space_id=space_id,
             channel_id=channel_id,
@@ -834,10 +846,10 @@ class InboxAdmissionMixin:
             "state": state,
             "correlation_key": context.correlation_key,
             "correlation_receipt": context.correlation_receipt,
-            "space_id": space_id,
-            "channel_id": channel_id,
-            "through_seq": through_seq,
-            "through_envelope_id": through_envelope_id,
+            "space_id": context.space_id,
+            "channel_id": context.channel_id,
+            "through_seq": context.through_seq,
+            "through_envelope_id": context.through_envelope_id,
         }
 
     async def _add_visible_message_ids(
@@ -919,50 +931,9 @@ class InboxAdmissionMixin:
             remaining_count=remaining_count,
         )
 
-    async def _project_prior_context(
-        self,
-        selected: tuple[StoredMessage, ...],
-    ) -> PriorContextProjection:
-        prior_context: list[str] = []
-        prior_context_ids: list[str] = []
-        prior_context_has_more = False
-        if selected:
-            anchors: dict[tuple[str, ...], StoredMessage] = {}
-            for item in selected:
-                anchors.setdefault(route_for(item).target, item)
-            prior_rows: dict[str, StoredMessage] = {}
-            for anchor in anchors.values():
-                prior_page = await self.store.get_prior_context_page(
-                    anchor,
-                    limit=PRIOR_CONTEXT_MAX_ITEMS,
-                    max_bytes=PRIOR_CONTEXT_MAX_BYTES,
-                )
-                prior_context_has_more = prior_context_has_more or prior_page.has_more
-                for item in prior_page.items:
-                    prior_rows.setdefault(item.envelope_id, item)
-            prior_byte_count = 0
-            for item in sorted(prior_rows.values(), key=self.store._inbox_order):
-                block = self.formatter(item)
-                block_bytes = len(block.encode("utf-8"))
-                if (
-                    len(prior_context) >= PRIOR_CONTEXT_MAX_ITEMS
-                    or prior_byte_count + block_bytes > PRIOR_CONTEXT_MAX_BYTES
-                ):
-                    prior_context_has_more = True
-                    continue
-                prior_context.append(block)
-                prior_context_ids.append(item.envelope_id)
-                prior_byte_count += block_bytes
-        return PriorContextProjection(
-            blocks=tuple(prior_context),
-            message_ids=tuple(prior_context_ids),
-            has_more=prior_context_has_more,
-        )
-
     async def _admit_inbox_page(
         self,
         projection: InboxPageProjection,
-        prior: PriorContextProjection,
         *,
         snapshot_generation: int,
         requesting_turn_id: str,
@@ -996,9 +967,7 @@ class InboxAdmissionMixin:
             )
             self._raise_send_mode_for(projection.selected)
             self.active.message_ids[:] = list(run.message_ids)
-            await self._add_visible_message_ids(
-                list(ids) + list(prior.message_ids)
-            )
+            await self._add_visible_message_ids(list(ids))
             self.active.routes.extend(routes)
             self._write_current_turn(
                 self._reconstruct_exact_turn(
@@ -1062,11 +1031,9 @@ class InboxAdmissionMixin:
             target=target, cursor=cursor, limit=limit
         )
         projection = self._project_inbox_page(page)
-        prior = await self._project_prior_context(projection.selected)
         if projection.selected:
             await self._admit_inbox_page(
                 projection,
-                prior,
                 snapshot_generation=page.snapshot_generation,
                 requesting_turn_id=requesting_turn_id,
                 requesting_provider_session_id=requesting_provider_session_id,
@@ -1075,8 +1042,6 @@ class InboxAdmissionMixin:
         return {
             "context_version": CONTEXT_VERSION,
             "messages": list(projection.blocks),
-            "prior_context": list(prior.blocks),
-            "prior_context_has_more": prior.has_more,
             "next_cursor": projection.next_cursor,
             "has_more": projection.has_more,
             "remaining_count": projection.remaining_count,

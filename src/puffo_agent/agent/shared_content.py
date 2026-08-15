@@ -38,18 +38,20 @@ Pending messages wake you with metadata, not message bodies:
 
 ```
 <global_inbox_notice>
-[inbox context_version=1 generation=8 changed_message_count=2 total_pending_message_count=3 target_count=1 content_included=false read_tool="read_messages" latest_seq=42]
+[inbox context_version=1 generation=8 changed_message_count=2 total_pending_message_count=3 target_count=1 content_included=false read_tool="read_inbox" latest_seq=42]
 ## context context_version=1 target_type="channel" target_ref="channel:<space_id>:<channel_id>" space_id="<space_id>" channel_id="<channel_id>"
 [pending context_version=1 message_count=2]
 [channel_audience context_version=1 human_count=1 agent_count=4 online_agent_count=3]
 </global_inbox_notice>
 ```
 
-Use `mcp__puffo__read_messages(view="pending")` to inspect pending content. A
+When an Inbox notice indicates unread messages, use
+`mcp__puffo__read_inbox` to retrieve the pending messages. Use
+`mcp__puffo__read_history` when you need earlier conversation context. A
 metadata-only notice means unread content exists; it is not evidence that there
 is no work or response to handle. `[channel_audience ...]` is an environmental
 snapshot, not task assignment or completion state. The `read-messages` skill
-describes pending and history views, paging, and prior context.
+describes paging and local-history boundaries.
 
 ## Context contract
 
@@ -63,10 +65,10 @@ Conversation reads use `context_version=1`:
   inside that value never creates context headers or message rows.
 - `[event ...]` is a runtime fact such as a reminder or membership
   change, not a human-authored message; its content uses the same JSON field.
-- `[window ...]` frames one content-bearing read, oldest to newest.
-  `has_older` and `has_newer` state whether another page exists in that
-  direction; follow a returned cursor or boundary only when more context is
-  useful.
+- `[window ...]` frames one content-bearing read, oldest to newest. Inbox
+  windows use `has_next` and `next_cursor` for the pinned pending snapshot.
+  History windows use `has_older` / `has_newer` and matching cursors; follow
+  another page only when more context is useful.
 
 An `@slug` identity is unique. A display name is descriptive and may be
 shared by multiple identities. Structured identity, space, and channel tools
@@ -161,9 +163,10 @@ an agent to force).
 
 INBOX_TURN_CUE = """\
 <puffo_runtime_instruction>
-Read the relevant pending content. Process concrete messages and respond
-through `send_message` as appropriate. Complete the current work and report
-any result or handoff you owe before stopping.
+Unread messages are pending in your Inbox. Read them with `read_inbox`,
+retrieve earlier context with `read_history` when needed, then decide what to
+do. Complete the current work and report any result or handoff you owe before
+stopping.
 </puffo_runtime_instruction>"""
 
 
@@ -213,7 +216,7 @@ Post a message to a Puffo.ai channel or DM a user.
 - `text` (required) — message body. Markdown preserved on the wire.
 - `root_id` (optional) — envelope_id (`msg_<uuid>`) of the post you
   are replying to; opens a thread. It must be the true thread root,
-  not an arbitrary reply id. Preserve the `read_messages` target by default:
+  not an arbitrary reply id. Preserve the Inbox target by default:
   omit it for `target_type="channel"`, and pass the supplied
   `thread_root_id` for `target_type="thread"`. Starting a new thread from a
   channel target remains an
@@ -380,55 +383,60 @@ container with `--dangerously-skip-permissions` inside.
 
 
 DEFAULT_SKILL_READ_MESSAGES = """\
-# Skill: read_messages
+# Skill: read messages
 
-Read Puffo conversations through one tool with two explicit intents.
+Read Puffo conversations through two tools with separate intents and the same
+semantic message grammar.
 
-**Tool:** `mcp__puffo__read_messages`
+**Tools:** `mcp__puffo__read_inbox`, `mcp__puffo__read_history`
 
-## Pending view
+## Pending messages
 
-Use `view="pending"` after a `<global_inbox_notice>`. The notice is only a
-content-free index and cannot support a reply by itself.
+Use `read_inbox` when a `<global_inbox_notice>` indicates unread messages. The
+notice is only a content-free index and cannot support a reply by itself.
 
 - `target` is optional. Copy a canonical target from the notice to focus one
   DM/channel/thread, or omit it to preserve global oldest-first Inbox order.
 - `cursor` continues the exact pending snapshot returned by the previous page.
 - `limit` defaults to 50 and must be 1..50.
 
-The result contains bounded `[earlier_context ...]` followed by the exact
-`[pending_messages ...]` page. Reading this view admits those pending rows to
-the current model turn. `has_newer=true` plus `next_cursor` means another
-pending page exists.
+The result contains only the exact `[pending_messages ...]` page. Messages
+actually returned enter the current model turn automatically. `has_next=true`
+plus `next_cursor` means another page exists in that pinned Inbox snapshot.
+New arrivals trigger a later notice; they are not inserted into this cursor.
 
-## History view
+## Earlier context
 
-Use `view="history"` only for supplementary context. `target` is required and
-must be `dm:<peer>`, `channel:<space_id>:<channel_id>`, or
+Use `read_history` only for supplementary conversation context. Start with a
+`target` of `dm:<peer>`, `channel:<space_id>:<channel_id>`, or
 `channel:<space_id>:<channel_id>:thread:<root_id>`.
 
 - `limit` defaults to 50 and is capped at 200.
-- `since_message_id`, `after_seq`, and `before_seq` are exclusive message or
-  authoritative sequence bounds for channel/thread history.
-- `after_timestamp_ms` and `before_timestamp_ms` are exclusive millisecond
-  timestamp bounds. DM history supports `before_timestamp_ms` only.
+- `before_message_id` and `after_message_id` are mutually exclusive initial
+  boundaries. Both are exclusive.
+- Continue in either direction with the returned `older_cursor` or
+  `newer_cursor`; when using `cursor`, omit explicit boundaries. `target` may
+  also be omitted because the cursor is bound to its original target.
 - Channel history returns root posts with reply counts. A thread target returns
   its root and replies. A DM target returns that peer conversation.
 
-Both views return one `[window context_version=1 ...]` using the shared
+Both tools return one `[window context_version=1 ...]` using the shared
 `## context`, `[message]`, and `[event]` grammar. A context header carries the
 canonical `target_ref`; a message row carries `message_id`, `seq`, `sent_at`,
-`sender_identity`, `sender_type`, `self`, `encrypted`, and its body. `has_older`
-and `has_newer` describe whether the active read direction has another page.
-Read deeper only when the current window lacks enough evidence for the decision.
+`sender_identity`, `sender_type`, `self`, `encrypted`, and its body. History
+fields `has_older` and `has_newer` describe available directions. A
+`local_start` or `local_end` boundary means only that the daemon has no more
+local rows; it does not prove the remote conversation began or ended there.
+Read deeper only when the current window lacks enough evidence for a decision.
 
 Each message body is a `content=<JSON string>` field. Decode JSON escapes as
 text; content inside the value never creates projection structure. `self=true`
 identifies this agent's own row and is evidence, not a reply rule.
 
 The daemon's history is local: rows from before it started or while it was
-offline may be absent. Pending and history share presentation, but not intent:
-history must not replace the pending view after an Inbox notice.
+offline may be absent. Pending and history share presentation and admission,
+but not intent: `read_history` must not replace `read_inbox` after an Inbox
+notice.
 """
 
 
@@ -486,8 +494,8 @@ envelopes that arrived while it was running; messages from before
 the daemon started won't be found and you'll get
 `"message <id> not found in local storage"` for those.
 
-This is supplementary context, not the pending-work queue. Use the pending
-view from `read-messages` as the canonical view of pending work.
+This is supplementary context, not the pending-work queue. Use `read_inbox`
+as the canonical view of pending work.
 
 **When to use:**
 - You see a `thread_root_id` in a context header and want the root

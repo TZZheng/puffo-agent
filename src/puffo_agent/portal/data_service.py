@@ -199,7 +199,13 @@ async def list_dm_history(request: web.Request) -> web.Response:
     if store is None:
         return web.json_response({"error": "agent db not found"}, status=404)
     try:
-        msgs = await store.get_dm_history(peer, limit, before)
+        msgs = await store.get_dm_history(
+            peer_slug=peer,
+            limit=limit,
+            before=before,
+            before_envelope_id=request.query.get("before_message_id") or None,
+            after_envelope_id=request.query.get("after_message_id") or None,
+        )
     except Exception as exc:
         logger.exception(
             "data-service: get_dm_history failed (agent=%s peer=%s)",
@@ -256,6 +262,7 @@ async def list_channel_roots(request: web.Request) -> web.Response:
     if err is not None:
         return err
     since = request.query.get("since") or None
+    before_message_id = request.query.get("before_message_id") or None
     limit = max(1, min(limit or 20, 201))
     store = await _store_for(request.app, agent_id)
     if store is None:
@@ -265,6 +272,7 @@ async def list_channel_roots(request: web.Request) -> web.Response:
             channel_id,
             limit=limit,
             since_envelope_id=since,
+            before_envelope_id=before_message_id,
             before_ts=before_ts,
             after_ts=after_ts,
             before_seq=before_seq,
@@ -315,6 +323,7 @@ async def list_thread_messages(request: web.Request) -> web.Response:
     if err is not None:
         return err
     since = request.query.get("since") or None
+    before_message_id = request.query.get("before_message_id") or None
     limit = max(1, min(limit or 50, 201))
     store = await _store_for(request.app, agent_id)
     if store is None:
@@ -324,6 +333,7 @@ async def list_thread_messages(request: web.Request) -> web.Response:
             root_id,
             limit=limit,
             since_envelope_id=since,
+            before_envelope_id=before_message_id,
             before_ts=before_ts,
             after_ts=after_ts,
             before_seq=before_seq,

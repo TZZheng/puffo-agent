@@ -166,10 +166,16 @@ class DataClient:
             return []
 
     async def get_dm_history(
-        self, peer_slug: str, limit: int = 20, before: int | None = None,
+        self,
+        peer_slug: str,
+        limit: int = 20,
+        before: int | None = None,
+        before_envelope_id: str | None = None,
+        after_envelope_id: str | None = None,
     ) -> list[StoredMessageDict]:
         """Recent DM messages exchanged with ``peer_slug``, oldest first.
-        ``before`` is an exclusive ms-epoch upper bound for paging."""
+        Message-id bounds are exclusive and stable across equal timestamps.
+        ``before`` remains as a legacy ms-epoch upper bound."""
         path = (
             f"/v1/data/{urllib.parse.quote(self.agent_id, safe='')}"
             f"/dms/recent"
@@ -177,6 +183,10 @@ class DataClient:
         params = {"peer": peer_slug, "limit": str(limit)}
         if before is not None:
             params["before"] = str(before)
+        if before_envelope_id:
+            params["before_message_id"] = before_envelope_id
+        if after_envelope_id:
+            params["after_message_id"] = after_envelope_id
         session = await self._get_session()
         try:
             async with session.get(
@@ -203,15 +213,16 @@ class DataClient:
         channel_id: str,
         limit: int = 20,
         since_envelope_id: str | None = None,
+        before_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
         before_seq: int | None = None,
         after_seq: int | None = None,
     ) -> list[ChannelRootDict]:
         """Root posts in ``channel_id`` with reply counts. Filters:
-        ``since_envelope_id`` (results have ``sent_at >`` that
-        envelope's ``sent_at``), explicit ms-epoch bounds, and explicit
-        authoritative server-sequence bounds.
+        ``since_envelope_id`` and ``before_envelope_id`` are exclusive
+        composite message boundaries. Legacy timestamp and sequence bounds
+        remain available to internal callers.
         """
         path = (
             f"/v1/data/{urllib.parse.quote(self.agent_id, safe='')}"
@@ -223,6 +234,8 @@ class DataClient:
         }
         if since_envelope_id:
             params["since"] = since_envelope_id
+        if before_envelope_id:
+            params["before_message_id"] = before_envelope_id
         if before_ts is not None:
             params["before"] = str(before_ts)
         if after_ts is not None:
@@ -263,6 +276,7 @@ class DataClient:
         root_id: str,
         limit: int = 50,
         since_envelope_id: str | None = None,
+        before_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
         before_seq: int | None = None,
@@ -277,6 +291,8 @@ class DataClient:
         params: dict[str, str] = {"limit": str(limit)}
         if since_envelope_id:
             params["since"] = since_envelope_id
+        if before_envelope_id:
+            params["before_message_id"] = before_envelope_id
         if before_ts is not None:
             params["before"] = str(before_ts)
         if after_ts is not None:

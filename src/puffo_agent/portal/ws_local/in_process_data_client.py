@@ -52,6 +52,7 @@ class InProcessDataClient:
         channel_id: str,
         limit: int = 20,
         since_envelope_id: str | None = None,
+        before_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
         before_seq: int | None = None,
@@ -61,6 +62,7 @@ class InProcessDataClient:
             channel_id=channel_id,
             limit=limit,
             since_envelope_id=since_envelope_id,
+            before_envelope_id=before_envelope_id,
             before_ts=before_ts,
             after_ts=after_ts,
             before_seq=before_seq,
@@ -68,15 +70,27 @@ class InProcessDataClient:
         )
 
     async def get_dm_history(
-        self, peer_slug: str, limit: int = 20, before: int | None = None,
+        self,
+        peer_slug: str,
+        limit: int = 20,
+        before: int | None = None,
+        before_envelope_id: str | None = None,
+        after_envelope_id: str | None = None,
     ) -> list[StoredMessage]:
-        return await self._store.get_dm_history(peer_slug, limit, before)
+        return await self._store.get_dm_history(
+            peer_slug=peer_slug,
+            limit=limit,
+            before=before,
+            before_envelope_id=before_envelope_id,
+            after_envelope_id=after_envelope_id,
+        )
 
     async def get_thread_messages(
         self,
         root_id: str,
         limit: int = 50,
         since_envelope_id: str | None = None,
+        before_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
         before_seq: int | None = None,
@@ -86,6 +100,7 @@ class InProcessDataClient:
             root_id=root_id,
             limit=limit,
             since_envelope_id=since_envelope_id,
+            before_envelope_id=before_envelope_id,
             before_ts=before_ts,
             after_ts=after_ts,
             before_seq=before_seq,

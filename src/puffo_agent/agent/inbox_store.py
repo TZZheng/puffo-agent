@@ -523,16 +523,20 @@ class InboxStoreMixin:
         if target and not (target.startswith("channel:") or target.startswith("dm:")):
             raise ValueError("invalid Inbox target")
         async with self._inbox_lock:
+            decoded: dict[str, Any] | None = None
+            if cursor:
+                decoded = self._decode_inbox_cursor(cursor)
+                cursor_target = decoded["target"]
+                if target and cursor_target != target:
+                    raise ValueError("Inbox cursor belongs to another target")
+                target = cursor_target
             state = await self._notice_state_unlocked()
             pending = tuple(
                 item
                 for item in await self._get_pending_unlocked()
                 if not target or self.target_projection(item) == target
             )
-            if cursor:
-                decoded = self._decode_inbox_cursor(cursor)
-                if decoded["target"] != target:
-                    raise ValueError("Inbox cursor belongs to another target")
+            if decoded is not None:
                 generation = int(decoded["generation"])
                 ceiling = tuple(decoded["ceiling"])
                 last = tuple(decoded["last"])

@@ -1125,26 +1125,40 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         peer_slug: str,
         limit: int = 50,
         before: int | None = None,
+        before_envelope_id: str | None = None,
+        after_envelope_id: str | None = None,
     ) -> list[StoredMessage]:
         db = await self._ensure_db()
+        after_resolved = await self._resolve_since_sent_at(after_envelope_id)
+        before_resolved = await self._resolve_since_sent_at(before_envelope_id)
+        clauses = [
+            "envelope_kind = 'dm'",
+            "(sender_slug = ? OR recipient_slug = ?)",
+            _NOT_GATED,
+        ]
+        params: list[Any] = [peer_slug, peer_slug]
+        if after_resolved is not None:
+            clauses.append("(sent_at > ? OR (sent_at = ? AND envelope_id > ?))")
+            params.extend([after_resolved[0], after_resolved[0], after_resolved[1]])
+        if before_resolved is not None:
+            clauses.append("(sent_at < ? OR (sent_at = ? AND envelope_id < ?))")
+            params.extend([before_resolved[0], before_resolved[0], before_resolved[1]])
         if before is not None:
-            sql = f"""SELECT * FROM messages
-                     WHERE envelope_kind = 'dm'
-                       AND (sender_slug = ? OR recipient_slug = ?)
-                       AND sent_at < ? AND {_NOT_GATED}
-                     ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"""
-            params: tuple = (peer_slug, peer_slug, before, limit)
-        else:
-            sql = f"""SELECT * FROM messages
-                     WHERE envelope_kind = 'dm'
-                       AND (sender_slug = ? OR recipient_slug = ?)
-                       AND {_NOT_GATED}
-                     ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"""
-            params = (peer_slug, peer_slug, limit)
-
-        async with db.execute(sql, params) as cursor:
+            clauses.append("sent_at < ?")
+            params.append(before)
+        order, selected_oldest_first = _history_order(
+            column_prefix="",
+            after_seq=None,
+            before_seq=None,
+            since_resolved=after_resolved,
+            before_resolved=before_resolved,
+        )
+        params.append(max(1, min(int(limit), 201)))
+        sql = f"SELECT * FROM messages WHERE {' AND '.join(clauses)} ORDER BY {order} LIMIT ?"
+        async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
-        return [self._row_to_msg(r) for r in reversed(rows)]
+        selected = rows if selected_oldest_first else reversed(rows)
+        return [self._row_to_msg(row) for row in selected]
 
     async def get_message_by_envelope(
         self,

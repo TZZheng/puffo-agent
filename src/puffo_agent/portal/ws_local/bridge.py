@@ -114,7 +114,7 @@ def _v1_notice_group(planned) -> tuple[str, dict[str, object], list[dict[str, ob
     """The v1 rendering of a scheduled Inbox *notice*.
 
     A scheduled turn carries no items — it is a notice whose content the
-    peer fetches through the pending ``read_messages`` view. The v2 bundle
+    peer fetches through ``read_inbox``. The v2 bundle
     carries that in its
     ``notice`` field, which the v1 frame has no room for, so the identical
     ``provider_input`` rides the frozen message shape instead. The peer's

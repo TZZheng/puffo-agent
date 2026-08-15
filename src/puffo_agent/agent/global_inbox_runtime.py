@@ -561,7 +561,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 audiences,
             ),
             latest_seq=latest_seq,
-            read_tool="read_messages",
+            read_tool="read_inbox",
         )
         provider_input = (
             "<global_inbox_notice>\n"

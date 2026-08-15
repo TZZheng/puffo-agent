@@ -42,7 +42,6 @@ from puffo_agent.agent.runtime_event_outbox import RuntimeEventOutbox
 from puffo_agent.agent.shared_content import INBOX_TURN_CUE
 from puffo_agent.crypto.keystore import KeyStore
 
-from _global_inbox_support import _run_prior_context_delivery_case
 from test_global_inbox_runtime import (
     Adapter,
     ScriptedContext,
@@ -287,26 +286,7 @@ def test_format_stored_message_marks_only_runtime_identity_aliases(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_peer_progress_turn_receives_grounded_prior_context(tmp_path):
-    result = await _run_prior_context_delivery_case(tmp_path)
-    assert result["provider_turns"] == 2
-    assert result["transport_calls"] == 1
-    assert result["peer_state"] is ProcessingState.PROCESSED
-    second_input = json.dumps(result["provider_inputs"][1], sort_keys=True)
-    for expected in (
-        result["human_body"],
-        result["first_contribution"],
-        result["peer_body"],
-    ):
-        assert expected in second_input
-    assert result["self_metadata"]["sender_slug"] == "agent"
-    assert result["self_metadata"]["is_self"] is True
-    assert result["prior_ids"] == ["human-origin", "agent-contribution"]
-    assert result["future_state"] is ProcessingState.PENDING
-
-
-@pytest.mark.asyncio
-async def test_read_inbox_prior_context_preserves_paging_and_exact_admission(
+async def test_read_inbox_pages_only_pending_rows_with_exact_admission(
     tmp_path,
 ):
     store = await make_store(tmp_path)
@@ -349,22 +329,12 @@ async def test_read_inbox_prior_context_preserves_paging_and_exact_admission(
     )
     assert "page one" in first["messages"][0]
     assert "page two" in second["messages"][0]
-    assert [
-        projection_metadata(block)["envelope_id"]
-        for block in first["prior_context"]
-    ] == ["prior-page-context"]
-    assert [
-        projection_metadata(block)["envelope_id"]
-        for block in second["prior_context"]
-    ] == ["prior-page-context"]
     assert first["has_more"] is True
     assert second["has_more"] is False
-    assert first["prior_context_has_more"] is False
-    assert second["prior_context_has_more"] is False
     assert second["next_cursor"] == ""
     assert runtime.active.message_ids == ["page-context-1", "page-context-2"]
     assert runtime.active.visible_message_ids == [
-        "page-context-1", "prior-page-context", "page-context-2",
+        "page-context-1", "page-context-2",
     ]
     prior = await store.get_message_by_envelope("prior-page-context")
     page_rows = await asyncio.gather(
@@ -515,7 +485,7 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     assert "latest_seq=9" in initial.provider_input
     assert "context_version=1" in initial.provider_input
     assert "content_included=false" in initial.provider_input
-    assert 'read_tool="read_messages"' in initial.provider_input
+    assert 'read_tool="read_inbox"' in initial.provider_input
     assert "channel:sp-1:ch-1" in initial.provider_input
     assert "channel:sp-1:ch-1:thread:root-1" in initial.provider_input
     audience = ("[channel_audience context_version=1 human_count=1 "
@@ -524,7 +494,7 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     assert initial.provider_input.count("[channel_audience ") == 2
     assert audience_reads == [("sp-1", "ch-1")]
     assert initial.provider_input.endswith(INBOX_TURN_CUE)
-    assert "respond" in initial.provider_input
+    assert "decide what to do" in " ".join(initial.provider_input.split())
     assert "decide-response" not in initial.provider_input
     assert plaintext not in initial_serialized
     assert attachment not in initial_serialized
@@ -1401,8 +1371,6 @@ async def test_read_inbox_byte_guard_admits_only_the_returned_page(
     assert set(page) == {
         "context_version",
         "messages",
-        "prior_context",
-        "prior_context_has_more",
         "next_cursor",
         "has_more",
         "remaining_count",

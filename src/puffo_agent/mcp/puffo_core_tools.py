@@ -85,7 +85,7 @@ async def _resolve_channel_space(cfg: Any, channel_id: str) -> str:
                 f"start with 'ch_'). If it's a user slug, prepend "
                 f"'@' to DM them: send_message(channel='@{channel_id}', "
                 f"...); to read a DM conversation use "
-                f"read_messages(view='history', target='dm:{channel_id}'). "
+                f"read_history(target='dm:{channel_id}'). "
                 f"To find a "
                 f"channel id, call list_channels_in_all_spaces."
             )
@@ -118,9 +118,8 @@ async def _stage_model_visible_messages(
     tool_name: str,
     tool_arguments: dict[str, object],
 ) -> str:
-    """Stage the highest channel watermark returned to the provider."""
-    # Same backend order the pending ``read_messages`` view uses: in-process
-    # tools (ws-local) hold
+    """Stage exact rows and, when available, their channel watermark."""
+    # Same backend order ``read_inbox`` uses: in-process tools (ws-local) hold
     # a live runtime and never an rpc_client, and ``GlobalInboxRuntime`` and
     # ``PuffoRpcClient`` expose ``stage_model_visible_read`` with the identical
     # keyword signature, so the call site below is shared.
@@ -139,7 +138,15 @@ async def _stage_model_visible_messages(
             state="unsupported_adapter",
         )
         return ""
-    candidates = [
+    visible = [
+        message.envelope_id
+        for message in messages
+        if isinstance(getattr(message, "envelope_id", None), str)
+        and message.envelope_id
+    ]
+    if not visible:
+        return ""
+    channel_candidates = [
         message
         for message in messages
         if getattr(message, "envelope_kind", "") != "dm"
@@ -148,39 +155,24 @@ async def _stage_model_visible_messages(
         and isinstance(getattr(message, "server_seq", None), int)
         and not isinstance(getattr(message, "server_seq", None), bool)
     ]
-    if not candidates:
-        state = (
-            "dm_unsupported"
-            if any(getattr(message, "envelope_kind", "") == "dm" for message in messages)
-            else "unsequenced"
-            if any(getattr(message, "server_seq", None) is None for message in messages)
-            else "unsupported_history"
-        )
-        log_runtime_event(
-            logger,
-            "history.read_staged",
-            level=logging.DEBUG,
-            agent_id=cfg.agent_id,
-            agent_slug=cfg.slug,
-            state=state,
-        )
-        return ""
-    watermark = max(candidates, key=lambda message: message.server_seq)
-    if any(
+    watermark = (
+        max(channel_candidates, key=lambda message: message.server_seq)
+        if len(channel_candidates) == len(messages) == len(visible)
+        else None
+    )
+    if watermark is not None and any(
         message.space_id != watermark.space_id
         or message.channel_id != watermark.channel_id
-        for message in candidates
+        for message in channel_candidates
     ):
-        # One continuation has one channel watermark; do not claim partial
-        # visibility for a mixed-channel presentation.
-        return ""
-    # Only stage the exact local rows that are represented in this response.
-    visible = [message.envelope_id for message in candidates]
+        watermark = None
     staged = await staging.stage_model_visible_read(
-        space_id=watermark.space_id,
-        channel_id=watermark.channel_id,
-        through_seq=watermark.server_seq,
-        through_envelope_id=watermark.envelope_id,
+        space_id=watermark.space_id if watermark is not None else None,
+        channel_id=watermark.channel_id if watermark is not None else None,
+        through_seq=watermark.server_seq if watermark is not None else None,
+        through_envelope_id=(
+            watermark.envelope_id if watermark is not None else None
+        ),
         tool_name=tool_name,
         tool_arguments=tool_arguments,
         visible_message_ids=visible,

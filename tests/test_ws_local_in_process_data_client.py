@@ -46,6 +46,7 @@ async def test_get_channel_roots_forwards_kwargs():
         "ch_42",
         limit=50,
         since_envelope_id="msg_x",
+        before_envelope_id="msg_y",
         before_ts=10,
         after_ts=5,
         before_seq=12,
@@ -55,6 +56,7 @@ async def test_get_channel_roots_forwards_kwargs():
         channel_id="ch_42",
         limit=50,
         since_envelope_id="msg_x",
+        before_envelope_id="msg_y",
         before_ts=10,
         after_ts=5,
         before_seq=12,
@@ -66,9 +68,21 @@ async def test_get_channel_roots_forwards_kwargs():
 async def test_get_dm_history_forwards():
     client, store, _ = _make_client()
     store.get_dm_history = AsyncMock(return_value=["m1"])
-    out = await client.get_dm_history("alice-1a", limit=10, before=123)
+    out = await client.get_dm_history(
+        "alice-1a",
+        limit=10,
+        before=123,
+        before_envelope_id="msg_before",
+        after_envelope_id="msg_after",
+    )
     assert out == ["m1"]
-    store.get_dm_history.assert_awaited_once_with("alice-1a", 10, 123)
+    store.get_dm_history.assert_awaited_once_with(
+        peer_slug="alice-1a",
+        limit=10,
+        before=123,
+        before_envelope_id="msg_before",
+        after_envelope_id="msg_after",
+    )
 
 
 @pytest.mark.asyncio
@@ -78,6 +92,7 @@ async def test_get_thread_messages_forwards_kwargs():
         "msg_root",
         limit=10,
         since_envelope_id=None,
+        before_envelope_id="msg_before",
         before_ts=None,
         after_ts=None,
         before_seq=None,
@@ -87,6 +102,7 @@ async def test_get_thread_messages_forwards_kwargs():
         root_id="msg_root",
         limit=10,
         since_envelope_id=None,
+        before_envelope_id="msg_before",
         before_ts=None,
         after_ts=None,
         before_seq=None,

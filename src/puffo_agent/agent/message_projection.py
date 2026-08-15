@@ -210,35 +210,27 @@ def format_inbox_notice(
 def format_inbox_read_result(result: Mapping[str, Any]) -> str:
     """Hide the internal page transport behind one semantic read window."""
     messages = tuple(str(block) for block in result["messages"])
-    prior_context = tuple(str(block) for block in result["prior_context"])
     next_cursor = result["next_cursor"]
     fields = [
         f"context_version={int(result['context_version'])}",
-        "view=\"pending\"",
+        "kind=\"inbox\"",
         "order=\"oldest_to_newest\"",
-        f"returned_count={len(prior_context) + len(messages)}",
-        f"earlier_context_count={len(prior_context)}",
+        f"returned_count={len(messages)}",
         f"pending_message_count={len(messages)}",
-        f"has_older={_bool(bool(result['prior_context_has_more']))}",
-        f"has_newer={_bool(bool(result['has_more']))}",
-        f"remaining_pending_count={int(result['remaining_count'])}",
+        f"has_next={_bool(bool(result['has_more']))}",
+        f"remaining_in_snapshot={int(result['remaining_count'])}",
         f"snapshot_generation={int(result['snapshot_generation'])}",
     ]
     if next_cursor:
         fields.append(f"next_cursor={_quoted(next_cursor)}")
     lines = [f"[window {' '.join(fields)}]"]
     lines.append(
-        f"[earlier_context context_version={CONTEXT_VERSION} "
-        f"message_count={len(prior_context)}]"
-    )
-    lines.extend(prior_context)
-    lines.append(
         f"[pending_messages context_version={CONTEXT_VERSION} "
         f"message_count={len(messages)}]"
     )
     lines.extend(messages)
     lines.append(
-        f"[end_window context_version={CONTEXT_VERSION} view=\"pending\"]"
+        f"[end_window context_version={CONTEXT_VERSION} kind=\"inbox\"]"
     )
     return "\n".join(lines)
 
@@ -249,17 +241,25 @@ def format_history_read_result(
     body: str,
     has_older: bool,
     has_newer: bool,
+    older_cursor: str = "",
+    newer_cursor: str = "",
     target_ref: str = "",
 ) -> str:
     """Frame a history projection with explicit Raft-style boundaries."""
     fields = [
         f"context_version={CONTEXT_VERSION}",
-        "view=\"history\"",
+        "kind=\"history\"",
         "order=\"oldest_to_newest\"",
         f"returned_count={len(messages)}",
         f"has_older={_bool(has_older)}",
         f"has_newer={_bool(has_newer)}",
+        f"older_boundary={_quoted('more' if has_older else 'local_start')}",
+        f"newer_boundary={_quoted('more' if has_newer else 'local_end')}",
     ]
+    if older_cursor:
+        fields.append(f"older_cursor={_quoted(older_cursor)}")
+    if newer_cursor:
+        fields.append(f"newer_cursor={_quoted(newer_cursor)}")
     if messages:
         oldest = messages[0]
         newest = messages[-1]
@@ -282,7 +282,7 @@ def format_history_read_result(
             f"[messages context_version={CONTEXT_VERSION} message_count=0]",
         ))
     lines.append(
-        f"[end_window context_version={CONTEXT_VERSION} view=\"history\"]"
+        f"[end_window context_version={CONTEXT_VERSION} kind=\"history\"]"
     )
     return "\n".join(lines)
 

@@ -9,8 +9,8 @@ from mcp.server.fastmcp import FastMCP
 from ..agent.message_projection import format_inbox_read_result
 from ..agent.message_store_models import parse_inbox_target
 from .core_history_read_tools import (
+    history_tool_arguments,
     read_history_messages,
-    read_messages_tool_arguments,
 )
 
 
@@ -19,8 +19,6 @@ def _normalize_inbox_read_result(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "context_version": int(result.get("context_version", 1)),
         "messages": result["messages"],
-        "prior_context": result.get("prior_context", ()),
-        "prior_context_has_more": bool(result.get("prior_context_has_more", False)),
         "next_cursor": result["next_cursor"],
         "has_more": result["has_more"],
         "remaining_count": result["remaining_count"],
@@ -28,71 +26,35 @@ def _normalize_inbox_read_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def register_message_read_tool(mcp: FastMCP, cfg: Any) -> None:
+def _inbox_tool_arguments(*, target: str, cursor: str, limit: int) -> dict[str, object]:
+    arguments: dict[str, object] = {}
+    if target:
+        arguments["target"] = target
+    if cursor:
+        arguments["cursor"] = cursor
+    if limit != 50:
+        arguments["limit"] = limit
+    return arguments
+
+
+def register_message_read_tools(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
-    async def read_messages(
-        view: str = "pending",
+    async def read_inbox(
         target: str = "",
         cursor: str = "",
         limit: int = 50,
-        since_message_id: str = "",
-        after_seq: int | None = None,
-        before_seq: int | None = None,
-        after_timestamp_ms: int | None = None,
-        before_timestamp_ms: int | None = None,
     ) -> str:
-        """Read one semantic conversation window.
+        """Read messages that are still pending in this agent's Inbox.
 
-        ``view='pending'`` drains pending Inbox work; target is optional and
-        cursor continues the returned snapshot. ``view='history'`` reads a
-        canonical DM/channel/thread target without changing pending intent and
-        accepts message, sequence, or timestamp bounds. ``limit`` bounds the
-        page size. Results use the same context/message grammar and explicit
-        older/newer window boundaries. See the managed ``read-messages`` skill
-        for paging semantics.
+        ``target`` optionally scopes one DM/channel/thread. ``cursor``
+        continues the exact pending snapshot returned by the previous page.
+        Returned pending messages enter the current model turn automatically.
+        See the managed ``read-messages`` skill for paging and boundaries.
         """
         if isinstance(limit, bool):
             raise RuntimeError("limit must be an integer")
-        arguments = read_messages_tool_arguments(
-            view=view,
-            target=target,
-            cursor=cursor,
-            limit=limit,
-            since_message_id=since_message_id,
-            after_seq=after_seq,
-            before_seq=before_seq,
-            after_timestamp_ms=after_timestamp_ms,
-            before_timestamp_ms=before_timestamp_ms,
-        )
-        if view == "history":
-            if cursor:
-                raise RuntimeError("cursor is only valid when view='pending'")
-            return await read_history_messages(
-                cfg,
-                target=target,
-                limit=limit,
-                since_message_id=since_message_id,
-                after_seq=after_seq,
-                before_seq=before_seq,
-                after_timestamp_ms=after_timestamp_ms,
-                before_timestamp_ms=before_timestamp_ms,
-                tool_arguments=arguments,
-            )
-        if view != "pending":
-            raise RuntimeError("view must be 'pending' or 'history'")
-        if any(
-            value not in (None, "")
-            for value in (
-                since_message_id,
-                after_seq,
-                before_seq,
-                after_timestamp_ms,
-                before_timestamp_ms,
-            )
-        ):
-            raise RuntimeError(
-                "history bounds are only valid when view='history'"
-            )
+        if not 1 <= int(limit) <= 50:
+            raise RuntimeError("limit must be between 1 and 50")
         if target:
             try:
                 parse_inbox_target(target)
@@ -108,7 +70,9 @@ def register_message_read_tool(mcp: FastMCP, cfg: Any) -> None:
                 target=target,
                 cursor=cursor,
                 limit=limit,
-                tool_arguments=arguments,
+                tool_arguments=_inbox_tool_arguments(
+                    target=target, cursor=cursor, limit=limit,
+                ),
             )
         elif cfg.rpc_client is not None:
             result = await cfg.rpc_client.read_inbox(
@@ -117,6 +81,38 @@ def register_message_read_tool(mcp: FastMCP, cfg: Any) -> None:
         else:
             raise RuntimeError("global Inbox runtime is unavailable")
         return format_inbox_read_result(_normalize_inbox_read_result(result))
+
+    @mcp.tool()
+    async def read_history(
+        target: str = "",
+        cursor: str = "",
+        before_message_id: str = "",
+        after_message_id: str = "",
+        limit: int = 50,
+    ) -> str:
+        """Read earlier conversation context for one DM/channel/thread.
+
+        Start with ``target`` and optionally one exclusive message-id boundary.
+        Continue a returned older/newer page with ``cursor``. Results use the
+        same semantic message grammar as ``read_inbox``. See the managed
+        ``read-messages`` skill for paging and local-history boundaries.
+        """
+        arguments = history_tool_arguments(
+            target=target,
+            cursor=cursor,
+            before_message_id=before_message_id,
+            after_message_id=after_message_id,
+            limit=limit,
+        )
+        return await read_history_messages(
+            cfg,
+            target=target,
+            cursor=cursor,
+            before_message_id=before_message_id,
+            after_message_id=after_message_id,
+            limit=limit,
+            tool_arguments=arguments,
+        )
 
 
 def register_reminder_tools(mcp: FastMCP, cfg: Any) -> None:
@@ -230,6 +226,6 @@ def register_reminder_replace_tool(mcp: FastMCP, cfg: Any) -> None:
 
 def register_inbox_tools(mcp: FastMCP, cfg: Any) -> None:
     """Register Inbox and reminder tools in their established order."""
-    register_message_read_tool(mcp, cfg)
+    register_message_read_tools(mcp, cfg)
     register_reminder_tools(mcp, cfg)
     register_reminder_replace_tool(mcp, cfg)

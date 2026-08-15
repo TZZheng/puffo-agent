@@ -179,22 +179,29 @@ class PuffoRpcClient:
     async def stage_model_visible_read(
         self,
         *,
-        space_id: str,
-        channel_id: str,
-        through_seq: int,
-        through_envelope_id: str,
         tool_name: str,
         tool_arguments: dict[str, object],
         visible_message_ids: list[str] | None = None,
+        space_id: str | None = None,
+        channel_id: str | None = None,
+        through_seq: int | None = None,
+        through_envelope_id: str | None = None,
     ) -> dict[str, Any]:
         body = {
-            "space_id": space_id,
-            "channel_id": channel_id,
-            "through_seq": through_seq,
-            "through_envelope_id": through_envelope_id,
             "tool_name": tool_name,
             "tool_arguments": tool_arguments,
         }
+        boundary = (space_id, channel_id, through_seq, through_envelope_id)
+        has_boundary = all(value not in (None, "") for value in boundary)
+        if any(value not in (None, "") for value in boundary) and not has_boundary:
+            raise RuntimeError("model-visible channel watermark is incomplete")
+        if has_boundary:
+            body.update(
+                space_id=space_id,
+                channel_id=channel_id,
+                through_seq=through_seq,
+                through_envelope_id=through_envelope_id,
+            )
         if visible_message_ids is not None:
             body["visible_message_ids"] = visible_message_ids
         path = (

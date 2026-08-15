@@ -65,7 +65,8 @@ def test_standing_prompt_is_compact_and_identity_is_compiled_once():
 def test_standing_prompt_owns_communication_policy_and_retains_contract():
     primer = " ".join(DEFAULT_SHARED_CLAUDE_MD.split())
     for phrase in (
-        "<global_inbox_notice>", "content_included=false", "read_messages",
+        "<global_inbox_notice>", "content_included=false", "read_inbox",
+        "read_history",
         "context_version=1", "target_ref", "sender_identity", "sender_type",
         "An `@slug` identity is unique", "send_message",
         "A metadata-only notice means unread content exists",
@@ -102,9 +103,9 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
         assert phrase in read
     assert "read-messages" in post
     normalized_read = " ".join(read.split())
-    assert "pending_messages" in read and "earlier_context" in read
-    assert "has_older" in read and "has_newer" in read
-    assert "bounded" in normalized_read
+    assert "pending_messages" in read and "earlier_context" not in read
+    assert "has_older" in read and "has_newer" in read and "has_next" in read
+    assert "pinned Inbox snapshot" in read
     assert "pending" in read and "history" in read
     assert "decide-response" not in DEFAULT_SKILLS
     assert "originating request and conversation intent" not in DEFAULT_SHARED_CLAUDE_MD
@@ -115,7 +116,7 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
         "visible_draft_basis", "new_channel_context", "context_ready",
         "dynamic `guidance`", "injected only when a draft is actually held",
         "sequence watermark alone is not semantic context",
-        "preserve the `read_messages` target by default",
+        "preserve the inbox target by default",
         'omit it for `target_type="channel"`',
         'pass the supplied `thread_root_id` for `target_type="thread"`',
     ):
@@ -138,8 +139,8 @@ def test_standing_prompt_reports_unavailable_shared_workspace_truthfully():
 def test_inbox_turn_cue_is_short_and_reinforces_the_standing_default():
     cue = " ".join(INBOX_TURN_CUE.split())
     assert "<puffo_runtime_instruction>" in cue
-    assert "read the relevant pending content" in cue.lower()
-    assert "respond through `send_message` as appropriate" in cue
+    assert "read them with `read_inbox`" in cue.lower()
+    assert "retrieve earlier context with `read_history`" in cue.lower()
     assert "report any result or handoff you owe" in cue
     assert "decide-response" not in cue
     assert len(INBOX_TURN_CUE.encode()) < 320
@@ -213,7 +214,7 @@ def test_managed_refresh_rewrites_stale_skill():
     skill.write_text("stale", encoding="utf-8")
     actions = dict(ensure_shared_primer(shared))
     assert actions["skills/read-messages/SKILL.md"] == "updated"
-    assert "earlier_context" in skill.read_text(encoding="utf-8")
+    assert "read_history" in skill.read_text(encoding="utf-8")
 
     removed = shared / "skills" / "decide-response"
     removed.mkdir()
