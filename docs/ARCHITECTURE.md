@@ -131,6 +131,12 @@ Important boundaries:
 - The Inbox notice is metadata, not a replay of every message. The model reads
   exact pending rows through `read_inbox`; `read_history` supplies earlier
   local conversation context through the same semantic projection.
+- Daemon, RPC, and ws-local boundaries keep their structured contracts. The
+  stdio MCP boundary projects context-bearing results exactly once as semantic
+  text, without a duplicate `structuredContent` copy or transport JSON.
+- A held send uses that same projection: the unchanged draft, participation
+  facts, prior basis, and newer context are explicit semantic blocks and
+  bounded windows rather than a nested transport object.
 - The daemon creates the local active turn before writing provider input.
   The pending view directly admits returned rows into that turn; it has no
   separate receipt, continuation callback, or model acknowledgement step.
@@ -338,7 +344,7 @@ Use these entry points when tracing a change:
 | Driver protocol | `agent/harness/driver.py`, `agent/harness/runtime_manager.py` |
 | Native/bridge receive | `agent/puffo_core_client.py`, `agent/inbound_receipts.py`, `agent/bridge_transport.py` |
 | Durable Inbox | `agent/message_store.py`, `agent/inbox_store.py`, `agent/global_inbox_runtime.py` |
-| Context rendering | `agent/message_projection.py`, `agent/context_controller.py` |
+| Context rendering | `agent/message_projection.py`, `mcp/tool_result_projection.py`, `agent/context_controller.py` |
 | Coordinated send | `agent/send_coordinator.py`, `agent/global_inbox_send.py`, `agent/global_inbox_held.py` |
 | Model tools | `mcp/puffo_core_server.py`, `mcp/core_*_tools.py` |
 | Memory | `agent/memory.py`, `agent/memory_store.py`, `mcp/memory_tools.py` |

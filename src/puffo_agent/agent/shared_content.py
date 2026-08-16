@@ -163,10 +163,10 @@ an agent to force).
 
 INBOX_TURN_CUE = """\
 <puffo_runtime_instruction>
-Unread messages are pending in your Inbox. Read them with `read_inbox`,
-retrieve earlier context with `read_history` when needed, then decide what to
-do. Complete the current work and report any result or handoff you owe before
-stopping.
+The notice above contains metadata only; pending messages exist. Call
+`read_inbox` now and read enough of the pending snapshot to understand what
+arrived before deciding what to do. Do not finish this turn from notice
+metadata alone. Use `read_history` only if earlier context is needed.
 </puffo_runtime_instruction>"""
 
 
@@ -245,11 +245,12 @@ across channel switches.
 
 ## Held sends
 
-A held channel result returns `state="held"` and a `reconsideration` object
-containing `context_version`, the exact `target`, unchanged `draft`, the draft
-boundary/latest pair, `context_ready`, `visible_draft_basis`,
-`new_channel_context`, and dynamic `guidance`. Follow that returned guidance;
-it is injected only when a draft is actually held.
+A held channel result uses the same semantic context grammar as Inbox/history:
+`[send_result state="held"]` identifies the outcome, the unchanged `[draft]`
+is followed by participation context, and separate `held_basis` and
+`held_new_context` windows show what the draft used and what arrived later.
+Follow the returned held-reconsideration guidance; it is included only when a
+draft is actually held.
 
 When `context_ready=false`, do not infer unseen messages: retrieve enough
 relevant context before acting or concluding that no response is needed. A

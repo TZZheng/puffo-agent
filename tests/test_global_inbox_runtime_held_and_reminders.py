@@ -494,7 +494,9 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     assert initial.provider_input.count("[channel_audience ") == 2
     assert audience_reads == [("sp-1", "ch-1")]
     assert initial.provider_input.endswith(INBOX_TURN_CUE)
-    assert "decide what to do" in " ".join(initial.provider_input.split())
+    notice_input = " ".join(initial.provider_input.split())
+    assert "Call `read_inbox` now" in notice_input
+    assert "Do not finish this turn from notice metadata alone" in notice_input
     assert "decide-response" not in initial.provider_input
     assert plaintext not in initial_serialized
     assert attachment not in initial_serialized

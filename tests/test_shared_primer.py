@@ -112,9 +112,9 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
     assert "canonical view of pending work" in " ".join(post.split())
     normalized_send = " ".join(send.lower().split())
     for phrase in (
-        'state="held"', "unchanged `draft`", "draft boundary/latest pair",
-        "visible_draft_basis", "new_channel_context", "context_ready",
-        "dynamic `guidance`", "injected only when a draft is actually held",
+        'state="held"', "unchanged `[draft]`", "participation context",
+        "held_basis", "held_new_context", "context_ready",
+        "held-reconsideration guidance", "included only when a draft is actually held",
         "sequence watermark alone is not semantic context",
         "preserve the inbox target by default",
         'omit it for `target_type="channel"`',
@@ -139,11 +139,12 @@ def test_standing_prompt_reports_unavailable_shared_workspace_truthfully():
 def test_inbox_turn_cue_is_short_and_reinforces_the_standing_default():
     cue = " ".join(INBOX_TURN_CUE.split())
     assert "<puffo_runtime_instruction>" in cue
-    assert "read them with `read_inbox`" in cue.lower()
-    assert "retrieve earlier context with `read_history`" in cue.lower()
-    assert "report any result or handoff you owe" in cue
+    assert "notice above contains metadata only" in cue.lower()
+    assert "call `read_inbox` now" in cue.lower()
+    assert "do not finish this turn from notice metadata alone" in cue.lower()
+    assert "use `read_history` only if earlier context is needed" in cue.lower()
     assert "decide-response" not in cue
-    assert len(INBOX_TURN_CUE.encode()) < 320
+    assert len(INBOX_TURN_CUE.encode()) < 360
 
 
 def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
@@ -151,8 +152,8 @@ def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
     send = " ".join(DEFAULT_SKILLS["send-message"][1].split()).lower()
     assert held_method not in send
     for phrase in (
-        "follow that returned guidance",
-        "injected only when a draft is actually held",
+        "follow the returned held-reconsideration guidance",
+        "included only when a draft is actually held",
     ):
         assert phrase in send
     for phrase in (
@@ -176,7 +177,7 @@ def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
     ):
         skill = " ".join(path.read_text(encoding="utf-8").split()).lower()
         assert held_method not in skill
-        assert "follow that returned guidance" in skill
+        assert "follow the returned held-reconsideration guidance" in skill
 
     other_prompt_surfaces = [" ".join(DEFAULT_SHARED_CLAUDE_MD.split())]
     other_prompt_surfaces.extend(

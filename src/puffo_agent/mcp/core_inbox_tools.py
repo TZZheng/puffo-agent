@@ -12,6 +12,10 @@ from .core_history_read_tools import (
     history_tool_arguments,
     read_history_messages,
 )
+from .tool_result_projection import (
+    ToolResultSurface,
+    project_text_result,
+)
 
 
 def _normalize_inbox_read_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -37,13 +41,18 @@ def _inbox_tool_arguments(*, target: str, cursor: str, limit: int) -> dict[str, 
     return arguments
 
 
-def register_message_read_tools(mcp: FastMCP, cfg: Any) -> None:
-    @mcp.tool()
+def register_message_read_tools(
+    mcp: FastMCP,
+    cfg: Any,
+    *,
+    result_surface: ToolResultSurface = "stdio_mcp",
+) -> None:
+    @mcp.tool(structured_output=False)
     async def read_inbox(
         target: str = "",
         cursor: str = "",
         limit: int = 50,
-    ) -> str:
+    ) -> Any:
         """Read messages that are still pending in this agent's Inbox.
 
         ``target`` optionally scopes one DM/channel/thread. ``cursor``
@@ -80,16 +89,19 @@ def register_message_read_tools(mcp: FastMCP, cfg: Any) -> None:
             )
         else:
             raise RuntimeError("global Inbox runtime is unavailable")
-        return format_inbox_read_result(_normalize_inbox_read_result(result))
+        return project_text_result(
+            format_inbox_read_result(_normalize_inbox_read_result(result)),
+            surface=result_surface,
+        )
 
-    @mcp.tool()
+    @mcp.tool(structured_output=False)
     async def read_history(
         target: str = "",
         cursor: str = "",
         before_message_id: str = "",
         after_message_id: str = "",
         limit: int = 50,
-    ) -> str:
+    ) -> Any:
         """Read earlier conversation context for one DM/channel/thread.
 
         Start with ``target`` and optionally one exclusive message-id boundary.
@@ -104,14 +116,17 @@ def register_message_read_tools(mcp: FastMCP, cfg: Any) -> None:
             after_message_id=after_message_id,
             limit=limit,
         )
-        return await read_history_messages(
-            cfg,
-            target=target,
-            cursor=cursor,
-            before_message_id=before_message_id,
-            after_message_id=after_message_id,
-            limit=limit,
-            tool_arguments=arguments,
+        return project_text_result(
+            await read_history_messages(
+                cfg,
+                target=target,
+                cursor=cursor,
+                before_message_id=before_message_id,
+                after_message_id=after_message_id,
+                limit=limit,
+                tool_arguments=arguments,
+            ),
+            surface=result_surface,
         )
 
 
@@ -224,8 +239,13 @@ def register_reminder_replace_tool(mcp: FastMCP, cfg: Any) -> None:
         raise RuntimeError("global Inbox runtime is unavailable")
 
 
-def register_inbox_tools(mcp: FastMCP, cfg: Any) -> None:
+def register_inbox_tools(
+    mcp: FastMCP,
+    cfg: Any,
+    *,
+    result_surface: ToolResultSurface = "stdio_mcp",
+) -> None:
     """Register Inbox and reminder tools in their established order."""
-    register_message_read_tools(mcp, cfg)
+    register_message_read_tools(mcp, cfg, result_surface=result_surface)
     register_reminder_tools(mcp, cfg)
     register_reminder_replace_tool(mcp, cfg)

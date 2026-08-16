@@ -32,6 +32,7 @@ from ..agent.send_coordinator import (
 )
 from .data_client import DataClient, DataNotFound
 from ._host_mcp import PuffoRpcClient
+from .tool_result_projection import ToolResultSurface
 
 logger = logging.getLogger(__name__)
 
@@ -643,17 +644,21 @@ async def _resolve_outgoing_root(
     )
 
 
-def register_core_tools(mcp: FastMCP, cfg: PuffoCoreToolsConfig) -> None:
+def register_core_tools(
+    mcp: FastMCP,
+    cfg: PuffoCoreToolsConfig,
+    *,
+    result_surface: ToolResultSurface = "stdio_mcp",
+) -> None:
     """Register the core MCP surface in its established public order."""
     from .core_history_tools import register_history_tools
     from .core_host_tools import register_host_tools
     from .core_identity_tools import register_identity_tools
     from .core_inbox_tools import register_inbox_tools
     from .core_message_tools import register_message_tools
-
-    register_inbox_tools(mcp, cfg)
+    register_inbox_tools(mcp, cfg, result_surface=result_surface)
     register_identity_tools(mcp, cfg)
-    register_message_tools(mcp, cfg)
+    register_message_tools(mcp, cfg, result_surface=result_surface)
     register_history_tools(mcp, cfg)
     register_host_tools(mcp, cfg)
 

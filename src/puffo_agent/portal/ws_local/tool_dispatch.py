@@ -88,7 +88,7 @@ def build_dispatch(
     from ...mcp.puffo_core_tools import register_core_tools
 
     captured = _CapturedRegistration(handlers={})
-    register_core_tools(captured, cfg)
+    register_core_tools(captured, cfg, result_surface="raw")
     return {
         name: captured.handlers[name]
         for name in allowed

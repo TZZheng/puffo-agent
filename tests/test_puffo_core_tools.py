@@ -271,6 +271,13 @@ def _build_tools(cfg):
 
 
 async def _call(mcp, name, args=None):
+    text = await _call_text(mcp, name, args)
+    if "[send_result " in text and 'state="failed"' in text:
+        raise RuntimeError(text)
+    return text
+
+
+async def _call_text(mcp, name, args=None):
     result = await mcp.call_tool(name, args or {})
     if (
         isinstance(result, tuple)
@@ -596,16 +603,16 @@ async def test_reminder_tools_fall_back_to_configured_loopback_rpc_client():
 
 
 @pytest.mark.asyncio
-async def test_semantic_rpc_unavailable_returns_structured_failure():
+async def test_semantic_rpc_unavailable_returns_semantic_failure():
     cfg, http, _ = _setup()
     cfg.send_coordinator = None
     cfg.rpc_client = None
-    result = await _build_tools(cfg).call_tool(
+    result = await _call_text(
+        _build_tools(cfg),
         "send_message", {"channel": "ch_a", "text": "do not post"},
     )
-    structured = result[1]
-    assert structured["state"] == "failed"
-    assert structured["attempted"] is True
+    assert 'state="failed"' in result
+    assert "attempted=true" in result
     assert not [call for call in http.calls if call[0] == "POST"]
 
 
@@ -620,11 +627,13 @@ async def test_semantic_in_process_uses_injected_persistent_coordinator():
             return {"state": "held", "attempted": True}
 
     cfg.send_coordinator = Stub()
-    result = await _build_tools(cfg).call_tool(
+    result = await _call_text(
+        _build_tools(cfg),
         "send_message",
         {"channel": "ch_a", "text": "x", "send_anyway": True},
     )
-    assert result[1] == {"state": "held", "attempted": True}
+    assert 'state="held"' in result
+    assert "attempted=true" in result
     assert calls[0].send_anyway is True
 
 
@@ -640,10 +649,11 @@ async def test_semantic_out_of_process_uses_structured_rpc_client():
 
     cfg.send_coordinator = None
     cfg.rpc_client = Rpc()
-    result = await _build_tools(cfg).call_tool(
+    result = await _call_text(
+        _build_tools(cfg),
         "send_message", {"channel": "ch_a", "text": "x", "send_anyway": True},
     )
-    assert result[1]["state"] == "sent"
+    assert 'state="sent"' in result
     assert bodies == [{
         "channel": "ch_a",
         "root_id": "",
@@ -665,7 +675,8 @@ async def test_keyless_configured_rpc_precedes_direct_unsigned_coordinator():
 
     cfg.send_coordinator = None
     cfg.rpc_client = Rpc()
-    result = await _build_tools(cfg).call_tool(
+    result = await _call_text(
+        _build_tools(cfg),
         "send_message",
         {
             "channel": "ch_a",
@@ -674,7 +685,7 @@ async def test_keyless_configured_rpc_precedes_direct_unsigned_coordinator():
             "send_anyway": True,
         },
     )
-    assert result[1]["state"] == "sent"
+    assert 'state="sent"' in result
     assert len(bodies) == 1
     assert bodies[0]["visibility_level"] == "human"
     assert bodies[0]["send_anyway"] is True
@@ -691,10 +702,12 @@ async def test_keyless_configured_rpc_failure_does_not_fall_back_to_http():
 
     cfg.send_coordinator = None
     cfg.rpc_client = Rpc()
-    result = await _build_tools(cfg).call_tool(
+    result = await _call_text(
+        _build_tools(cfg),
         "send_message", {"channel": "ch_a", "text": "x"},
     )
-    assert result[1]["error_kind"] == "rpc_unavailable"
+    assert 'state="failed"' in result
+    assert 'error_kind="rpc_unavailable"' in result
     assert not [call for call in http.calls if call[0] == "POST_UNSIGNED"]
 
 
