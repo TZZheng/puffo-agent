@@ -6,6 +6,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Runtime observability can no longer block Agent execution.** Profile Logs,
+  Runtime Events upload, and the local runtime-state snapshot are treated as
+  best-effort observations after a provider event occurs. A full or unhealthy
+  Runtime Events outbox no longer prevents a real Codex or Claude Code turn
+  from starting or completing.
+
 ## [2.0.0a11] — 2026-08-15
 
 > Staging candidate for authoritative Harness context telemetry.

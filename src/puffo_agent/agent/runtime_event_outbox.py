@@ -16,7 +16,6 @@ from ._logging import log_runtime_event
 from .harness.driver import HarnessEvent, HarnessEventType
 from .runtime_events import (
     TURN_OUTCOMES,
-    LifecycleValidator,
     RuntimeEvent,
     RuntimeEventProjector,
     safe_error,
@@ -653,10 +652,11 @@ class RuntimeEventUploader:
 
 
 class RuntimeEventProjectingSink:
-    """Durably project metadata from the Runtime Manager's event stream.
+    """Project metadata from the Runtime Manager into the upload outbox.
 
     Assistant output, reasoning, tool content, and provider-native payloads are
-    deliberately not projected into this remotely uploaded outbox.
+    deliberately not projected into this remotely uploaded outbox. This sink
+    records observations; it does not decide whether a real turn may run.
     """
 
     def __init__(
@@ -666,7 +666,6 @@ class RuntimeEventProjectingSink:
     ):
         self.outbox = outbox
         self.projector = projector
-        self.validator = LifecycleValidator()
 
     async def __call__(self, event: HarnessEvent) -> None:
         kind = (
@@ -693,7 +692,6 @@ class RuntimeEventProjectingSink:
                 event_id=projected.event_id,
                 event_type=projected.type,
             )
-            self.validator.accept(projected)
             await self.outbox.enqueue(
                 projected, terminal=projected.type == "turn.finished"
             )

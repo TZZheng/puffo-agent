@@ -1941,7 +1941,7 @@ def _build_projection_adapter(tmp_path, driver, monkeypatch):
         preparer=_StubPreparer(),
         session_fingerprint="fp",
     )
-    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db", max_rows=1)
     monkeypatch.setattr(local_runtime, "build_driver", lambda name: driver)
     adapter = build_local_runtime_adapter(
         prepared, outbox=outbox, logical_session_ref="logical-session"
@@ -1956,7 +1956,7 @@ async def test_local_sink_projects_only_bounded_safe_legacy_status(
     """The local runtime sink must emit only bounded ``assistant_text`` (once per
     completed non-silent block) and label-only ``tool_use`` per normalized start,
     never duplicates, post-terminal fragments, or native/argument/reasoning
-    material. Post-2.0 the sink emitted nothing; a native replay would leak.
+    material. A saturated outbox must not block this Profile Log or the turn.
     """
     from puffo_agent.agent.adapters.base import TurnContext
 
