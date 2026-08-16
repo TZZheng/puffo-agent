@@ -6,6 +6,21 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a10] — 2026-08-15
+
+> Staging candidate for explicit Inbox reads and unified held-send context.
+
+### Changed
+
+- **An Inbox wake now explicitly requires reading pending content.** The
+  metadata-only notice directs the Agent to call `read_inbox` before deciding
+  what to do, while leaving the resulting response or silence to the Agent.
+- **Model-facing reads and sends share one semantic context grammar.** The
+  stdio MCP boundary returns text-only `window`, `message`, `draft`,
+  participation, and held-reconsideration blocks without duplicating nested
+  transport JSON. Internal daemon, RPC, and ws-local contracts remain
+  structured.
+
 ## [2.0.0a9] — 2026-08-15
 
 > Staging candidate for bounded Inbox and conversation-history reads.
