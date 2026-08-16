@@ -6,6 +6,23 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a11] — 2026-08-15
+
+> Staging candidate for authoritative Harness context telemetry.
+
+### Fixed
+
+- **Codex context usage follows the current app-server schema.** The Driver
+  reads `tokenUsage.last.totalTokens` while retaining the older flattened
+  fallback, so admission, compaction, and Web telemetry use the same value.
+- **Claude Code reports a native post-turn context snapshot.** The Runtime
+  Manager queries `get_context_usage` after the provider Turn is terminal and
+  falls back to the result-frame estimate only when native telemetry is
+  unavailable. Telemetry timeout cannot retroactively fail a completed Turn.
+- **Keyless Agents retain context limits in runtime status.** Cloud bridge
+  heartbeats now preserve `max_context` and `auto_compact_threshold_pct` just
+  like signed local-agent heartbeats.
+
 ## [2.0.0a10] — 2026-08-15
 
 > Staging candidate for explicit Inbox reads and unified held-send context.
