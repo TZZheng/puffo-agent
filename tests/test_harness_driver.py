@@ -621,6 +621,19 @@ async def test_manager_adapter_submits_only_current_semantic_input():
     assert captured["content"].count("current-notice-sentinel") == 1
 
 
+def _claude_context_response(frame, total_tokens=42, max_tokens=200_000):
+    return {
+        "type": "control_response",
+        "response": {
+            "request_id": frame["request_id"],
+            "subtype": "success",
+            "response": {
+                "totalTokens": total_tokens, "rawMaxTokens": max_tokens,
+            },
+        },
+    }
+
+
 def _metadata_driver(provider, provider_inputs):
     holder = {}
 
@@ -646,17 +659,7 @@ def _metadata_driver(provider, provider_inputs):
 
     def replay_claude_frame(frame):
         if frame.get("type") == "control_request":
-            proc.feed({
-                "type": "control_response",
-                "response": {
-                    "request_id": frame["request_id"],
-                    "subtype": "success",
-                    "response": {
-                        "totalTokens": 1,
-                        "rawMaxTokens": 200_000,
-                    },
-                },
-            })
+            proc.feed(_claude_context_response(frame, total_tokens=1))
             return
         if frame.get("type") == "user":
             provider_inputs.append(frame["message"]["content"][0]["text"])
@@ -870,7 +873,9 @@ def _feed_codex_protocol_events(proc):
     proc.feed({
         "method": "thread/tokenUsage/updated",
         "params": {"tokenUsage": {
-            "totalTokens": 12, "modelContextWindow": 100,
+            "last": {"totalTokens": 12},
+            "total": {},
+            "modelContextWindow": 100,
         }},
     })
     proc.feed({
@@ -1287,17 +1292,7 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
         def on_frame(frame):
             proc = holder["proc"]
             if frame.get("type") == "control_request":
-                proc.feed({
-                    "type": "control_response",
-                    "response": {
-                        "request_id": frame["request_id"],
-                        "subtype": "success",
-                        "response": {
-                            "totalTokens": 42,
-                            "rawMaxTokens": 200_000,
-                        },
-                    },
-                })
+                proc.feed(_claude_context_response(frame))
                 return
             if frame.get("uuid") == "replay-1":
                 proc.feed({
@@ -1770,6 +1765,11 @@ def _token_telemetry_driver(provider):
         return proc, CodexAppServerDriver(lambda _spec: proc), expected
 
     def claude_on_frame(frame):
+        if frame.get("type") == "control_request":
+            holder["proc"].feed(
+                _claude_context_response(frame, total_tokens=84)
+            )
+            return
         if frame.get("type") == "user":
             holder["proc"].feed({**frame, "isReplay": True})
 
@@ -1782,7 +1782,7 @@ def _token_telemetry_driver(provider):
     return (
         proc,
         ClaudeCodeCliDriver(lambda *_args: proc, replay_timeout=1),
-        (40, 30, 80),
+        (40, 30, 84),
     )
 
 
@@ -1799,11 +1799,13 @@ def _feed_token_telemetry(provider, proc):
             "last": base_last,
             "total": {"inputTokens": 500, "cachedInputTokens": 300,
                       "outputTokens": 80},
+            "modelContextWindow": 258_400,
         }}})
         proc.feed({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {
             "last": final_last,
             "total": {"inputTokens": 700, "cachedInputTokens": 400,
                       "outputTokens": 140},
+            "modelContextWindow": 258_400,
         }}})
         proc.feed({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
     else:

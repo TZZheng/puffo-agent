@@ -403,6 +403,16 @@ class PuffoAgent:
             and context_tokens > 0
         ):
             turn_complete_payload["current_context"] = context_tokens
+        context_window = result.metadata.get("context_window")
+        if (
+            isinstance(context_window, int)
+            and not isinstance(context_window, bool)
+            and context_window > 0
+        ):
+            turn_complete_payload["context_window"] = context_window
+        context_measured_at = result.metadata.get("context_measured_at")
+        if isinstance(context_measured_at, str) and context_measured_at:
+            turn_complete_payload["context_measured_at"] = context_measured_at
         asyncio.ensure_future(
             get_reporter().emit(
                 self.agent_id,

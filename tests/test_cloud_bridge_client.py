@@ -220,6 +220,8 @@ async def test_status_frame_carries_bounded_runtime():
                     "provider": "openai",
                     "harness": "codex",
                     "model": "gpt-5",
+                    "max_context": 258_400,
+                    "auto_compact_threshold_pct": 75,
                     "secret": "drop-me",
                 },
             )
@@ -236,6 +238,8 @@ async def test_status_frame_carries_bounded_runtime():
         "provider": "openai",
         "harness": "codex",
         "model": "gpt-5",
+        "max_context": 258_400,
+        "auto_compact_threshold_pct": 75,
     }
 
 
