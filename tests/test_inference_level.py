@@ -136,19 +136,22 @@ def _local_spec(tmp_path: Path, monkeypatch, level: str):
     return preparer._prepare_claude_spec("")
 
 
-def _docker_adapter(level: str):
-    from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
+def _docker_spec(tmp_path: Path, monkeypatch, level: str):
+    from puffo_agent.agent.harness.docker_runtime import DockerRuntimePreparer
+    from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
 
-    a = DockerCLIAdapter.__new__(DockerCLIAdapter)
-    a.agent_id = "t-1"
-    a._docker_bin = "docker"
-    a.container_name = "puffo-t-1"
-    a.claude_api_key = ""
-    a.env_overrides = {}
-    a.auto_compact_threshold_pct = None
-    a.model = "claude-opus-4-8"
-    a.inference_level = level
-    return a
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    cfg = AgentConfig(
+        id="t-1",
+        runtime=RuntimeConfig(
+            kind="cli-docker",
+            provider="anthropic",
+            harness="claude-code",
+            model="claude-opus-4-8",
+            inference_level=level,
+        ),
+    )
+    return DockerRuntimePreparer(DaemonConfig(), cfg)._prepare_claude_spec("")
 
 
 @pytest.mark.parametrize(
@@ -163,13 +166,14 @@ def test_local_claude_effort_args(tmp_path, monkeypatch, level, expected):
         assert args[args.index("--effort") + 1] == expected
 
 
-def test_docker_claude_argv_carries_effort():
-    cmd = _docker_adapter("high")._build_command([])
-    assert cmd[cmd.index("--effort") + 1] == "high"
+def test_docker_claude_argv_carries_effort(tmp_path, monkeypatch):
+    args = list(_docker_spec(tmp_path, monkeypatch, "high").launch_args)
+    assert args[args.index("--effort") + 1] == "high"
 
 
-def test_docker_claude_argv_skips_invalid():
-    assert "--effort" not in _docker_adapter("turbo")._build_command([])
+def test_docker_claude_argv_skips_invalid(tmp_path, monkeypatch):
+    args = _docker_spec(tmp_path, monkeypatch, "turbo").launch_args
+    assert "--effort" not in args
 
 
 # ─── inference_level via the self-serve refresh MCP ──────────

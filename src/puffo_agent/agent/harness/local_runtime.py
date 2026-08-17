@@ -127,7 +127,7 @@ def _is_legacy_permission_hook(entry: object) -> bool:
     )
 
 
-def _remove_legacy_permission_hook(claude_dir: Path) -> None:
+def remove_legacy_permission_hook(claude_dir: Path) -> None:
     """Remove a hook written by an older local Adapter.
 
     Only ``bypassPermissions`` is supported by the Driver path, so retaining
@@ -241,9 +241,9 @@ class RuntimePreparer(Protocol):
     """Minimal contract a runtime owner satisfies to be bound into the
     durable Runtime Manager by :func:`build_local_runtime_adapter`.
 
-    Both the host-local and the Docker Codex preparers implement it; the
-    Docker owner additionally exposes ``process_factory`` and ``aclose``
-    that the composition boundary wires into the Driver.
+    Both host-local and Docker preparers implement it; the Docker owner
+    additionally exposes ``process_factory`` and ``aclose`` that the
+    composition boundary wires into the selected Driver.
     """
 
     agent_id: str
@@ -537,7 +537,7 @@ class LocalRuntimePreparer:
                 "puffo_core is incomplete",
                 self.agent_id,
             )
-        _remove_legacy_permission_hook(self.claude_dir)
+        remove_legacy_permission_hook(self.claude_dir)
         runtime = self.agent_cfg.runtime
         llm_env = anthropic_base_url_env(runtime.llm_base_url)
         environment = dict(os.environ)
@@ -823,9 +823,9 @@ def build_local_runtime_adapter(
     """Bind a prepared Driver runtime to the durable Runtime Manager.
 
     ``driver`` defaults to the ratified Driver for ``prepared.harness_name``;
-    the Docker Codex composition injects ``CodexAppServerDriver`` with its
-    exec transport factory and passes ``cleanup`` (bounded container stop)
-    that runs after the manager closes.
+    Docker composition injects the selected Driver with its exec transport
+    factory and passes ``cleanup`` (bounded container stop), which runs after
+    the manager closes.
     """
     if driver is None:
         driver = build_driver(prepared.harness_name)
@@ -918,4 +918,5 @@ __all__ = [
     "build_local_runtime_adapter",
     "build_codex_gateway_provider",
     "compute_session_fingerprint",
+    "remove_legacy_permission_hook",
 ]

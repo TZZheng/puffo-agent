@@ -525,8 +525,8 @@ class RuntimeConfig:
     # codex (cli-local) sandbox policy: read-only | workspace-write |
     # danger-full-access. Default leaves codex's sandbox fully open.
     sandbox: str = "danger-full-access"
-    # Agent engine (CLI kinds only). cli-local supports the long-lived
-    # ``claude-code`` and ``codex`` Drivers; cli-docker supports Claude Code.
+    # Agent engine (CLI kinds only). Both CLI runtimes support the long-lived
+    # ``claude-code`` and ``codex`` Drivers.
     # ``hermes`` and ``gemini-cli`` remain named design-only values so stale
     # configs receive an explicit migration diagnostic.
     harness: str = "claude-code"

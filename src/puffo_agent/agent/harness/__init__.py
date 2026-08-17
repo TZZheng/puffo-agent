@@ -1,14 +1,8 @@
-"""Execution engines used by Puffo runtimes.
-
-Docker executes Claude Code only. Host-local execution uses the long-lived
-Claude Code and Codex Driver implementations.
-"""
+"""Protocol Drivers used by host-local and Docker Puffo runtimes."""
 
 from dataclasses import dataclass
 from typing import Any
 
-from .base import DockerHarness
-from .claude_code import ClaudeCodeHarness
 from .driver import (
     Driver,
     RuntimeRef,
@@ -20,20 +14,6 @@ from .driver import (
 from .codex_driver import CodexAppServerDriver, CodexDriver
 from .claude_code_driver import ClaudeCodeCliDriver, ClaudeDriver
 
-
-def build_docker_harness(name: str) -> DockerHarness:
-    """Resolve the sole executable Docker harness from ``agent.yml``.
-
-    Claude Code is the compatibility default for configs without a harness.
-    """
-    if not name or name == "claude-code":
-        return ClaudeCodeHarness()
-    raise ValueError(
-        f"Docker harness {name!r} is not executable; "
-        "the supported Docker harness is 'claude-code'"
-    )
-
-
 @dataclass(frozen=True)
 class UnsupportedDriver:
     harness: str
@@ -43,7 +23,7 @@ class UnsupportedDriver:
 def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
     """Construct only the two ratified Driver implementations.
 
-    This factory is deliberately separate from :func:`build_docker_harness`.
+    Process placement is supplied separately through ``process_factory``.
     """
     if name == "codex":
         return CodexAppServerDriver(**kwargs)
@@ -53,9 +33,6 @@ def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
 
 
 __all__ = [
-    "DockerHarness",
-    "ClaudeCodeHarness",
-    "build_docker_harness",
     "Driver",
     "RuntimeRef",
     "SessionRef",

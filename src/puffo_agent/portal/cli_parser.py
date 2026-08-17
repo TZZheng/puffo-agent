@@ -259,13 +259,12 @@ def _add_agent_runtime_parser(agent_sub, handlers: CommandHandlers) -> None:
         choices=["claude-code", "codex"],
         help=(
             "cli-local / cli-docker: which agent engine runs inside the "
-            "runtime. cli-local supports 'claude-code' (anthropic) and "
-            "'codex' (openai); cli-docker supports 'claude-code' only. "
-            "cli-local uses long-lived Drivers; cli-docker uses its container "
-            "adapter with a persistent Claude session. 'codex' spawns "
-            "`codex app-server` as a long-lived JSON-RPC subprocess; auth via "
-            "runtime.api_key "
-            "or operator-side `codex login`. 'hermes' and 'gemini-cli' are "
+            "runtime. Claude Code pairs with Anthropic and Codex with OpenAI. "
+            "Both cli-local and cli-docker use the same long-lived Drivers; "
+            "cli-docker places the selected CLI in a per-Agent container. "
+            "Codex uses `codex app-server`; Claude Code uses stream-json. "
+            "Auth comes from runtime.api_key or the matching operator-side "
+            "CLI login. 'hermes' and 'gemini-cli' are "
             "design-only and rejected by config validation."
         ),
     )

@@ -70,7 +70,7 @@ context, Driver, MCP, coordination, memory, and reminder contracts.
 
 ```text
 prepare paths and managed prompt
-  -> prepare Driver or Docker compatibility adapter
+  -> prepare host-local or Docker Driver runtime
   -> construct PuffoAgent and transport client
   -> warm transport and runtime
   -> construct GlobalInboxRuntime + SendCoordinator
@@ -211,7 +211,8 @@ failures. Provider-native diagnostics stay opaque and are not serialized.
 | --- | --- | --- |
 | `cli-local` | Codex | `CodexAppServerDriver` over `codex app-server`. |
 | `cli-local` | Claude Code | `ClaudeCodeCliDriver` over stream-json CLI. |
-| `cli-docker` | Claude Code only | Compatibility Adapter in a per-Agent container. |
+| `cli-docker` | Codex | `CodexAppServerDriver` over `docker exec -i codex app-server`. |
+| `cli-docker` | Claude Code | `ClaudeCodeCliDriver` over `docker exec -i claude` stream-json. |
 | `ws-local` | External Agent | Authenticated loopback attachment; no daemon-owned LLM. |
 
 `cli-sandbox` is reserved. Hermes and Gemini remain named design candidates but
@@ -337,8 +338,7 @@ Three loopback services support local integration:
   the operator approval and allowlist/blocklist side effects for an untrusted
   inbound DM. With `auto_accept_dm=false`, that inbound DM remains gated.
 - Reactions are not a Puffo message feature in this release.
-- Docker Codex, Hermes, Gemini, and `cli-sandbox` are not supported runtime
-  combinations.
+- Hermes, Gemini, and `cli-sandbox` are not supported runtime combinations.
 - Sequence-less receipt handling remains as a compatibility/local-event lane;
   current Server bridge message frames carry an authoritative positive `seq`.
 
