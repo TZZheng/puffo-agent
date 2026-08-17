@@ -96,6 +96,8 @@ def test_agent_config_default_puffo_core():
 
 def test_puffo_core_tool_names():
     assert "send_message" in PUFFO_CORE_TOOL_NAMES
+    assert "read_inbox" in PUFFO_CORE_TOOL_NAMES
+    assert "read_history" in PUFFO_CORE_TOOL_NAMES
     assert "whoami" in PUFFO_CORE_TOOL_NAMES
     assert "refresh" in PUFFO_CORE_TOOL_NAMES
     assert "reload_system_prompt" not in PUFFO_CORE_TOOL_NAMES
@@ -229,7 +231,7 @@ async def test_puffo_core_server_surface_and_identity():
     async with mcp._mcp_server.lifespan(mcp._mcp_server):
         tool_names = {t.name for t in await mcp.list_tools()}
         assert {
-            "whoami", "send_message", "get_channel_history", "refresh",
+            "whoami", "send_message", "read_inbox", "read_history", "refresh",
             "install_skill", "list_skills", "install_mcp_server",
             "list_mcp_servers",
         } <= tool_names

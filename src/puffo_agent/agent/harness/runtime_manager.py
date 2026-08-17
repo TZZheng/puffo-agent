@@ -819,6 +819,37 @@ class RuntimeManagerAdapter(Adapter):
                 )
         return None
 
+    async def _refresh_terminal_context(self, metadata: dict[str, Any]) -> None:
+        """Prefer one fresh native snapshot over provider-specific estimates."""
+        try:
+            status = await self.manager.context_status()
+        except Exception:  # noqa: BLE001 - telemetry must not fail the turn
+            logger.debug("post-turn context refresh failed", exc_info=True)
+            return
+        if isinstance(status, UnsupportedCapability) or status.stale:
+            return
+        used_tokens = status.used_tokens
+        if (
+            isinstance(used_tokens, int)
+            and not isinstance(used_tokens, bool)
+            and used_tokens > 0
+        ):
+            metadata["context_tokens"] = used_tokens
+        context_window = status.context_window
+        if (
+            isinstance(context_window, int)
+            and not isinstance(context_window, bool)
+            and context_window > 0
+        ):
+            metadata["context_window"] = context_window
+            pct = self.manager.spec.auto_compact_threshold_pct
+            threshold = (
+                int(context_window * pct / 100) if pct is not None else None
+            )
+            self._latest_context_limits = (context_window, threshold)
+        if status.measured_at:
+            metadata["context_measured_at"] = status.measured_at
+
     async def _timed_out_turn_result(
         self,
         turn: TurnRef | None,
@@ -863,6 +894,7 @@ class RuntimeManagerAdapter(Adapter):
         # must not leave the Agent turn active forever.
         stream = self.manager.events()
         turn: TurnRef | None = None
+        completed: TurnResult | None = None
         timeout = asyncio.timeout(timeout_seconds)
         try:
             async with timeout:
@@ -878,8 +910,6 @@ class RuntimeManagerAdapter(Adapter):
                 completed = await self._consume_turn_events(
                     ctx, stream, turn, metadata
                 )
-                if completed is not None:
-                    return completed
         except TimeoutError:
             if not timeout.expired():
                 raise
@@ -890,6 +920,11 @@ class RuntimeManagerAdapter(Adapter):
             close_stream = getattr(stream, "aclose", None)
             if close_stream is not None:
                 await close_stream()
+        if completed is not None:
+            # The provider Turn is already terminal. Context telemetry has its
+            # own bounded timeout and must not retroactively fail that Turn.
+            await self._refresh_terminal_context(completed.metadata)
+            return completed
         return TurnResult(reply="", metadata={"stream_error": "runtime_exited"})
 
     def register_continuation_callback(
@@ -943,6 +978,35 @@ class RuntimeManagerAdapter(Adapter):
             else self.manager.native_session_id
         )
         return value or None
+
+    def inbox_notice_delivery_capability(self) -> str:
+        capabilities = (
+            self.manager.opened.capabilities
+            if self.manager.opened is not None
+            else None
+        )
+        steer = (
+            capabilities.steer
+            if capabilities is not None
+            else getattr(self.manager.driver, "static_steer_capability", "none")
+        )
+        value = getattr(steer, "value", steer)
+        if value == "current_turn":
+            return "direct"
+        if value == "gated":
+            return "gated"
+        return "next_turn"
+
+    async def offer_inbox_notice(
+        self,
+        provider_turn_id: str,
+        provider_input: str,
+    ) -> bool:
+        active = self.manager.active_turn_ref
+        if active is None or self.manager.native_turn_id != provider_turn_id:
+            return False
+        receipt = await self.manager.steer_turn(active, TurnInput(provider_input))
+        return not isinstance(receipt, UnsupportedCapability) and receipt.accepted
 
     async def get_context_snapshot(self) -> ContextSnapshot:
         status = await self.manager.context_status()

@@ -304,6 +304,7 @@ def _make_ws_session(
 
 
 def _make_owned_runtime(point: AttachPoint, bridge, holder: dict[str, WsLocalSession]):
+    from ...agent.channel_audience import read_channel_audience
     from ...agent.global_inbox_runtime import (
         ActiveBoundaryAdapter,
         BaselineAdapter,
@@ -326,6 +327,12 @@ def _make_owned_runtime(point: AttachPoint, bridge, holder: dict[str, WsLocalSes
         held_catchup=client.recover_pending_delivery,
         send_mode_keys=(point.agent_id, client.slug),
         agent_id=point.agent_id,
+        channel_audience_loader=lambda space_id, channel_id: read_channel_audience(
+            space_id,
+            channel_id,
+            http=client.http,
+            log=logger,
+        ),
     )
     coordinator = SendCoordinator(
         slug=client.slug,

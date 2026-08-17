@@ -18,6 +18,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, Sequence
 
+from .channel_audience import (
+    ChannelAudienceLoader,
+    load_channel_audiences,
+    project_notice_targets,
+)
 from .context_controller import (
     AdmissionCandidate,
     ContextController,
@@ -26,6 +31,7 @@ from .context_controller import (
     ToolResultAdmission,
 )
 from .inbox_scheduler import (
+    COALESCE_SECONDS,
     MAX_ESTIMATED_TOKENS,
     MAX_FORMATTED_BYTES,
     InboxCoalescer,
@@ -42,7 +48,11 @@ from .message_store import (
     StoredMessage,
 )
 from ._logging import log_runtime_event
-from .message_projection import CONTEXT_VERSION, format_message_group
+from .message_projection import (
+    CONTEXT_VERSION,
+    format_inbox_notice,
+    format_message_group,
+)
 from .reminder_scheduler import ReminderScheduler
 from .shared_content import INBOX_TURN_CUE
 
@@ -56,7 +66,7 @@ DEGRADED_RECOVERY_MAX_SECONDS = 300.0
 
 from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
-from .global_inbox_admission import InboxAdmissionMixin, InboxReadContext
+from .global_inbox_admission import InboxAdmissionMixin
 from .global_inbox_types import (
     ActiveBoundaryAdapter,
     ActiveExactUnion,
@@ -159,6 +169,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         runtime_event_outbox: Any | None = None,
         reminder_scheduler: ReminderScheduler | None = None,
         status_lifecycle: TurnStatusLifecycle | None = None,
+        channel_audience_loader: ChannelAudienceLoader | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -182,6 +193,10 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             tuple[str, str, str, str, int, str], HeldAdmissionEvidence
         ] = {}
         self._boundary = asyncio.Lock()
+        # Provider binding and direct Inbox admission can race on the first
+        # turn of a newly opened harness session. Both mutate the same durable
+        # turn owner and in-memory exact union, so they share one short lock.
+        self._turn_state_lock = asyncio.Lock()
         self._stopping = False
         self._degraded = False
         self._degraded_until: float | None = None
@@ -197,15 +212,20 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         # wire slug).  Inbox attribution is derived from the same identities;
         # no durable or provider state is introduced.
         self.formatter = self._format_for_provider
+        capability = getattr(adapter, "inbox_notice_delivery_capability", None)
         self.notice_delivery = notice_delivery or InboxNoticeDelivery(
-            NoticeDeliveryCapability.NEXT_TURN
+            capability() if callable(capability) else NoticeDeliveryCapability.NEXT_TURN
         )
+        self._busy_notice_task: asyncio.Task[None] | None = None
+        self._busy_notice_dirty = False
+        self._busy_notice_delay_seconds = COALESCE_SECONDS
         self.runtime_event_outbox = runtime_event_outbox
         self.reminder_scheduler = reminder_scheduler or ReminderScheduler(
             store=store,
             notify=self.notify,
         )
         self.status_lifecycle = status_lifecycle
+        self.channel_audience_loader = channel_audience_loader
         self.send_delegate: TrackingSendDelegate | None = None
         self.held_recovery_source = HeldRecoverySource(
             self,
@@ -240,6 +260,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         self._degraded_until = None
         self._degraded_attempts = 0
         self.coalescer.notify()
+        self._schedule_busy_notice()
 
     async def create_reminder(
         self,
@@ -332,7 +353,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 await self.coalescer.wait_for_burst()
             elif await self.store.get_pending(limit=1):
                 notice = await self.store.get_notice_state()
-                if notice.is_due_for(self.adapter.get_provider_session_id()):
+                if await self.store.get_notice_candidates(
+                    self.adapter.get_provider_session_id()
+                ):
                     remaining = (
                         max(
                             0.0,
@@ -368,6 +391,15 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 await self.process_once()
         finally:
             self.reminder_scheduler.stop()
+            busy_notice_task = self._busy_notice_task
+            if busy_notice_task is not None and not busy_notice_task.done():
+                busy_notice_task.cancel()
+                try:
+                    await busy_notice_task
+                except asyncio.CancelledError:
+                    pass
+            self._busy_notice_task = None
+            self._busy_notice_dirty = False
             if not reminder_task.done():
                 reminder_task.cancel()
             try:
@@ -388,8 +420,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 await self.store.finalize_empty_turn(
                     turn_id=run.turn_id,
                     state="requeued",
-                    rearm_notice=True,
                 )
+            await self.store.release_notice_delivery(run.provider_session_id)
             log_runtime_event(
                 logger,
                 "turn.requeued",
@@ -413,6 +445,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
     def stop(self) -> None:
         self._stopping = True
         self.reminder_scheduler.stop()
+        if self._busy_notice_task is not None:
+            self._busy_notice_task.cancel()
         self.coalescer.notify()
 
     def _target_summary(
@@ -423,6 +457,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         more_pending: bool,
         pending_targets: tuple[tuple[str, ...], ...],
     ) -> str:
+        """Serialize the internal ws-local route summary, never model prose."""
         return json.dumps(
             {
                 "version": 2,
@@ -481,47 +516,56 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
 
     async def _plan_notice(
         self,
-        pending_universe: tuple[StoredMessage, ...],
+        notice_items: tuple[StoredMessage, ...],
         notice: Any,
         *,
+        total_pending_count: int,
         turn_id: str | None,
         planning_cycle_key: str | None,
     ) -> PlannedTurn:
-        routes = tuple(route_for(item) for item in pending_universe)
+        routes = tuple(route_for(item) for item in notice_items)
         targets: list[tuple[str, ...]] = []
         normalized_counts: dict[str, int] = {}
+        target_channels: dict[str, tuple[str, str]] = {}
         for route in routes:
             if route.target not in targets:
                 targets.append(route.target)
-        for item in pending_universe:
+        for item, route in zip(notice_items, routes, strict=True):
             projection = self.store.target_projection(item)
             normalized_counts[projection] = normalized_counts.get(projection, 0) + 1
+            if route.kind in {"channel", "thread"}:
+                target_channels.setdefault(
+                    projection,
+                    (route.space_id, route.channel_id),
+                )
+        audiences = await load_channel_audiences(
+            self.channel_audience_loader,
+            target_channels.values(),
+            log=logger,
+        )
         latest_seq = max(
             (
                 item.server_seq
-                for item in pending_universe
+                for item in notice_items
                 if item.server_seq is not None
             ),
             default=None,
         )
-        summary = json.dumps(
-            {
-                "version": 3,
-                "content_included": False,
-                "read_tool": "read_inbox",
-                "generation": notice.generation,
-                "message_count": notice.pending_count,
-                "targets": [
-                    {"target": target, "count": count}
-                    for target, count in normalized_counts.items()
-                ],
-                "latest_seq": latest_seq,
-            },
-            separators=(",", ":"),
+        notice_summary = format_inbox_notice(
+            generation=notice.generation,
+            changed_message_count=len(notice_items),
+            total_pending_message_count=total_pending_count,
+            targets=project_notice_targets(
+                normalized_counts,
+                target_channels,
+                audiences,
+            ),
+            latest_seq=latest_seq,
+            read_tool="read_inbox",
         )
         provider_input = (
             "<global_inbox_notice>\n"
-            + summary
+            + notice_summary
             + "\n</global_inbox_notice>\n"
             + INBOX_TURN_CUE
         )
@@ -530,8 +574,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             "notice.due",
             agent_id=self.agent_id,
             notice_generation=notice.generation,
-            requires_encryption=any(item.is_encrypted for item in pending_universe),
-            message_count=notice.pending_count,
+            requires_encryption=any(item.is_encrypted for item in notice_items),
+            changed_message_count=len(notice_items),
+            total_pending_messages=total_pending_count,
             target_count=len(targets),
             latest_seq=latest_seq,
             outcome="planned",
@@ -544,7 +589,12 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             routes=(),
             targets=tuple(targets),
             pending_targets=tuple(targets),
-            target_summary=summary,
+            target_summary=self._target_summary(
+                tuple(targets),
+                len(notice_items),
+                more_pending=True,
+                pending_targets=tuple(targets),
+            ),
             formatted_blocks=(),
             provider_input=provider_input,
             formatted_tokens=0,
@@ -553,7 +603,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             wrapper_overhead_bytes=len(provider_input.encode("utf-8")),
             more_available=True,
             notice_generation=notice.generation,
-            requires_encryption=any(item.is_encrypted for item in pending_universe),
+            notice_message_ids=tuple(item.envelope_id for item in notice_items),
+            requires_encryption=any(item.is_encrypted for item in notice_items),
         )
 
     def _log_planned_batch(self, planned: PlannedTurn) -> None:
@@ -685,27 +736,25 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         planning_cycle_key: str | None = None,
         provider_session_id: str | None = None,
     ) -> PlannedTurn | None:
-        pending_universe = (
-            items if items is not None else await self.store.get_pending()
-        )
         if items is not None:
             return await self._plan_bounded_batch(
-                pending_universe,
+                items,
                 max_items=max_items,
                 turn_id=turn_id,
                 planning_cycle_key=planning_cycle_key,
             )
-        notice = await self.store.get_notice_state()
         session = (
             provider_session_id
             if provider_session_id is not None
             else self.adapter.get_provider_session_id()
         )
-        if not pending_universe or not notice.is_due_for(session):
+        notice, notice_items = await self.store.get_notice_snapshot(session)
+        if not notice_items:
             return None
         return await self._plan_notice(
-            pending_universe,
+            notice_items,
             notice,
+            total_pending_count=notice.pending_count,
             turn_id=turn_id,
             planning_cycle_key=planning_cycle_key,
         )
@@ -720,48 +769,44 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         )
         return replacement.candidate if replacement else previous
 
-    async def _admit(self, planned: PlannedTurn, event: ProviderAdmissionEvent) -> None:
-        if event.planning_cycle_key != planned.planning_cycle_key:
-            raise RuntimeError("provider admission did not correlate to planned turn")
-        # Durable Inbox recovery is keyed by the provider session.  Stateless
-        # local adapters must not create a run that can never be authenticated
-        # on recovery (or expose identity-required MCP history tools).
-        if not event.provider_session_id:
-            raise RuntimeError("provider does not support durable Inbox admission")
+    async def _start_local_turn(self, planned: PlannedTurn) -> None:
+        """Persist the daemon-owned turn before any provider input is written."""
+        provider_session_id = self.adapter.get_provider_session_id()
         if planned.message_ids:
             run = await self.store.admit_messages(
                 planned.message_ids,
                 turn_id=planned.turn_id,
-                provider_session_id=event.provider_session_id,
+                provider_session_id=provider_session_id,
             )
         else:
             run = await self.store.start_turn(
                 turn_id=planned.turn_id,
-                provider_session_id=event.provider_session_id,
+                provider_session_id=provider_session_id,
                 notice_generation=planned.notice_generation,
+                notice_message_ids=planned.notice_message_ids,
             )
         self.active.turn_id = run.turn_id
         self.active.message_ids[:] = list(run.message_ids)
+        self.active.notice_message_ids[:] = list(planned.notice_message_ids)
         await self._add_visible_message_ids(list(run.message_ids))
-        self.active.provider_session_id = event.provider_session_id
-        self.active.provider_turn_id = event.provider_turn_id
+        self.active.provider_session_id = provider_session_id
+        self.active.provider_turn_id = None
         self.active.routes[:] = list(planned.routes)
         if self.coordinator is not None:
-            self.coordinator.provider_session_id = event.provider_session_id
+            self.coordinator.provider_session_id = provider_session_id
+        self._write_current_turn(planned)
         await self._notify_status_active()
         log_runtime_event(
             logger,
             "turn.admitted",
-            level=logging.DEBUG,
             agent_id=self.agent_id,
             turn_id=run.turn_id,
-            batch_id=event.planning_cycle_key,
-            provider_session_id=event.provider_session_id,
-            provider_turn_id=event.provider_turn_id,
-            correlation_key=event.planning_cycle_key,
-            envelope_id=run.message_ids[0] if len(run.message_ids) == 1 else None,
+            batch_id=planned.planning_cycle_key,
+            provider_session_id=provider_session_id,
+            notice_generation=planned.notice_generation,
             state=run.state,
             message_count=len(run.message_ids),
+            outcome="local_active",
         )
         if planned.notice_generation:
             log_runtime_event(
@@ -769,11 +814,57 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 "notice.admitted",
                 agent_id=self.agent_id,
                 turn_id=run.turn_id,
-                provider_session_id=event.provider_session_id,
-                provider_turn_id=event.provider_turn_id,
+                provider_session_id=provider_session_id,
                 notice_generation=planned.notice_generation,
-                outcome="admitted",
+                outcome="claimed",
             )
+
+    async def _admit(self, planned: PlannedTurn, event: ProviderAdmissionEvent) -> None:
+        """Bind provider identity to the already-active daemon turn."""
+        if event.planning_cycle_key != planned.planning_cycle_key:
+            raise RuntimeError("provider admission did not correlate to planned turn")
+        async with self._turn_state_lock:
+            if self.active.turn_id != planned.turn_id:
+                raise RuntimeError("provider admission crossed the active turn")
+            previous_session_id = self.active.provider_session_id
+            provider_session_id = event.provider_session_id or previous_session_id
+            if provider_session_id != previous_session_id:
+                await self.store.transfer_turn_session(
+                    planned.turn_id,
+                    from_provider_session_id=previous_session_id,
+                    to_provider_session_id=provider_session_id,
+                )
+            if planned.notice_message_ids and provider_session_id:
+                await self.store.mark_notice_delivered(
+                    planned.notice_generation,
+                    provider_session_id,
+                    planned.notice_message_ids,
+                    turn_id=planned.turn_id,
+                )
+            self.active.provider_session_id = provider_session_id
+            self.active.provider_turn_id = event.provider_turn_id
+            if self.coordinator is not None:
+                self.coordinator.provider_session_id = provider_session_id
+            self._write_current_turn(planned)
+        log_runtime_event(
+            logger,
+            "turn.admitted",
+            level=logging.DEBUG,
+            agent_id=self.agent_id,
+            turn_id=planned.turn_id,
+            batch_id=event.planning_cycle_key,
+            provider_session_id=provider_session_id,
+            provider_turn_id=event.provider_turn_id,
+            correlation_key=event.planning_cycle_key,
+            envelope_id=(
+                self.active.message_ids[0]
+                if len(self.active.message_ids) == 1
+                else None
+            ),
+            state=ProcessingState.IN_TURN.value,
+            message_count=len(self.active.message_ids),
+            outcome="bound",
+        )
 
     async def _notify_status_active(self) -> None:
         """Expose the exact active union to the worker's status lifecycle.
@@ -863,21 +954,6 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 exc_info=True,
             )
 
-    async def _admit_inbox_read(
-        self,
-        context: InboxReadContext,
-        event: ProviderAdmissionEvent,
-        fired: list[bool],
-    ) -> None:
-        """Admit a mid-turn Inbox read, then expose the grown active union.
-
-        The durable admission and its processing-state decisions stay in the
-        implementation trait; this override only mirrors the post-admission
-        union into the worker's status lifecycle.
-        """
-        await super()._admit_inbox_read(context, event, fired)
-        await self._notify_status_active()
-
     async def _admit_held_recovery(
         self,
         event: ProviderAdmissionEvent,
@@ -912,12 +988,25 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
     def _write_current_turn(self, planned: PlannedTurn) -> None:
         path = self.current_turn_path
         path.parent.mkdir(parents=True, exist_ok=True)
+        use_active = self.active.turn_id == planned.turn_id and (
+            bool(self.active.message_ids) or not planned.message_ids
+        )
+        message_ids = (
+            tuple(self.active.message_ids) if use_active else planned.message_ids
+        )
+        routes = tuple(self.active.routes) if use_active else planned.routes
+        targets: list[tuple[str, ...]] = []
+        for route in routes:
+            if route.target not in targets:
+                targets.append(route.target)
+        if not targets:
+            targets.extend(planned.targets)
         body: dict[str, Any] = {
             "version": CURRENT_TURN_VERSION,
             "turn_id": planned.turn_id,
-            "message_ids": list(planned.message_ids),
-            "targets": [list(target) for target in planned.targets],
-            "routes": [asdict(route) for route in planned.routes],
+            "message_ids": list(message_ids),
+            "targets": [list(target) for target in targets],
+            "routes": [asdict(route) for route in routes],
             "provider_session_id": self.active.provider_session_id,
             "provider_turn_id": self.active.provider_turn_id,
         }
@@ -930,11 +1019,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                     "native_session_id": outbox_state.get("native_session_id", ""),
                 }
             )
-        if len(planned.targets) == 1 and planned.routes:
-            route = planned.routes[0]
+        if len(targets) == 1 and routes and message_ids:
+            route = routes[0]
             body["channel_id"] = route.channel_id
             body["root_id"] = route.thread_root_id
-            body["triggering_post_id"] = planned.message_ids[0]
+            body["triggering_post_id"] = message_ids[0]
         temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
             with temp.open("w", encoding="utf-8") as handle:
@@ -1051,12 +1140,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
     async def _notice_is_current(self, planned: PlannedTurn) -> bool:
         if not planned.notice_generation:
             return True
-        notice = await self.store.get_notice_state()
-        return bool(
-            notice.pending_count
-            and notice.generation == planned.notice_generation
-            and notice.is_due_for(self.adapter.get_provider_session_id())
+        candidates = await self.store.get_notice_candidates(
+            self.adapter.get_provider_session_id()
         )
+        candidate_ids = {item.envelope_id for item in candidates}
+        return bool(candidate_ids.intersection(planned.notice_message_ids))
 
     async def _invoke_turn_with_retries(self, planned: PlannedTurn) -> None:
         retries = 0
@@ -1129,14 +1217,15 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 turn_id=planned.turn_id,
                 provider_session_id=self.active.provider_session_id,
             )
-        else:
-            # The Turn admitted no rows, so the unchanged pending set keeps a
-            # live notice generation instead of staying suppressed for this
-            # warm provider session.
-            await self.store.finalize_empty_turn(
-                turn_id=planned.turn_id,
-                rearm_notice=True,
+            await self.store.release_notice_delivery(
+                self.active.provider_session_id,
+                tuple(self.active.notice_message_ids),
             )
+        else:
+            # The provider received the notice but chose not to read Inbox.
+            # That is a normal deferred outcome, not a transport failure and
+            # therefore must not create another generation for the same set.
+            await self.store.finalize_empty_turn(turn_id=planned.turn_id)
         for item_id in self.active.message_ids:
             row = await self.store.get_message_by_envelope(item_id)
             log_runtime_event(
@@ -1182,8 +1271,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             await self.store.finalize_empty_turn(
                 turn_id=planned.turn_id,
                 state="requeued",
-                rearm_notice=True,
             )
+        await self.store.release_notice_delivery(
+            self.active.provider_session_id,
+            tuple(self.active.notice_message_ids),
+        )
         for item_id in self.active.message_ids:
             row = await self.store.get_message_by_envelope(item_id)
             log_runtime_event(
@@ -1248,8 +1340,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
     async def _wake_remaining_pending(self) -> None:
         if self._degraded or not await self.store.get_pending(limit=1):
             return
-        notice = await self.store.get_notice_state()
-        if notice.is_due_for(self.adapter.get_provider_session_id()):
+        if await self.store.get_notice_candidates(
+            self.adapter.get_provider_session_id()
+        ):
             self.notify()
 
     async def process_once(self) -> bool:
@@ -1267,8 +1360,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             if not await self._notice_is_current(planned):
                 self.health = RuntimeHealth()
                 return False
-            self._write_current_turn(planned)
             self.attempts.reset()
+            async with self._turn_state_lock:
+                await self._start_local_turn(planned)
             self.adapter.register_admission_callback(
                 lambda event: self._admit(planned, event),
                 planned.planning_cycle_key,
@@ -1287,25 +1381,30 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             try:
                 await self._invoke_turn_with_retries(planned)
                 if self.active.turn_id == planned.turn_id:
-                    await self._mark_active_processed(planned, process_started)
+                    async with self._turn_state_lock:
+                        await self._mark_active_processed(planned, process_started)
                     terminal = True
                     terminal_succeeded = True
                 else:
                     self._degrade("provider returned without correlated admission")
             except asyncio.CancelledError:
-                await self._requeue_active_turn(planned, process_started, "cancelled")
+                async with self._turn_state_lock:
+                    await self._requeue_active_turn(
+                        planned, process_started, "cancelled"
+                    )
                 terminal = True
                 terminal_error = "global inbox turn cancelled before completion"
                 raise
             except Exception as exc:
-                terminal = await self._requeue_active_turn(
-                    planned, process_started, "provider_error"
-                )
+                async with self._turn_state_lock:
+                    terminal = await self._requeue_active_turn(
+                        planned, process_started, "provider_error"
+                    )
                 terminal_error = f"{type(exc).__name__}: {exc}"
                 diagnostic = (
                     "turn failed and was requeued"
                     if terminal
-                    else "turn failed before durable admission"
+                    else "turn failed outside the active durable turn"
                 )
                 self._degrade(diagnostic)
                 log_runtime_event(
@@ -1341,35 +1440,35 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
     async def _admit_retry_attempt(
         self, planned: PlannedTurn, event: ProviderAdmissionEvent
     ) -> None:
-        """Correlate a real retry turn without re-admitting the durable union."""
+        """Bind a retry provider turn without re-admitting its durable union."""
         if (
             event.planning_cycle_key != planned.planning_cycle_key
             or self.active.turn_id != planned.turn_id
         ):
             raise RuntimeError("provider retry admission crossed the active turn")
-        # Same durable-admission rule as ``_admit``: a session-less provider
-        # cannot own recoverable Inbox rows.
-        if not event.provider_session_id:
-            raise RuntimeError("provider does not support durable Inbox admission")
-        transferred = event.provider_session_id != self.active.provider_session_id
-        if transferred:
-            # A replacement session received the rebuilt exact bodies as its
-            # fallback payload; durable ownership must move with them, in one
-            # atomic transition, before any row of this turn can be completed.
-            # A conflict here raises out of the admission callback, so the turn
-            # fails into the ordinary requeue instead of finalizing.
-            await self.store.transfer_turn_session(
-                planned.turn_id,
-                from_provider_session_id=self.active.provider_session_id,
-                to_provider_session_id=event.provider_session_id,
-            )
-        self.active.provider_session_id = event.provider_session_id
-        self.active.provider_turn_id = event.provider_turn_id
-        if self.coordinator is not None:
-            self.coordinator.provider_session_id = event.provider_session_id
-        if transferred:
-            # Keep the crash join pointing at the session that now owns the
-            # turn, so a restart resumes instead of unwinding on stale identity.
+        async with self._turn_state_lock:
+            previous_session_id = self.active.provider_session_id
+            provider_session_id = event.provider_session_id or previous_session_id
+            transferred = provider_session_id != previous_session_id
+            if transferred:
+                # A replacement session received the rebuilt exact bodies as
+                # its fallback payload; durable ownership follows atomically.
+                await self.store.transfer_turn_session(
+                    planned.turn_id,
+                    from_provider_session_id=previous_session_id,
+                    to_provider_session_id=provider_session_id,
+                )
+            if planned.notice_message_ids and provider_session_id:
+                await self.store.mark_notice_delivered(
+                    planned.notice_generation,
+                    provider_session_id,
+                    planned.notice_message_ids,
+                    turn_id=planned.turn_id,
+                )
+            self.active.provider_session_id = provider_session_id
+            self.active.provider_turn_id = event.provider_turn_id
+            if self.coordinator is not None:
+                self.coordinator.provider_session_id = provider_session_id
             self._write_current_turn(planned)
 
     def _clear_terminal_turn(self) -> None:
@@ -1527,8 +1626,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             await self.store.finalize_empty_turn(
                 turn_id=run.turn_id,
                 state="requeued",
-                rearm_notice=True,
             )
+        await self.store.release_notice_delivery(run.provider_session_id)
         log_runtime_event(
             logger,
             "turn.requeued",
@@ -1555,14 +1654,15 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         defer_requeued_recovery: bool = False,
         activated: bool = False,
     ) -> bool:
-        requeued = await self._requeue_recovery_run(
-            raw,
-            run,
-            durable_ids,
-            recovery_started,
-            state,
-            activated=activated,
-        )
+        async with self._turn_state_lock:
+            requeued = await self._requeue_recovery_run(
+                raw,
+                run,
+                durable_ids,
+                recovery_started,
+                state,
+                activated=activated,
+            )
         self.health = RuntimeHealth(state, diagnostic)
         self._defer_requeued_recovery = defer_requeued_recovery and requeued
         if activated:
@@ -1691,6 +1791,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             turn_id=turn_id,
             provider_session_id=self.active.provider_session_id,
         )
+        await self.store.release_notice_delivery(self.active.provider_session_id)
         log_runtime_event(
             logger,
             "turn.processed",
@@ -1720,6 +1821,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         await self.store.requeue_messages(
             tuple(self.active.message_ids), turn_id=turn_id
         )
+        await self.store.release_notice_delivery(self.active.provider_session_id)
         log_runtime_event(
             logger,
             "turn.requeued",
@@ -1837,9 +1939,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                     defer_requeued_recovery=True,
                     activated=True,
                 )
-            return await self._complete_recovery(turn_id, recovery_started)
+            async with self._turn_state_lock:
+                return await self._complete_recovery(turn_id, recovery_started)
         except asyncio.CancelledError:
-            await self._cancel_recovery(turn_id, recovery_started)
+            async with self._turn_state_lock:
+                await self._cancel_recovery(turn_id, recovery_started)
             raise
         except Exception as exc:
             return await self._unwind_recovery(

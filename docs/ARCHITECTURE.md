@@ -102,9 +102,10 @@ sequenceDiagram
     T-->>S: delivery ACK when the decision permits it
     DB->>I: notify pending work
     I->>I: coalesce and group by space + channel/thread/DM target
+    I->>DB: create daemon-owned active turn
     I->>L: metadata-only Inbox notice
-    L->>M: read_inbox and optional history reads
-    M->>DB: admit exact displayed rows to the active turn
+    L->>M: read_inbox and optional read_history calls
+    M->>DB: return one bounded window; admit any displayed pending rows
     L->>M: zero or more send_message calls
     M->>C: semantic destination, body, thread, visibility, send_anyway
     C->>S: coordinated channel send
@@ -116,20 +117,42 @@ sequenceDiagram
         C-->>L: draft + exact target + recovered context + guidance
         L->>M: revise, wait/remind, stay silent, or explicitly send_anyway
     end
+    L-->>I: provider turn result
+    alt provider turn succeeded
+        I->>DB: move in_turn rows to processed
+    else failed, cancelled, or interrupted
+        I->>DB: move in_turn rows back to pending
+    end
 ```
 
 Important boundaries:
 
 - The transport pushes availability; the model does not poll the Server.
 - The Inbox notice is metadata, not a replay of every message. The model reads
-  exact pending rows through `read_inbox` and can page or inspect history as
-  needed.
+  exact pending rows through `read_inbox`; `read_history` supplies earlier
+  local conversation context through the same semantic projection.
+- Daemon, RPC, and ws-local boundaries keep their structured contracts. The
+  stdio MCP boundary projects context-bearing results exactly once as semantic
+  text, without a duplicate `structuredContent` copy or transport JSON.
+- A held send uses that same projection: the unchanged draft, participation
+  facts, prior basis, and newer context are explicit semantic blocks and
+  bounded windows rather than a nested transport object.
+- The daemon creates the local active turn before writing provider input.
+  The pending view directly admits returned rows into that turn; it has no
+  separate receipt, continuation callback, or model acknowledgement step.
 - Pending work can span spaces and targets in one provider turn. Each rendered
   message retains its target, Server sequence, timestamp, sender identity/type,
   thread metadata, visibility, and encryption tag.
 - One `GlobalInboxRuntime` owns one serial provider boundary per Agent. New
   arrivals can be steered only when the active Driver exposes a safe steering
   capability; otherwise they remain durable for the next turn.
+- The three-second window coalesces newly changed pending IDs. It is not a retry
+  interval for an unchanged unread set. A successful notice turn that performs
+  no Inbox read is a normal provider defer and does not immediately run again.
+- Notice delivery records the exact pending IDs contributed to the current
+  native provider session. Later arrivals produce a delta notice; a replacement
+  session rediscovers the remaining pending set once. Provider failure or crash
+  recovery releases the affected delivery evidence so it can be retried.
 - Plain assistant output is suppressed for Global Inbox turns. Chat output must
   use `send_message`, so routing is explicit and one turn may send to several
   targets.
@@ -193,6 +216,14 @@ failures. Provider-native diagnostics stay opaque and are not serialized.
 
 `cli-sandbox` is reserved. Hermes and Gemini remain named design candidates but
 are rejected by the current runtime matrix.
+
+Codex accepts active-turn Inbox deltas through native `turn/steer`. Claude Code
+stream-json accepts another user frame, but even one written immediately after
+a tool result is queued as a separate Claude native turn; an arbitrary busy-time
+write can also interrupt the current request. Puffo therefore does not report
+that write as admission into the active logical turn. Its durable delta remains
+pending until the current terminal event, then starts as a separately tracked
+turn.
 
 ## 6. Durable State
 
@@ -313,7 +344,7 @@ Use these entry points when tracing a change:
 | Driver protocol | `agent/harness/driver.py`, `agent/harness/runtime_manager.py` |
 | Native/bridge receive | `agent/puffo_core_client.py`, `agent/inbound_receipts.py`, `agent/bridge_transport.py` |
 | Durable Inbox | `agent/message_store.py`, `agent/inbox_store.py`, `agent/global_inbox_runtime.py` |
-| Context rendering | `agent/message_projection.py`, `agent/context_controller.py` |
+| Context rendering | `agent/message_projection.py`, `mcp/tool_result_projection.py`, `agent/context_controller.py` |
 | Coordinated send | `agent/send_coordinator.py`, `agent/global_inbox_send.py`, `agent/global_inbox_held.py` |
 | Model tools | `mcp/puffo_core_server.py`, `mcp/core_*_tools.py` |
 | Memory | `agent/memory.py`, `agent/memory_store.py`, `mcp/memory_tools.py` |
@@ -324,8 +355,8 @@ Use these entry points when tracing a change:
 ## 12. Invariants
 
 1. Inbound content is durably classified before transport acknowledgement.
-2. Only rows explicitly admitted across a provider boundary advance active-turn
-   visibility.
+2. A pending row advances into the daemon-owned active turn only when it is
+   explicitly returned to the provider by `read_inbox` or `read_history`.
 3. Global Inbox turns serialize per Agent; target identity remains explicit.
 4. Freshness metadata is daemon-owned and never model-authored.
 5. A held send has no message, delivery, notification, or freshness side

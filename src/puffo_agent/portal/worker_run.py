@@ -689,6 +689,7 @@ class StandardWorkerRun:
         return run_global_turn
 
     def _build_global_runtime(self, context: WorkerRunContext, *, status_lifecycle=None):
+        from ..agent.channel_audience import read_channel_audience
         from ..agent.global_inbox_runtime import (
             ActiveBoundaryAdapter,
             BaselineAdapter,
@@ -711,6 +712,12 @@ class StandardWorkerRun:
             agent_id=paths.agent_id,
             runtime_event_outbox=context.runtime_event_outbox,
             status_lifecycle=status_lifecycle,
+            channel_audience_loader=lambda space_id, channel_id: read_channel_audience(
+                space_id,
+                channel_id,
+                http=client.http,
+                log=logger,
+            ),
         )
         coordinator = SendCoordinator(
             slug=client.slug,

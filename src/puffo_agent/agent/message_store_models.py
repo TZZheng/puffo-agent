@@ -105,28 +105,14 @@ class InboxNoticeState:
 
     @property
     def delivery_pending(self) -> bool:
-        """Whether the current generation lacks a session-aware acceptance.
-
-        New scheduling must use :meth:`is_due_for`, because one accepted
-        generation is suppressed only for the native provider session that
-        accepted it.  This compatibility projection remains useful to receipt
-        callers that only need to know whether a new generation exists.
-        """
+        """Whether the current generation lacks a session-aware delivery."""
         return self.pending_count > 0 and (
             self.generation != self.last_delivered_generation
             or not self.last_delivered_provider_session_id
         )
 
     def is_due_for(self, provider_session_id: str | None) -> bool:
-        """Return whether this session needs one metadata-only notice.
-
-        Some provider transports learn their native session id only in the
-        acceptance receipt for their first offered turn.  Before that receipt,
-        a notice is due only when this generation has no session-aware
-        acceptance at all.  Once an accepting session is durable, an unknown
-        session must remain suppressed rather than recreating an equivalent
-        notice loop.
-        """
+        """Return whether this provider session needs Inbox discovery."""
         if self.pending_count <= 0:
             return False
         if not provider_session_id:
@@ -320,7 +306,7 @@ def reminder_time_to_rfc3339(value: int) -> str:
     )
 
 
-def parse_reminder_target(target: str) -> tuple[str, str, str, str]:
+def parse_inbox_target(target: str) -> tuple[str, str, str, str]:
     """Validate and decompose a canonical local Inbox target.
 
     Returns ``(kind, space_id, channel_id, thread_root_id_or_peer)``.  The
@@ -349,7 +335,15 @@ def parse_reminder_target(target: str) -> tuple[str, str, str, str]:
         and valid_segment(parts[4])
     ):
         return ("channel", parts[1], parts[2], parts[4])
-    raise ValueError("invalid reminder target")
+    raise ValueError(
+        "target must be dm:<peer>, channel:<space_id>:<channel_id>, or "
+        "channel:<space_id>:<channel_id>:thread:<root_id>"
+    )
+
+
+def parse_reminder_target(target: str) -> tuple[str, str, str, str]:
+    """Backward-compatible reminder name for the shared target parser."""
+    return parse_inbox_target(target)
 
 
 class LifecycleConflict(Exception):

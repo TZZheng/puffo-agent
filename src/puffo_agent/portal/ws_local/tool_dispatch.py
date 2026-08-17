@@ -24,6 +24,7 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "send_message_with_attachments",
     # read / navigation
     "read_inbox",
+    "read_history",
     # durable Agent-local reminders
     "create_reminder",
     "list_reminders",
@@ -33,9 +34,6 @@ WS_LOCAL_ALLOWED_TOOLS: frozenset[str] = frozenset({
     "whoami",
     "get_post",
     "get_post_segment",
-    "get_channel_history",
-    "get_dm_history",
-    "get_thread_history",
     "list_channel_members",
     "list_spaces",
     "list_channels_in_space",
@@ -90,7 +88,7 @@ def build_dispatch(
     from ...mcp.puffo_core_tools import register_core_tools
 
     captured = _CapturedRegistration(handlers={})
-    register_core_tools(captured, cfg)
+    register_core_tools(captured, cfg, result_surface="raw")
     return {
         name: captured.handlers[name]
         for name in allowed

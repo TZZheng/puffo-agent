@@ -10,11 +10,9 @@ envelopes even though busy state is shown.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 
 import pytest
 
-from puffo_agent.agent.context_controller import ProviderAdmissionEvent
 from puffo_agent.agent.core import AgentAPIError
 from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
 from puffo_agent.agent.status_reporter import StatusReporter
@@ -24,18 +22,6 @@ from test_global_inbox_runtime import _ContinuationAdapter, make_store, receipt
 from test_status_reporter import FakeHttp
 
 INTRO_ID = "intro-prompt-ch_x-1778641626040"
-
-
-class _PoppingContinuationAdapter(_ContinuationAdapter):
-    """Fires each registered ``read_inbox`` continuation exactly once."""
-
-    async def admit_continuation(self):
-        callback, key, *_ = self.continuations.pop(0)
-        await callback(ProviderAdmissionEvent(
-            planning_cycle_key=key, provider_session_id="provider-1",
-            provider_turn_id="provider-turn", tool_call_id="read",
-            admitted_at=datetime.now(timezone.utc),
-        ))
 
 
 class _LifecycleRunner:
@@ -51,10 +37,8 @@ class _LifecycleRunner:
     async def __call__(self, planned):
         await self.adapter.admit()
         await self.runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
-        await self.adapter.admit_continuation()
         if self.expand:
             await self.runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
-            await self.adapter.admit_continuation()
         if self.outcome == "failure":
             raise self.error
         if self.outcome == "cancelled":
@@ -178,7 +162,7 @@ async def test_global_inbox_turn_owns_one_status_lifecycle(tmp_path, monkeypatch
         if case["expand"]:
             await receipt(store, "m2", 2)
 
-    adapter = _PoppingContinuationAdapter()
+    adapter = _ContinuationAdapter()
     runner = _LifecycleRunner(
         adapter,
         expand=case["expand"],
@@ -227,7 +211,7 @@ async def test_crash_recovery_reuses_and_settles_original_processing_run(tmp_pat
     )
     planned = await original.plan_pending(items=tuple(await store.get_pending()))
     assert planned is not None
-    original._write_current_turn(planned)
+    await original._start_local_turn(planned)
     original_adapter.register_admission_callback(
         lambda event: original._admit(planned, event),
         planned.planning_cycle_key,

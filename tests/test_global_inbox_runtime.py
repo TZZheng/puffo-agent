@@ -34,6 +34,7 @@ from puffo_agent.agent.global_inbox_runtime import (
 )
 from puffo_agent.agent.message_store import (
     MessageStore,
+    ProcessingState,
     ReceiptDisposition,
     ReceiptResult,
     ReceiptWriteStatus,
@@ -966,7 +967,7 @@ async def test_global_notice_turns_are_ephemeral_to_the_agent_log(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pre_admission_failure_leaves_pending_without_self_retry(
+async def test_provider_start_failure_requeues_local_turn_without_busy_retry(
     tmp_path, caplog,
 ):
     caplog.set_level(logging.INFO)
@@ -988,7 +989,7 @@ async def test_pre_admission_failure_leaves_pending_without_self_retry(
     assert not await runtime.process_once()
     assert calls == 1
     assert runtime.health == RuntimeHealth(
-        "degraded", "turn failed before durable admission"
+        "degraded", "turn failed and was requeued"
     )
     assert runtime._degraded is True
     assert [m.envelope_id for m in await store.get_pending()] == ["m1"]
@@ -998,7 +999,7 @@ async def test_pre_admission_failure_leaves_pending_without_self_retry(
     ]
     assert len(failures) == 1
     assert failures[0]["error_type"] == "RuntimeError"
-    assert failures[0]["outcome"] == "degraded"
+    assert failures[0]["outcome"] == "requeued"
     await store.close()
 
 
@@ -1135,7 +1136,7 @@ class _ContinuationAdapter(Adapter):
         ))
 
 
-def _visible_read_runtime(store, tmp_path):
+async def _visible_read_runtime(store, tmp_path):
     adapter = _ContinuationAdapter()
     runtime = GlobalInboxRuntime(
         store=store,
@@ -1146,6 +1147,10 @@ def _visible_read_runtime(store, tmp_path):
     runtime.active.turn_id = "turn"
     runtime.active.provider_session_id = "provider-1"
     runtime.active.provider_turn_id = "provider-turn"
+    await store.start_turn(
+        turn_id="turn",
+        provider_session_id="provider-1",
+    )
     runtime.active.routes[:] = [
         MessageRoute("history-2", "channel", "sp-1", "ch-1"),
     ]
@@ -1173,6 +1178,10 @@ async def _stage_visible_read(runtime, boundary, adapter, caplog):
 
 async def _admit_and_assert_visible_read(runtime, boundary, adapter, caplog):
     await adapter.admit_continuation()
+    assert runtime.active.message_ids == ["history-2"]
+    row = await runtime.store.get_message_by_envelope("history-2")
+    assert row is not None
+    assert row.processing_turn_id == "turn"
     assert runtime.active.visible_message_ids == ["history-2"]
     assert await boundary.get_active_turn_through_seq("sp-1", "ch-1") == 2
     await adapter.admit_continuation()
@@ -1234,7 +1243,7 @@ async def test_model_visible_read_advances_only_after_exact_tool_result_admissio
     caplog.set_level(logging.DEBUG, logger="puffo_agent.agent.global_inbox_runtime")
     store = await make_store(tmp_path)
     await receipt(store, "history-2", 2)
-    adapter, runtime, boundary = _visible_read_runtime(store, tmp_path)
+    adapter, runtime, boundary = await _visible_read_runtime(store, tmp_path)
     await _stage_visible_read(runtime, boundary, adapter, caplog)
     await _admit_and_assert_visible_read(runtime, boundary, adapter, caplog)
     await _assert_visible_read_send_correlation(runtime, boundary, caplog)
@@ -1259,6 +1268,7 @@ async def test_initial_admission_visibility_is_exact_deduplicated_and_memory_onl
         target_summary="", formatted_blocks=(), provider_input="", formatted_tokens=0,
         wrapper_overhead_tokens=0, formatted_bytes=0, wrapper_overhead_bytes=0,
     )
+    await runtime._start_local_turn(planned)
     await runtime._admit(planned, ProviderAdmissionEvent(
         planning_cycle_key="initial-visible-key", provider_session_id="provider-1",
         provider_turn_id="provider-turn", admitted_at=datetime.now(timezone.utc),
@@ -1337,6 +1347,10 @@ async def test_model_visible_read_admits_at_runtime_tool_return(tmp_path, caplog
     runtime.active.turn_id = "turn-tool-return"
     runtime.active.provider_session_id = adapter.session
     runtime.active.provider_turn_id = "provider-turn-tool-return"
+    await store.start_turn(
+        turn_id="turn-tool-return",
+        provider_session_id=adapter.session,
+    )
 
     result = await runtime.stage_model_visible_read(
         space_id="sp-1",
@@ -1349,6 +1363,9 @@ async def test_model_visible_read_admits_at_runtime_tool_return(tmp_path, caplog
     )
 
     assert result["state"] == "admitted"
+    row = await store.get_message_by_envelope("history-tool-return")
+    assert row is not None
+    assert row.processing_state is ProcessingState.IN_TURN
     assert runtime.active.through_by_channel[("sp-1", "ch-1")] == 7
     assert runtime.active.visible_message_ids == ["history-tool-return"]
     history_events = [
@@ -1522,7 +1539,7 @@ async def test_driver_recovery_abandons_before_exact_union_replacement(tmp_path)
     )
     planned = await seed.plan_pending()
     assert planned is not None
-    seed._write_current_turn(planned)
+    await seed._start_local_turn(planned)
     seed_adapter.register_admission_callback(
         lambda event: seed._admit(planned, event),
         planned.planning_cycle_key,
@@ -1530,7 +1547,6 @@ async def test_driver_recovery_abandons_before_exact_union_replacement(tmp_path)
     await seed_adapter.admit()
     page = await seed.read_inbox(limit=2, tool_arguments={"limit": 2})
     assert len(page["messages"]) == 2
-    await seed_adapter.admit_continuation()
     persisted = json.loads(seed.current_turn_path.read_text(encoding="utf-8"))
     assert persisted["message_ids"] == ["first", "second"]
 
@@ -1735,7 +1751,7 @@ async def test_admission_retry_auth_unsafe_or_exhaustion_requeues(
 
 
 @pytest.mark.asyncio
-async def test_silence_without_correlated_admission_degrades_without_self_wake(
+async def test_success_without_inbox_read_leaves_messages_pending(
     tmp_path,
 ):
     store = await make_store(tmp_path)
@@ -1752,7 +1768,7 @@ async def test_silence_without_correlated_admission_degrades_without_self_wake(
         store=store, adapter=adapter, run_turn=run, workspace=tmp_path,
     )
     await runtime.process_once()
-    assert runtime.health.state == "degraded"
+    assert runtime.health.state == "idle"
     assert [row.envelope_id for row in await store.get_pending()] == ["silent"]
     assert calls == 1
     assert not runtime.current_turn_path.exists()

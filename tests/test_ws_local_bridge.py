@@ -11,9 +11,11 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+from types import SimpleNamespace
 
 import pytest
 
+from puffo_agent.agent.global_inbox_types import ActiveExactUnion
 from puffo_agent.portal.ws_local.bridge import BridgeClosed, WsLocalBridge
 from puffo_agent.portal.ws_local.bundles import BundleQueue
 from puffo_agent.portal.ws_local.session import WsLocalSession
@@ -138,6 +140,44 @@ async def test_dispatch_after_death_raises_immediately():
     await run
     with pytest.raises(BridgeClosed):
         await bridge.dispatch(sess, "r1", [_msg("a")], {"channel_id": "c"})
+
+
+@pytest.mark.asyncio
+async def test_v2_disconnect_finalizes_an_empty_durable_turn():
+    calls = []
+
+    class Store:
+        async def finalize_empty_turn(self, **kwargs):
+            calls.append(("finalize", kwargs))
+
+        async def release_notice_delivery(self, session, message_ids):
+            calls.append(("release", session, message_ids))
+
+    active = ActiveExactUnion(
+        turn_id="turn-empty",
+        notice_message_ids=["pending-1"],
+        provider_session_id="provider-1",
+    )
+    notified = []
+    runtime = SimpleNamespace(
+        active=active,
+        store=Store(),
+        notify=lambda: notified.append(True),
+        _turn_state_lock=asyncio.Lock(),
+    )
+    bridge = WsLocalBridge(runtime=runtime)
+    bridge._waiter = asyncio.get_running_loop().create_future()
+
+    await bridge.on_dead("connection lost")
+
+    with pytest.raises(BridgeClosed, match="connection lost"):
+        await bridge._waiter
+    assert calls == [
+        ("finalize", {"turn_id": "turn-empty", "state": "requeued"}),
+        ("release", "provider-1", ("pending-1",)),
+    ]
+    assert not active.turn_id
+    assert notified == [True]
 
 
 @pytest.mark.asyncio

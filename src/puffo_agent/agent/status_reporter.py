@@ -117,7 +117,7 @@ class StatusReporter:
         except Exception as exc:  # noqa: BLE001
             logger.warning("keyless status emit (%s) failed (%s)", status, exc)
 
-    def _runtime_payload(self) -> dict[str, str] | None:
+    def _runtime_payload(self) -> dict[str, Any] | None:
         if self._runtime_provider is None:
             return None
         try:
@@ -125,12 +125,19 @@ class StatusReporter:
         except Exception as exc:  # noqa: BLE001
             logger.debug("runtime_provider raised (%s)", exc)
             return None
-        allowed = ("kind", "provider", "harness", "model", "inference_level")
-        return {
+        text_fields = (
+            "kind", "provider", "harness", "model", "inference_level",
+        )
+        payload: dict[str, Any] = {
             key: str(runtime.get(key, ""))[:256]
-            for key in allowed
+            for key in text_fields
             if key in runtime
         }
+        for key in ("max_context", "auto_compact_threshold_pct"):
+            value = runtime.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                payload[key] = value
+        return payload
 
     async def report_current_status(self) -> None:
         """Best-effort status refresh used after bridge reconnects."""

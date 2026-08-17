@@ -98,6 +98,7 @@ class PlannedTurn:
     wrapper_overhead_bytes: int
     more_available: bool = False
     notice_generation: int = 0
+    notice_message_ids: tuple[str, ...] = ()
     requires_encryption: bool = False
 
     @property
@@ -121,6 +122,7 @@ class PlannedTurn:
 class ActiveExactUnion:
     turn_id: str = ""
     message_ids: list[str] = field(default_factory=list)
+    notice_message_ids: list[str] = field(default_factory=list)
     # In-memory only: rows whose plaintext has crossed a provider boundary.
     visible_message_ids: list[str] = field(default_factory=list)
     provider_session_id: str | None = None
@@ -131,6 +133,7 @@ class ActiveExactUnion:
     def clear(self) -> None:
         self.turn_id = ""
         self.message_ids.clear()
+        self.notice_message_ids.clear()
         self.visible_message_ids.clear()
         self.provider_session_id = None
         self.provider_turn_id = None

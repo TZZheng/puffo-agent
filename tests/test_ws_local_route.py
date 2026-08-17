@@ -153,13 +153,11 @@ async def test_ws_local_bridge_records_actual_tool_before_opaque_admission():
 
 
 @pytest.mark.asyncio
-async def test_ws_local_bridge_accepts_the_read_tools_admission_receipt_key():
+async def test_ws_local_bridge_accepts_history_admission_receipt_key():
     """BLOCKER 2: two producers, two key names, one bridge consumer.
 
-    ``read_inbox``/``get_post_segment`` return the receipt as
-    ``admission_receipt`` while ``stage_held_send_result`` returns
-    ``tool_result_admission``. Recognising only the latter left every read
-    admission uncorrelatable, which killed the session mid-turn.
+    History/post readers return the receipt as ``admission_receipt`` while
+    ``stage_held_send_result`` returns ``tool_result_admission``.
     """
     adapter = route_mod._WsLocalContextAdapter()
     seen = []
@@ -169,10 +167,10 @@ async def test_ws_local_bridge_accepts_the_read_tools_admission_receipt_key():
 
     adapter.register_continuation_callback(
         callback,
-        "inbox-read-key",
+        "history-read-key",
         correlation_receipt="read-receipt",
-        tool_names=("read_inbox",),
-        tool_arguments={"limit": 7},
+        tool_names=("get_post_segment",),
+        tool_arguments={"envelope_id": "post-1", "segment": 0},
     )
     runtime = type("Runtime", (), {"adapter": adapter})()
     bridge = WsLocalBridge(runtime=runtime)
@@ -182,17 +180,17 @@ async def test_ws_local_bridge_accepts_the_read_tools_admission_receipt_key():
     })()
 
     await bridge.on_tool_result(
-        "read_inbox", {"limit": 7},
+        "get_post_segment", {"envelope_id": "post-1", "segment": 0},
         {"messages": [], "admission_receipt": "[puffo:model-visible-read:read-receipt]"},
     )
     await bridge.on_admitted(
         bundle, type("Frame", (), {"correlation_key": "read-receipt"})(),
     )
-    assert [event.planning_cycle_key for event in seen] == ["inbox-read-key"]
+    assert [event.planning_cycle_key for event in seen] == ["history-read-key"]
 
 
 @pytest.mark.asyncio
-async def test_ws_local_history_callback_updates_visible_registry_only_after_admission(
+async def test_ws_local_history_callback_admits_visible_pending_after_correlation(
     tmp_path,
 ):
     from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
@@ -251,10 +249,10 @@ async def test_ws_local_history_callback_updates_visible_registry_only_after_adm
         tool_name="get_post", tool_arguments={"channel": "ch-1", "seq": 4},
     )
     assert runtime.active.visible_message_ids == ["ws-history"]
-    assert runtime.active.message_ids == []
+    assert runtime.active.message_ids == ["ws-history"]
     assert runtime.active.through_by_channel == {("sp-1", "ch-1"): 4}
     assert (await store.get_message_by_envelope("ws-history")).processing_state == (
-        ProcessingState.PENDING.value
+        ProcessingState.IN_TURN.value
     )
     with pytest.raises(RuntimeError, match="correlation failed"):
         await adapter.emit_admission(turn_id="turn-1", correlation_key=receipt)
@@ -279,7 +277,7 @@ async def test_ws_local_history_callback_updates_visible_registry_only_after_adm
     assert runtime.active.visible_message_ids == ["ws-history"]
     assert runtime.active.through_by_channel == {("sp-1", "ch-1"): 4}
     assert (await store.get_message_by_envelope("ws-history")).processing_state == (
-        ProcessingState.PENDING.value
+        ProcessingState.IN_TURN.value
     )
     await store.close()
 
@@ -414,7 +412,7 @@ async def test_full_attach_flow_v1_peer_receives_single_root_bundle_and_can_send
 
     Covers the documented v1 guarantee in both directions: the peer is
     scheduled and delivered a frozen single-root batch off the owned runtime
-    (it used to receive nothing at all), its ``read_inbox`` is admitted
+    (it used to receive nothing at all), its pending ``read_inbox`` is admitted
     without any ``admitted`` frame (v1 has none), and ``send_message``
     reaches a real SendCoordinator (it used to fail closed with
     ``coordinator_unavailable``).
@@ -459,16 +457,17 @@ async def test_full_attach_flow_v1_peer_receives_single_root_bundle_and_can_send
 
     # Delivery is the model-visible transition for v1 (there is no `admitted`
     # frame), so the runtime's turn is admitted and bound.
-    turn_id = await _poll(lambda: _ready(client.global_runtime.active.turn_id))
-    assert client.global_runtime.active.provider_turn_id == turn_id
+    turn_id = await _poll(
+        lambda: _ready(client.global_runtime.active.provider_turn_id)
+    )
+    assert client.global_runtime.active.turn_id == turn_id
 
-    # ... and the read the notice asks for is admitted off its tool result,
-    # so the rows really do become model-visible for this turn.
+    # The notice read directly admits the returned rows to the active turn.
     transport.feed({"type": "tool_call", "command_id": "cmd_0",
                     "tool": "read_inbox", "params": {}})
     read = await _poll(lambda: _ready(transport.by_type("tool_result")))
     assert read[0]["ok"] is True
-    assert "[puffo:model-visible-read:" in read[0]["result"]["admission_receipt"]
+    assert "admission_receipt" not in read[0]["result"]
     assert client.global_runtime.active.message_ids == ["v1-one"]
 
     transport.feed({"type": "tool_call", "command_id": "cmd_1",

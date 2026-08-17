@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
@@ -19,11 +20,9 @@ from .global_inbox_types import (
     PlannedTurn,
     route_for,
 )
-from .inbox_scheduler import MAX_FORMATTED_BYTES
+from .inbox_scheduler import MAX_FORMATTED_BYTES, NoticeDeliveryCapability
 from .message_projection import CONTEXT_VERSION
 from .message_store import (
-    PRIOR_CONTEXT_MAX_BYTES,
-    PRIOR_CONTEXT_MAX_ITEMS,
     ProcessingState,
     ReceiptDisposition,
     StoredMessage,
@@ -38,10 +37,10 @@ logger = logging.getLogger("puffo_agent.agent.global_inbox_runtime")
 class VisibleReadContext:
     active_turn_id: str
     provider_session_id: str
-    space_id: str
-    channel_id: str
-    through_seq: int
-    through_envelope_id: str
+    space_id: str | None
+    channel_id: str | None
+    through_seq: int | None
+    through_envelope_id: str | None
     visible_ids: tuple[str, ...]
     correlation_key: str
     correlation_receipt: str
@@ -53,26 +52,6 @@ class InboxPageProjection:
     selected: tuple[StoredMessage, ...]
     next_cursor: str | None
     has_more: bool
-    remaining_count: int
-
-
-@dataclass(frozen=True)
-class PriorContextProjection:
-    blocks: tuple[str, ...]
-    message_ids: tuple[str, ...]
-    has_more: bool
-
-
-@dataclass(frozen=True)
-class InboxReadContext:
-    active_turn_id: str
-    provider_session_id: str
-    selected: tuple[StoredMessage, ...]
-    routes: tuple[MessageRoute, ...]
-    prior_context_ids: tuple[str, ...]
-    correlation_key: str
-    correlation_receipt: str
-    snapshot_generation: int
     remaining_count: int
 
 
@@ -372,7 +351,7 @@ class InboxAdmissionMixin:
         return result
 
     def _write_active_current_turn(self) -> None:
-        """Atomically persist the exact active union after held admission."""
+        """Atomically persist the exact union after a mid-turn admission."""
         targets = tuple(dict.fromkeys(route.target for route in self.active.routes))
         self._write_current_turn(
             PlannedTurn(
@@ -393,15 +372,80 @@ class InboxAdmissionMixin:
             )
         )
 
-    def note_input_ready(self, turn_id: str) -> None:
-        self.notice_delivery.note_input_ready(turn_id)
+    def _schedule_busy_notice(self) -> None:
+        """Coalesce new ingress into the active native turn when supported."""
+        turn_id = self.active.turn_id
+        if (
+            not turn_id
+            or self.notice_delivery.capability
+            is NoticeDeliveryCapability.NEXT_TURN
+        ):
+            return
+        self._busy_notice_dirty = True
+        if self._busy_notice_task is not None and not self._busy_notice_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._busy_notice_task = loop.create_task(
+            self._deliver_busy_notices(turn_id),
+            name=f"inbox-notice-{turn_id}",
+        )
+
+    async def _deliver_busy_notices(self, turn_id: str) -> None:
+        """Deliver only changed Inbox identities, with bounded error retries."""
+        current = asyncio.current_task()
+        attempts = 0
+        try:
+            await asyncio.sleep(self._busy_notice_delay_seconds)
+            while not self._stopping and self.active.turn_id == turn_id:
+                self._busy_notice_dirty = False
+                try:
+                    await self.offer_busy_notice(turn_id=turn_id)
+                    attempts = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    attempts += 1
+                    log_runtime_event(
+                        logger,
+                        "notice.deferred",
+                        level=logging.WARNING,
+                        agent_id=self.agent_id,
+                        turn_id=turn_id,
+                        provider_session_id=self.active.provider_session_id,
+                        attempt=attempts,
+                        error_category="provider_delivery",
+                        error_type=type(exc).__name__,
+                        outcome="retry" if attempts < 2 else "next_turn",
+                    )
+                    if attempts >= 2:
+                        return
+                    self._busy_notice_dirty = True
+                    await asyncio.sleep(
+                        min(self._busy_notice_delay_seconds, float(attempts))
+                    )
+                    continue
+                if not self._busy_notice_dirty:
+                    return
+                await asyncio.sleep(self._busy_notice_delay_seconds)
+        finally:
+            if self._busy_notice_task is current:
+                self._busy_notice_task = None
 
     async def offer_busy_notice(self, *, turn_id: str) -> bool:
         """Offer metadata-only work to the named active Turn when safe."""
-        if turn_id != self.active.turn_id:
+        provider_session_id = self.active.provider_session_id
+        provider_turn_id = self.active.provider_turn_id
+        if (
+            turn_id != self.active.turn_id
+            or not provider_session_id
+            or not provider_turn_id
+        ):
             return False
         planned = await self.plan_pending(
-            provider_session_id=self.active.provider_session_id,
+            provider_session_id=provider_session_id,
         )
         if planned is None:
             return False
@@ -413,12 +457,13 @@ class InboxAdmissionMixin:
         planned = decision.candidate.payload
         if not isinstance(planned, PlannedTurn):
             return False
-        offer = getattr(self.adapter, "offer_inbox_notice", None)
-        if not callable(offer):
-            return False
-
         async def deliver() -> bool:
-            return bool(await offer(turn_id, planned.provider_input))
+            return bool(
+                await self.adapter.offer_inbox_notice(
+                    provider_turn_id,
+                    planned.provider_input,
+                )
+            )
 
         accepted = await self.notice_delivery.offer(
             named_turn_id=turn_id,
@@ -427,10 +472,23 @@ class InboxAdmissionMixin:
         )
         if not accepted:
             return False
-        return await self.store.mark_notice_delivered(
+        recorded = await self.store.mark_notice_delivered(
             planned.notice_generation,
-            self.active.provider_session_id,
+            provider_session_id,
+            planned.notice_message_ids,
+            turn_id=turn_id,
         )
+        if (
+            recorded
+            and self.active.turn_id == turn_id
+            and self.active.provider_session_id == provider_session_id
+            and self.active.provider_turn_id == provider_turn_id
+        ):
+            known = set(self.active.notice_message_ids)
+            self.active.notice_message_ids.extend(
+                item for item in planned.notice_message_ids if item not in known
+            )
+        return recorded
 
     def resolve_active_send_route(
         self,
@@ -509,42 +567,57 @@ class InboxAdmissionMixin:
     async def _prepare_visible_read(
         self,
         *,
-        space_id: str,
-        channel_id: str,
-        through_seq: int,
-        through_envelope_id: str,
+        space_id: str | None,
+        channel_id: str | None,
+        through_seq: int | None,
+        through_envelope_id: str | None,
         visible_message_ids: list[str] | None,
     ) -> VisibleReadContext:
-        if through_seq < 0:
-            raise RuntimeError("model-visible read sequence must be non-negative")
-        row = await self.store.get_message_by_envelope(through_envelope_id)
-        if (
-            row is None
-            or row.server_seq != through_seq
-            or row.space_id != space_id
-            or row.channel_id != channel_id
-            or row.envelope_kind == "dm"
-        ):
-            log_runtime_event(
-                logger,
-                "history.read_staged",
-                level=logging.DEBUG,
-                agent_id=self.agent_id,
-                turn_id=self.active.turn_id,
-                provider_session_id=self.active.provider_session_id,
-                envelope_id=through_envelope_id,
-                space_id=space_id,
-                channel_id=channel_id,
-                latest_seq=through_seq,
-                state=(
-                    "dm_unsupported"
-                    if row is not None and row.envelope_kind == "dm"
-                    else "invalid_watermark"
-                ),
+        visible_ids = list(
+            visible_message_ids
+            or ([through_envelope_id] if through_envelope_id else ())
+        )
+        if not visible_ids:
+            raise RuntimeError("model-visible read requires visible message IDs")
+        boundary = (space_id, channel_id, through_seq, through_envelope_id)
+        has_boundary = all(value not in (None, "") for value in boundary)
+        if any(value not in (None, "") for value in boundary) and not has_boundary:
+            raise RuntimeError("model-visible channel watermark is incomplete")
+        if has_boundary:
+            if (
+                isinstance(through_seq, bool)
+                or not isinstance(through_seq, int)
+                or through_seq < 0
+            ):
+                raise RuntimeError(
+                    "model-visible read sequence must be non-negative"
+                )
+            row = await self.store.get_message_by_envelope(
+                str(through_envelope_id)
             )
-            raise RuntimeError(
-                "model-visible read watermark does not match local storage"
-            )
+            if (
+                row is None
+                or row.server_seq != through_seq
+                or row.space_id != space_id
+                or row.channel_id != channel_id
+                or row.envelope_kind == "dm"
+            ):
+                log_runtime_event(
+                    logger,
+                    "history.read_staged",
+                    level=logging.DEBUG,
+                    agent_id=self.agent_id,
+                    turn_id=self.active.turn_id,
+                    provider_session_id=self.active.provider_session_id,
+                    envelope_id=through_envelope_id,
+                    space_id=space_id,
+                    channel_id=channel_id,
+                    latest_seq=through_seq,
+                    state="invalid_watermark",
+                )
+                raise RuntimeError(
+                    "model-visible read watermark does not match local storage"
+                )
         active_turn_id = self.active.turn_id
         provider_session_id = self.active.provider_session_id
         if not active_turn_id or not provider_session_id:
@@ -560,21 +633,22 @@ class InboxAdmissionMixin:
                 state="no_active_turn",
             )
             raise RuntimeError("no active provider turn for model-visible read")
-        visible_ids = list(visible_message_ids or ())
         await self._add_visible_message_ids(
             visible_ids,
-            space_id=space_id,
-            channel_id=channel_id,
-            through_seq=through_seq,
+            space_id=space_id if has_boundary else None,
+            channel_id=channel_id if has_boundary else None,
+            through_seq=through_seq if has_boundary else None,
             mutate=False,
         )
         return VisibleReadContext(
             active_turn_id=active_turn_id,
             provider_session_id=provider_session_id,
-            space_id=space_id,
-            channel_id=channel_id,
-            through_seq=through_seq,
-            through_envelope_id=through_envelope_id,
+            space_id=str(space_id) if has_boundary else None,
+            channel_id=str(channel_id) if has_boundary else None,
+            through_seq=through_seq if has_boundary else None,
+            through_envelope_id=(
+                str(through_envelope_id) if has_boundary else None
+            ),
             visible_ids=tuple(visible_ids),
             correlation_key=f"visible_read_{uuid.uuid4().hex}",
             correlation_receipt=uuid.uuid4().hex,
@@ -613,32 +687,88 @@ class InboxAdmissionMixin:
     ) -> None:
         if fired[0] or event.planning_cycle_key != context.correlation_key:
             return
-        if (
-            self.active.turn_id != context.active_turn_id
-            or self.active.provider_session_id != context.provider_session_id
-            or event.provider_session_id != context.provider_session_id
-        ):
-            raise RuntimeError(
-                "model-visible read admission crossed the active provider turn"
-            )
-        fired[0] = True
+        admitted_rows: tuple[StoredMessage, ...] = ()
         try:
-            await self._add_visible_message_ids(
-                context.visible_ids,
-                space_id=context.space_id,
-                channel_id=context.channel_id,
-                through_seq=context.through_seq,
-            )
-            await ActiveBoundaryAdapter(
-                self.store, self.active
-            ).advance_active_turn_through_seq(
-                context.space_id,
-                context.channel_id,
-                context.through_seq,
-            )
+            async with self._turn_state_lock:
+                if (
+                    self.active.turn_id != context.active_turn_id
+                    or self.active.provider_session_id
+                    != context.provider_session_id
+                    or event.provider_session_id != context.provider_session_id
+                ):
+                    raise RuntimeError(
+                        "model-visible read admission crossed the active provider turn"
+                    )
+                fired[0] = True
+                visible_rows_list: list[StoredMessage | None] = []
+                for envelope_id in context.visible_ids:
+                    visible_rows_list.append(
+                        await self.store.get_message_by_envelope(envelope_id)
+                    )
+                visible_rows = tuple(visible_rows_list)
+                admitted_rows = tuple(
+                    row
+                    for row in visible_rows
+                    if row is not None
+                    and row.processing_state is ProcessingState.PENDING
+                    and row.receipt_disposition
+                    in {
+                        ReceiptDisposition.ELIGIBLE,
+                        ReceiptDisposition.LOCAL_RUNTIME,
+                    }
+                )
+                if admitted_rows:
+                    self._raise_send_mode_for(admitted_rows)
+                    await self.store.admit_messages(
+                        (row.envelope_id for row in admitted_rows),
+                        turn_id=context.active_turn_id,
+                        provider_session_id=context.provider_session_id,
+                    )
+                    durable_rows = await self.store.get_in_turn_messages(
+                        context.active_turn_id,
+                        context.provider_session_id,
+                    )
+                    self.active.message_ids[:] = [
+                        row.envelope_id for row in durable_rows
+                    ]
+                    self.active.routes[:] = [route_for(row) for row in durable_rows]
+                    self._write_active_current_turn()
+                await self._add_visible_message_ids(
+                    context.visible_ids,
+                    space_id=context.space_id,
+                    channel_id=context.channel_id,
+                    through_seq=context.through_seq,
+                )
+                if (
+                    context.space_id is not None
+                    and context.channel_id is not None
+                    and context.through_seq is not None
+                ):
+                    await ActiveBoundaryAdapter(
+                        self.store, self.active
+                    ).advance_active_turn_through_seq(
+                        context.space_id,
+                        context.channel_id,
+                        context.through_seq,
+                    )
         except Exception:
             self._log_visible_read(context, "admission_failed", event=event)
             raise
+        if admitted_rows:
+            for row in admitted_rows:
+                log_runtime_event(
+                    logger,
+                    "inbox.row_in_turn",
+                    agent_id=self.agent_id,
+                    turn_id=context.active_turn_id,
+                    provider_session_id=context.provider_session_id,
+                    provider_turn_id=event.provider_turn_id,
+                    message_id=row.envelope_id,
+                    server_seq=row.server_seq,
+                    target=self.store.target_projection(row),
+                    outcome="history_visible",
+                )
+            await self._notify_status_active()
         self._log_visible_read(
             context,
             "admitted",
@@ -685,15 +815,15 @@ class InboxAdmissionMixin:
     async def stage_model_visible_read(
         self,
         *,
-        space_id: str,
-        channel_id: str,
-        through_seq: int,
-        through_envelope_id: str,
         tool_name: str,
         tool_arguments: Mapping[str, Any],
         visible_message_ids: list[str] | None = None,
+        space_id: str | None = None,
+        channel_id: str | None = None,
+        through_seq: int | None = None,
+        through_envelope_id: str | None = None,
     ) -> dict[str, Any]:
-        """Advance freshness at the adapter's proven model-visible boundary."""
+        """Admit exact model-visible rows and any proven channel boundary."""
         context = await self._prepare_visible_read(
             space_id=space_id,
             channel_id=channel_id,
@@ -716,10 +846,10 @@ class InboxAdmissionMixin:
             "state": state,
             "correlation_key": context.correlation_key,
             "correlation_receipt": context.correlation_receipt,
-            "space_id": space_id,
-            "channel_id": channel_id,
-            "through_seq": through_seq,
-            "through_envelope_id": through_envelope_id,
+            "space_id": context.space_id,
+            "channel_id": context.channel_id,
+            "through_seq": context.through_seq,
+            "through_envelope_id": context.through_envelope_id,
         }
 
     async def _add_visible_message_ids(
@@ -801,163 +931,86 @@ class InboxAdmissionMixin:
             remaining_count=remaining_count,
         )
 
-    async def _project_prior_context(
+    async def _admit_inbox_page(
         self,
-        selected: tuple[StoredMessage, ...],
-    ) -> PriorContextProjection:
-        prior_context: list[str] = []
-        prior_context_ids: list[str] = []
-        prior_context_has_more = False
-        if selected:
-            anchors: dict[tuple[str, ...], StoredMessage] = {}
-            for item in selected:
-                anchors.setdefault(route_for(item).target, item)
-            prior_rows: dict[str, StoredMessage] = {}
-            for anchor in anchors.values():
-                prior_page = await self.store.get_prior_context_page(
-                    anchor,
-                    limit=PRIOR_CONTEXT_MAX_ITEMS,
-                    max_bytes=PRIOR_CONTEXT_MAX_BYTES,
-                )
-                prior_context_has_more = prior_context_has_more or prior_page.has_more
-                for item in prior_page.items:
-                    prior_rows.setdefault(item.envelope_id, item)
-            prior_byte_count = 0
-            for item in sorted(prior_rows.values(), key=self.store._inbox_order):
-                block = self.formatter(item)
-                block_bytes = len(block.encode("utf-8"))
-                if (
-                    len(prior_context) >= PRIOR_CONTEXT_MAX_ITEMS
-                    or prior_byte_count + block_bytes > PRIOR_CONTEXT_MAX_BYTES
-                ):
-                    prior_context_has_more = True
-                    continue
-                prior_context.append(block)
-                prior_context_ids.append(item.envelope_id)
-                prior_byte_count += block_bytes
-        return PriorContextProjection(
-            blocks=tuple(prior_context),
-            message_ids=tuple(prior_context_ids),
-            has_more=prior_context_has_more,
-        )
-
-    async def _admit_inbox_read(
-        self,
-        context: InboxReadContext,
-        event: ProviderAdmissionEvent,
-        fired: list[bool],
+        projection: InboxPageProjection,
+        *,
+        snapshot_generation: int,
+        requesting_turn_id: str,
+        requesting_provider_session_id: str | None,
+        requesting_provider_turn_id: str | None,
     ) -> None:
-        if fired[0] or event.planning_cycle_key != context.correlation_key:
-            return
-        if (
-            self.active.turn_id != context.active_turn_id
-            or self.active.provider_session_id != context.provider_session_id
-            or event.provider_session_id != context.provider_session_id
-        ):
-            raise RuntimeError("Inbox read admission crossed the active Turn")
-        ids = tuple(item.envelope_id for item in context.selected)
-        run = await self.store.admit_messages(
-            ids,
-            turn_id=context.active_turn_id,
-            provider_session_id=context.provider_session_id,
-        )
-        fired[0] = True
-        self._raise_send_mode_for(context.selected)
-        self.active.message_ids[:] = list(run.message_ids)
-        await self._add_visible_message_ids(list(ids) + list(context.prior_context_ids))
-        self.active.routes.extend(context.routes)
-        turn_rows = await self.store.get_in_turn_messages(
-            context.active_turn_id,
-            context.provider_session_id,
-        )
-        if turn_rows:
+        """Move the exact returned page into the daemon's active local turn."""
+        async with self._turn_state_lock:
+            if (
+                self.active.turn_id != requesting_turn_id
+                or (
+                    requesting_provider_session_id is not None
+                    and self.active.provider_session_id
+                    != requesting_provider_session_id
+                )
+                or (
+                    requesting_provider_turn_id is not None
+                    and self.active.provider_turn_id != requesting_provider_turn_id
+                )
+            ):
+                raise RuntimeError("Inbox read crossed the active provider turn")
+            turn_id = requesting_turn_id
+            provider_session_id = self.active.provider_session_id
+            provider_turn_id = self.active.provider_turn_id
+            ids = tuple(item.envelope_id for item in projection.selected)
+            routes = tuple(route_for(item) for item in projection.selected)
+            run = await self.store.admit_messages(
+                ids,
+                turn_id=turn_id,
+                provider_session_id=provider_session_id,
+            )
+            self._raise_send_mode_for(projection.selected)
+            self.active.message_ids[:] = list(run.message_ids)
+            await self._add_visible_message_ids(list(ids))
+            self.active.routes.extend(routes)
             self._write_current_turn(
                 self._reconstruct_exact_turn(
-                    turn_id=context.active_turn_id,
-                    rows=turn_rows,
+                    turn_id=turn_id,
+                    rows=projection.selected,
                 )
             )
-        for item, route in zip(context.selected, context.routes):
-            if item.server_seq is not None and route.kind != "dm":
-                key = (route.space_id, route.channel_id)
-                proven = await self.store.get_model_visible_through_seq(
-                    context.active_turn_id,
-                    route.space_id,
-                    route.channel_id,
+            for item, route in zip(projection.selected, routes):
+                if item.server_seq is not None and route.kind != "dm":
+                    key = (route.space_id, route.channel_id)
+                    proven = await self.store.get_model_visible_through_seq(
+                        turn_id,
+                        route.space_id,
+                        route.channel_id,
+                    )
+                    if proven is not None:
+                        self.active.through_by_channel[key] = proven
+                log_runtime_event(
+                    logger,
+                    "inbox.row_in_turn",
+                    agent_id=self.agent_id,
+                    turn_id=turn_id,
+                    provider_session_id=provider_session_id,
+                    provider_turn_id=provider_turn_id,
+                    message_id=item.envelope_id,
+                    server_seq=item.server_seq,
+                    target=self.store.target_projection(item),
+                    notice_generation=snapshot_generation,
+                    outcome="in_turn",
                 )
-                if proven is not None:
-                    self.active.through_by_channel[key] = proven
             log_runtime_event(
                 logger,
-                "inbox.row_in_turn",
+                "inbox.read_admitted",
                 agent_id=self.agent_id,
-                turn_id=context.active_turn_id,
-                provider_session_id=context.provider_session_id,
-                provider_turn_id=event.provider_turn_id,
-                tool_call_id=event.tool_call_id,
-                correlation_key=context.correlation_key,
-                message_id=item.envelope_id,
-                server_seq=item.server_seq,
-                target=self.store.target_projection(item),
-                notice_generation=context.snapshot_generation,
+                turn_id=turn_id,
+                provider_session_id=provider_session_id,
+                provider_turn_id=provider_turn_id,
+                notice_generation=snapshot_generation,
+                message_count=len(ids),
+                remaining_count=projection.remaining_count,
                 outcome="in_turn",
             )
-        log_runtime_event(
-            logger,
-            "inbox.read_admitted",
-            agent_id=self.agent_id,
-            turn_id=context.active_turn_id,
-            provider_session_id=context.provider_session_id,
-            provider_turn_id=event.provider_turn_id,
-            correlation_key=context.correlation_key,
-            notice_generation=context.snapshot_generation,
-            message_count=len(ids),
-            outcome="admitted",
-        )
-
-    async def _register_inbox_read(
-        self,
-        context: InboxReadContext,
-        callback: Callable[[ProviderAdmissionEvent], Awaitable[None]],
-        arguments: Mapping[str, Any],
-    ) -> None:
-        if self._admits_tool_results_on_return:
-            self._log_inbox_read_staged(context, "tool_return")
-            await self._admit_returned_tool_result(
-                callback,
-                planning_cycle_key=context.correlation_key,
-                provider_session_id=context.provider_session_id,
-            )
-            return
-        register = getattr(self.adapter, "register_continuation_callback", None)
-        if not callable(register):
-            raise RuntimeError("provider cannot correlate Inbox tool results")
-        register(
-            callback,
-            context.correlation_key,
-            tool_names=("read_inbox",),
-            tool_arguments=dict(arguments),
-            correlation_receipt=context.correlation_receipt,
-        )
-        self._log_inbox_read_staged(context, "staged")
-
-    def _log_inbox_read_staged(
-        self,
-        context: InboxReadContext,
-        outcome: str,
-    ) -> None:
-        log_runtime_event(
-            logger,
-            "inbox.read_staged",
-            agent_id=self.agent_id,
-            turn_id=context.active_turn_id,
-            provider_session_id=context.provider_session_id,
-            correlation_key=context.correlation_key,
-            notice_generation=context.snapshot_generation,
-            message_count=len(context.selected),
-            remaining_count=context.remaining_count,
-            outcome=outcome,
-        )
+        await self._notify_status_active()
 
     async def read_inbox(
         self,
@@ -967,49 +1020,30 @@ class InboxAdmissionMixin:
         limit: int = 50,
         tool_arguments: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Return one content page and admit it at the adapter's read boundary."""
-        active_turn_id = self.active.turn_id
-        provider_session_id = self.active.provider_session_id
-        if not active_turn_id or not provider_session_id:
-            raise RuntimeError("no active provider turn for Inbox read")
+        """Return one page and directly admit it to the active daemon turn."""
+        del tool_arguments
+        requesting_turn_id = self.active.turn_id
+        requesting_provider_session_id = self.active.provider_session_id
+        requesting_provider_turn_id = self.active.provider_turn_id
+        if not requesting_turn_id:
+            raise RuntimeError("no active daemon turn for Inbox read")
         page = await self.store.read_inbox_page(
             target=target, cursor=cursor, limit=limit
         )
         projection = self._project_inbox_page(page)
-        prior = await self._project_prior_context(projection.selected)
-        correlation_receipt = ""
         if projection.selected:
-            context = InboxReadContext(
-                active_turn_id=active_turn_id,
-                provider_session_id=provider_session_id,
-                selected=projection.selected,
-                routes=tuple(route_for(item) for item in projection.selected),
-                prior_context_ids=prior.message_ids,
-                correlation_key=f"inbox_read_{uuid.uuid4().hex}",
-                correlation_receipt=uuid.uuid4().hex,
+            await self._admit_inbox_page(
+                projection,
                 snapshot_generation=page.snapshot_generation,
-                remaining_count=projection.remaining_count,
+                requesting_turn_id=requesting_turn_id,
+                requesting_provider_session_id=requesting_provider_session_id,
+                requesting_provider_turn_id=requesting_provider_turn_id,
             )
-            fired = [False]
-
-            async def admit_read(event: ProviderAdmissionEvent) -> None:
-                await self._admit_inbox_read(context, event, fired)
-
-            arguments = (
-                tool_arguments
-                if tool_arguments is not None
-                else {"target": target, "cursor": cursor, "limit": limit}
-            )
-            await self._register_inbox_read(context, admit_read, arguments)
-            correlation_receipt = context.correlation_receipt
         return {
             "context_version": CONTEXT_VERSION,
             "messages": list(projection.blocks),
-            "prior_context": list(prior.blocks),
-            "prior_context_has_more": prior.has_more,
             "next_cursor": projection.next_cursor,
             "has_more": projection.has_more,
             "remaining_count": projection.remaining_count,
             "snapshot_generation": page.snapshot_generation,
-            "correlation_receipt": correlation_receipt,
         }

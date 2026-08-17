@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -432,14 +431,19 @@ async def boundary_harness(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_real_rpc_history_and_inbox_admission_wait_for_provider_completion(
+async def test_model_visible_history_and_inbox_join_the_same_active_turn(
     boundary_harness: BoundaryHarness,
 ):
     h = boundary_harness
 
+    history_arguments = {
+        "target": "channel:sp_1:ch-history",
+        "limit": 50,
+    }
     history_call = await h.mcp.call_tool(
-        "get_channel_history", {"channel": "ch-history", "limit": 50}
+        "read_history", history_arguments
     )
+    assert not isinstance(history_call, tuple)
     history_text = _tool_text(history_call)
     assert "history peer body" in history_text
     assert re.search(r"\[puffo:model-visible-read:[^]]+\]", history_text)
@@ -455,8 +459,8 @@ async def test_real_rpc_history_and_inbox_admission_wait_for_provider_completion
         r"(\[puffo:model-visible-read:[^]]+\])", history_text
     ).group(1)
     await h.emit_tool_result(
-        tool_name="get_channel_history",
-        arguments={"channel": "ch-history", "limit": 50},
+        tool_name="read_history",
+        arguments=history_arguments,
         result=history_text,
     )
     await _wait_until(
@@ -466,37 +470,25 @@ async def test_real_rpc_history_and_inbox_admission_wait_for_provider_completion
     )
     assert history_receipt in history_text
     assert await h.active_boundary("ch-history") == 2
+    history_row = await h.store.get_message_by_envelope("history-peer")
+    assert history_row is not None
+    assert history_row.processing_state is ProcessingState.IN_TURN
+    assert h.runtime.active.message_ids == ["history-peer"]
     assert h.runtime.active.visible_message_ids == ["history-peer"]
 
     inbox_call = await h.mcp.call_tool(
         "read_inbox",
         {"target": "channel:sp_1:ch-inbox", "limit": 1},
     )
-    inbox_page = inbox_call[1]
-    assert "inbox peer body" in inbox_page["messages"][0]
-    assert inbox_page["admission_receipt"].startswith(
-        "[puffo:model-visible-read:"
-    )
+    assert not isinstance(inbox_call, tuple)
+    inbox_text = _tool_text(inbox_call)
+    assert "inbox peer body" in inbox_text
+    assert "admission_receipt" not in inbox_text
     inbox_row = await h.store.get_message_by_envelope("inbox-peer")
     assert inbox_row is not None
-    assert inbox_row.processing_state is ProcessingState.PENDING
-    assert h.runtime.active.visible_message_ids == ["history-peer"]
-    assert await h.active_boundary("ch-inbox") is None
-
-    await h.emit_tool_result(
-        tool_name="read_inbox",
-        arguments={"target": "channel:sp_1:ch-inbox", "limit": 1},
-        result=json.dumps(inbox_page),
-    )
-    await _wait_until(
-        lambda: h.runtime.active.through_by_channel.get(
-            ("sp_1", "ch-inbox")
-        ) == 3
-    )
-    inbox_row = await h.store.get_message_by_envelope("inbox-peer")
     assert inbox_row.processing_state is ProcessingState.IN_TURN
     assert await h.active_boundary("ch-inbox") == 3
-    assert h.runtime.active.message_ids == ["inbox-peer"]
+    assert h.runtime.active.message_ids == ["history-peer", "inbox-peer"]
     assert h.runtime.active.visible_message_ids == ["history-peer", "inbox-peer"]
 
     await h.finish()
@@ -511,19 +503,18 @@ async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
     send_arguments = {"channel": "ch-held", "text": "held draft"}
 
     held_call = await h.mcp.call_tool("send_message", send_arguments)
-    held_result = held_call[1]
-    assert held_result["state"] == "held"
-    assert held_result["synchronized"] is True
-    assert held_result["latest_seq"] == 7
-    assert held_result["latest_envelope_id"] == "held-peer"
-    reconsideration = held_result["reconsideration"]
-    assert reconsideration["context_ready"] is True
-    assert "previous self contribution" in reconsideration["new_channel_context"]
-    assert "held peer body" in reconsideration["new_channel_context"]
-    assert reconsideration["guidance"] == HELD_SEND_RECONSIDERATION_GUIDANCE
-    assert held_result["tool_result_admission"].startswith(
-        "[puffo:model-visible-read:"
-    )
+    assert not isinstance(held_call, tuple)
+    held_result = _tool_text(held_call)
+    assert '[send_result context_version=1 state="held"' in held_result
+    assert "synchronized=true" in held_result
+    assert "latest_seq=7" in held_result
+    assert 'latest_envelope_id="held-peer"' in held_result
+    assert '[window context_version=1 kind="held_basis"' in held_result
+    assert '[window context_version=1 kind="held_new_context"' in held_result
+    assert held_result.count("previous self contribution") == 1
+    assert "held peer body" in held_result
+    assert HELD_SEND_RECONSIDERATION_GUIDANCE in held_result
+    assert re.search(r"\[puffo:model-visible-read:[^]]+\]", held_result)
     assert len(h.transport.calls) == 1
 
     row = await h.store.get_message_by_envelope("held-peer")
@@ -569,15 +560,20 @@ async def test_exact_held_chain_admits_only_at_original_send_result_boundary(
         "held-peer",
     ]
 
-    inbox_call = await h.mcp.call_tool("read_inbox", {"target": target, "limit": 1})
-    assert inbox_call[1]["messages"] == []
+    inbox_call = await h.mcp.call_tool(
+        "read_inbox", {"target": target, "limit": 1}
+    )
+    assert "[pending_messages context_version=1 message_count=0]" in _tool_text(
+        inbox_call
+    )
 
     sent_call = await h.mcp.call_tool(
         "send_message",
         {**send_arguments, "send_anyway": True},
     )
-    sent = sent_call[1]
-    assert sent["state"] == "sent"
+    assert not isinstance(sent_call, tuple)
+    sent = _tool_text(sent_call)
+    assert '[send_result context_version=1 state="sent"' in sent
     assert len(h.transport.calls) == 2
     assert h.transport.calls[-1][1]["freshness"] == {
         "context_baseline_seq": None,
@@ -594,8 +590,10 @@ async def test_held_admission_freezes_provider_turn_at_staging(
 ):
     h = boundary_harness
     arguments = {"channel": "ch-held", "text": "held draft"}
-    held_result = (await h.mcp.call_tool("send_message", arguments))[1]
-    assert held_result["state"] == "held"
+    held_result = _tool_text(
+        await h.mcp.call_tool("send_message", arguments)
+    )
+    assert '[send_result context_version=1 state="held"' in held_result
 
     # The event and active runtime can agree on a later provider turn, but
     # neither may reinterpret a continuation staged for the original turn.
@@ -621,7 +619,11 @@ async def test_rpc_response_without_provider_completion_keeps_pending_and_unseen
 ):
     h = boundary_harness
     history_call = await h.mcp.call_tool(
-        "get_channel_history", {"channel": "ch-history", "limit": 50}
+        "read_history",
+        {
+            "target": "channel:sp_1:ch-history",
+            "limit": 50,
+        },
     )
     history_text = _tool_text(history_call)
     assert "history peer body" in history_text
@@ -641,29 +643,32 @@ async def test_real_provider_correlation_rejects_empty_failed_and_mismatched_res
     boundary_harness: BoundaryHarness,
 ):
     h = boundary_harness
+    arguments = {
+        "target": "channel:sp_1:ch-history",
+        "limit": 50,
+    }
     history_call = await h.mcp.call_tool(
-        "get_channel_history", {"channel": "ch-history", "limit": 50}
+        "read_history", arguments
     )
     history_text = _tool_text(history_call)
     receipt = re.search(
         r"(\[puffo:model-visible-read:[^]]+\])", history_text
     ).group(1)
-    arguments = {"channel": "ch-history", "limit": 50}
     wrong_receipt = "[puffo:model-visible-read:wrong-receipt-marker]"
     cases = [
         ("get_thread_history", arguments, history_text, "native-session", "native-turn", False),
-        ("get_channel_history", {"channel": "wrong"}, history_text, "native-session", "native-turn", False),
+        ("read_history", {**arguments, "target": "channel:sp_1:wrong"}, history_text, "native-session", "native-turn", False),
         (
-            "get_channel_history",
+            "read_history",
             arguments,
             f"history peer body\n{wrong_receipt}",
             "native-session",
             "native-turn",
             False,
         ),
-        ("get_channel_history", arguments, history_text, "native-session", "wrong-turn", False),
-        ("get_channel_history", arguments, history_text, "wrong-session", "native-turn", False),
-        ("get_channel_history", arguments, history_text, "native-session", "native-turn", True),
+        ("read_history", arguments, history_text, "native-session", "wrong-turn", False),
+        ("read_history", arguments, history_text, "wrong-session", "native-turn", False),
+        ("read_history", arguments, history_text, "native-session", "native-turn", True),
     ]
     for tool_name, tool_args, result, session_id, turn_id, is_error in cases:
         await h.emit_tool_result(
@@ -687,13 +692,13 @@ async def test_real_provider_correlation_rejects_empty_failed_and_mismatched_res
                 "send_anyway": True,
             },
         )
-        blocked = blocked_call[1]
-        assert blocked["state"] == "failed"
-        assert blocked["error_kind"] == "reconsideration_ineligible"
+        blocked = _tool_text(blocked_call)
+        assert 'state="failed"' in blocked
+        assert 'error_kind="reconsideration_ineligible"' in blocked
         assert not h.transport.calls
 
     await h.emit_tool_result(
-        tool_name="get_channel_history",
+        tool_name="read_history",
         arguments=arguments,
         result=history_text.replace(receipt, receipt),
     )
@@ -716,9 +721,9 @@ async def test_empty_or_failed_rpc_read_has_no_admission_receipt_or_lifecycle_ch
         "read_inbox",
         {"target": "channel:sp_1:does-not-exist", "limit": 1},
     )
-    empty_page = empty[1]
-    assert empty_page["messages"] == []
-    assert "admission_receipt" not in empty_page
+    empty_text = _tool_text(empty)
+    assert "[pending_messages context_version=1 message_count=0]" in empty_text
+    assert "admission_receipt" not in empty_text
     assert await h.active_boundary("ch-inbox") is None
 
     await h.emit_tool_result(

@@ -159,6 +159,11 @@ def register_member_directory_tools(mcp: FastMCP, cfg: Any) -> None:
             if not slug:
                 continue
             profile = profiles.get(slug, {})
+            availability = (
+                {"online": member["online"]}
+                if isinstance(member.get("online"), bool)
+                else {}
+            )
             members.append(
                 identity_projection(
                     slug,
@@ -167,6 +172,7 @@ def register_member_directory_tools(mcp: FastMCP, cfg: Any) -> None:
                     owner_slug=member.get("owner_slug"),
                     role=member.get("role") or "member",
                     self_identity=slug == cfg.slug.lstrip("@"),
+                    **availability,
                 )
             )
         return {

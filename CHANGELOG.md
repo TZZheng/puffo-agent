@@ -6,6 +6,128 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Runtime observability can no longer block Agent execution.** Profile Logs,
+  Runtime Events upload, and the local runtime-state snapshot are treated as
+  best-effort observations after a provider event occurs. A full or unhealthy
+  Runtime Events outbox no longer prevents a real Codex or Claude Code turn
+  from starting or completing.
+
+## [2.0.0a11] — 2026-08-15
+
+> Staging candidate for authoritative Harness context telemetry.
+
+### Fixed
+
+- **Codex context usage follows the current app-server schema.** The Driver
+  reads `tokenUsage.last.totalTokens` while retaining the older flattened
+  fallback, so admission, compaction, and Web telemetry use the same value.
+- **Claude Code reports a native post-turn context snapshot.** The Runtime
+  Manager queries `get_context_usage` after the provider Turn is terminal and
+  falls back to the result-frame estimate only when native telemetry is
+  unavailable. Telemetry timeout cannot retroactively fail a completed Turn.
+- **Keyless Agents retain context limits in runtime status.** Cloud bridge
+  heartbeats now preserve `max_context` and `auto_compact_threshold_pct` just
+  like signed local-agent heartbeats.
+
+## [2.0.0a10] — 2026-08-15
+
+> Staging candidate for explicit Inbox reads and unified held-send context.
+
+### Changed
+
+- **An Inbox wake now explicitly requires reading pending content.** The
+  metadata-only notice directs the Agent to call `read_inbox` before deciding
+  what to do, while leaving the resulting response or silence to the Agent.
+- **Model-facing reads and sends share one semantic context grammar.** The
+  stdio MCP boundary returns text-only `window`, `message`, `draft`,
+  participation, and held-reconsideration blocks without duplicating nested
+  transport JSON. Internal daemon, RPC, and ws-local contracts remain
+  structured.
+
+## [2.0.0a9] — 2026-08-15
+
+> Staging candidate for bounded Inbox and conversation-history reads.
+
+### Changed
+
+- **Unread work and supplementary history now have explicit MCP intents.**
+  `read_inbox` reads the Agent's pending Inbox snapshot, while `read_history`
+  retrieves bounded DM, channel, or thread context with stable opaque cursors
+  and explicit local-history boundaries. Both tools use the same semantic
+  Puffo message projection without exposing transport JSON.
+- **Every pending row actually shown to the model joins the active turn.** This
+  includes rows reached through history lookup, while channel freshness only
+  advances when the returned window proves one complete sequenced boundary.
+
+## [2.0.0a8] — 2026-08-15
+
+> Staging candidate for unified semantic conversation reads.
+
+### Changed
+
+- **Inbox and history browsing now expose one semantic MCP tool.**
+  `read_messages(view="pending" | "history")` replaces the overlapping Inbox,
+  channel, thread, and DM read tools. Both views use the same Puffo context
+  grammar and explicit older/newer window boundaries; pending admission and
+  history lookup remain distinct intents behind that interface.
+
+## [2.0.0a7] — 2026-08-15
+
+> Staging candidate for session-aware Inbox turns and model-visible history
+> admission.
+
+### Changed
+
+- **Inbox notices are scoped to the native provider session.** New ingress is
+  coalesced without repeatedly starting empty turns, while work that arrives
+  during a busy Claude Code turn remains pending for the next tracked turn.
+- **Any model-visible channel read joins the active durable turn.** Exact
+  pending rows returned by channel, thread, or post history move to `in_turn`;
+  a successful provider turn processes them and failure or cancellation
+  returns them to `pending`.
+
+### Fixed
+
+- **Turn completion and retry no longer race late Inbox admission.** Durable
+  state, provider-session correlation, restart recovery, and processing-run
+  reporting now converge on the same exact message set.
+
+## [2.0.0a6] — 2026-08-14
+
+> Corrected staging build for the A5 Inbox and history contract.
+
+### Changed
+
+- **History ordering and MCP registration now satisfy the repository's
+  structural limits.** Shared ordering policy is centralized, while channel
+  and DM tool registration remain behaviorally identical and retain their
+  established order.
+
+## [2.0.0a5] — 2026-08-14
+
+> Staging candidate for daemon-owned Inbox turns and unambiguous history reads.
+
+### Changed
+
+- **Global Inbox turns now start locally before provider input.** A
+  `read_inbox` call directly moves the exact returned pending rows into that
+  active turn; successful turns process them and failed or interrupted turns
+  return them to pending. There is no second model-to-daemon Inbox ACK.
+- **Claude replay is telemetry rather than a delivery gate.** Writing the
+  provider input establishes delivery, while replay events can still enrich
+  provider session and turn diagnostics without delaying the turn lifecycle.
+- **History pagination uses explicit units.** Channel and thread readers now
+  expose envelope, server-sequence, and millisecond timestamp bounds under
+  distinct names. The former short names remain as compatibility aliases.
+
+### Fixed
+
+- **Inbox admission no longer depends on provider-specific tool-result
+  correlation.** Native, Docker, and external harnesses share the same durable
+  daemon-owned pending, in-turn, processed, and retry lifecycle.
+
 ## [2.0.0a4] — 2026-08-12
 
 > Staging candidate for the complete one-shot Reminder lifecycle.

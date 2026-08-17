@@ -196,6 +196,19 @@ class Adapter(ABC):
     def get_provider_session_id(self) -> str | None:
         return None
 
+    def inbox_notice_delivery_capability(self) -> str:
+        """How this adapter can deliver metadata while a turn is active."""
+        return "next_turn"
+
+    async def offer_inbox_notice(
+        self,
+        provider_turn_id: str,
+        provider_input: str,
+    ) -> bool:
+        """Offer one metadata-only Inbox delta to the active provider turn."""
+        del provider_turn_id, provider_input
+        return False
+
     def register_admission_callback(
         self,
         callback: AdmissionCallback | None,

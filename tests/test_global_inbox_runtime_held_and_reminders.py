@@ -3,15 +3,15 @@
 import asyncio
 import json
 import logging
+import re
 import time
-from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
+from puffo_agent.agent.channel_audience import ChannelAudience
 from puffo_agent.agent.context_controller import (
     DecisionOutcome,
-    ProviderAdmissionEvent,
 )
 from puffo_agent.agent.global_inbox_runtime import (
     ActiveBoundaryAdapter,
@@ -29,6 +29,7 @@ from puffo_agent.agent.inbox_scheduler import (
 from puffo_agent.agent.message_store import (
     MessageStore,
     ProcessingState,
+    ReceiptDisposition,
     StoredMessage,
 )
 from puffo_agent.agent.reminder_sync import (
@@ -41,7 +42,6 @@ from puffo_agent.agent.runtime_event_outbox import RuntimeEventOutbox
 from puffo_agent.agent.shared_content import INBOX_TURN_CUE
 from puffo_agent.crypto.keystore import KeyStore
 
-from _global_inbox_support import _run_prior_context_delivery_case
 from test_global_inbox_runtime import (
     Adapter,
     ScriptedContext,
@@ -180,34 +180,12 @@ async def test_repeated_held_sync_proof_returns_stable_local_semantic_context(
 
 
 @pytest.mark.asyncio
-async def test_notice_then_correlated_read_admits_and_processes_exact_page(tmp_path):
+async def test_notice_read_directly_admits_and_processes_exact_page(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "pull-1", 1)
     await receipt(store, "pull-2", 2)
 
-    class PullAdapter(Adapter):
-        def __init__(self):
-            super().__init__()
-            self.continuation = None
-            self.continuation_key = ""
-
-        def register_continuation_callback(
-            self, callback, planning_cycle_key, **_kwargs
-        ):
-            self.continuation = callback
-            self.continuation_key = planning_cycle_key
-
-        async def admit_continuation(self):
-            callback, self.continuation = self.continuation, None
-            await callback(ProviderAdmissionEvent(
-                planning_cycle_key=self.continuation_key,
-                provider_session_id=self.session,
-                provider_turn_id="provider-turn",
-                tool_call_id="tool-1",
-                admitted_at=datetime.now(timezone.utc),
-            ))
-
-    adapter = PullAdapter()
+    adapter = Adapter()
 
     async def run(planned):
         assert "text-pull" not in planned.provider_input
@@ -217,11 +195,9 @@ async def test_notice_then_correlated_read_admits_and_processes_exact_page(tmp_p
         page = await runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
         assert len(page["messages"]) == 1
         assert [row.envelope_id for row in await store.get_pending()] == [
-            "pull-1", "pull-2"
+            "pull-2"
         ]
-        await adapter.admit_continuation()
         assert runtime.active.visible_message_ids == ["pull-1"]
-        assert [row.envelope_id for row in await store.get_pending()] == ["pull-2"]
 
     runtime = GlobalInboxRuntime(
         store=store, adapter=adapter, run_turn=run, workspace=tmp_path
@@ -310,26 +286,7 @@ def test_format_stored_message_marks_only_runtime_identity_aliases(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_peer_progress_turn_receives_grounded_prior_context(tmp_path):
-    result = await _run_prior_context_delivery_case(tmp_path)
-    assert result["provider_turns"] == 2
-    assert result["transport_calls"] == 1
-    assert result["peer_state"] is ProcessingState.PROCESSED
-    second_input = json.dumps(result["provider_inputs"][1], sort_keys=True)
-    for expected in (
-        result["human_body"],
-        result["first_contribution"],
-        result["peer_body"],
-    ):
-        assert expected in second_input
-    assert result["self_metadata"]["sender_slug"] == "agent"
-    assert result["self_metadata"]["is_self"] is True
-    assert result["prior_ids"] == ["human-origin", "agent-contribution"]
-    assert result["future_state"] is ProcessingState.PENDING
-
-
-@pytest.mark.asyncio
-async def test_read_inbox_prior_context_preserves_paging_and_exact_admission(
+async def test_read_inbox_pages_only_pending_rows_with_exact_admission(
     tmp_path,
 ):
     store = await make_store(tmp_path)
@@ -372,22 +329,12 @@ async def test_read_inbox_prior_context_preserves_paging_and_exact_admission(
     )
     assert "page one" in first["messages"][0]
     assert "page two" in second["messages"][0]
-    assert [
-        projection_metadata(block)["envelope_id"]
-        for block in first["prior_context"]
-    ] == ["prior-page-context"]
-    assert [
-        projection_metadata(block)["envelope_id"]
-        for block in second["prior_context"]
-    ] == ["prior-page-context"]
     assert first["has_more"] is True
     assert second["has_more"] is False
-    assert first["prior_context_has_more"] is False
-    assert second["prior_context_has_more"] is False
     assert second["next_cursor"] == ""
     assert runtime.active.message_ids == ["page-context-1", "page-context-2"]
     assert runtime.active.visible_message_ids == [
-        "page-context-1", "prior-page-context", "page-context-2",
+        "page-context-1", "page-context-2",
     ]
     prior = await store.get_message_by_envelope("prior-page-context")
     page_rows = await asyncio.gather(
@@ -423,36 +370,13 @@ async def test_correlated_read_processes_sequence_less_local_runtime_event(tmp_p
         intro_channel_id="ch-1",
     )
 
-    class PullAdapter(Adapter):
-        def __init__(self):
-            super().__init__()
-            self.continuation = None
-            self.continuation_key = ""
-
-        def register_continuation_callback(
-            self, callback, planning_cycle_key, **_kwargs
-        ):
-            self.continuation = callback
-            self.continuation_key = planning_cycle_key
-
-        async def admit_continuation(self):
-            callback, self.continuation = self.continuation, None
-            await callback(ProviderAdmissionEvent(
-                planning_cycle_key=self.continuation_key,
-                provider_session_id=self.session,
-                provider_turn_id="provider-turn",
-                tool_call_id="tool-local",
-                admitted_at=datetime.now(timezone.utc),
-            ))
-
-    adapter = PullAdapter()
+    adapter = Adapter()
 
     async def run(planned):
         await adapter.admit()
         page = await runtime.read_inbox(limit=50, tool_arguments={})
         assert len(page["messages"]) == 1
         assert "introduce yourself" in page["messages"][0]
-        await adapter.admit_continuation()
         route = runtime.resolve_active_send_route(
             "ch-1", {"root_id": ""}, {}
         )
@@ -503,6 +427,23 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     attachment = "attachment-content-sentinel"
     store = await make_store(tmp_path)
     await receipt(store, "notice-1", 8, content=f"{plaintext}:{attachment}")
+    await store.store_receipt(
+        {
+            "envelope_id": "notice-thread",
+            "envelope_kind": "channel",
+            "sender_slug": "alice",
+            "channel_id": "ch-1",
+            "space_id": "sp-1",
+            "thread_root_id": "root-1",
+            "content": "thread-notice-sentinel",
+            "content_type": "text/plain",
+            "sent_at": 9,
+            "is_encrypted": True,
+        },
+        server_seq=9,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
 
     class BusyAdapter(Adapter):
         def __init__(self):
@@ -515,12 +456,19 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
             return self.accept
 
     adapter = BusyAdapter()
+    audience_reads = []
+
+    async def load_audience(space_id, channel_id):
+        audience_reads.append((space_id, channel_id))
+        return ChannelAudience(4, 1, 3)
+
     runtime = GlobalInboxRuntime(
         store=store,
         adapter=adapter,
         run_turn=lambda _planned: None,
         workspace=tmp_path,
         notice_delivery=InboxNoticeDelivery(NoticeDeliveryCapability.DIRECT),
+        channel_audience_loader=load_audience,
     )
     initial = await runtime.plan_pending()
     assert initial is not None
@@ -531,26 +479,45 @@ async def test_initial_and_busy_notices_are_complete_content_free_inputs(tmp_pat
     })
     assert initial.message_ids == ()
     assert initial.formatted_blocks == ()
-    assert '"generation":' in initial.provider_input
-    assert '"message_count":1' in initial.provider_input
-    assert '"latest_seq":8' in initial.provider_input
-    assert '"version":3' in initial.provider_input
-    assert '"content_included":false' in initial.provider_input
-    assert '"read_tool":"read_inbox"' in initial.provider_input
+    assert "generation=" in initial.provider_input
+    assert "changed_message_count=2" in initial.provider_input
+    assert "total_pending_message_count=2" in initial.provider_input
+    assert "latest_seq=9" in initial.provider_input
+    assert "context_version=1" in initial.provider_input
+    assert "content_included=false" in initial.provider_input
+    assert 'read_tool="read_inbox"' in initial.provider_input
     assert "channel:sp-1:ch-1" in initial.provider_input
+    assert "channel:sp-1:ch-1:thread:root-1" in initial.provider_input
+    audience = ("[channel_audience context_version=1 human_count=1 "
+                "agent_count=4 online_agent_count=3]")
+    assert audience in initial.provider_input
+    assert initial.provider_input.count("[channel_audience ") == 2
+    assert audience_reads == [("sp-1", "ch-1")]
     assert initial.provider_input.endswith(INBOX_TURN_CUE)
-    assert "respond" in initial.provider_input
+    notice_input = " ".join(initial.provider_input.split())
+    assert "Call `read_inbox` now" in notice_input
+    assert "Do not finish this turn from notice metadata alone" in notice_input
     assert "decide-response" not in initial.provider_input
     assert plaintext not in initial_serialized
     assert attachment not in initial_serialized
+    assert "thread-notice-sentinel" not in initial_serialized
 
+    await store.start_turn(
+        turn_id="active-turn",
+        provider_session_id="provider-1",
+    )
     runtime.active.turn_id = "active-turn"
     runtime.active.provider_session_id = "provider-1"
-    assert await runtime.offer_busy_notice(turn_id="active-turn")
+    runtime.active.provider_turn_id = "provider-turn-1"
+    runtime._busy_notice_delay_seconds = 0
+    runtime.notify()
+    assert runtime._busy_notice_task is not None
+    await runtime._busy_notice_task
     busy_serialized = json.dumps(adapter.offers)
     assert plaintext not in busy_serialized
     assert attachment not in busy_serialized
     state = await store.get_notice_state()
+    assert adapter.offers[0][0] == "provider-turn-1"
     assert state.last_delivered_generation == state.generation
     assert state.last_delivered_provider_session_id == "provider-1"
     assert not state.is_due_for("provider-1")
@@ -575,6 +542,7 @@ async def test_rejected_or_stale_busy_notice_retains_generation(tmp_path):
     )
     runtime.active.turn_id = "active-turn"
     runtime.active.provider_session_id = "provider-1"
+    runtime.active.provider_turn_id = "provider-turn-1"
     before = await store.get_notice_state()
     assert not await runtime.offer_busy_notice(turn_id="stale-turn")
     assert not await runtime.offer_busy_notice(turn_id="active-turn")
@@ -589,14 +557,10 @@ async def test_rejected_or_stale_busy_notice_retains_generation(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_notice_turn_without_correlated_read_rearms_for_same_session(
+async def test_empty_notice_turn_does_not_retry_unchanged_work_for_same_session(
     tmp_path,
 ):
-    """Durable pending work is re-notified on the same warm provider session.
-
-    A Turn that admitted no rows is not an Inbox ACK, so the unchanged pending
-    set must not stay suppressed until unrelated ingress arrives.
-    """
+    """An empty successful Turn is a provider defer, not a retry timer."""
     store = await make_store(tmp_path)
     await receipt(store, "notice-unread", 10)
     adapter = Adapter()
@@ -621,25 +585,24 @@ async def test_notice_turn_without_correlated_read_rearms_for_same_session(
     assert [row.envelope_id for row in await store.get_pending()] == [
         "notice-unread"
     ]
-    assert after.generation == before.generation + 1
+    assert after.generation == before.generation
     assert after.last_delivered_generation == before.generation
     assert after.last_delivered_provider_session_id == adapter.session
-    assert after.is_due_for(adapter.session)
-    assert await runtime.process_once()
-    assert calls == 2
+    assert not after.is_due_for(adapter.session)
+    assert not await runtime.process_once()
+    assert calls == 1
     assert runtime._degraded is False
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_notice_restart_redelivers_same_session_and_rediscovers_once_for_replacement(
+async def test_notice_restart_suppresses_same_session_and_rediscovers_replacement(
     tmp_path,
 ):
     def described_pending(provider_input):
         """Return the notice body without its per-delivery generation."""
-        summary = json.loads(provider_input.split("\n", 2)[1])
-        summary.pop("generation")
-        return summary
+        notice = provider_input.split("</global_inbox_notice>", 1)[0]
+        return re.sub(r" generation=\d+", "", notice)
 
     store = await make_store(tmp_path)
     await receipt(store, "session-notice", 10)
@@ -658,9 +621,7 @@ async def test_notice_restart_redelivers_same_session_and_rediscovers_once_for_r
     )
     assert await first.process_once()
     accepted = await store.get_notice_state()
-    # The Turn admitted no rows, so the same session stays eligible for a
-    # redelivery rather than stranding the still-pending row.
-    assert accepted.is_due_for(first_adapter.session)
+    assert not accepted.is_due_for(first_adapter.session)
     assert len(first_calls) == 1
 
     resumed_calls = []
@@ -675,9 +636,8 @@ async def test_notice_restart_redelivers_same_session_and_rediscovers_once_for_r
         run_turn=resumed_run,
         workspace=tmp_path,
     )
-    assert await resumed.process_once()
-    assert len(resumed_calls) == 1
-    assert described_pending(resumed_calls[0]) == described_pending(first_calls[0])
+    assert not await resumed.process_once()
+    assert resumed_calls == []
 
     replacement_adapter = Adapter()
     replacement_adapter.session = "provider-2"
@@ -722,11 +682,10 @@ async def test_mixed_message_and_due_reminder_share_one_notice_read_and_turn(tmp
     async def run(planned):
         assert ordinary_body not in planned.provider_input
         assert "exact Agent-authored reminder content" not in planned.provider_input
-        summary = json.loads(
-            planned.provider_input.split("\n", 2)[1]
-        )
-        assert summary["message_count"] == 2
-        assert summary["targets"] == [{"target": "channel:sp-1:ch-1", "count": 2}]
+        assert "changed_message_count=2" in planned.provider_input
+        assert "total_pending_message_count=2" in planned.provider_input
+        assert 'target_ref="channel:sp-1:ch-1"' in planned.provider_input
+        assert "[pending context_version=1 message_count=2]" in planned.provider_input
         await adapter.admit()
         observed["page"] = await runtime.read_inbox(limit=50)
         observed["ids"] = tuple(runtime.active.message_ids)
@@ -905,12 +864,13 @@ async def test_different_target_reminder_still_uses_one_global_notice_and_turn(t
         turns += 1
         assert ordinary_body not in planned.provider_input
         assert "exact content for the second target" not in planned.provider_input
-        summary = json.loads(planned.provider_input.split("\n", 2)[1])
-        assert summary["message_count"] == 2
-        assert summary["targets"] == [
-            {"target": "channel:sp-1:ch-1", "count": 1},
-            {"target": "channel:sp-1:ch-2", "count": 1},
-        ]
+        assert "changed_message_count=2" in planned.provider_input
+        assert "total_pending_message_count=2" in planned.provider_input
+        assert planned.provider_input.count(
+            "[pending context_version=1 message_count=1]"
+        ) == 2
+        assert 'target_ref="channel:sp-1:ch-1"' in planned.provider_input
+        assert 'target_ref="channel:sp-1:ch-2"' in planned.provider_input
         await adapter.admit()
         observed["page"] = await runtime.read_inbox(limit=50)
         observed["ids"] = tuple(runtime.active.message_ids)
@@ -1011,22 +971,24 @@ async def test_changed_pending_generation_replaces_accepted_notice_without_losin
     )
     assert await runtime.process_once()
     accepted = await store.get_notice_state()
-    # Neither Turn admits a read, so each empty Turn re-arms delivery for the
-    # unchanged pending set instead of suppressing it.
-    assert accepted.is_due_for(adapter.session)
+    assert not accepted.is_due_for(adapter.session)
 
     await receipt(store, "second-unread", 11, content=second_body)
     changed = await store.get_notice_state()
     assert changed.generation == accepted.generation + 1
     assert changed.is_due_for(adapter.session)
+    assert [row.envelope_id for row in await store.get_notice_candidates(adapter.session)] == [
+        "second-unread"
+    ]
     assert await runtime.process_once()
     final = await store.get_notice_state()
-    assert final.generation == changed.generation + 1
-    assert final.is_due_for(adapter.session)
+    assert final.generation == changed.generation
+    assert not final.is_due_for(adapter.session)
 
     assert len(notices) == 2
     assert notices[0] != notices[1]
-    assert '"message_count":2' in notices[1]
+    assert "changed_message_count=1" in notices[1]
+    assert "total_pending_message_count=2" in notices[1]
     assert first_body not in notices[1]
     assert second_body not in notices[1]
     assert [row.envelope_id for row in await store.get_pending()] == [
@@ -1037,7 +999,7 @@ async def test_changed_pending_generation_replaces_accepted_notice_without_losin
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal", ["provider_failure", "cancellation"])
-async def test_accepted_empty_notice_rearms_after_non_success_terminal(
+async def test_failed_empty_notice_releases_delivery_for_retry(
     tmp_path, terminal,
 ):
     store = await make_store(tmp_path)
@@ -1068,9 +1030,9 @@ async def test_accepted_empty_notice_rearms_after_non_success_terminal(
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    rearmed = await store.get_notice_state()
-    assert rearmed.generation == before.generation + 1
-    assert rearmed.is_due_for(adapter.session)
+    released = await store.get_notice_state()
+    assert released.generation == before.generation
+    assert released.is_due_for(adapter.session)
     assert [row.envelope_id for row in await store.get_pending()] == [
         f"{terminal}-notice",
     ]
@@ -1078,7 +1040,7 @@ async def test_accepted_empty_notice_rearms_after_non_success_terminal(
 
 
 @pytest.mark.asyncio
-async def test_crash_recovery_requeues_empty_notice_turn_and_rearms_delivery(tmp_path):
+async def test_crash_recovery_requeues_empty_notice_turn_and_releases_delivery(tmp_path):
     store = await make_store(tmp_path)
     await receipt(store, "notice-crash", 11)
     adapter = Adapter()
@@ -1112,8 +1074,8 @@ async def test_crash_recovery_requeues_empty_notice_turn_and_rearms_delivery(tmp
     assert [row.envelope_id for row in await store.get_pending()] == [
         "notice-crash"
     ]
-    assert after.generation == before.generation + 1
-    assert after.last_delivered_generation == before.generation
+    assert after.generation == before.generation
+    assert after.last_delivered_generation < before.generation
     assert after.delivery_pending
     assert not recovered.current_turn_path.exists()
     await store.close()
@@ -1127,6 +1089,7 @@ async def test_startup_recovers_orphaned_turn_without_crash_join(
 ):
     store = await make_store(tmp_path)
     await receipt(store, "orphan-pending", 12)
+    await receipt(store, "orphan-tail", 13)
     notice = await store.get_notice_state()
     assert await store.mark_notice_delivered(notice.generation, "provider-old")
     if admitted:
@@ -1163,8 +1126,13 @@ async def test_startup_recovers_orphaned_turn_without_crash_join(
     repaired = await store.get_notice_state()
     assert run is not None and run.state == "requeued"
     assert [row.envelope_id for row in await store.get_pending()] == [
-        "orphan-pending"
+        "orphan-pending",
+        "orphan-tail",
     ]
+    assert [
+        row.envelope_id
+        for row in await store.get_notice_candidates("provider-old")
+    ] == ["orphan-pending", "orphan-tail"]
     assert repaired.delivery_pending
     assert await store.get_active_turn_runs() == ()
     if admitted:
@@ -1184,26 +1152,6 @@ async def test_one_turn_reads_two_targets_sends_twice_and_processes_exact_union(
     await receipt(store, "target-a", 1, channel="ch-a")
     await receipt(store, "target-b", 2, channel="ch-b")
 
-    class MultiReadAdapter(Adapter):
-        def __init__(self):
-            super().__init__()
-            self.continuations = {}
-
-        def register_continuation_callback(
-            self, callback, planning_cycle_key, **_metadata
-        ):
-            self.continuations[planning_cycle_key] = callback
-
-        async def admit_key(self, key):
-            callback = self.continuations.pop(key)
-            await callback(ProviderAdmissionEvent(
-                planning_cycle_key=key,
-                provider_session_id=self.session,
-                provider_turn_id="provider-turn",
-                tool_call_id=f"tool-{key}",
-                admitted_at=datetime.now(timezone.utc),
-            ))
-
     class Coordinator:
         def __init__(self):
             self.calls = []
@@ -1217,7 +1165,7 @@ async def test_one_turn_reads_two_targets_sends_twice_and_processes_exact_union(
                 "seq": 10 + len(self.calls),
             }
 
-    adapter = MultiReadAdapter()
+    adapter = Adapter()
     coordinator = Coordinator()
 
     async def run(_planned):
@@ -1232,8 +1180,6 @@ async def test_one_turn_reads_two_targets_sends_twice_and_processes_exact_union(
                 },
             )
             assert len(page["messages"]) == 1
-            key = next(iter(adapter.continuations))
-            await adapter.admit_key(key)
             route = runtime.resolve_active_send_route(
                 channel, {"destination": channel}, {}
             )
@@ -1277,24 +1223,6 @@ async def test_zero_send_notice_turn_can_succeed_without_output(tmp_path):
         page = await runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
         assert page["messages"]
         # No send is attempted; the Turn still completes its exact union.
-        callback = adapter.continuation
-        await callback(ProviderAdmissionEvent(
-            planning_cycle_key=adapter.continuation_key,
-            provider_session_id=adapter.session,
-            provider_turn_id="provider-turn",
-            tool_call_id="tool-zero",
-            admitted_at=datetime.now(timezone.utc),
-        ))
-
-    # Add only the continuation seam used by read_inbox to the simple adapter.
-    adapter.continuation = None
-    adapter.continuation_key = ""
-
-    def register(callback, planning_cycle_key, **_metadata):
-        adapter.continuation = callback
-        adapter.continuation_key = planning_cycle_key
-
-    adapter.register_continuation_callback = register
     runtime = GlobalInboxRuntime(
         store=store,
         adapter=adapter,
@@ -1415,7 +1343,7 @@ async def test_transient_provider_failure_self_recovers_after_backoff_without_in
 
 
 @pytest.mark.asyncio
-async def test_read_inbox_byte_guard_repaginates_without_lifecycle_mutation(
+async def test_read_inbox_byte_guard_admits_only_the_returned_page(
     tmp_path,
 ):
     store = await make_store(tmp_path)
@@ -1445,22 +1373,56 @@ async def test_read_inbox_byte_guard_repaginates_without_lifecycle_mutation(
     assert set(page) == {
         "context_version",
         "messages",
-        "prior_context",
-        "prior_context_has_more",
         "next_cursor",
         "has_more",
         "remaining_count",
         "snapshot_generation",
-        "correlation_receipt",
     }
     assert [row.envelope_id for row in await store.get_pending()] == [
-        "guard-1", "guard-2"
+        "guard-2"
     ]
+    assert runtime.active.message_ids == ["guard-1"]
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_read_inbox_admits_exact_page_at_runtime_tool_return(
+async def test_read_inbox_rejects_a_page_fetched_for_a_finished_turn(tmp_path):
+    store = await make_store(tmp_path)
+    await receipt(store, "late-page", 1)
+    read_started = asyncio.Event()
+    continue_read = asyncio.Event()
+    original_read = store.read_inbox_page
+
+    async def delayed_read(**kwargs):
+        read_started.set()
+        await continue_read.wait()
+        return await original_read(**kwargs)
+
+    store.read_inbox_page = delayed_read
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime.active.turn_id = "turn-a"
+    runtime.active.provider_session_id = "provider-1"
+    runtime.active.provider_turn_id = "provider-turn-a"
+    reading = asyncio.create_task(runtime.read_inbox(limit=1))
+    await read_started.wait()
+    runtime.active.turn_id = "turn-b"
+    runtime.active.provider_turn_id = "provider-turn-b"
+    continue_read.set()
+
+    with pytest.raises(RuntimeError, match="crossed the active provider turn"):
+        await reading
+    assert [row.envelope_id for row in await store.get_pending()] == ["late-page"]
+    assert runtime.active.message_ids == []
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_inbox_admits_exact_page_directly(
     tmp_path, caplog,
 ):
     caplog.set_level(
@@ -1498,10 +1460,10 @@ async def test_read_inbox_admits_exact_page_at_runtime_tool_return(
         if event["event"].startswith("inbox.read")
     ]
     assert [event["event"] for event in inbox_events] == [
-        "inbox.read_staged", "inbox.read_admitted",
+        "inbox.read_admitted",
     ]
-    assert inbox_events[0]["outcome"] == "tool_return"
-    assert inbox_events[1]["provider_turn_id"] == (
+    assert inbox_events[0]["outcome"] == "in_turn"
+    assert inbox_events[0]["provider_turn_id"] == (
         "provider-turn-tool-return"
     )
     await store.close()
@@ -1528,22 +1490,6 @@ class _CrashAfterBoundary(RuntimeError):
     pass
 
 
-class _CrashCorrelatingAdapter(Adapter):
-    def register_continuation_callback(
-        self, callback, planning_cycle_key, **_metadata
-    ):
-        self.continuation = callback
-        self.continuation_key = planning_cycle_key
-
-    async def admit_continuation(self, tool_call_id):
-        callback, self.continuation = self.continuation, None
-        await callback(ProviderAdmissionEvent(
-            planning_cycle_key=self.continuation_key,
-            provider_session_id=self.session, provider_turn_id="native-turn",
-            tool_call_id=tool_call_id, admitted_at=datetime.now(timezone.utc),
-        ))
-
-
 async def _seed_crash_join_turn(tmp_path, message_count):
     store = await make_store(tmp_path)
     for seq in range(1, message_count + 1):
@@ -1553,7 +1499,7 @@ async def _seed_crash_join_turn(tmp_path, message_count):
         "logical-turn", session_ref="logical-session",
         native_session_id="provider-1",
     )
-    adapter = _CrashCorrelatingAdapter()
+    adapter = Adapter()
     seed = GlobalInboxRuntime(
         store=store, adapter=adapter, run_turn=lambda _planned: None,
         workspace=tmp_path, agent_id="agent", runtime_event_outbox=outbox,
@@ -1569,7 +1515,6 @@ async def _seed_crash_join_turn(tmp_path, message_count):
             tool_arguments={"cursor": cursor, "limit": 1},
         )
         assert len(page["messages"]) == 1
-        await adapter.admit_continuation(f"tool-{page_number + 1}")
         admitted.append(f"page-{page_number + 1}")
         persisted = json.loads(seed.current_turn_path.read_text())
         assert persisted["message_ids"] == admitted

@@ -65,7 +65,8 @@ def test_standing_prompt_is_compact_and_identity_is_compiled_once():
 def test_standing_prompt_owns_communication_policy_and_retains_contract():
     primer = " ".join(DEFAULT_SHARED_CLAUDE_MD.split())
     for phrase in (
-        "<global_inbox_notice>", '"content_included":false', "read_inbox",
+        "<global_inbox_notice>", "content_included=false", "read_inbox",
+        "read_history",
         "context_version=1", "target_ref", "sender_identity", "sender_type",
         "An `@slug` identity is unique", "send_message",
         "A metadata-only notice means unread content exists",
@@ -91,8 +92,7 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
     ):
         assert absent not in DEFAULT_SHARED_CLAUDE_MD
 
-    read = DEFAULT_SKILLS["read-inbox"][1]
-    history = DEFAULT_SKILLS["channel-history"][1]
+    read = DEFAULT_SKILLS["read-messages"][1]
     post = DEFAULT_SKILLS["get-post"][1]
     send = DEFAULT_SKILLS["send-message"][1]
     for phrase in (
@@ -101,25 +101,22 @@ def test_standing_prompt_owns_communication_policy_and_retains_contract():
         "[event]", "body",
     ):
         assert phrase in read
-    for text in (history, post):
-        assert "read-inbox" in text
+    assert "read-messages" in post
     normalized_read = " ".join(read.split())
-    assert "messages" in read and "prior_context" in read
-    assert "prior_context_has_more" in read
-    assert "strictly earlier" in normalized_read
-    assert "do not acknowledge pending Inbox rows" in read
-    assert "standing communication guidance" in normalized_read
+    assert "pending_messages" in read and "earlier_context" not in read
+    assert "has_older" in read and "has_newer" in read and "has_next" in read
+    assert "pinned Inbox snapshot" in read
+    assert "pending" in read and "history" in read
     assert "decide-response" not in DEFAULT_SKILLS
     assert "originating request and conversation intent" not in DEFAULT_SHARED_CLAUDE_MD
-    assert "does not acknowledge pending Inbox work" in " ".join(history.split())
-    assert "does not acknowledge pending Inbox work" in " ".join(post.split())
+    assert "canonical view of pending work" in " ".join(post.split())
     normalized_send = " ".join(send.lower().split())
     for phrase in (
-        'state="held"', "unchanged `draft`", "draft boundary/latest pair",
-        "visible_draft_basis", "new_channel_context", "context_ready",
-        "dynamic `guidance`", "injected only when a draft is actually held",
+        'state="held"', "unchanged `[draft]`", "participation context",
+        "held_basis", "held_new_context", "context_ready",
+        "held-reconsideration guidance", "included only when a draft is actually held",
         "sequence watermark alone is not semantic context",
-        "preserve the `read_inbox` target by default",
+        "preserve the inbox target by default",
         'omit it for `target_type="channel"`',
         'pass the supplied `thread_root_id` for `target_type="thread"`',
     ):
@@ -142,11 +139,12 @@ def test_standing_prompt_reports_unavailable_shared_workspace_truthfully():
 def test_inbox_turn_cue_is_short_and_reinforces_the_standing_default():
     cue = " ".join(INBOX_TURN_CUE.split())
     assert "<puffo_runtime_instruction>" in cue
-    assert "read the relevant pending content" in cue.lower()
-    assert "respond through `send_message` as appropriate" in cue
-    assert "report any result or handoff you owe" in cue
+    assert "notice above contains metadata only" in cue.lower()
+    assert "call `read_inbox` now" in cue.lower()
+    assert "do not finish this turn from notice metadata alone" in cue.lower()
+    assert "use `read_history` only if earlier context is needed" in cue.lower()
     assert "decide-response" not in cue
-    assert len(INBOX_TURN_CUE.encode()) < 320
+    assert len(INBOX_TURN_CUE.encode()) < 360
 
 
 def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
@@ -154,8 +152,8 @@ def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
     send = " ".join(DEFAULT_SKILLS["send-message"][1].split()).lower()
     assert held_method not in send
     for phrase in (
-        "follow that returned guidance",
-        "injected only when a draft is actually held",
+        "follow the returned held-reconsideration guidance",
+        "included only when a draft is actually held",
     ):
         assert phrase in send
     for phrase in (
@@ -179,7 +177,7 @@ def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():
     ):
         skill = " ".join(path.read_text(encoding="utf-8").split()).lower()
         assert held_method not in skill
-        assert "follow that returned guidance" in skill
+        assert "follow the returned held-reconsideration guidance" in skill
 
     other_prompt_surfaces = [" ".join(DEFAULT_SHARED_CLAUDE_MD.split())]
     other_prompt_surfaces.extend(
@@ -199,7 +197,7 @@ def test_harnesses_discover_managed_skills_with_correct_tool_names():
     assert "mcp__puffo__" not in codex
     assert "send_message" in codex
     ensure_shared_primer(root / "shared")
-    for skill_id in ("read-inbox", "send-message"):
+    for skill_id in ("read-messages", "send-message"):
         claude_skill = root / "workspace" / ".claude" / "skills" / skill_id / "SKILL.md"
         codex_skill = root / "workspace" / ".agents" / "skills" / skill_id / "SKILL.md"
         for skill in (claude_skill, codex_skill):
@@ -213,11 +211,11 @@ def test_managed_refresh_rewrites_stale_skill():
     root = _tmp()
     shared = root / "shared"
     ensure_shared_primer(shared)
-    skill = shared / "skills" / "read-inbox" / "SKILL.md"
+    skill = shared / "skills" / "read-messages" / "SKILL.md"
     skill.write_text("stale", encoding="utf-8")
     actions = dict(ensure_shared_primer(shared))
-    assert actions["skills/read-inbox/SKILL.md"] == "updated"
-    assert "prior_context" in skill.read_text(encoding="utf-8")
+    assert actions["skills/read-messages/SKILL.md"] == "updated"
+    assert "read_history" in skill.read_text(encoding="utf-8")
 
     removed = shared / "skills" / "decide-response"
     removed.mkdir()

@@ -12,11 +12,9 @@ transition before any row can be marked processed.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 
 import pytest
 
-from puffo_agent.agent.context_controller import ProviderAdmissionEvent
 from puffo_agent.agent.core import AgentAPIError
 from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
 from puffo_agent.agent.message_store import LifecycleConflict, ProcessingState
@@ -30,27 +28,7 @@ BODY = "the exact admitted body a replacement session must receive"
 
 
 class _RetrySessionAdapter(Adapter):
-    """Correlate a notice admission, a ``read_inbox`` result, and a retry."""
-
-    def __init__(self):
-        super().__init__()
-        self.continuation = None
-        self.continuation_key = ""
-
-    def register_continuation_callback(self, callback, planning_cycle_key, **_kwargs):
-        self.continuation = callback
-        self.continuation_key = planning_cycle_key
-
-    async def admit_continuation(self, provider_turn_id):
-        callback, self.continuation = self.continuation, None
-        assert callback is not None
-        await callback(ProviderAdmissionEvent(
-            planning_cycle_key=self.continuation_key,
-            provider_session_id=self.session,
-            provider_turn_id=provider_turn_id,
-            tool_call_id=f"read-{provider_turn_id}",
-            admitted_at=datetime.now(timezone.utc),
-        ))
+    """Correlate the initial provider turn and its replacement retry."""
 
 
 class _ReadThenRetryRunner:
@@ -75,7 +53,6 @@ class _ReadThenRetryRunner:
         page = await self.runtime.read_inbox(limit=1, tool_arguments={"limit": 1})
         assert len(page["messages"]) == 1
         self.read_bodies.append(page["messages"][0])
-        await self.adapter.admit_continuation(provider_turn_id="provider-read-1")
         raise AgentAPIError("rate limit", is_auth=False)
 
     async def handle_global_inbox_retry(self, planned):
@@ -177,6 +154,38 @@ async def test_failed_session_transition_processes_nothing(tmp_path):
     assert row.processed_at is None
     assert [item.envelope_id for item in await store.get_pending()] == ["inbox-row"]
     assert runtime.health.state == "degraded"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_notice_retry_moves_delivery_to_replacement_session(tmp_path):
+    """A successful replacement must not wake again for the same notice IDs."""
+    store = await make_store(tmp_path)
+    await receipt(store, "unread-row", 1)
+    adapter = _RetrySessionAdapter()
+
+    class Runner:
+        async def __call__(self, _planned):
+            await adapter.admit(session=SESSION_A, provider_turn_id="turn-1")
+            raise AgentAPIError("rate limit", is_auth=False)
+
+        async def handle_global_inbox_retry(self, _planned):
+            adapter.session = SESSION_B
+            await adapter.admit(session=SESSION_B, provider_turn_id="turn-2")
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=Runner(),
+        workspace=tmp_path,
+        retry_sleep=lambda _delay: asyncio.sleep(0),
+    )
+
+    assert await runtime.process_once()
+    state = await store.get_notice_state()
+    assert state.last_delivered_provider_session_id == SESSION_B
+    assert not await store.get_notice_candidates(SESSION_B)
+    assert not await runtime.process_once()
     await store.close()
 
 

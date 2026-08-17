@@ -163,6 +163,9 @@ CREATE TABLE IF NOT EXISTS dm_notices (
 _DEPENDENT_SCHEMA = """
 CREATE INDEX IF NOT EXISTS idx_messages_channel
     ON messages (channel_id, sent_at) WHERE channel_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_channel_server_seq
+    ON messages (channel_id, server_seq)
+    WHERE channel_id IS NOT NULL AND server_seq IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_messages_dm
     ON messages (sender_slug, sent_at) WHERE envelope_kind = 'dm';
 CREATE INDEX IF NOT EXISTS idx_messages_dm_recipient
@@ -229,6 +232,10 @@ INSERT OR IGNORE INTO inbox_notice_state(
     singleton, generation, pending_count, first_pending_deadline_ms,
     last_delivered_generation
 ) VALUES (1, 0, 0, NULL, 0);
+CREATE TABLE IF NOT EXISTS inbox_notice_contributions (
+    envelope_id TEXT PRIMARY KEY,
+    provider_session_id TEXT NOT NULL
+);
 
 -- One row is both the immutable one-shot reminder intent and its only
 -- occurrence. This table intentionally represents a single trigger only.
@@ -264,6 +271,25 @@ CREATE TABLE IF NOT EXISTS reminder_occurrences (
 CREATE INDEX IF NOT EXISTS idx_reminder_occurrences_due
     ON reminder_occurrences (state, intended_at_ms, occurrence_id);
 """
+
+
+def _history_order(
+    *,
+    column_prefix: str,
+    after_seq: int | None,
+    before_seq: int | None,
+    since_resolved: tuple[int, str] | None,
+    before_resolved: tuple[int, str] | None,
+) -> tuple[str, bool]:
+    """Return SQL ordering and whether the selected rows are already oldest-first."""
+    envelope = f"{column_prefix}envelope_id"
+    if after_seq is not None:
+        return f"{column_prefix}server_seq ASC, {envelope} ASC", True
+    if before_seq is not None:
+        return f"{column_prefix}server_seq DESC, {envelope} DESC", False
+    oldest_first = since_resolved is not None and before_resolved is None
+    direction = "ASC" if oldest_first else "DESC"
+    return f"{column_prefix}sent_at {direction}, {envelope} {direction}", oldest_first
 
 
 class MessageStore(ReminderStoreMixin, InboxStoreMixin):
@@ -1099,26 +1125,40 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         peer_slug: str,
         limit: int = 50,
         before: int | None = None,
+        before_envelope_id: str | None = None,
+        after_envelope_id: str | None = None,
     ) -> list[StoredMessage]:
         db = await self._ensure_db()
+        after_resolved = await self._resolve_since_sent_at(after_envelope_id)
+        before_resolved = await self._resolve_since_sent_at(before_envelope_id)
+        clauses = [
+            "envelope_kind = 'dm'",
+            "(sender_slug = ? OR recipient_slug = ?)",
+            _NOT_GATED,
+        ]
+        params: list[Any] = [peer_slug, peer_slug]
+        if after_resolved is not None:
+            clauses.append("(sent_at > ? OR (sent_at = ? AND envelope_id > ?))")
+            params.extend([after_resolved[0], after_resolved[0], after_resolved[1]])
+        if before_resolved is not None:
+            clauses.append("(sent_at < ? OR (sent_at = ? AND envelope_id < ?))")
+            params.extend([before_resolved[0], before_resolved[0], before_resolved[1]])
         if before is not None:
-            sql = f"""SELECT * FROM messages
-                     WHERE envelope_kind = 'dm'
-                       AND (sender_slug = ? OR recipient_slug = ?)
-                       AND sent_at < ? AND {_NOT_GATED}
-                     ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"""
-            params: tuple = (peer_slug, peer_slug, before, limit)
-        else:
-            sql = f"""SELECT * FROM messages
-                     WHERE envelope_kind = 'dm'
-                       AND (sender_slug = ? OR recipient_slug = ?)
-                       AND {_NOT_GATED}
-                     ORDER BY sent_at DESC, envelope_id DESC LIMIT ?"""
-            params = (peer_slug, peer_slug, limit)
-
-        async with db.execute(sql, params) as cursor:
+            clauses.append("sent_at < ?")
+            params.append(before)
+        order, selected_oldest_first = _history_order(
+            column_prefix="",
+            after_seq=None,
+            before_seq=None,
+            since_resolved=after_resolved,
+            before_resolved=before_resolved,
+        )
+        params.append(max(1, min(int(limit), 201)))
+        sql = f"SELECT * FROM messages WHERE {' AND '.join(clauses)} ORDER BY {order} LIMIT ?"
+        async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
-        return [self._row_to_msg(r) for r in reversed(rows)]
+        selected = rows if selected_oldest_first else reversed(rows)
+        return [self._row_to_msg(row) for row in selected]
 
     async def get_message_by_envelope(
         self,
@@ -1220,6 +1260,8 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         before_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
+        before_seq: int | None = None,
+        after_seq: int | None = None,
     ) -> list[ChannelRoot]:
         """Recent root posts in ``channel_id`` (``thread_root_id``
         IS NULL) with the count of replies that point at each.
@@ -1239,8 +1281,11 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
           ``sent_at``. Combined with ``since`` we take the larger.
         - ``before_ts`` (ms-epoch) — exclusive upper bound on
           ``sent_at``.
+        - ``after_seq`` / ``before_seq`` — exclusive bounds on the
+          authoritative server sequence. Rows without a sequence are excluded
+          when either sequence bound is present.
 
-        Returned newest-first up to ``limit``. Raises
+        Returned oldest-first up to ``limit``. Raises
         ``DataNotFound`` if the channel has never had any message
         stored — so the MCP layer can distinguish "unknown channel"
         from "known but empty window".
@@ -1268,12 +1313,19 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         if before_ts is not None:
             clauses.append("m.sent_at < ?")
             params.append(int(before_ts))
+        if after_seq is not None:
+            clauses.append("m.server_seq IS NOT NULL AND m.server_seq > ?")
+            params.append(int(after_seq))
+        if before_seq is not None:
+            clauses.append("m.server_seq IS NOT NULL AND m.server_seq < ?")
+            params.append(int(before_seq))
         where = " AND ".join(clauses)
-        ascending_cursor = since_resolved is not None and before_resolved is None
-        order = (
-            "m.sent_at ASC, m.envelope_id ASC"
-            if ascending_cursor
-            else "m.sent_at DESC, m.envelope_id DESC"
+        order, selected_oldest_first = _history_order(
+            column_prefix="m.",
+            after_seq=after_seq,
+            before_seq=before_seq,
+            since_resolved=since_resolved,
+            before_resolved=before_resolved,
         )
         sql = (
             "SELECT m.*, "
@@ -1281,18 +1333,19 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             " WHERE r.thread_root_id = m.envelope_id) AS reply_count "
             f"FROM messages m WHERE {where} ORDER BY {order} LIMIT ?"
         )
-        params.append(max(1, min(int(limit), 200)))
+        params.append(max(1, min(int(limit), 201)))
 
         async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
-        # Cursor pages already select oldest-first; uncursorred history is
-        # selected newest-first then reversed for the public oldest-first view.
+        # Lower-bound pages select oldest-first. Upper-bound and unbounded pages
+        # select the newest matching window, then reverse it for the public
+        # oldest-first view.
         return [
             ChannelRoot(
                 message=self._row_to_msg(r),
                 reply_count=int(r["reply_count"]),
             )
-            for r in (rows if ascending_cursor else reversed(rows))
+            for r in (rows if selected_oldest_first else reversed(rows))
         ]
 
     async def get_thread_messages(
@@ -1303,6 +1356,8 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         before_envelope_id: str | None = None,
         before_ts: int | None = None,
         after_ts: int | None = None,
+        before_seq: int | None = None,
+        after_seq: int | None = None,
     ) -> list[StoredMessage]:
         """Messages belonging to a thread (the root itself plus
         every reply pointing at it), filtered the same way as
@@ -1335,20 +1390,28 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         if before_ts is not None:
             clauses.append("sent_at < ?")
             params.append(int(before_ts))
+        if after_seq is not None:
+            clauses.append("server_seq IS NOT NULL AND server_seq > ?")
+            params.append(int(after_seq))
+        if before_seq is not None:
+            clauses.append("server_seq IS NOT NULL AND server_seq < ?")
+            params.append(int(before_seq))
         where = " AND ".join(clauses)
-        ascending_cursor = since_resolved is not None and before_resolved is None
-        order = (
-            "sent_at ASC, envelope_id ASC"
-            if ascending_cursor
-            else "sent_at DESC, envelope_id DESC"
+        order, selected_oldest_first = _history_order(
+            column_prefix="",
+            after_seq=after_seq,
+            before_seq=before_seq,
+            since_resolved=since_resolved,
+            before_resolved=before_resolved,
         )
         sql = f"SELECT * FROM messages WHERE {where} ORDER BY {order} LIMIT ?"
-        params.append(max(1, min(int(limit), 200)))
+        params.append(max(1, min(int(limit), 201)))
 
         async with db.execute(sql, tuple(params)) as cursor:
             rows = await cursor.fetchall()
         return [
-            self._row_to_msg(r) for r in (rows if ascending_cursor else reversed(rows))
+            self._row_to_msg(r)
+            for r in (rows if selected_oldest_first else reversed(rows))
         ]
 
     async def has_channel_intro_been_prompted(self, channel_id: str) -> bool:

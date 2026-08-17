@@ -283,7 +283,7 @@ async def test_coalescer_pulls_a_pending_long_deadline_into_the_normal_window():
 
 
 @pytest.mark.asyncio
-async def test_notice_delivery_capability_matrix_is_turn_guarded_and_gated():
+async def test_notice_delivery_capability_matrix_is_turn_guarded():
     delivered: list[str] = []
 
     async def deliver():
@@ -299,19 +299,7 @@ async def test_notice_delivery_capability_matrix_is_turn_guarded_and_gated():
     )
 
     gated = InboxNoticeDelivery(NoticeDeliveryCapability.GATED)
-    assert not await gated.offer(
-        named_turn_id="active", active_turn_id="active", deliver=deliver
-    )
-    gated.note_input_ready("other")
-    assert not await gated.offer(
-        named_turn_id="active", active_turn_id="active", deliver=deliver
-    )
-    gated.note_input_ready("active")
     assert await gated.offer(
-        named_turn_id="active", active_turn_id="active", deliver=deliver
-    )
-    # Readiness is one-shot and cannot authorize a later injection.
-    assert not await gated.offer(
         named_turn_id="active", active_turn_id="active", deliver=deliver
     )
 

@@ -1,5 +1,4 @@
 import json
-import logging
 import os
 import sys
 import tempfile
@@ -272,6 +271,13 @@ def _build_tools(cfg):
 
 
 async def _call(mcp, name, args=None):
+    text = await _call_text(mcp, name, args)
+    if "[send_result " in text and 'state="failed"' in text:
+        raise RuntimeError(text)
+    return text
+
+
+async def _call_text(mcp, name, args=None):
     result = await mcp.call_tool(name, args or {})
     if (
         isinstance(result, tuple)
@@ -372,7 +378,7 @@ async def test_send_tool_descriptions_point_to_managed_skill():
 
 
 @pytest.mark.asyncio
-async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
+async def test_message_read_schemas_separate_inbox_work_from_history_context():
     cfg, _, _ = _setup()
     calls = []
 
@@ -381,20 +387,25 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
             calls.append(kwargs)
             return {
                 "messages": ["message"],
-                "prior_context": ["prior"],
                 "next_cursor": "cursor-2",
                 "has_more": True,
                 "remaining_count": 72,
                 "snapshot_generation": 9,
-                "correlation_receipt": "receipt-9",
             }
 
     cfg.inbox_runtime = Runtime()
     mcp = _build_tools(cfg)
     tools = {tool.name: tool for tool in await mcp.list_tools()}
-    schema = tools["read_inbox"].inputSchema
-    assert set(schema["properties"]) == {"target", "cursor", "limit"}
-    assert set(schema["properties"]).isdisjoint({
+    inbox_schema = tools["read_inbox"].inputSchema
+    history_schema = tools["read_history"].inputSchema
+    assert set(inbox_schema["properties"]) == {"target", "cursor", "limit"}
+    assert set(history_schema["properties"]) == {
+        "target", "cursor", "before_message_id", "after_message_id", "limit",
+    }
+    assert {
+        "read_messages", "get_channel_history", "get_dm_history", "get_thread_history",
+    }.isdisjoint(tools)
+    assert set(inbox_schema["properties"] | history_schema["properties"]).isdisjoint({
         "freshness", "freshness_mode", "mode", "context_baseline_seq",
         "seen_seq", "synchronized", "transport", "provider_session_id",
         "session_ref", "turn_id", "turn_ref", "sequence", "seq",
@@ -406,16 +417,10 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
         "read_inbox",
         {"target": "channel:sp_1:ch_1", "cursor": "opaque", "limit": 17},
     )
-    structured = result[1]
-    assert structured == {
-        "messages": ["message"],
-        "prior_context": ["prior"],
-        "next_cursor": "cursor-2",
-        "has_more": True,
-        "remaining_count": 72,
-        "snapshot_generation": 9,
-        "admission_receipt": "[puffo:model-visible-read:receipt-9]",
-    }
+    rendered = "".join(getattr(item, "text", str(item)) for item in result[0])
+    assert '[window context_version=1 kind="inbox"' in rendered
+    assert "message" in rendered
+    assert "earlier_context" not in rendered
     assert calls == [{
         "target": "channel:sp_1:ch_1",
         "cursor": "opaque",
@@ -427,15 +432,12 @@ async def test_read_inbox_schema_and_live_runtime_dispatch_are_semantic_only():
         },
     }]
 
-    description = " ".join(tools["read_inbox"].description.lower().split())
-    for phrase in (
-        "target", "cursor", "limit", "messages", "prior_context",
-        "prior_context_has_more", "next_cursor", "has_more",
-    ):
-        assert phrase.lower() in description, (phrase, description)
-    for forbidden in ("same originating assignment", "send-anyway", "held", "benchmark", "assignment-completion"):
-        assert forbidden not in description
-    assert "managed" in description and "read-inbox" in description
+    inbox_description = " ".join(tools["read_inbox"].description.lower().split())
+    history_description = " ".join(tools["read_history"].description.lower().split())
+    assert "pending" in inbox_description and "cursor" in inbox_description
+    assert "earlier conversation" in history_description
+    assert "managed" in inbox_description and "read-messages" in inbox_description
+    assert "managed" in history_description and "read-messages" in history_description
 
 
 @pytest.mark.asyncio
@@ -601,16 +603,16 @@ async def test_reminder_tools_fall_back_to_configured_loopback_rpc_client():
 
 
 @pytest.mark.asyncio
-async def test_semantic_rpc_unavailable_returns_structured_failure():
+async def test_semantic_rpc_unavailable_returns_semantic_failure():
     cfg, http, _ = _setup()
     cfg.send_coordinator = None
     cfg.rpc_client = None
-    result = await _build_tools(cfg).call_tool(
+    result = await _call_text(
+        _build_tools(cfg),
         "send_message", {"channel": "ch_a", "text": "do not post"},
     )
-    structured = result[1]
-    assert structured["state"] == "failed"
-    assert structured["attempted"] is True
+    assert 'state="failed"' in result
+    assert "attempted=true" in result
     assert not [call for call in http.calls if call[0] == "POST"]
 
 
@@ -625,11 +627,13 @@ async def test_semantic_in_process_uses_injected_persistent_coordinator():
             return {"state": "held", "attempted": True}
 
     cfg.send_coordinator = Stub()
-    result = await _build_tools(cfg).call_tool(
+    result = await _call_text(
+        _build_tools(cfg),
         "send_message",
         {"channel": "ch_a", "text": "x", "send_anyway": True},
     )
-    assert result[1] == {"state": "held", "attempted": True}
+    assert 'state="held"' in result
+    assert "attempted=true" in result
     assert calls[0].send_anyway is True
 
 
@@ -645,10 +649,11 @@ async def test_semantic_out_of_process_uses_structured_rpc_client():
 
     cfg.send_coordinator = None
     cfg.rpc_client = Rpc()
-    result = await _build_tools(cfg).call_tool(
+    result = await _call_text(
+        _build_tools(cfg),
         "send_message", {"channel": "ch_a", "text": "x", "send_anyway": True},
     )
-    assert result[1]["state"] == "sent"
+    assert 'state="sent"' in result
     assert bodies == [{
         "channel": "ch_a",
         "root_id": "",
@@ -670,7 +675,8 @@ async def test_keyless_configured_rpc_precedes_direct_unsigned_coordinator():
 
     cfg.send_coordinator = None
     cfg.rpc_client = Rpc()
-    result = await _build_tools(cfg).call_tool(
+    result = await _call_text(
+        _build_tools(cfg),
         "send_message",
         {
             "channel": "ch_a",
@@ -679,7 +685,7 @@ async def test_keyless_configured_rpc_precedes_direct_unsigned_coordinator():
             "send_anyway": True,
         },
     )
-    assert result[1]["state"] == "sent"
+    assert 'state="sent"' in result
     assert len(bodies) == 1
     assert bodies[0]["visibility_level"] == "human"
     assert bodies[0]["send_anyway"] is True
@@ -696,10 +702,12 @@ async def test_keyless_configured_rpc_failure_does_not_fall_back_to_http():
 
     cfg.send_coordinator = None
     cfg.rpc_client = Rpc()
-    result = await _build_tools(cfg).call_tool(
+    result = await _call_text(
+        _build_tools(cfg),
         "send_message", {"channel": "ch_a", "text": "x"},
     )
-    assert result[1]["error_kind"] == "rpc_unavailable"
+    assert 'state="failed"' in result
+    assert 'error_kind="rpc_unavailable"' in result
     assert not [call for call in http.calls if call[0] == "POST_UNSIGNED"]
 
 
@@ -1069,7 +1077,7 @@ def _assert_dm_hint(exc: Exception, slug: str) -> None:
     msg = str(exc)
     assert "not a channel id" in msg, f"expected slug-hint error, got: {msg}"
     assert f"@{slug}" in msg
-    assert "get_dm_history" in msg
+    assert "read_history" in msg
 
 
 @pytest.mark.asyncio
@@ -1117,39 +1125,6 @@ async def test_send_message_with_attachments_bare_slug_gets_dm_hint():
             {"paths": ["note.txt"], "channel": "alice-1234"},
         )
     _assert_dm_hint(excinfo.value, "alice-1234")
-
-
-@pytest.mark.asyncio
-async def test_get_channel_history_bare_slug_gets_dm_hint():
-    """The local-store read path would otherwise return an empty
-    window for a slug ref — dark instead of diagnostic."""
-    cfg, _, ms = _setup()
-    await ms.open()
-    mcp = _build_tools(cfg)
-    with pytest.raises(Exception) as excinfo:
-        await _call(mcp, "get_channel_history", {"channel": "alice-1234"})
-    _assert_dm_hint(excinfo.value, "alice-1234")
-    await ms.close()
-@pytest.mark.asyncio
-async def test_get_channel_history_non_ch_ref_known_to_cache_still_works():
-    """The slug-hint guard only fires on refs the cache does NOT
-    know — an exotic non-``ch_`` id with a cached space mapping keeps
-    working."""
-    cfg, _, ms = _setup()
-    await ms.open()
-    await ms.mark_channel_space("weird-legacy-id", "sp_test")
-    await ms.store({
-        "envelope_id": "env_legacy", "envelope_kind": "channel",
-        "sender_slug": "alice-0001", "channel_id": "weird-legacy-id",
-        "space_id": "sp_test", "content_type": "text/plain",
-        "content": "still reachable", "sent_at": _now_ms(),
-    })
-    mcp = _build_tools(cfg)
-    result = await _call(
-        mcp, "get_channel_history", {"channel": "weird-legacy-id"},
-    )
-    assert "still reachable" in result
-    await ms.close()
 
 
 @pytest.mark.asyncio
@@ -1228,7 +1203,7 @@ async def test_send_message_rejects_named_channel():
 
 
 @pytest.mark.asyncio
-async def test_get_channel_history_from_local():
+async def test_read_history_channel_from_local():
     cfg, http, ms = _setup()
     await ms.open()
 
@@ -1247,7 +1222,11 @@ async def test_get_channel_history_from_local():
     })
 
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "get_channel_history", {"channel": "ch_abc", "limit": 10})
+    result = await _call(
+        mcp,
+        "read_history",
+        {"target": "channel:sp_test:ch_abc", "limit": 10},
+    )
     assert "alice-0001" in result
     assert "bob-0001" in result
     assert "Hello from Alice" in result
@@ -1282,9 +1261,15 @@ async def test_structured_content_read_boundaries(content, expected):
             await ms.store(row)
         mcp = _build_tools(cfg)
         outputs = [
-            await _call(mcp, "get_channel_history", {"channel": "ch_struct"}),
-            await _call(mcp, "get_dm_history", {"peer": "alice"}),
-            await _call(mcp, "get_thread_history", {"root_id": "root"}),
+            await _call(mcp, "read_history", {
+                "target": "channel:sp_test:ch_struct",
+            }),
+            await _call(mcp, "read_history", {
+                "target": "dm:alice",
+            }),
+            await _call(mcp, "read_history", {
+                "target": "channel:sp_test:ch_struct:thread:root",
+            }),
             await _call(mcp, "get_post", {"post_ref": "root"}),
             await _call(mcp, "get_post_segment", {"envelope_id": "root", "segment": 0}),
         ]
@@ -1341,16 +1326,17 @@ async def test_message_read_tools_stage_highest_model_visible_server_sequence():
     rpc = RecordingRpc()
     cfg.rpc_client = rpc
     mcp = _build_tools(cfg)
-
-    channel_result = await _call(
-        mcp, "get_channel_history", {"channel": "ch_visible"},
-    )
+    channel_args = {
+        "target": "channel:sp_visible:ch_visible",
+    }
+    thread_args = {
+        "target": "channel:sp_visible:ch_visible:thread:env_root",
+    }
+    channel_result = await _call(mcp, "read_history", channel_args)
     clamped_result = await _call(
-        mcp,
-        "get_channel_history",
-        {"channel": "ch_visible", "limit": 999},
+        mcp, "read_history", {**channel_args, "limit": 999},
     )
-    await _call(mcp, "get_thread_history", {"root_id": "env_root"})
+    await _call(mcp, "read_history", thread_args)
     await _call(mcp, "get_post", {"post_ref": "env_reply"})
     await _call(
         mcp,
@@ -1362,16 +1348,16 @@ async def test_message_read_tools_stage_highest_model_visible_server_sequence():
         (call["tool_name"], call["through_seq"], call["through_envelope_id"])
         for call in rpc.calls
     ] == [
-        ("get_channel_history", 41, "env_root"),
-        ("get_channel_history", 41, "env_root"),
-        ("get_thread_history", 42, "env_reply"),
+        ("read_history", 41, "env_root"),
+        ("read_history", 41, "env_root"),
+        ("read_history", 42, "env_reply"),
         ("get_post", 42, "env_reply"),
         ("get_post_segment", 42, "env_reply"),
     ]
     assert [call["tool_arguments"] for call in rpc.calls] == [
-        {"channel": "ch_visible"},
-        {"channel": "ch_visible", "limit": 200},
-        {"root_id": "env_root"},
+        channel_args,
+        {**channel_args, "limit": 999},
+        thread_args,
         {"post_ref": "env_reply"},
         {"envelope_id": "env_reply", "segment": 0},
     ]
@@ -1422,7 +1408,9 @@ async def test_history_reads_stage_through_the_in_process_inbox_runtime():
     cfg.inbox_runtime = runtime
     mcp = _build_tools(cfg)
 
-    result = await _call(mcp, "get_channel_history", {"channel": "ch_runtime"})
+    result = await _call(mcp, "read_history", {
+        "target": "channel:sp_runtime:ch_runtime",
+    })
     assert "[puffo:model-visible-read:runtime-receipt]" in result
     assert len(runtime.calls) == 1
     assert runtime.calls[0]["through_seq"] == 77
@@ -1432,11 +1420,7 @@ async def test_history_reads_stage_through_the_in_process_inbox_runtime():
 
 
 @pytest.mark.asyncio
-async def test_dm_and_unsequenced_reads_do_not_stage_channel_freshness(caplog):
-    caplog.set_level(
-        logging.DEBUG,
-        logger="puffo_agent.mcp.puffo_core_tools",
-    )
+async def test_dm_and_unsequenced_reads_stage_rows_without_channel_freshness():
     cfg, _, ms = _setup()
     await ms.store({
         "envelope_id": "legacy",
@@ -1450,13 +1434,28 @@ async def test_dm_and_unsequenced_reads_do_not_stage_channel_freshness(caplog):
     })
     await ms.store_receipt(
         {
+            "envelope_id": "sequenced",
+            "envelope_kind": "channel",
+            "sender_slug": "bob-0001",
+            "channel_id": "ch_legacy",
+            "space_id": "sp_legacy",
+            "content_type": "text/plain",
+            "content": "sequenced body",
+            "sent_at": _now_ms() + 1,
+        },
+        server_seq=42,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    await ms.store_receipt(
+        {
             "envelope_id": "dm_9",
             "envelope_kind": "dm",
             "sender_slug": "alice-0001",
             "recipient_slug": "agent-0001",
             "content_type": "text/plain",
             "content": "private",
-            "sent_at": _now_ms() + 1,
+            "sent_at": _now_ms() + 2,
         },
         server_seq=43,
         disposition=ReceiptDisposition.ELIGIBLE,
@@ -1477,37 +1476,37 @@ async def test_dm_and_unsequenced_reads_do_not_stage_channel_freshness(caplog):
     rpc = RecordingRpc()
     cfg.rpc_client = rpc
     mcp = _build_tools(cfg)
-    await _call(mcp, "get_post", {"post_ref": "legacy"})
+    await _call(mcp, "read_history", {
+        "target": "channel:sp_legacy:ch_legacy",
+    })
     await _call(mcp, "get_post", {"post_ref": "dm_9"})
-    assert rpc.calls == []
-    history_states = []
-    for record in caplog.records:
-        message = record.getMessage()
-        if "runtime_event=" not in message:
-            continue
-        event = json.loads(message.split("runtime_event=", 1)[1])
-        if event["event"] == "history.read_staged":
-            history_states.append(event["state"])
-    assert history_states == ["unsequenced", "dm_unsupported"]
+    assert [call["visible_message_ids"] for call in rpc.calls] == [
+        ["legacy", "sequenced"], ["dm_9"],
+    ]
+    assert all(call["through_seq"] is None for call in rpc.calls)
+    assert all(call["through_envelope_id"] is None for call in rpc.calls)
     await ms.close()
 
 
 @pytest.mark.asyncio
-async def test_get_channel_history_unknown_channel():
+async def test_read_history_unknown_channel():
     """Channel never seen → 'no such channel: …'. Distinct from
     the empty-window message so the agent doesn't conflate a
     bad channel id with a quiet one."""
     cfg, _, ms = _setup()
     await ms.open()
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "get_channel_history", {"channel": "ch_nonexistent"})
-    assert "no such channel" in result
-    assert "ch_nonexistent" in result
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "read_history", {
+            "target": "channel:sp_test:ch_nonexistent",
+        })
+    assert "no such channel" in str(excinfo.value)
+    assert "ch_nonexistent" in str(excinfo.value)
     await ms.close()
 
 
 @pytest.mark.asyncio
-async def test_get_dm_history_from_local():
+async def test_read_history_dm_from_local():
     cfg, _, ms = _setup()
     await ms.open()
     base = _now_ms()
@@ -1527,7 +1526,9 @@ async def test_get_dm_history_from_local():
         "content_type": "text/plain", "content": "bob here", "sent_at": base + 2000,
     })
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "get_dm_history", {"peer": "alice-0001", "limit": 10})
+    result = await _call(mcp, "read_history", {
+        "target": "dm:alice-0001", "limit": 10,
+    })
     assert "hi from alice" in result
     assert "hi back" in result
     assert "bob here" not in result   # a different peer is filtered out
@@ -1537,19 +1538,20 @@ async def test_get_dm_history_from_local():
 
 
 @pytest.mark.asyncio
-async def test_get_dm_history_empty():
+async def test_read_history_dm_empty():
     cfg, _, ms = _setup()
     await ms.open()
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "get_dm_history", {"peer": "nobody-9999"})
-    assert "no direct messages" in result
+    result = await _call(mcp, "read_history", {
+        "target": "dm:nobody-9999",
+    })
+    assert 'returned_count=0' in result
+    assert 'target_ref="dm:nobody-9999"' in result
     await ms.close()
 
 
 @pytest.mark.asyncio
-async def test_get_channel_history_empty_window():
-    """Channel exists but the ``since`` filter pushes past every
-    root → 'no root posts in the requested window'."""
+async def test_read_history_channel_empty_window():
     cfg, _, ms = _setup()
     await ms.open()
     base = _now_ms()
@@ -1561,26 +1563,72 @@ async def test_get_channel_history_empty_window():
     })
     mcp = _build_tools(cfg)
     result = await _call(
-        mcp, "get_channel_history",
-        {"channel": "ch_seen", "since": "env_root"},
+        mcp,
+        "read_history",
+        {
+            "target": "channel:sp_test:ch_seen",
+            "after_message_id": "env_root",
+        },
     )
-    assert "no root posts" in result
+    assert 'returned_count=0' in result
     await ms.close()
 
 
 @pytest.mark.asyncio
-async def test_get_thread_history_unknown_root():
+async def test_read_history_cursor_keeps_equal_timestamp_rows_distinct():
+    cfg, _, ms = _setup()
+    await ms.open()
+    base = _now_ms()
+    for seq, env_id in ((11, "env_a"), (12, "env_b"), (13, "env_c")):
+        await ms.store_receipt(
+            {
+                "envelope_id": env_id,
+                "envelope_kind": "channel",
+                "sender_slug": "alice-0001",
+                "channel_id": "ch_bounds",
+                "space_id": "sp_test",
+                "content_type": "text/plain",
+                "content": env_id,
+                "sent_at": base,
+            },
+            server_seq=seq,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="test",
+        )
+    mcp = _build_tools(cfg)
+    first = await _call(mcp, "read_history", {
+        "target": "channel:sp_test:ch_bounds", "limit": 1,
+    })
+    older = first.split('older_cursor="', 1)[1].split('"', 1)[0]
+    second = await _call(mcp, "read_history", {"cursor": older, "limit": 1})
+    older = second.split('older_cursor="', 1)[1].split('"', 1)[0]
+    third = await _call(mcp, "read_history", {"cursor": older, "limit": 1})
+
+    assert ['message_id="env_c"', 'message_id="env_b"', 'message_id="env_a"'] == [
+        next(part for part in page.split() if part.startswith('message_id='))
+        for page in (first, second, third)
+    ]
+    assert "older_cursor=" not in third
+    assert 'older_boundary="local_start"' in third
+    await ms.close()
+
+
+@pytest.mark.asyncio
+async def test_read_history_unknown_thread():
     cfg, _, ms = _setup()
     await ms.open()
     mcp = _build_tools(cfg)
-    result = await _call(mcp, "get_thread_history", {"root_id": "msg_nonexistent"})
-    assert "no such thread" in result
-    assert "msg_nonexistent" in result
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "read_history", {
+            "target": "channel:sp_test:ch_test:thread:msg_nonexistent",
+        })
+    assert "no such thread" in str(excinfo.value)
+    assert "msg_nonexistent" in str(excinfo.value)
     await ms.close()
 
 
 @pytest.mark.asyncio
-async def test_get_thread_history_empty_window():
+async def test_read_history_thread_empty_window():
     cfg, _, ms = _setup()
     await ms.open()
     base = _now_ms()
@@ -1591,13 +1639,15 @@ async def test_get_thread_history_empty_window():
         "content": "Root", "sent_at": base,
     })
     mcp = _build_tools(cfg)
-    # ``since=env_root`` filters out the root itself; thread has no
-    # replies → empty window.
     result = await _call(
-        mcp, "get_thread_history",
-        {"root_id": "env_root", "since": "env_root"},
+        mcp,
+        "read_history",
+        {
+            "target": "channel:sp_test:ch_t:thread:env_root",
+            "after_message_id": "env_root",
+        },
     )
-    assert "no messages in this thread" in result
+    assert 'returned_count=0' in result
     await ms.close()
 
 
@@ -1833,6 +1883,7 @@ async def test_list_channel_members():
                 "role": "member",
                 "identity_type": "agent",
                 "owner_slug": "alice-0001",
+                "online": True,
             },
         ]
     }
@@ -1860,6 +1911,7 @@ async def test_list_channel_members():
     assert members["@agent-0001"]["identity_type"] == "agent"
     assert members["@agent-0001"]["owner_identity"] == "@alice-0001"
     assert members["@agent-0001"]["self"] is True
+    assert members["@agent-0001"]["online"] is True
 
 
 @pytest.mark.asyncio

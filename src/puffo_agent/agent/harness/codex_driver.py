@@ -9,6 +9,7 @@ import os
 import re
 import uuid
 from collections.abc import AsyncIterator, Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from ..errors import AgentAPIError
@@ -186,6 +187,8 @@ def _permission_response(
 
 
 class CodexAppServerDriver(Driver):
+    static_steer_capability = SteerCapability.CURRENT_TURN
+
     def __init__(
         self,
         process_factory: Callable[[RuntimeSpec], Any] | None = None,
@@ -658,9 +661,10 @@ class CodexAppServerDriver(Driver):
             if not isinstance(usage, dict):
                 usage = {}
             self._context = ContextStatus(
-                used_tokens=_integer(usage.get("totalTokens")),
+                used_tokens=_context_tokens(usage),
                 context_window=_integer(usage.get("modelContextWindow")),
                 stale=False,
+                measured_at=datetime.now(timezone.utc).isoformat(),
             )
             self._update_usage(usage)
             await self._emit(
@@ -862,17 +866,17 @@ class CodexAppServerDriver(Driver):
         thread totals, with re-sent cached input excluded, and context comes
         from ``last.totalTokens``. The final values stand at turn/completed.
         """
-        last = usage.get("last")
-        total = usage.get("total")
-        if not isinstance(last, dict) or not isinstance(total, dict):
-            return
-        context_tokens = last.get("totalTokens")
+        context_tokens = _context_tokens(usage)
         if (
             isinstance(context_tokens, int)
             and not isinstance(context_tokens, bool)
             and context_tokens > 0
         ):
             self._usage_latest["context_tokens"] = context_tokens
+        last = usage.get("last")
+        total = usage.get("total")
+        if not isinstance(last, dict) or not isinstance(total, dict):
+            return
         try:
             cum_out = int(total.get("outputTokens") or 0)
             cum_in = max(
@@ -932,7 +936,25 @@ def _is_request_id(value: Any) -> bool:
 
 
 def _integer(value: Any) -> int | None:
-    return int(value) if isinstance(value, (int, float)) else None
+    return (
+        int(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        else None
+    )
+
+
+def _context_tokens(usage: dict[str, Any]) -> int | None:
+    """Read the current request footprint from the Codex token snapshot.
+
+    Current app-server schemas nest it under ``last.totalTokens``. Keep the
+    historical flattened fallback for older compatible app-server builds.
+    """
+    last = usage.get("last")
+    if isinstance(last, dict):
+        value = _integer(last.get("totalTokens"))
+        if value is not None:
+            return value
+    return _integer(usage.get("totalTokens"))
 
 
 def _tool_arguments(value: Any) -> dict[str, Any]:

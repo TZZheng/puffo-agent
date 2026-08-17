@@ -67,8 +67,9 @@ The local event contains:
 
 It uses the existing local-order frontier and `GlobalInboxRuntime.notify()`
 path. Ordinary messages and reminders pending in the same notice generation
-can share one content-free Inbox notice, ordered `read_inbox` page, and ordinary
-turn path. Later arrivals can rearm the target and create another generation.
+can share one content-free Inbox notice, ordered `read_inbox` page, and
+ordinary turn path. Later arrivals
+can rearm the target and create another generation.
 Message records retain their own timestamps and message projection.
 
 ## Restart and ownership boundary

@@ -26,9 +26,9 @@ from .session import V2_CAPABILITIES
 
 # Both model-visible-read producers are legitimate and their key names are
 # consumed as-is by the RPC/host-mcp path: ``stage_held_send_result`` returns
-# ``tool_result_admission``; the ``read_inbox`` / ``get_post_segment`` tool
-# wrappers return ``admission_receipt``. The bridge is the one consumer that
-# must accept either, or a read admission can never be correlated.
+# ``tool_result_admission``; bounded history/post readers such as
+# ``get_post_segment`` return ``admission_receipt``. The bridge accepts either
+# private marker shape for continuations that still require provider proof.
 _ADMISSION_MARKER_KEYS = ("tool_result_admission", "admission_receipt")
 
 
@@ -114,7 +114,8 @@ def _v1_notice_group(planned) -> tuple[str, dict[str, object], list[dict[str, ob
     """The v1 rendering of a scheduled Inbox *notice*.
 
     A scheduled turn carries no items — it is a notice whose content the
-    peer fetches with ``read_inbox``. The v2 bundle carries that in its
+    peer fetches through ``read_inbox``. The v2 bundle
+    carries that in its
     ``notice`` field, which the v1 frame has no room for, so the identical
     ``provider_input`` rides the frozen message shape instead. The peer's
     model then reads the same instruction and calls the same tool.
@@ -227,15 +228,27 @@ class WsLocalBridge:
 
     async def on_dead(self, reason: str) -> None:
         self._dead_reason = reason
-        if self._runtime is not None and self._runtime.active.turn_id:
-            await self._runtime.store.requeue_messages(
-                tuple(self._runtime.active.message_ids),
-                turn_id=self._runtime.active.turn_id,
-            )
-            self._runtime.active.clear()
-            self._runtime.notify()
         if self._waiter is not None and not self._waiter.done():
             self._waiter.set_exception(BridgeClosed(reason))
+        if self._runtime is not None and self._runtime.active.turn_id:
+            async with self._runtime._turn_state_lock:
+                active = self._runtime.active
+                if active.message_ids:
+                    await self._runtime.store.requeue_messages(
+                        tuple(active.message_ids),
+                        turn_id=active.turn_id,
+                    )
+                else:
+                    await self._runtime.store.finalize_empty_turn(
+                        turn_id=active.turn_id,
+                        state="requeued",
+                    )
+                await self._runtime.store.release_notice_delivery(
+                    active.provider_session_id,
+                    tuple(active.notice_message_ids),
+                )
+                self._runtime.active.clear()
+            self._runtime.notify()
 
     async def dispatch_planned(self, session, planned) -> None:
         if self._dead_reason is not None:

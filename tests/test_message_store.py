@@ -535,6 +535,32 @@ async def test_channel_roots_before_and_after_ts():
     await store.close()
 
 
+@pytest.mark.asyncio
+async def test_channel_and_thread_history_sequence_bounds():
+    store = _temp_store()
+    await store.open()
+    rows = [
+        (11, _channel_payload("root", sent_at=100)),
+        (12, _channel_payload("reply_1", sent_at=200, thread_root_id="root")),
+        (13, _channel_payload("reply_2", sent_at=300, thread_root_id="root")),
+        (14, _channel_payload("later_root", sent_at=400)),
+    ]
+    for seq, payload in rows:
+        await store.store_receipt(
+            payload,
+            server_seq=seq,
+            disposition=ReceiptDisposition.ELIGIBLE,
+            reason="test",
+        )
+
+    roots = await store.get_channel_roots("ch_1", after_seq=11, before_seq=15)
+    thread = await store.get_thread_messages("root", after_seq=11, before_seq=14)
+
+    assert [row.message.envelope_id for row in roots] == ["later_root"]
+    assert [row.envelope_id for row in thread] == ["reply_1", "reply_2"]
+    await store.close()
+
+
 # ── get_thread_messages ───────────────────────────────────────────
 
 
@@ -1439,8 +1465,7 @@ async def test_durable_notice_deadline_is_fixed_and_survives_reopen(tmp_path):
     later = await store.get_notice_state()
     assert later.first_pending_deadline_ms == 4_000
     assert later.generation > first.generation
-    # A transport that learns its native session only from acceptance may
-    # still offer an unaccepted generation once.
+    # Notice scheduling is daemon-owned and independent of provider identity.
     assert later.is_due_for(None)
     await store.close()
 
@@ -1454,7 +1479,7 @@ async def test_durable_notice_deadline_is_fixed_and_survives_reopen(tmp_path):
     assert accepted.is_due_for("provider-2")
     assert not await reopened.mark_notice_delivered(later.generation, "provider-1")
     assert await reopened.mark_notice_delivered(later.generation, "provider-2")
-    assert not await reopened.mark_notice_delivered(later.generation, "provider-2")
+    assert not await reopened.get_notice_candidates("provider-2")
     await reopened.close()
 
 
@@ -1501,44 +1526,39 @@ async def test_notice_state_session_migration_preserves_baseline_row(tmp_path):
     async with db.execute("PRAGMA table_info(inbox_notice_state)") as cursor:
         columns = {row["name"] for row in await cursor.fetchall()}
     assert "last_delivered_provider_session_id" in columns
-    assert await store.mark_notice_delivered(7, "replacement-session")
-    assert (await store.get_notice_state()).last_delivered_provider_session_id == (
-        "replacement-session"
-    )
+    assert not await store.mark_notice_delivered(7, "replacement-session")
     await store.close()
 
 
 @pytest.mark.asyncio
-async def test_empty_notice_turn_rearms_unchanged_pending_work_atomically(tmp_path):
-    now = [1_000]
-    store = MessageStore(tmp_path / "notice-rearm.db", now_ms=lambda: now[0])
+async def test_failed_notice_delivery_releases_exact_contribution(tmp_path):
+    store = MessageStore(tmp_path / "notice-release.db")
     await store.store_receipt(
-        _channel_payload("notice-pending"),
+        _channel_payload("notice-first"),
         server_seq=1,
         disposition=ReceiptDisposition.ELIGIBLE,
         reason="test",
     )
-    delivered = await store.get_notice_state()
-    assert await store.mark_notice_delivered(delivered.generation, "provider-1")
-    await store.start_turn(
-        turn_id="empty-notice-turn",
-        provider_session_id="provider-1",
+    await store.store_receipt(
+        _channel_payload("notice-second"),
+        server_seq=2,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
     )
-
-    now[0] = 2_000
-    run = await store.finalize_empty_turn(
-        turn_id="empty-notice-turn",
-        state="requeued",
-        rearm_notice=True,
+    state = await store.get_notice_state()
+    assert await store.mark_notice_delivered(
+        state.generation,
+        "provider-1",
+        ["notice-first"],
     )
-    rearmed = await store.get_notice_state()
-
-    assert run.state == "requeued"
-    assert rearmed.pending_count == 1
-    assert rearmed.generation == delivered.generation + 1
-    assert rearmed.last_delivered_generation == delivered.generation
-    assert rearmed.first_pending_deadline_ms == 5_000
-    assert rearmed.delivery_pending
+    assert [row.envelope_id for row in await store.get_notice_candidates("provider-1")] == [
+        "notice-second"
+    ]
+    assert await store.release_notice_delivery("provider-1", ["notice-first"])
+    assert [row.envelope_id for row in await store.get_notice_candidates("provider-1")] == [
+        "notice-first",
+        "notice-second",
+    ]
     await store.close()
 
 
@@ -1558,6 +1578,7 @@ async def test_successful_empty_notice_turn_keeps_same_session_suppressed(
         turn_id="empty-success-turn",
         provider_session_id="provider-1",
         notice_generation=due.generation,
+        notice_message_ids=["notice-empty-success"],
     )
     run = await store.finalize_empty_turn(turn_id="empty-success-turn")
     state = await store.get_notice_state()
@@ -1570,6 +1591,23 @@ async def test_successful_empty_notice_turn_keeps_same_session_suppressed(
     assert not state.is_due_for("provider-1")
     assert state.is_due_for("provider-2")
     assert await store.get_active_turn_runs() == ()
+    await store.store_receipt(
+        _channel_payload("notice-after-terminal"),
+        server_seq=2,
+        disposition=ReceiptDisposition.ELIGIBLE,
+        reason="test",
+    )
+    changed = await store.get_notice_state()
+    assert not await store.mark_notice_delivered(
+        changed.generation,
+        "provider-1",
+        ["notice-after-terminal"],
+        turn_id="empty-success-turn",
+    )
+    assert [
+        row.envelope_id
+        for row in await store.get_notice_candidates("provider-1")
+    ] == ["notice-after-terminal"]
     await store.close()
 
 

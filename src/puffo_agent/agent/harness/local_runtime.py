@@ -75,7 +75,6 @@ from .driver import (
     HarnessEventType,
     RuntimeSpec,
     SessionRef,
-    TurnRef,
 )
 from .runtime_manager import RuntimeManager, RuntimeManagerAdapter
 
@@ -842,50 +841,51 @@ def build_local_runtime_adapter(
     manager: RuntimeManager
     session_fingerprint = [prepared.session_fingerprint]
 
-    async def require_initial_capacity() -> None:
-        sizing_projector = RuntimeEventProjector(
-            agent_id=prepared.preparer.agent_id,
-            session_ref=projector.session_ref,
-            scope=projector.scope,
-        )
-        sizing_start = HarnessEvent(
-            type="turn.started",
-            driver=prepared.harness_name,
-            session_ref=SessionRef(projector.session_ref),
-            turn_ref=TurnRef(f"turn_{'f' * 32}"),
-            occurred_at="9999-12-31T23:59:59.999999+00:00",
-        )
-        estimated = sum(
-            len(outbox.canonical_bytes(value))
-            for value in sizing_projector.project_all(sizing_start)
-        )
-        # The durable usage read runs on the outbox worker thread: this hook is
-        # awaited from the daemon loop, which must not block on SQLite.
-        await outbox.arequire_turn_capacity(estimated_start_bytes=estimated)
-
     async def persist_event(event: HarnessEvent) -> None:
-        legacy_projector.project(event)
+        try:
+            legacy_projector.project(event)
+        except Exception:
+            logger.exception(
+                "agent %s: Profile Log projection failed; runtime continues",
+                prepared.preparer.agent_id,
+            )
         logical_session = str(event.session_ref or manager.session_ref)
         projector.session_ref = logical_session
-        await projecting_sink(event)
+        try:
+            await projecting_sink(event)
+        except Exception as exc:
+            logger.warning(
+                "agent %s: Runtime Events observation failed (%s); "
+                "runtime continues",
+                prepared.preparer.agent_id,
+                type(exc).__name__,
+            )
         event_type = getattr(event.type, "value", event.type)
         # Only the session and turn boundaries rewrite durable state; every
         # other event (a streamed delta above all) must reach the outbox no
         # more than once, so the state read stays inside the branch using it.
-        if event_type == "turn.started":
-            active_turn = str(event.turn_ref)
-        elif event_type in {"turn.completed", "turn.abandoned"}:
-            active_turn = None
-        elif event_type in {"session.opened", "session.resumed"}:
-            active_turn = (await outbox.astate()).get("active_turn_ref") or None
-        else:
-            return
-        await outbox.aset_active_turn(
-            active_turn,
-            session_ref=logical_session,
-            native_session_id=manager.native_session_id,
-            session_fingerprint=session_fingerprint[0],
-        )
+        try:
+            if event_type == "turn.started":
+                active_turn = str(event.turn_ref)
+            elif event_type in {"turn.completed", "turn.abandoned"}:
+                active_turn = None
+            elif event_type in {"session.opened", "session.resumed"}:
+                active_turn = (await outbox.astate()).get("active_turn_ref") or None
+            else:
+                return
+            await outbox.aset_active_turn(
+                active_turn,
+                session_ref=logical_session,
+                native_session_id=manager.native_session_id,
+                session_fingerprint=session_fingerprint[0],
+            )
+        except Exception as exc:
+            logger.warning(
+                "agent %s: Runtime session snapshot failed (%s); "
+                "runtime continues",
+                prepared.preparer.agent_id,
+                type(exc).__name__,
+            )
 
     async def reload_spec(system_prompt: str) -> RuntimeSpec:
         spec = await prepared.preparer.refresh_spec(system_prompt)
@@ -900,7 +900,6 @@ def build_local_runtime_adapter(
         native_session_id=prepared.native_session_id,
         driver_name=prepared.harness_name,
         event_sink=persist_event,
-        before_start=require_initial_capacity,
     )
     return RuntimeManagerAdapter(
         manager,

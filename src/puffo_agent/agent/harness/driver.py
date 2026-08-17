@@ -49,6 +49,7 @@ class PermissionRef:
 
 class SteerCapability(str, Enum):
     NONE = "none"
+    GATED = "gated"
     CURRENT_TURN = "current_turn"
 
 

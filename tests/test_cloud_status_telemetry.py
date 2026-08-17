@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from puffo_agent.agent.status_reporter import StatusReporter
 from puffo_agent.portal.state import (
     AgentConfig,
     DaemonConfig,
@@ -11,6 +12,24 @@ from puffo_agent.portal.state import (
     RuntimeConfig,
 )
 from puffo_agent.portal.worker import Worker
+
+
+def test_keyless_runtime_payload_preserves_context_numbers():
+    reporter = StatusReporter(
+        SimpleNamespace(),
+        runtime_provider=lambda: {
+            "harness": "codex",
+            "max_context": 258_400,
+            "auto_compact_threshold_pct": 75,
+            "secret": "drop-me",
+        },
+    )
+
+    assert reporter._runtime_payload() == {
+        "harness": "codex",
+        "max_context": 258_400,
+        "auto_compact_threshold_pct": 75,
+    }
 
 
 def test_runtime_info_reports_effective_codex_defaults():

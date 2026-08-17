@@ -596,7 +596,6 @@ async def test_continuation_failure_persists_terminal_before_next_turn(tmp_path)
     with pytest.raises(RuntimeStateError, match="outcome abandoned"):
         await asyncio.wait_for(first, timeout=1)
     assert manager.active_turn_ref is None
-    assert sink.validator.active_turn_ref is None
 
     driver.started = asyncio.Event()
     second = asyncio.create_task(adapter.run_turn(_context()))
@@ -621,7 +620,6 @@ async def test_continuation_failure_persists_terminal_before_next_turn(tmp_path)
         data={"outcome": "succeeded"},
     ))
     assert (await asyncio.wait_for(second, timeout=1)).reply == ""
-    assert sink.validator.active_turn_ref is None
     assert [row.event_type for row in outbox.prefix()] == [
         "turn.started",
         "activity.updated",

@@ -1,166 +1,311 @@
-"""MCP registration for history read tools."""
+"""History-window implementation for the agent-facing ``read_history`` tool."""
 
 from __future__ import annotations
 
+import base64
+import json
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
-
 from ..agent.message_projection import (
+    format_history_read_result,
     format_message_group,
 )
+from ..agent.message_store_models import parse_inbox_target
 from .data_client import DataNotFound
-from .puffo_core_tools import (
-    _resolve_channel_space,
-    _stage_model_visible_messages,
-)
+from .puffo_core_tools import _stage_model_visible_messages
 
 
-def register_channel_and_dm_history_tools(mcp: FastMCP, cfg: Any) -> None:
-    @mcp.tool()
-    async def get_channel_history(
-        channel: str,
-        limit: int = 20,
-        since: str = "",
-        before: int = 0,
-        after: int = 0,
-    ) -> str:
-        """List local channel root posts.
+def _encode_history_cursor(*, target: str, direction: str, anchor: str) -> str:
+    value = {"v": 1, "target": target, "direction": direction, "anchor": anchor}
+    raw = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
 
-        ``channel`` is ``ch_<uuid>``; ``limit``, ``since``, ``before``, and
-        ``after`` filter the result. It returns semantic target/row projection
-        groups with root reply counts; use ``get_thread_history`` for replies.
-        See the managed ``channel-history`` skill for context use.
-        """
-        limit = max(1, min(int(limit), 200))
-        channel_ref = channel.strip()
-        if channel_ref.startswith("#"):
+
+def _decode_history_cursor(cursor: str) -> dict[str, str]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        value = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            "invalid history cursor; retry read_history without cursor"
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("v") != 1
+        or not isinstance(value.get("target"), str)
+        or value.get("direction") not in {"older", "newer"}
+        or not isinstance(value.get("anchor"), str)
+        or not value["target"]
+        or not value["anchor"]
+    ):
+        raise RuntimeError(
+            "invalid history cursor; retry read_history without cursor"
+        )
+    return {
+        "target": value["target"],
+        "direction": value["direction"],
+        "anchor": value["anchor"],
+    }
+
+
+def _resolve_history_window(
+    *,
+    target: str,
+    cursor: str,
+    before_message_id: str,
+    after_message_id: str,
+) -> tuple[str, str, str]:
+    if cursor:
+        if before_message_id or after_message_id:
             raise RuntimeError(
-                "'#<name>' channel addressing isn't supported; pass the "
-                "channel id directly."
+                "cursor cannot be combined with before_message_id or "
+                "after_message_id"
             )
-        # Local-store read would return empty on a slug — route non-
-        # ``ch_`` refs through the resolver purely for its hint error.
-        if not channel_ref.startswith("ch_"):
-            await _resolve_channel_space(cfg, channel_ref)
-        channel_id = channel_ref
+        decoded = _decode_history_cursor(cursor)
+        if target and target != decoded["target"]:
+            raise RuntimeError("history cursor belongs to another target")
+        return decoded["target"], decoded["direction"], decoded["anchor"]
+    if not target:
+        raise RuntimeError("target is required when cursor is omitted")
+    if before_message_id and after_message_id:
+        raise RuntimeError(
+            "before_message_id and after_message_id are mutually exclusive"
+        )
+    if before_message_id:
+        return target, "older", before_message_id
+    if after_message_id:
+        return target, "newer", after_message_id
+    return target, "older", ""
 
-        try:
-            roots = await cfg.data_client.get_channel_roots(
-                channel_id,
-                limit=limit,
-                since_envelope_id=since or None,
-                before_ts=int(before) if before else None,
-                after_ts=int(after) if after else None,
-            )
-        except DataNotFound:
-            return f"(no such channel: {channel_id})"
-        if not roots:
-            return "(no root posts in the requested window)"
-        tool_arguments: dict[str, object] = {"channel": channel}
-        if limit != 20:
-            tool_arguments["limit"] = limit
-        if since:
-            tool_arguments["since"] = since
-        if before:
-            tool_arguments["before"] = before
-        if after:
-            tool_arguments["after"] = after
-        receipt_marker = await _stage_model_visible_messages(
+
+def history_tool_arguments(
+    *,
+    target: str,
+    cursor: str,
+    before_message_id: str,
+    after_message_id: str,
+    limit: int,
+) -> dict[str, object]:
+    arguments: dict[str, object] = {}
+    for key, value in (
+        ("target", target),
+        ("cursor", cursor),
+        ("before_message_id", before_message_id),
+        ("after_message_id", after_message_id),
+    ):
+        if value:
+            arguments[key] = value
+    if limit != 50:
+        arguments["limit"] = limit
+    return arguments
+
+
+def _bounded_window(
+    rows: list[Any],
+    *,
+    limit: int,
+    direction: str,
+    anchored: bool,
+) -> tuple[list[Any], bool, bool]:
+    has_more = len(rows) > limit
+    if direction == "newer":
+        return rows[:limit], anchored, has_more
+    return rows[-limit:], has_more, anchored
+
+
+def _history_cursors(
+    messages: list[Any],
+    *,
+    target: str,
+    has_older: bool,
+    has_newer: bool,
+    anchor: str,
+) -> tuple[str, str]:
+    oldest_anchor = str(messages[0].envelope_id) if messages else anchor
+    newest_anchor = str(messages[-1].envelope_id) if messages else anchor
+    older = (
+        _encode_history_cursor(
+            target=target,
+            direction="older",
+            anchor=oldest_anchor,
+        )
+        if has_older and oldest_anchor
+        else ""
+    )
+    newer = (
+        _encode_history_cursor(
+            target=target,
+            direction="newer",
+            anchor=newest_anchor,
+        )
+        if has_newer and newest_anchor
+        else ""
+    )
+    return older, newer
+
+
+def _anchor_matches_target(
+    message: Any,
+    *,
+    kind: str,
+    space_id: str,
+    channel_id: str,
+    tail: str,
+) -> bool:
+    if kind == "dm":
+        peer = tail.lstrip("@")
+        return (
+            message.envelope_kind == "dm"
+            and peer in {message.sender_slug, message.recipient_slug}
+        )
+    if (
+        message.envelope_kind != "channel"
+        or message.space_id != space_id
+        or message.channel_id != channel_id
+    ):
+        return False
+    return not tail or message.envelope_id == tail or message.thread_root_id == tail
+
+
+async def _validate_anchor(
+    cfg: Any,
+    *,
+    anchor: str,
+    kind: str,
+    space_id: str,
+    channel_id: str,
+    tail: str,
+) -> None:
+    if not anchor:
+        return
+    message = await cfg.data_client.get_message_by_envelope(anchor)
+    if message is None or not _anchor_matches_target(
+        message,
+        kind=kind,
+        space_id=space_id,
+        channel_id=channel_id,
+        tail=tail,
+    ):
+        raise RuntimeError("history boundary message does not belong to target")
+
+
+async def _read_rows(
+    cfg: Any,
+    *,
+    kind: str,
+    channel_id: str,
+    tail: str,
+    anchor: str,
+    direction: str,
+    limit: int,
+) -> tuple[list[Any], dict[str, int]]:
+    before = anchor if anchor and direction == "older" else None
+    after = anchor if anchor and direction == "newer" else None
+    if kind == "dm":
+        messages = await cfg.data_client.get_dm_history(
+            tail.lstrip("@"),
+            limit=limit + 1,
+            before_envelope_id=before,
+            after_envelope_id=after,
+        )
+        return messages, {}
+    if tail:
+        messages = await cfg.data_client.get_thread_messages(
+            tail,
+            limit=limit + 1,
+            since_envelope_id=after,
+            before_envelope_id=before,
+        )
+        return messages, {}
+    roots = await cfg.data_client.get_channel_roots(
+        channel_id,
+        limit=limit + 1,
+        since_envelope_id=after,
+        before_envelope_id=before,
+    )
+    return (
+        [entry.message for entry in roots],
+        {entry.message.envelope_id: entry.reply_count for entry in roots},
+    )
+
+
+async def read_history_messages(
+    cfg: Any,
+    *,
+    target: str,
+    cursor: str,
+    before_message_id: str,
+    after_message_id: str,
+    limit: int,
+    tool_arguments: dict[str, object],
+) -> str:
+    """Read one bounded local-history window for a canonical target."""
+    target, direction, anchor = _resolve_history_window(
+        target=target,
+        cursor=cursor,
+        before_message_id=before_message_id,
+        after_message_id=after_message_id,
+    )
+    try:
+        kind, space_id, channel_id, tail = parse_inbox_target(target)
+    except ValueError as exc:
+        raise RuntimeError(str(exc)) from None
+    if isinstance(limit, bool):
+        raise RuntimeError("limit must be an integer")
+    limit = max(1, min(int(limit), 200))
+    await _validate_anchor(
+        cfg,
+        anchor=anchor,
+        kind=kind,
+        space_id=space_id,
+        channel_id=channel_id,
+        tail=tail,
+    )
+    try:
+        messages, reply_counts = await _read_rows(
             cfg,
-            [entry.message for entry in roots],
-            tool_name="get_channel_history",
-            tool_arguments=tool_arguments,
-        )
-        result = format_message_group(
-            [entry.message for entry in roots],
-            current_agent_aliases=(cfg.slug,),
-            reply_counts={
-                entry.message.envelope_id: entry.reply_count for entry in roots
-            },
-        )
-        return f"{result}\n{receipt_marker}" if receipt_marker else result
-
-    @mcp.tool()
-    async def get_dm_history(
-        peer: str,
-        limit: int = 20,
-        before: int = 0,
-    ) -> str:
-        """List local DMs with ``peer``, oldest first.
-
-        ``before`` is an exclusive ms-epoch paging bound. Results use the
-        semantic target/row projection. See the managed ``channel-history``
-        skill for supplementary-context guidance.
-        """
-        limit = max(1, min(int(limit), 200))
-        peer_slug = peer.strip().lstrip("@")
-        if not peer_slug:
-            raise RuntimeError("pass the peer's slug to read DM history.")
-        msgs = await cfg.data_client.get_dm_history(
-            peer_slug,
+            kind=kind,
+            channel_id=channel_id,
+            tail=tail,
+            anchor=anchor,
+            direction=direction,
             limit=limit,
-            before=int(before) if before else None,
         )
-        if not msgs:
-            return "(no direct messages with that peer in the requested window)"
-        return format_message_group(msgs, current_agent_aliases=(cfg.slug,))
-
-
-def register_thread_history_tools(mcp: FastMCP, cfg: Any) -> None:
-    @mcp.tool()
-    async def get_thread_history(
-        root_id: str,
-        limit: int = 50,
-        since: str = "",
-        before: int = 0,
-        after: int = 0,
-    ) -> str:
-        """List a local thread's root and replies, oldest first.
-
-        ``root_id`` is the root envelope id; ``limit``, ``since``, ``before``,
-        and ``after`` filter it. Results use the semantic target/row projection.
-        See the managed ``channel-history`` skill for supplementary context.
-        """
-        if not root_id.strip():
-            raise RuntimeError("root_id required")
-        limit = max(1, min(int(limit), 200))
-        try:
-            msgs = await cfg.data_client.get_thread_messages(
-                root_id.strip(),
-                limit=limit,
-                since_envelope_id=since or None,
-                before_ts=int(before) if before else None,
-                after_ts=int(after) if after else None,
-            )
-        except DataNotFound:
-            return f"(no such thread: {root_id.strip()})"
-        if not msgs:
-            return "(no messages in this thread for the requested window)"
-        tool_arguments = {"root_id": root_id}
-        if limit != 50:
-            tool_arguments["limit"] = limit
-        if since:
-            tool_arguments["since"] = since
-        if before:
-            tool_arguments["before"] = before
-        if after:
-            tool_arguments["after"] = after
-        receipt_marker = await _stage_model_visible_messages(
-            cfg,
-            msgs,
-            tool_name="get_thread_history",
-            tool_arguments=tool_arguments,
-        )
-        result = format_message_group(
-            msgs,
-            current_agent_aliases=(cfg.slug,),
-            thread_root_id=root_id.strip(),
-        )
-        return f"{result}\n{receipt_marker}" if receipt_marker else result
-
-
-def register_history_read_tools(mcp: FastMCP, cfg: Any) -> None:
-    """Register conversation history tools in their established order."""
-    register_channel_and_dm_history_tools(mcp, cfg)
-    register_thread_history_tools(mcp, cfg)
+    except DataNotFound:
+        label = "thread" if tail and kind != "dm" else kind
+        raise RuntimeError(f"no such {label} target: {target}") from None
+    messages, has_older, has_newer = _bounded_window(
+        messages,
+        limit=limit,
+        direction=direction,
+        anchored=bool(anchor),
+    )
+    marker = await _stage_model_visible_messages(
+        cfg,
+        messages,
+        tool_name="read_history",
+        tool_arguments=tool_arguments,
+    )
+    body = format_message_group(
+        messages,
+        current_agent_aliases=(cfg.slug,),
+        thread_root_id=tail if kind != "dm" and tail else "",
+        reply_counts=reply_counts or None,
+    )
+    older_cursor, newer_cursor = _history_cursors(
+        messages,
+        target=target,
+        has_older=has_older,
+        has_newer=has_newer,
+        anchor=anchor,
+    )
+    result = format_history_read_result(
+        messages,
+        body=body,
+        has_older=has_older,
+        has_newer=has_newer,
+        older_cursor=older_cursor,
+        newer_cursor=newer_cursor,
+        target_ref=target,
+    )
+    return f"{result}\n{marker}" if marker else result

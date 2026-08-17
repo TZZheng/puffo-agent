@@ -635,12 +635,19 @@ class CloudBridgeClient:
         if error_text is not None:
             frame["error_text"] = error_text[:1024]
         if runtime is not None:
-            allowed = ("kind", "provider", "harness", "model", "inference_level")
-            frame["runtime"] = {
+            text_fields = (
+                "kind", "provider", "harness", "model", "inference_level",
+            )
+            bounded_runtime: dict[str, Any] = {
                 key: str(runtime.get(key, ""))[:256]
-                for key in allowed
+                for key in text_fields
                 if key in runtime
             }
+            for key in ("max_context", "auto_compact_threshold_pct"):
+                value = runtime.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    bounded_runtime[key] = value
+            frame["runtime"] = bounded_runtime
         await ws.send_json(frame)
 
     def _discard_waiter(

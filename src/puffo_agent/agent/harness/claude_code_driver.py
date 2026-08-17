@@ -1,4 +1,4 @@
-"""Claude Code CLI Driver with replay-based idle input acceptance."""
+"""Claude Code CLI Driver with non-blocking stream-json turn delivery."""
 
 from __future__ import annotations
 
@@ -38,10 +38,6 @@ from .driver import (
 from .subprocess_io import drain_subprocess_stream
 
 
-class AmbiguousDeliveryError(RuntimeError):
-    """Claude may have accepted input before Puffo observed its replay."""
-
-
 class _ContextUsageUnsupported(RuntimeError):
     pass
 
@@ -66,6 +62,11 @@ def claude_capabilities(compact_advertised: bool = False) -> DriverCapabilities:
 
 
 class ClaudeCodeCliDriver(Driver):
+    # A second stream-json user frame is queued as another Claude native Turn.
+    # It is not an admission into the active Puffo Turn, even when written just
+    # after a tool result, so the scheduler must deliver it through next-turn.
+    static_steer_capability = SteerCapability.NONE
+
     def __init__(
         self,
         process_factory: Callable[..., Any] | None = None,
@@ -193,43 +194,22 @@ class ClaudeCodeCliDriver(Driver):
                 "content": [{"type": "text", "text": input.content}],
             },
         }
-        replay = self._pending_replay
         try:
-            # The write belongs inside the try: a child that died between
-            # open() and the turn write makes drain() raise, and leaving that
-            # path outside the cleanup strands `_active` plus an orphaned
-            # replay future whose exception nobody retrieves.
+            # The daemon has already opened its durable local turn. A
+            # successful stdin drain is therefore enough to return control;
+            # Claude's replay remains useful telemetry but must not gate MCP
+            # calls made while the provider is processing this frame.
             await self._write(frame)
-            async with asyncio.timeout(self.replay_timeout):
-                if self._init is not None and not self._init.done():
-                    await asyncio.shield(self._init)
-                observed_uuid = await asyncio.shield(self._pending_replay)
-        except (asyncio.TimeoutError, AmbiguousDeliveryError):
-            self._active = TurnRef("")
-            self._active_native_turn_id = ""
-            return TurnStarted(
-                local, accepted=False, delivery="ambiguous_at_least_once"
-            )
         except BaseException:
-            # A turn that never reached the provider is not in flight; clear it
-            # so the next start_turn is not refused as "already active".
             self._active = TurnRef("")
             self._active_native_turn_id = ""
-            if not replay.done():
-                replay.cancel()
-            elif not replay.cancelled():
-                replay.exception()
+            self._clear_pending_replay()
             raise
-        finally:
-            self._pending_replay = None
-            self._pending_content = ""
-            self._pending_uuid = ""
         return TurnStarted(
             local,
             native_turn_id=replay_uuid,
             accepted=True,
-            delivery="replay_acknowledged",
-            replay_id=observed_uuid,
+            delivery="stdin_written",
         )
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput):
@@ -370,14 +350,21 @@ class ClaudeCodeCliDriver(Driver):
     def _fail_pending_futures(self, message: str) -> None:
         for future in (
             self._init,
-            self._pending_replay,
             *self._context_requests.values(),
         ):
             if future is not None and not future.done():
                 future.set_exception(RuntimeError(message))
         self._init = None
-        self._pending_replay = None
+        self._clear_pending_replay()
         self._context_requests.clear()
+
+    def _clear_pending_replay(self) -> None:
+        pending = self._pending_replay
+        if pending is not None and not pending.done():
+            pending.cancel()
+        self._pending_replay = None
+        self._pending_content = ""
+        self._pending_uuid = ""
 
     async def _write(self, frame: dict[str, Any]) -> None:
         encoded = (
@@ -404,11 +391,7 @@ class ClaudeCodeCliDriver(Driver):
                     continue
                 await self._handle(frame)
         finally:
-            error = AmbiguousDeliveryError(
-                "Claude exited before replay acceptance was observed"
-            )
-            if self._pending_replay is not None and not self._pending_replay.done():
-                self._pending_replay.set_exception(error)
+            self._clear_pending_replay()
             if self._init is not None and not self._init.done():
                 self._init.set_exception(RuntimeError("Claude exited before init"))
             if not self._closed:
@@ -504,8 +487,12 @@ class ClaudeCodeCliDriver(Driver):
         )
 
     async def _complete_replay(self, frame: dict[str, Any]) -> None:
-        assert self._pending_replay is not None
-        self._pending_replay.set_result(str(frame.get("uuid")))
+        pending = self._pending_replay
+        if pending is None:
+            return
+        if not pending.done():
+            pending.set_result(str(frame.get("uuid")))
+        self._clear_pending_replay()
         await self._emit(
             HarnessEventType.TURN_STARTED, turn_ref=self._active, native_payload=frame
         )
@@ -633,6 +620,7 @@ class ClaudeCodeCliDriver(Driver):
             },
             native_payload=frame,
         )
+        self._clear_pending_replay()
         self._active, self._active_native_turn_id = TurnRef(""), ""
         # A `tool_use` whose `tool_result` never arrives would otherwise keep
         # its name and arguments alive until close, so a later turn reusing the

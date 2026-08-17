@@ -27,6 +27,7 @@ def test_allowed_tools_are_the_send_read_and_membership_tools():
         "send_message_with_attachments",
         # read / navigation
         "read_inbox",
+        "read_history",
         # durable Agent-local reminders
         "create_reminder",
         "list_reminders",
@@ -36,9 +37,6 @@ def test_allowed_tools_are_the_send_read_and_membership_tools():
         "whoami",
         "get_post",
         "get_post_segment",
-        "get_channel_history",
-        "get_dm_history",
-        "get_thread_history",
         "list_channel_members",
         "list_spaces",
         "list_channels_in_space",
@@ -106,6 +104,10 @@ def test_ws_local_semantic_tool_signatures_expose_no_internal_controls():
     dispatch = build_dispatch(MagicMock())
     expected = {
         "read_inbox": {"target", "cursor", "limit"},
+        "read_history": {
+            "target", "cursor", "before_message_id", "after_message_id",
+            "limit",
+        },
         "create_reminder": {"content", "target", "intended_at"},
         "list_reminders": {"state", "limit"},
         "cancel_reminder": {"reminder_id"},
@@ -133,7 +135,7 @@ def test_ws_local_semantic_tool_signatures_expose_no_internal_controls():
 
 
 @pytest.mark.asyncio
-async def test_ws_local_read_inbox_uses_live_runtime_and_preserves_correlation():
+async def test_ws_local_read_inbox_uses_live_runtime():
     from puffo_agent.mcp.puffo_core_tools import PuffoCoreToolsConfig
 
     calls = []
@@ -147,7 +149,6 @@ async def test_ws_local_read_inbox_uses_live_runtime_and_preserves_correlation()
                 "has_more": False,
                 "remaining_count": 0,
                 "snapshot_generation": 3,
-                "correlation_receipt": "receipt-3",
             }
 
     cfg = PuffoCoreToolsConfig(
@@ -160,16 +161,13 @@ async def test_ws_local_read_inbox_uses_live_runtime_and_preserves_correlation()
     )
     dispatch = build_dispatch(cfg)
     result = await dispatch["read_inbox"](
-        target="channel:sp:ch", cursor="", limit=7
+        target="channel:sp:ch",
+        cursor="",
+        limit=7,
     )
-    assert result == {
-        "messages": ["whole"],
-        "next_cursor": "",
-        "has_more": False,
-        "remaining_count": 0,
-        "snapshot_generation": 3,
-        "admission_receipt": "[puffo:model-visible-read:receipt-3]",
-    }
+    assert '[window context_version=1 kind="inbox"' in result
+    assert "[pending_messages context_version=1 message_count=1]" in result
+    assert "whole" in result
     assert calls == [{
         "target": "channel:sp:ch",
         "cursor": "",

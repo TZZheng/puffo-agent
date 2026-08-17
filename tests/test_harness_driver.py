@@ -227,7 +227,7 @@ def test_claude_effective_capabilities():
     compact = claude_capabilities(True)
     assert baseline.session_resume is True
     assert baseline.inflight_turn_recovery is False
-    assert baseline.steer == baseline.cancel == "none"
+    assert (baseline.steer, baseline.cancel) == ("none", "none")
     assert baseline.context_status == "pull"
     assert baseline.compact == "none"
     assert compact.compact == "session_command"
@@ -621,6 +621,19 @@ async def test_manager_adapter_submits_only_current_semantic_input():
     assert captured["content"].count("current-notice-sentinel") == 1
 
 
+def _claude_context_response(frame, total_tokens=42, max_tokens=200_000):
+    return {
+        "type": "control_response",
+        "response": {
+            "request_id": frame["request_id"],
+            "subtype": "success",
+            "response": {
+                "totalTokens": total_tokens, "rawMaxTokens": max_tokens,
+            },
+        },
+    }
+
+
 def _metadata_driver(provider, provider_inputs):
     holder = {}
 
@@ -646,17 +659,7 @@ def _metadata_driver(provider, provider_inputs):
 
     def replay_claude_frame(frame):
         if frame.get("type") == "control_request":
-            proc.feed({
-                "type": "control_response",
-                "response": {
-                    "request_id": frame["request_id"],
-                    "subtype": "success",
-                    "response": {
-                        "totalTokens": 1,
-                        "rawMaxTokens": 200_000,
-                    },
-                },
-            })
+            proc.feed(_claude_context_response(frame, total_tokens=1))
             return
         if frame.get("type") == "user":
             provider_inputs.append(frame["message"]["content"][0]["text"])
@@ -761,8 +764,7 @@ async def _read_metadata_pages(runtime, proc, provider):
             cursor=cursor, limit=1, tool_arguments=arguments,
         )
         assert len(page["messages"]) == 1
-        marker = f"[puffo:model-visible-read:{page['correlation_receipt']}]"
-        _feed_metadata_result(proc, provider, page_number, arguments, marker)
+        _feed_metadata_result(proc, provider, page_number, arguments, "read complete")
         admitted.append(f"message-{page_number}")
 
         def admission_is_persisted():
@@ -871,7 +873,9 @@ def _feed_codex_protocol_events(proc):
     proc.feed({
         "method": "thread/tokenUsage/updated",
         "params": {"tokenUsage": {
-            "totalTokens": 12, "modelContextWindow": 100,
+            "last": {"totalTokens": 12},
+            "total": {},
+            "modelContextWindow": 100,
         }},
     })
     proc.feed({
@@ -1265,10 +1269,6 @@ async def _assert_claude_unsupported_calls_write_nothing(
     driver, started, process,
 ):
     assert isinstance(
-        await driver.steer_turn(started.turn_ref, TurnInput("x")),
-        UnsupportedCapability,
-    )
-    assert isinstance(
         await driver.cancel_turn(started.turn_ref), UnsupportedCapability
     )
     before = len(process.stdin.writes)
@@ -1292,19 +1292,9 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
         def on_frame(frame):
             proc = holder["proc"]
             if frame.get("type") == "control_request":
-                proc.feed({
-                    "type": "control_response",
-                    "response": {
-                        "request_id": frame["request_id"],
-                        "subtype": "success",
-                        "response": {
-                            "totalTokens": 42,
-                            "rawMaxTokens": 200_000,
-                        },
-                    },
-                })
+                proc.feed(_claude_context_response(frame))
                 return
-            if frame.get("uuid"):
+            if frame.get("uuid") == "replay-1":
                 proc.feed({
                     **frame, "isReplay": True,
                     "message": {"role": "user", "content": [
@@ -1319,16 +1309,8 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
                             "type": "tool_use", "id": "tool-claude",
                             "name": "read_inbox", "input": {"limit": 1},
                         },
-                    ]},
+                        ]},
                 })
-                proc.feed({
-                    "type": "user", "message": {"content": [{
-                        "type": "tool_result", "tool_use_id": "tool-claude",
-                        "content": "[puffo:model-visible-read:receipt-claude]",
-                    }]},
-                })
-                proc.feed({"type": "result", "subtype": "success", "usage": {}})
-                proc.feed({"type": "rate_limit_event", "secret": "not-public"})
 
         proc = _FakeProcess(on_frame)
         holder["proc"] = proc
@@ -1347,11 +1329,20 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
     started = await driver.start_turn(TurnInput(
         "hello\r\nworld", client_correlation_id="replay-1"
     ))
-    assert started.accepted and started.delivery == "replay_acknowledged"
-    assert started.replay_id == "replay-1"
+    assert started.accepted and started.delivery == "stdin_written"
+    assert started.replay_id == ""
     await _next_matching(stream, "turn.started")
     await _next_matching(stream, "turn.assistant_delta")
     await _next_matching(stream, "turn.tool_started")
+    steered = await driver.steer_turn(started.turn_ref, TurnInput("inbox delta"))
+    assert isinstance(steered, UnsupportedCapability)
+    assert steered.capability == "steer"
+    holder["proc"].feed({
+        "type": "user", "message": {"content": [{
+            "type": "tool_result", "tool_use_id": "tool-claude",
+            "content": "[puffo:model-visible-read:receipt-claude]",
+        }]},
+    })
     tool_completed = await _next_matching(stream, "turn.tool_completed")
     assert tool_completed.data == {
         "tool_call_ref": "tool-claude",
@@ -1360,6 +1351,9 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
     }
     assert "arguments" not in tool_completed.data
     assert "result" not in tool_completed.data
+    assert len(holder["proc"].stdin.writes) == 1
+    holder["proc"].feed({"type": "result", "subtype": "success", "usage": {}})
+    holder["proc"].feed({"type": "rate_limit_event", "secret": "not-public"})
     await _next_matching(stream, "turn.completed")
     trailing = await _next_matching(stream, "session.updated")
     assert trailing.turn_ref is None
@@ -1475,7 +1469,7 @@ async def test_claude_driver_resume_flag_maps_to_resumed_system_init():
 
 
 @pytest.mark.asyncio
-async def test_claude_driver_pre_replay_process_loss_is_ambiguous():
+async def test_claude_driver_stdin_delivery_does_not_wait_for_replay():
     holder = {}
 
     def factory(_args, _spec):
@@ -1492,8 +1486,8 @@ async def test_claude_driver_pre_replay_process_loss_is_ambiguous():
     driver = ClaudeCodeCliDriver(factory, replay_timeout=1)
     await driver.open(RuntimeSpec("/workspace"))
     receipt = await driver.start_turn(TurnInput("accepted maybe"))
-    assert not receipt.accepted
-    assert receipt.delivery == "ambiguous_at_least_once"
+    assert receipt.accepted
+    assert receipt.delivery == "stdin_written"
     await driver.close()
 
 
@@ -1771,6 +1765,11 @@ def _token_telemetry_driver(provider):
         return proc, CodexAppServerDriver(lambda _spec: proc), expected
 
     def claude_on_frame(frame):
+        if frame.get("type") == "control_request":
+            holder["proc"].feed(
+                _claude_context_response(frame, total_tokens=84)
+            )
+            return
         if frame.get("type") == "user":
             holder["proc"].feed({**frame, "isReplay": True})
 
@@ -1783,7 +1782,7 @@ def _token_telemetry_driver(provider):
     return (
         proc,
         ClaudeCodeCliDriver(lambda *_args: proc, replay_timeout=1),
-        (40, 30, 80),
+        (40, 30, 84),
     )
 
 
@@ -1800,11 +1799,13 @@ def _feed_token_telemetry(provider, proc):
             "last": base_last,
             "total": {"inputTokens": 500, "cachedInputTokens": 300,
                       "outputTokens": 80},
+            "modelContextWindow": 258_400,
         }}})
         proc.feed({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {
             "last": final_last,
             "total": {"inputTokens": 700, "cachedInputTokens": 400,
                       "outputTokens": 140},
+            "modelContextWindow": 258_400,
         }}})
         proc.feed({"method": "turn/completed", "params": {"turn": {"status": "completed"}}})
     else:
@@ -1940,7 +1941,7 @@ def _build_projection_adapter(tmp_path, driver, monkeypatch):
         preparer=_StubPreparer(),
         session_fingerprint="fp",
     )
-    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
+    outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db", max_rows=1)
     monkeypatch.setattr(local_runtime, "build_driver", lambda name: driver)
     adapter = build_local_runtime_adapter(
         prepared, outbox=outbox, logical_session_ref="logical-session"
@@ -1955,7 +1956,7 @@ async def test_local_sink_projects_only_bounded_safe_legacy_status(
     """The local runtime sink must emit only bounded ``assistant_text`` (once per
     completed non-silent block) and label-only ``tool_use`` per normalized start,
     never duplicates, post-terminal fragments, or native/argument/reasoning
-    material. Post-2.0 the sink emitted nothing; a native replay would leak.
+    material. A saturated outbox must not block this Profile Log or the turn.
     """
     from puffo_agent.agent.adapters.base import TurnContext
 
