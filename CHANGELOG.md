@@ -6,6 +6,23 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a13] - 2026-08-16
+
+> Integrated staging candidate built from the merged Agent Foundation,
+> flat-memory compatibility, and current control-plane fixes.
+
+### Fixed
+
+- **Web Refresh now performs a complete refresh by default.** A parameterless
+  control command reloads the session and host-managed skills/MCP state as well
+  as the Agent prompt; callers can still request a narrower refresh explicitly.
+- **Credential recovery no longer re-flags healthy Agents as broken.** External
+  Claude credential rotation and successful refreshes clear the shared failure
+  state, while a benign unchanged fresh credential is not counted as failure.
+- **Archived and deleted Agents leave their spaces before device revocation.**
+  The daemon and CLI use the same ordered flow, preserve retryable failures for
+  a later sweep, and avoid leaving ordinary channel-roster memberships behind.
+
 ## [2.0.0a12] — 2026-08-16
 
 > Staging candidate restoring Puffo Agent 1.2 memory compatibility while
