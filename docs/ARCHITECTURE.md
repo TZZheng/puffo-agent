@@ -243,12 +243,11 @@ Default state is rooted at `~/.puffo-agent/` (overridable with
     runtime_events.db        # bounded local Runtime event outbox
     runtime.json             # daemon health/status projection
     memory/
-      briefing/
-        profile.md
-        <topic>.md
-      notes/
-      recollection/
-      imports/
+      <topic>.md              # standing memory, loaded into every prompt
+      briefing/               # retained 2.0-alpha compatibility topics
+      notes/                  # searchable detail, loaded on demand
+      recollection/           # maintenance-owned chronology
+      imports/                # importer-owned source material
         index.md
     workspace/
       shared -> ../../../shared/ # same host-wide directory for every Agent
@@ -262,17 +261,27 @@ state; native wire encryption does not make the already-decrypted local store
 ciphertext-only.
 
 Existing Agent configuration is normalized at explicit compatibility
-boundaries. Legacy direct-provider runtime names migrate to `cli-local`; old
-flat `memory/*.md` files migrate into the memory tree; existing identity,
-workspace, message, and session state is retained.
+boundaries. Legacy direct-provider runtime names migrate to `cli-local`;
+existing identity, workspace, flat memory, structured alpha memory, message,
+and session state is retained.
 
 ## 7. Memory
 
-The memory tree is implemented end to end:
+The active prompt path preserves the Puffo Agent 1.2 memory contract:
 
-- `briefing/` is deterministic, bounded, and compiled into managed provider
-  prompt artifacts. `briefing/profile.md` receives the managed identity block;
-  additional topics are Agent-owned.
+- The editable root `profile.md` is loaded verbatim under `# Your role`.
+- Flat `memory/*.md` files are standing memory and are loaded without the
+  structured briefing size budget.
+- Prompt assembly is read-only: startup does not move, delete, or rewrite
+  memory files.
+
+The 2.0-alpha structured implementation remains as a compatibility layer:
+
+- `briefing/` topics are included in the same standing-memory view when no
+  same-named flat topic exists. User text outside the old managed
+  `briefing/profile.md` block is retained as profile notes.
+- Notes named by `briefing/migrated-notes.md` are included so an earlier alpha
+  migration cannot make former flat memory disappear.
 - `notes/` holds searchable detail and is not injected by default.
 - `recollection/` is maintenance-owned chronological memory.
 - `imports/` is importer-owned and read-only to ordinary Agent turns;
@@ -282,10 +291,10 @@ The memory tree is implemented end to end:
 - Semantic MCP tools expose notes, briefing topics, recall, imports, and status.
 - `memory_git.py` records write history for audit and rollback.
 
-Briefing files are limited to 16 KiB each and the compiled briefing to 64 KiB.
-Notes and recollection have separate larger per-file limits. A briefing change
-sets a refresh flag; the worker rebuilds managed prompt artifacts and reloads
-the provider at a safe lifecycle boundary.
+Structured briefing writes remain limited to 16 KiB each and 64 KiB total;
+legacy flat files retain their 1.2 unbounded behavior. Writes made through
+Puffo's memory surfaces request a provider prompt refresh at a safe lifecycle
+boundary.
 
 ## 8. Runtime Events And Reminders
 

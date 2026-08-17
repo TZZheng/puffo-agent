@@ -16,7 +16,9 @@ from puffo_agent.agent.adapters import docker_cli
 from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
 
 
-def _make_adapter(tmp_path, memory_limit="", memory_reservation=""):
+def _make_adapter(
+    tmp_path, memory_limit="", memory_reservation="", memory_dir="",
+):
     return DockerCLIAdapter(
         agent_id="t",
         model="",
@@ -28,6 +30,7 @@ def _make_adapter(tmp_path, memory_limit="", memory_reservation=""):
         shared_fs_dir=str(tmp_path / "shared"),
         memory_limit=memory_limit,
         memory_reservation=memory_reservation,
+        memory_dir=str(memory_dir) if memory_dir else "",
     )
 
 
@@ -98,6 +101,13 @@ def test_flags_appear_before_image_token(tmp_path):
     image_idx = argv.index("puffo/agent-runtime:test")
     assert argv.index("--memory") < image_idx
     assert argv.index("--memory-reservation") < image_idx
+
+
+def test_custom_memory_dir_is_mounted_at_the_canonical_container_path(tmp_path):
+    custom = tmp_path / "external-memory"
+    adapter = _make_adapter(tmp_path, memory_dir=custom)
+    argv = _capture_docker_run_argv(adapter, tmp_path)
+    assert f"{custom}:/home/agent/.puffo-agent-state/memory" in argv
 
 
 def test_daemon_defaults_apply_when_yaml_omits_fields(tmp_path):

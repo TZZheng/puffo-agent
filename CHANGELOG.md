@@ -6,8 +6,21 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a12] — 2026-08-16
+
+> Staging candidate restoring Puffo Agent 1.2 memory compatibility while
+> retaining the structured-memory alpha data and tools.
+
 ### Fixed
 
+- **Existing Agent memory again follows the 1.2 runtime contract.** The full
+  root `profile.md` and flat `memory/*.md` files are loaded into Codex and
+  Claude Code prompts without destructive startup migration or alpha briefing
+  limits. Existing structured briefing data remains visible through a
+  read-only compatibility view, including notes moved by earlier alpha builds.
+- **Custom memory directories work in Docker runtimes.** Claude Code and Codex
+  containers now mount the resolved Agent memory directory at the canonical
+  MCP path instead of silently reading the default Agent-home directory.
 - **Runtime observability can no longer block Agent execution.** Profile Logs,
   Runtime Events upload, and the local runtime-state snapshot are treated as
   best-effort observations after a provider event occurs. A full or unhealthy

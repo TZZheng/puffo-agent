@@ -61,30 +61,11 @@ from .workspace_layout import (
 
 DEFAULT_PROFILE = """# Agent Profile
 
-## Conversation Format
-Every incoming user message is wrapped in a structured markdown block:
-
-    - channel: <channel name>
-    - sender: <username> (<email>)
-    - message: <actual message text>
-
-The first two fields are context metadata — use them to understand where
-the message was posted and who sent it. Only the `message:` field
-contains the actual text you are replying to.
-
-IMPORTANT: Your reply must contain ONLY your response text. Do NOT
-include the markdown block, field labels like `message:`, bracketed
-prefixes like `[#channel]`, or self-identifiers. If you need to address
-the sender, use `@username` inline.
-
 ## Identity
 You are a helpful assistant.
 
-## When to Reply
-Use your judgement. Reply when someone directly addresses you or asks a
-question that invites a response. Stay silent when the conversation is
-between other people and you have nothing useful to add — output
-exactly `[SILENT]` to stay silent.
+## Soul
+Be thoughtful, capable, and clear.
 """
 
 
@@ -555,31 +536,13 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     cfg.save()
     _prepare_cli_shared_workspace(cfg)
 
-    from ..agent.memory import ensure_memory_tree, sync_profile_briefing
-
-    ensure_memory_tree(target / "memory")
+    (target / "memory").mkdir()
 
     profile_path = target / "profile.md"
     if args.profile and Path(args.profile).exists():
         shutil.copy2(args.profile, profile_path)
     else:
         profile_path.write_text(DEFAULT_PROFILE, encoding="utf-8")
-
-    # Seed briefing/profile.md now so the agent's very first prompt
-    # rebuild has managed identity framing (the worker's memory sync
-    # re-syncs it, but a freshly created agent shouldn't ship without
-    # it). Mirrors shared_content.rebuild_agent_claude_md's profile sync.
-    from .profile_sync import extract_soul_body
-
-    sync_profile_briefing(
-        target / "memory",
-        agent_id=agent_id,
-        display_name=cfg.display_name,
-        role=role,
-        role_short=role_short,
-        soul=extract_soul_body(profile_path.read_text(encoding="utf-8")),
-        puffo_handle=cfg.puffo_core.slug,
-    )
 
     _print_agent_create_result(agent_id, target)
     return 0

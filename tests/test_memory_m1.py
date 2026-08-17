@@ -1,7 +1,5 @@
-"""M1 memory acceptance tests: memory tree, bounded briefing compile
-(fail closed), managed profile briefing, flat-memory migration, and
-the MemoryManager compat surface (save → briefing topic + refresh
-flag)."""
+"""Memory compatibility tests: the retained structured implementation plus
+the active Puffo Agent 1.2 flat-memory surface."""
 
 import json
 import re
@@ -17,6 +15,7 @@ from puffo_agent.agent.memory import (
     compile_briefing,
     ensure_memory_tree,
     migrate_flat_memory,
+    read_standing_memory_entries,
     render_profile_briefing,
     sync_profile_briefing,
 )
@@ -47,13 +46,11 @@ def test_ensure_memory_tree_creates_layout(tmp_path):
     }
 
 
-def test_memory_manager_init_seeds_tree(tmp_path):
+def test_memory_manager_init_uses_flat_layout_without_seeding_tree(tmp_path):
     root = tmp_path / "memory"
     MemoryManager(str(root))
-    assert (root / "briefing").is_dir()
-    assert (root / "notes").is_dir()
-    assert (root / "recollection").is_dir()
-    assert (root / "imports" / "index.md").is_file()
+    assert root.is_dir()
+    assert list(root.iterdir()) == []
 
 
 def test_ensure_memory_tree_is_idempotent_and_preserves_content(tmp_path):
@@ -186,6 +183,9 @@ def test_profile_briefing_resync_preserves_user_text_outside_markers(tmp_path):
     assert "New role" in text
     assert "Old role" not in text
     assert "User-authored addendum." in text
+    standing = dict(read_standing_memory_entries(root))
+    assert standing["profile-notes"] == "User-authored addendum."
+    assert "New role" not in standing["profile-notes"]
 
 
 # ── legacy flat-memory migration ─────────────────────────────────────
@@ -218,6 +218,9 @@ def test_migrate_flat_memory_small_to_briefing_big_to_notes(tmp_path):
     assert set(moved) == {"briefing/small.md", "notes/big.md"}
     # The migrated tree still compiles within budget.
     assert "a small fact" in compile_briefing(root)
+    standing = dict(read_standing_memory_entries(root))
+    assert standing["small"] == "a small fact"
+    assert standing["big"] == "x" * (PER_FILE_LIMIT + 1)
 
     # Idempotent: a second pass is a no-op.
     before = _tree_snapshot(root)
@@ -390,25 +393,37 @@ def _rebuild(root: Path) -> str:
     )
 
 
-def test_rebuild_picks_up_new_briefing_topic_and_ignores_notes(tmp_path):
+def test_rebuild_combines_flat_memory_with_structured_compatibility(tmp_path):
     (tmp_path / "profile.md").write_text(
         "# Soul\nI verify briefings.", encoding="utf-8",
     )
     (tmp_path / "workspace").mkdir()
     memory = tmp_path / "memory"
+    memory.mkdir()
 
     first = _rebuild(tmp_path)
     assert "I verify briefings." in first
 
+    (memory / "standing.md").write_text(
+        "Legacy standing fact A12.", encoding="utf-8",
+    )
+    ensure_memory_tree(memory)
     (memory / "briefing" / "deploys.md").write_text(
         "Deploy fact ZQX-77.", encoding="utf-8",
+    )
+    (memory / "briefing" / "standing.md").write_text(
+        "STALE-COMPAT-COPY", encoding="utf-8",
     )
     (memory / "notes" / "scratch.md").write_text(
         "NOTE-ONLY-DETAIL-42", encoding="utf-8",
     )
+    before = _tree_snapshot(memory)
     second = _rebuild(tmp_path)
+    assert "Legacy standing fact A12." in second
+    assert "STALE-COMPAT-COPY" not in second
     assert "Deploy fact ZQX-77." in second
     assert "NOTE-ONLY-DETAIL-42" not in second
+    assert _tree_snapshot(memory) == before
     assert (tmp_path / ".claude" / "CLAUDE.md").read_text(encoding="utf-8") == second
     assert (tmp_path / ".gemini" / "GEMINI.md").read_text(encoding="utf-8") == second
 
@@ -428,37 +443,23 @@ def test_rebuild_flag_dropped_by_memory_manager_save(tmp_path):
 # ── MemoryManager.save() compat ──────────────────────────────────────
 
 
-def test_save_writes_briefing_topic_with_frontmatter(tmp_path):
+def test_save_writes_flat_topic_with_frontmatter(tmp_path):
     root = tmp_path / "memory"
     mm = MemoryManager(str(root))
     mm.save("deploy notes/prod", "The fact.")
-    path = root / "briefing" / "deploy_notes-prod.md"
+    path = root / "deploy_notes-prod.md"
     text = path.read_text(encoding="utf-8")
     assert text.startswith("---\ntopic: deploy notes/prod\nupdated: ")
     assert text.endswith("The fact.\n")
     assert "The fact." in mm.get_context()
 
 
-def test_save_oversized_file_fails_closed_without_partial_state(tmp_path):
+def test_save_retains_legacy_unbounded_flat_behavior(tmp_path):
     root = tmp_path / "memory"
     mm = MemoryManager(str(root))
-    with pytest.raises(BriefingCompileError) as ei:
-        mm.save("big", "x" * (PER_FILE_LIMIT + 1))
-    assert ei.value.code == "memory_file_too_large"
-    assert not (root / "briefing" / "big.md").exists()
-
-
-def test_save_over_total_budget_fails_closed_without_partial_state(tmp_path):
-    root = tmp_path / "memory"
-    mm = MemoryManager(str(root))
-    for i in range(4):
-        (root / "briefing" / f"seed-{i}.md").write_text(
-            "s" * (15 * 1024), encoding="utf-8",
-        )
-    with pytest.raises(BriefingCompileError) as ei:
-        mm.save("overflow", "o" * (8 * 1024))
-    assert ei.value.code == "memory_briefing_too_large"
-    assert not (root / "briefing" / "overflow.md").exists()
+    body = "x" * (TOTAL_LIMIT + 1)
+    mm.save("large", body)
+    assert body in (root / "large.md").read_text(encoding="utf-8")
 
 
 def test_save_without_workspace_dir_drops_no_flag(tmp_path):

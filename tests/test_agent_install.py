@@ -670,12 +670,8 @@ def test_process_refresh_flags_deletes_flags_after_processing(tmp_path, monkeypa
 def test_process_refresh_flags_keeps_authenticated_puffo_handle(
     tmp_path, monkeypatch,
 ):
-    """A refresh flag regenerates the managed profile block, so the
-    identity line is rewritten from whatever the refresh path forwards.
-    An imported agent pairs under a ``puffo_core.slug`` that differs from
-    its local ``agent_id``; if the handle is dropped here, the first
-    memory write (which drops ``refresh_agent.flag``) silently reverts the
-    model's self-identity to the unaddressable local id."""
+    """A prompt refresh keeps the authenticated network handle while leaving
+    memory untouched, even when it differs from the local agent id."""
     from puffo_agent.portal import worker as worker_mod
 
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "home"))
@@ -702,8 +698,8 @@ def test_process_refresh_flags_keeps_authenticated_puffo_handle(
         puffo_handle="bot-42-x9f2",
     ))
 
-    briefing = (memory_dir / "briefing" / "profile.md").read_text(
-        encoding="utf-8",
-    )
-    assert "You are bot-42-x9f2 (agent `bot-42-x9f2`)." in briefing
-    assert "bot-42 (agent" not in briefing
+    prompt = (tmp_path / "home" / "agents" / "bot-42" / ".claude" / "CLAUDE.md")
+    text = prompt.read_text(encoding="utf-8")
+    assert "Puffo handle: `@bot-42-x9f2`" in text
+    assert "Puffo handle: `@bot-42`" not in text
+    assert not (memory_dir / "briefing" / "profile.md").exists()
