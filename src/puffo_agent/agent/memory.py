@@ -1,18 +1,24 @@
-"""Agent memory tree (M1): bounded briefing compile + notes.
+"""Agent memory persistence and structured-memory compatibility.
+
+The active runtime contract matches Puffo Agent 1.2: ``memory/*.md`` is
+standing memory and is loaded into every provider prompt.  The structured
+memory tree remains available to existing alpha installs and MCP tools, but
+startup never migrates flat files into it or rewrites user content.
 
 Layout under an agent's memory root::
 
     memory/
-      briefing/           # always-loaded; compiled (bounded) into the
-        profile.md        #   provider prompt artifacts. profile.md is
-        <topic>.md        #   identity framing, synced from agent.yml.
+      <topic>.md          # active 1.2 standing memory
+      briefing/           # retained alpha compatibility topics
+        profile.md        # old managed profile; only user addenda survive
+        <topic>.md        # included when no flat topic has the same name
       notes/              # durable detail; searchable, never injected
       recollection/       # reserved (M4)
       imports/index.md    # reserved; provenance of imported content
 
-The compile is deterministic (profile first, then sorted filenames)
-and fails closed: an over-limit briefing raises
-``BriefingCompileError`` rather than truncating.
+The standalone structured compile remains deterministic and bounded for MCP
+compatibility. The active standing-memory view is deterministic but does not
+apply those alpha limits to flat files.
 """
 
 from __future__ import annotations
@@ -60,6 +66,10 @@ PROFILE_MANAGED_END = "<!-- /puffo:managed-profile -->"
 _MANAGED_BLOCK_RE = re.compile(
     re.escape(PROFILE_MANAGED_BEGIN) + r".*?" + re.escape(PROFILE_MANAGED_END),
     re.DOTALL,
+)
+
+_MIGRATED_NOTE_POINTER_RE = re.compile(
+    rf"^- ({re.escape(NOTES_DIR)}/.+\.md) — migrated from flat memory$"
 )
 
 
@@ -290,12 +300,108 @@ def _flat_memory_files(memory_root: Path) -> list[Path]:
             continue
         if path.is_symlink() or not _resolves_within_root(path, memory_root):
             logger.warning(
-                "memory migrate: skipping %s — symlink or resolves outside the memory root",
+                "memory: skipping %s — symlink or resolves outside the memory root",
                 path,
             )
             continue
         files.append(path)
     return files
+
+
+def read_standing_memory_entries(memory_root: Path) -> list[tuple[str, str]]:
+    """Return the prompt-visible standing-memory view.
+
+    Flat ``memory/*.md`` files are authoritative and retain the 1.2 runtime
+    behavior.  Structured briefing topics and notes referenced by the alpha
+    migration pointer are compatibility fallbacks, so an upgrade cannot make
+    previously migrated memory disappear.  Files are never moved or rewritten;
+    a flat topic wins when both layouts contain the same stem.
+    """
+    root = Path(memory_root)
+    if not root.is_dir():
+        return []
+
+    entries: dict[str, str] = {}
+    for path in _flat_memory_files(root):
+        _add_standing_memory_entry(entries, path)
+
+    briefing = safe_memory_scope(root, BRIEFING_DIR)
+    if briefing is not None:
+        for path in sorted(briefing.glob("*.md")):
+            if not _is_briefing_topic(path):
+                continue
+            if not _resolves_within_root(path, root):
+                continue
+            if path.name == PROFILE_BRIEFING_NAME:
+                _add_profile_addendum(entries, path)
+                continue
+            if path.stem == MIGRATED_NOTES_TOPIC:
+                continue
+            _add_standing_memory_entry(entries, path)
+
+    for path in _migrated_note_targets(root):
+        _add_standing_memory_entry(entries, path)
+
+    return sorted(entries.items())
+
+
+def _add_standing_memory_entry(
+    entries: dict[str, str],
+    path: Path,
+    *,
+    topic: str = "",
+) -> None:
+    stem = topic or path.stem
+    if stem in entries:
+        return
+    try:
+        body = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return
+    if body:
+        entries[stem] = body
+
+
+def _add_profile_addendum(entries: dict[str, str], path: Path) -> None:
+    """Keep user text outside the alpha managed-profile block."""
+    try:
+        body = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return
+    addendum = _MANAGED_BLOCK_RE.sub("", body).strip()
+    if addendum:
+        entries.setdefault("profile-notes", addendum)
+
+
+def _migrated_note_targets(memory_root: Path) -> list[Path]:
+    pointer = memory_root / BRIEFING_DIR / f"{MIGRATED_NOTES_TOPIC}.md"
+    if (
+        not pointer.is_file()
+        or pointer.is_symlink()
+        or not _resolves_within_root(pointer, memory_root)
+    ):
+        return []
+    try:
+        lines = pointer.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return []
+
+    targets: list[Path] = []
+    for line in lines:
+        match = _MIGRATED_NOTE_POINTER_RE.fullmatch(line.strip())
+        if match is None:
+            continue
+        logical = Path(match.group(1))
+        if len(logical.parts) != 2 or logical.parts[0] != NOTES_DIR:
+            continue
+        path = memory_root / logical
+        if (
+            path.is_file()
+            and not path.is_symlink()
+            and _resolves_within_root(path, memory_root)
+        ):
+            targets.append(path)
+    return sorted(set(targets))
 
 
 def _migrate_flat_files(memory_root: Path, flat: list[Path]) -> list[str]:
@@ -464,22 +570,23 @@ def sync_profile_briefing(
 
 
 class MemoryManager:
-    """Compat shim over the memory tree. ``save()`` keeps its historic
-    name/signature but writes a briefing topic (bounded, fail closed)
-    and marks the prompt artifacts for rebuild; ``get_context()``
-    returns the compiled briefing instead of a full join."""
+    """The Puffo Agent 1.2 flat-memory compatibility surface."""
 
     def __init__(self, memory_dir: str, workspace_dir: str = ""):
         self.memory_dir = memory_dir
         self.workspace_dir = workspace_dir
-        ensure_memory_tree(Path(memory_dir))
+        Path(memory_dir).mkdir(parents=True, exist_ok=True)
+        self.memories = dict(read_standing_memory_entries(Path(memory_dir)))
 
     def get_context(self) -> str:
-        return compile_briefing(Path(self.memory_dir))
+        if not self.memories:
+            return ""
+        parts = ["## Memory\n"]
+        for topic, content in self.memories.items():
+            parts.append(f"### {topic}\n{content}\n")
+        return "\n".join(parts)
 
     def save(self, topic: str, content: str):
-        from .memory_store import MemoryStore
-
         safe_topic = topic.replace(" ", "_").replace("/", "-")
         # Aware-UTC with ``Z`` suffix (``datetime.utcnow`` is
         # deprecated in 3.12+).
@@ -490,15 +597,10 @@ class MemoryManager:
             .replace("+00:00", "Z")
         )
         body = f"---\ntopic: {topic}\nupdated: {updated}\n---\n\n{content}\n"
-        # The store validates sizes (per-file + would-be compiled
-        # total, raising BriefingCompileError) before any write, so an
-        # oversized save never leaves partial state behind. The
-        # refresh flag stays owned by save() — the store gets no
-        # workspace_dir — so its reason keeps the M1 shape.
-        MemoryStore(self.memory_dir).put_memory_file(
-            f"{BRIEFING_DIR}/{safe_topic}.md",
-            body,
-        )
+        root = Path(self.memory_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / f"{safe_topic}.md").write_text(body, encoding="utf-8")
+        self.memories[topic] = content
         self._request_refresh(topic)
 
     def _request_refresh(self, topic: str) -> None:

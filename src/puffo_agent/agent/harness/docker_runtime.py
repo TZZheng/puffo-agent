@@ -111,6 +111,7 @@ class DockerCodexPreparer:
         self.workspace_dir = agent_cfg.resolve_workspace_dir()
         self.claude_dir = agent_cfg.resolve_claude_dir()
         self.agent_home = agent_home_dir(self.agent_id)
+        self.memory_dir = agent_cfg.resolve_memory_dir()
         self.codex_home = agent_codex_user_dir(self.agent_id)
         self.shared_fs_dir = shared_fs_dir()
         self.image = agent_cfg.runtime.docker_image or DEFAULT_IMAGE
@@ -453,6 +454,7 @@ class DockerCodexPreparer:
         )
         self.codex_home.mkdir(parents=True, exist_ok=True)
         self.agent_home.mkdir(parents=True, exist_ok=True)
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
         command = [
             self._docker_bin,
             "run",
@@ -479,8 +481,16 @@ class DockerCodexPreparer:
             f"{self.shared_fs_dir}:/workspace/.shared",
             "-v",
             f"{_puffo_agent_pkg_dir()}:/opt/puffoagent-pkg:ro",
-            "--init",
         ]
+        default_memory = self.agent_home / "memory"
+        if self.memory_dir.resolve() != default_memory.resolve():
+            command.extend(
+                [
+                    "-v",
+                    f"{self.memory_dir}:{CODEX_CONTAINER_STATE_DIR}/memory",
+                ]
+            )
+        command.append("--init")
         if self.memory_limit:
             command.extend(["--memory", self.memory_limit])
         if self.memory_reservation:

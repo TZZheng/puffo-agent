@@ -291,6 +291,7 @@ def _make_agent_cfg(
         puffo_core=puffo_core,
         resolve_workspace_dir=lambda: Path("/tmp/ws"),
         resolve_claude_dir=lambda: Path("/tmp/ws/.claude"),
+        resolve_memory_dir=lambda: Path("/tmp/memory"),
     )
 
 

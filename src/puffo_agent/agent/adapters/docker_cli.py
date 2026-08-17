@@ -72,7 +72,7 @@ def _puffo_agent_pkg_dir() -> Path:
 # image-tag pruning. ``_ensure_image`` only builds when the tag is
 # missing locally.
 DEFAULT_IMAGE = "puffo/agent-runtime:v19"
-CONTAINER_LAYOUT_VERSION = "21"
+CONTAINER_LAYOUT_VERSION = "22"
 
 # Pinned Claude Code CLI version baked into the image. Floating would
 # let an upstream release shift the stream-json protocol or
@@ -162,6 +162,7 @@ class DockerCLIAdapter(Adapter):
         puffo_core_slug: str = "",
         puffo_core_keys_dir: str = "",
         claude_api_key: str = "",
+        memory_dir: str = "",
     ):
         self.agent_id = agent_id
         self.model = model
@@ -174,6 +175,9 @@ class DockerCLIAdapter(Adapter):
         # are bind-mounted in, not the whole home, so the container's
         # default home skeleton stays intact.
         self.agent_home_dir = Path(agent_home_dir)
+        self.memory_dir = (
+            Path(memory_dir) if memory_dir else self.agent_home_dir / "memory"
+        )
         self.claude_home_src = self.agent_home_dir / ".claude"
         # Cross-agent cooperation dir; same mount in every container
         # on this host — intentional escape hatch from per-agent
@@ -761,6 +765,7 @@ class DockerCLIAdapter(Adapter):
             mounted=True,
         )
         self.agent_home_dir.mkdir(parents=True, exist_ok=True)
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
         (self.agent_home_dir / ".claude").mkdir(parents=True, exist_ok=True)
         agent_claude_json = self.agent_home_dir / ".claude.json"
         agent_claude_json.touch(exist_ok=True)
@@ -771,7 +776,7 @@ class DockerCLIAdapter(Adapter):
         agent_claude_json: Path,
         shared_status: str,
     ) -> list[str]:
-        return [
+        command = [
             self._docker_bin,
             "run",
             "-d",
@@ -804,8 +809,17 @@ class DockerCLIAdapter(Adapter):
             # (-wal, -shm) sit alongside the .db.
             "-v",
             f"{self.agent_home_dir}:/home/agent/.puffo-agent-state",
-            "--init",
         ]
+        default_memory = self.agent_home_dir / "memory"
+        if self.memory_dir.resolve() != default_memory.resolve():
+            command.extend(
+                [
+                    "-v",
+                    f"{self.memory_dir}:/home/agent/.puffo-agent-state/memory",
+                ]
+            )
+        command.append("--init")
+        return command
 
     def _add_optional_container_args(self, command: list[str]) -> None:
         host_plugins = Path.home() / ".claude" / "plugins"

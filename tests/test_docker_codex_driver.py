@@ -34,11 +34,14 @@ from puffo_agent.portal.worker_run import StandardWorkerRun, WorkerRunPaths
 from puffo_agent.portal.workspace_layout import ensure_workspace_shared_link
 
 
-def _preparer(tmp_path, monkeypatch, *, gateway=False) -> DockerCodexPreparer:
+def _preparer(
+    tmp_path, monkeypatch, *, gateway=False, custom_memory=False,
+) -> DockerCodexPreparer:
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "host"))
     config = AgentConfig(
         id="docker-codex",
+        memory_dir=(str(tmp_path / "external-memory") if custom_memory else "memory"),
         runtime=RuntimeConfig(
             kind="cli-docker",
             provider="openai",
@@ -118,7 +121,7 @@ def _seed_local_to_docker_layout(preparer):
 
 
 def test_docker_codex_runtime_boundary(tmp_path, monkeypatch):
-    preparer = _preparer(tmp_path, monkeypatch, gateway=True)
+    preparer = _preparer(tmp_path, monkeypatch, gateway=True, custom_memory=True)
     (Path.home() / ".codex").mkdir(parents=True, exist_ok=True)
     (Path.home() / ".codex" / "config.toml").write_text(
         "[mcp_servers.host_only]\n"
@@ -174,6 +177,8 @@ def test_docker_codex_runtime_boundary(tmp_path, monkeypatch):
         assert run_cmd[:2] == ["/fake/docker", "run"]
         assert f"{preparer.codex_home}:/home/agent/.codex" in run_cmd
         assert f"{preparer.agent_home}:/home/agent/.puffo-agent-state" in run_cmd
+        memory_mount = f"{preparer.memory_dir}:/home/agent/.puffo-agent-state/memory"
+        assert memory_mount in run_cmd
         assert any(":/workspace" in part for part in run_cmd)
         assert f"{preparer.shared_fs_dir}:/workspace/shared" in run_cmd
         assert not (preparer.workspace_dir / "shared").is_symlink()

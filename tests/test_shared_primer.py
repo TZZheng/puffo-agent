@@ -12,10 +12,6 @@ from puffo_agent.agent.shared_content import (
 )
 
 
-PARENT_CLAUDE_BYTES = 16109
-PARENT_CODEX_BYTES = 15989
-
-
 def _tmp() -> Path:
     return Path(tempfile.mkdtemp())
 
@@ -26,6 +22,7 @@ def _rebuild(
     profile = root / "profile.md"
     profile.write_text("# Soul\nSOUL-MARKER-7b", encoding="utf-8")
     memory = root / "memory"
+    memory.mkdir()
     workspace = root / "workspace"
     workspace.mkdir()
     common = dict(
@@ -38,8 +35,8 @@ def _rebuild(
     claude = rebuild_agent_claude_md(
         **common, claude_user_dir=root / ".claude", gemini_user_dir=root / ".gemini",
     )
-    (memory / "briefing" / "topic.md").write_text(
-        "NON-PROFILE-TOPIC-MARKER-c0", encoding="utf-8",
+    (memory / "topic.md").write_text(
+        "FLAT-TOPIC-MARKER-c0", encoding="utf-8",
     )
     claude = rebuild_agent_claude_md(
         **common, claude_user_dir=root / ".claude", gemini_user_dir=root / ".gemini",
@@ -48,18 +45,16 @@ def _rebuild(
     return claude, codex
 
 
-def test_standing_prompt_is_compact_and_identity_is_compiled_once():
+def test_standing_prompt_contains_runtime_identity_profile_and_flat_memory():
     claude, codex = _rebuild(_tmp())
     for text in (claude, codex):
         for marker in (
             "DISPLAY-NAME-MARKER-9d", "AGENT-ID-MARKER-8c", "LONG-ROLE-MARKER-ae",
-            "SHORT-ROLE-MARKER-bf", "SOUL-MARKER-7b", "NON-PROFILE-TOPIC-MARKER-c0",
+            "SHORT-ROLE-MARKER-bf", "SOUL-MARKER-7b", "FLAT-TOPIC-MARKER-c0",
         ):
             assert text.count(marker) == 1
-        assert "# Your role" not in text
+        assert "# Your role" in text
         assert "# Your memory" in text
-    assert len(claude.encode()) < PARENT_CLAUDE_BYTES
-    assert len(codex.encode()) < PARENT_CODEX_BYTES
 
 
 def test_standing_prompt_owns_communication_policy_and_retains_contract():

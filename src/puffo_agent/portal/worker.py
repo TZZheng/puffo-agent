@@ -73,12 +73,11 @@ def _rebuild_managed_system_prompt(
     """Dispatch wrapper: write the right system-prompt file(s) for the
     agent's harness. Codex agents get ``$CODEX_HOME/AGENTS.md``; other
     harnesses use the shared Claude/Gemini prompt-file builder.
-    Returns the assembled prompt body either way. The identity fields
-    feed the managed ``memory/briefing/profile.md`` re-sync inside the
-    rebuild. ``puffo_handle`` is the authenticated ``puffo_core.slug``
-    the model should call itself on the network; ``agent_id`` continues
-    to name every local path (keystore, agent dir, RPC namespace) and so
-    stays separate.
+    Returns the assembled prompt body either way. The identity fields form
+    immutable addressing context next to the editable root ``profile.md``;
+    prompt rebuilds never rewrite memory. ``puffo_handle`` is the authenticated
+    ``puffo_core.slug`` the model should call itself on the network;
+    ``agent_id`` continues to name local storage and RPC namespaces.
     """
     if harness_name == "codex":
         return rebuild_agent_codex_md(
@@ -216,6 +215,7 @@ def _new_docker_adapter(
         puffo_core_slug=agent_cfg.puffo_core.slug,
         puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
         claude_api_key=_claude_cli_api_key(daemon_cfg, harness.name()),
+        memory_dir=str(agent_cfg.resolve_memory_dir()),
     )
 
 
