@@ -6,6 +6,19 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a15] - 2026-08-17
+
+> Staging candidate removing the fixed Inbox delay for idle Agents.
+
+### Fixed
+
+- **Idle Agents now begin Inbox processing immediately.** The three-second,
+  non-resetting aggregation window applies only while a durable turn is active;
+  startup recovery with pending work also wakes immediately.
+- **Bursts of immediate notifications no longer enqueue redundant planning
+  cycles.** Multiple committed receipts share one unconsumed wake while the
+  next plan reads the complete durable pending set.
+
 ## [2.0.0a14] - 2026-08-17
 
 > Staging candidate unifying Docker execution with the shared Driver and
