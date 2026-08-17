@@ -23,6 +23,7 @@ from puffo_agent.agent.global_inbox_runtime import (
     route_for,
 )
 from puffo_agent.agent.inbox_scheduler import (
+    COALESCE_SECONDS,
     InboxNoticeDelivery,
     NoticeDeliveryCapability,
 )
@@ -419,6 +420,30 @@ async def test_only_intro_system_anchor_authorizes_top_level_channel_send(tmp_pa
     assert route.kind == "thread"
     assert route.thread_root_id == row.envelope_id
     await store.close()
+
+
+def test_notify_wakes_idle_runtime_immediately_and_coalesces_active_turn(tmp_path):
+    class RecordingCoalescer:
+        def __init__(self):
+            self.delays = []
+
+        def notify(self, *, delay_seconds=None):
+            self.delays.append(delay_seconds)
+
+    coalescer = RecordingCoalescer()
+    runtime = GlobalInboxRuntime(
+        store=object(),
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+        coalescer=coalescer,
+    )
+
+    runtime.notify()
+    runtime.active.turn_id = "active-turn"
+    runtime.notify()
+
+    assert coalescer.delays == [0.0, COALESCE_SECONDS]
 
 
 @pytest.mark.asyncio

@@ -101,7 +101,7 @@ sequenceDiagram
     DB-->>T: durable receipt decision
     T-->>S: delivery ACK when the decision permits it
     DB->>I: notify pending work
-    I->>I: coalesce and group by space + channel/thread/DM target
+    I->>I: wake idle Agent now; coalesce active-turn deltas
     I->>DB: create daemon-owned active turn
     I->>L: metadata-only Inbox notice
     L->>M: read_inbox and optional read_history calls
@@ -146,9 +146,11 @@ Important boundaries:
 - One `GlobalInboxRuntime` owns one serial provider boundary per Agent. New
   arrivals can be steered only when the active Driver exposes a safe steering
   capability; otherwise they remain durable for the next turn.
-- The three-second window coalesces newly changed pending IDs. It is not a retry
-  interval for an unchanged unread set. A successful notice turn that performs
-  no Inbox read is a normal provider defer and does not immediately run again.
+- An idle Agent is notified immediately. During an active turn, a non-resetting
+  three-second window coalesces newly changed pending IDs before safe steering
+  or the next turn. It is not a retry interval for an unchanged unread set. A
+  successful notice turn that performs no Inbox read is a normal provider defer
+  and does not immediately run again.
 - Notice delivery records the exact pending IDs contributed to the current
   native provider session. Later arrivals produce a delta notice; a replacement
   session rediscovers the remaining pending set once. Provider failure or crash
