@@ -6,6 +6,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a12] — 2026-08-16
+
+> Staging candidate restoring Puffo Agent 1.2 memory compatibility while
+> retaining the structured-memory alpha data and tools.
+
 ### Fixed
 
 - **Existing Agent memory again follows the 1.2 runtime contract.** The full
