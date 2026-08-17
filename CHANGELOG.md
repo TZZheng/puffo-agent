@@ -6,6 +6,28 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a14] - 2026-08-17
+
+> Staging candidate unifying Docker execution with the shared Driver and
+> Runtime Manager architecture.
+
+### Changed
+
+- **Docker Claude Code and Codex now use the same Driver contracts as local
+  runtimes.** Docker owns process placement, mounts, credentials, and bounded
+  container lifecycle while provider protocol behavior remains in the shared
+  Claude stream-json and Codex app-server Drivers.
+- **The legacy Docker-only Adapter and duplicate harness wrappers were
+  removed.** Existing Agent configuration, isolated homes, sessions, skills,
+  MCP servers, memory, shared workspace access, and resource limits are
+  prepared by one Docker runtime owner.
+
+### Fixed
+
+- **Docker Codex again runs as a supported first-class runtime.** The bundled
+  image contains both supported CLIs and the Puffo MCP dependencies, and
+  existing containers are recreated once for the new harness-aware layout.
+
 ## [2.0.0a13] - 2026-08-16
 
 > Integrated staging candidate built from the merged Agent Foundation,
