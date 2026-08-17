@@ -39,10 +39,10 @@ from ...portal.state import (
 )
 from ...portal.workspace_layout import prepare_workspace_shared_access
 from ..adapters.desired_install import run_spawn_install
-from ..adapters.docker_cli import (
+from .docker_support import (
     DEFAULT_IMAGE,
-    _puffo_agent_pkg_dir,
-    _run_cmd,
+    puffo_agent_pkg_dir,
+    run_cmd,
     container_state,
     ensure_docker_image,
     CONTAINER_LAYOUT_VERSION,
@@ -380,10 +380,10 @@ class DockerCodexPreparer:
                 # A live prior container must be stopped through the owned
                 # bounded lifecycle before removal. A failed stop aborts the
                 # replacement instead of falling through to forced removal.
-                await _run_cmd(
+                await run_cmd(
                     [self._docker_bin, "stop", "-t", "5", self.container_name],
                 )
-            await _run_cmd(
+            await run_cmd(
                 [self._docker_bin, "rm", self.container_name],
             )
             state = ""
@@ -400,14 +400,14 @@ class DockerCodexPreparer:
                 self.container_name,
                 state,
             )
-            await _run_cmd([self._docker_bin, "start", self.container_name])
+            await run_cmd([self._docker_bin, "start", self.container_name])
         elif state == "paused":
             logger.info(
                 "agent %s: unpausing container %r",
                 self.agent_id,
                 self.container_name,
             )
-            await _run_cmd([self._docker_bin, "unpause", self.container_name])
+            await run_cmd([self._docker_bin, "unpause", self.container_name])
         elif state == "":
             await ensure_docker_image(
                 self._docker_bin, self.image, agent_id=self.agent_id
@@ -480,7 +480,7 @@ class DockerCodexPreparer:
             "-v",
             f"{self.shared_fs_dir}:/workspace/.shared",
             "-v",
-            f"{_puffo_agent_pkg_dir()}:/opt/puffoagent-pkg:ro",
+            f"{puffo_agent_pkg_dir()}:/opt/puffoagent-pkg:ro",
         ]
         default_memory = self.agent_home / "memory"
         if self.memory_dir.resolve() != default_memory.resolve():
@@ -496,7 +496,7 @@ class DockerCodexPreparer:
         if self.memory_reservation:
             command.extend(["--memory-reservation", self.memory_reservation])
         command.append(self.image)
-        rc, _, stderr = await _run_cmd(command, check=False)
+        rc, _, stderr = await run_cmd(command, check=False)
         if rc != 0:
             raise RuntimeError(
                 f"docker run failed for {self.container_name}: "
@@ -555,7 +555,7 @@ class DockerCodexPreparer:
         # ``docker stop`` (not ``rm -f``) preserves the container's fs —
         # codex home, sessions, config — so the next start resumes cleanly.
         # ``-t 5`` bounds the SIGTERM grace inside Worker.stop's 30s budget.
-        await _run_cmd(
+        await run_cmd(
             [self._docker_bin, "stop", "-t", "5", self.container_name],
             check=False,
         )

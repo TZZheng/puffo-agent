@@ -8,6 +8,7 @@ import pytest
 
 from puffo_agent.agent.adapters import docker_cli
 from puffo_agent.agent.adapters.docker_cli import DockerCLIAdapter
+from puffo_agent.agent.harness import docker_support
 
 
 def _adapter(tmp_path) -> DockerCLIAdapter:
@@ -39,9 +40,9 @@ def test_container_state_distinguishes_absent_from_docker_failure(tmp_path):
     async def unavailable(*_args, **_kwargs):
         return 1, b"", b"daemon unavailable"
 
-    with patch.object(docker_cli, "_run_cmd", new=absent):
+    with patch.object(docker_support, "run_cmd", new=absent):
         assert asyncio.run(adapter._container_state()) == ""
-    with patch.object(docker_cli, "_run_cmd", new=unavailable):
+    with patch.object(docker_support, "run_cmd", new=unavailable):
         assert asyncio.run(adapter._container_state()) is None
 
 

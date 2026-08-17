@@ -76,7 +76,7 @@ def _docker_patches(fake_run):
             lambda: "/fake/docker",
         ),
         patch(
-            "puffo_agent.agent.harness.docker_runtime._run_cmd", new=fake_run
+            "puffo_agent.agent.harness.docker_runtime.run_cmd", new=fake_run
         ),
         patch(
             "puffo_agent.agent.harness.docker_runtime.container_state",
