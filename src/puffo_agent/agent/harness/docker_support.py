@@ -20,8 +20,8 @@ def puffo_agent_pkg_dir() -> Path:
 # Bump both values when the bundled image or mount layout changes. The image
 # tag makes first use build new contents; the layout marker recreates existing
 # per-Agent containers that still point at an older image or mount set.
-DEFAULT_IMAGE = "puffo/agent-runtime:v19"
-CONTAINER_LAYOUT_VERSION = "22"
+DEFAULT_IMAGE = "puffo/agent-runtime:v20"
+CONTAINER_LAYOUT_VERSION = "23"
 
 CLAUDE_CODE_NPM_VERSION = "2.1.224"
 CODEX_NPM_VERSION = "0.147.0"
@@ -46,8 +46,11 @@ RUN npm install -g @openai/codex@__CODEX_CODE_VERSION__
 # Puffo MCP tools server deps. ``--break-system-packages`` is required on
 # Debian bookworm (PEP 668); acceptable for this single-purpose image.
 RUN pip3 install --break-system-packages --no-cache-dir \\
-        "mcp>=1.0" "aiohttp>=3.9" "uv>=0.5" \\
-        "cryptography>=43" "pyhpke>=0.6" "aiosqlite>=0.20" "pyyaml>=6.0"
+        "aiohttp>=3.9" "aiohttp-socks>=0.10" "aiosqlite>=0.20" \\
+        "certifi>=2024.2.2" "cryptography>=43" "mcp>=1.0,<2" \\
+        "pillow>=10.0" "pyhpke>=0.6" "psutil>=5.9" \\
+        "python-socks>=2.4" "pyyaml>=6.0" "tzdata>=2024.1" \\
+        "websockets>=12.0" "uv>=0.5"
 
 RUN useradd -m -u 2000 -s /bin/bash agent
 USER agent

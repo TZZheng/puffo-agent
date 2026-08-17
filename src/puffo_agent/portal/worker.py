@@ -50,9 +50,7 @@ from .state import (
     agent_dir,
     agent_home_dir,
     claude_cli_api_key,
-    cli_session_json_path,
     docker_shared_dir as docker_shared_dir,
-    shared_fs_dir,
 )
 
 
@@ -120,132 +118,17 @@ def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
     return claude_cli_api_key(daemon_cfg)
 
 
-def build_docker_adapter(daemon_cfg: DaemonConfig, agent_cfg: AgentConfig) -> Adapter:
-    """Construct a non-Driver adapter for ``runtime.kind``.
-
-    Host-local Claude and Codex runtimes are built by Worker through the
-    Driver runtime; cli-docker + codex routes through
-    :func:`build_docker_codex_runtime`. This factory remains only for the
-    Docker Claude compatibility runtime.
-    """
-    kind = agent_cfg.runtime.kind or "cli-local"
-    if kind == "cli-docker":
-        harness = _resolve_docker_harness(agent_cfg)
-        adapter = _new_docker_adapter(daemon_cfg, agent_cfg, harness)
-        _configure_docker_mcp(adapter, daemon_cfg, agent_cfg, harness.name())
-        return adapter
-
-    if kind == "cli-local":
-        raise RuntimeError(
-            "cli-local is constructed by Worker through the Driver runtime; "
-            "build_docker_adapter only constructs non-Driver adapters"
-        )
-
-    raise RuntimeError(
-        f"agent {agent_cfg.id!r}: unknown runtime kind {kind!r} "
-        "(valid: cli-local, cli-docker, ws-local)"
-    )
-
-
-def build_docker_codex_runtime(
+def build_docker_runtime(
     daemon_cfg: DaemonConfig, agent_cfg: AgentConfig,
 ):
-    """Construct the Docker Codex runtime owner for the Driver path.
+    """Construct the Docker runtime owner for a ratified Driver.
 
-    ``cli-docker`` + ``codex`` runs the pinned Codex CLI through
-    ``CodexAppServerDriver`` over a per-agent ``docker exec`` transport;
-    the returned preparer owns the container, the agent-scoped Codex home,
-    and the bounded ``docker stop`` shutdown. The Driver/outbox assembly
-    lives in ``worker_run`` through ``build_local_runtime_adapter``.
+    The returned preparer owns only container placement and host assets;
+    Claude Code and Codex protocol behavior stays in the normal Drivers.
     """
-    from ..agent.harness.docker_runtime import DockerCodexPreparer
+    from ..agent.harness.docker_runtime import DockerRuntimePreparer
 
-    return DockerCodexPreparer(daemon_cfg, agent_cfg)
-
-
-def _resolve_docker_harness(agent_cfg: AgentConfig):
-    from ..agent.harness import build_docker_harness
-
-    provider = resolve_effective_provider(
-        "cli-docker", getattr(agent_cfg.runtime, "provider", "")
-    )
-    name = resolve_effective_harness(
-        "cli-docker", provider, getattr(agent_cfg.runtime, "harness", "")
-    )
-    if name != "claude-code":
-        raise RuntimeError(
-            f"agent {agent_cfg.id!r}: Docker harness {name!r} is design-only; "
-            "the supported Docker runtime is claude-code"
-        )
-    harness = build_docker_harness(name)
-    return harness
-
-
-def _new_docker_adapter(
-    daemon_cfg: DaemonConfig, agent_cfg: AgentConfig, harness
-) -> Adapter:
-    from ..agent.adapters.docker_cli import DockerCLIAdapter
-    from .control.context_telemetry import configured_compact_pct
-
-    return DockerCLIAdapter(
-        agent_id=agent_cfg.id,
-        model=agent_cfg.runtime.model or daemon_cfg.anthropic.model or "",
-        image=agent_cfg.runtime.docker_image,
-        workspace_dir=str(agent_cfg.resolve_workspace_dir()),
-        claude_dir=str(agent_cfg.resolve_claude_dir()),
-        session_file=str(cli_session_json_path(agent_cfg.id)),
-        agent_home_dir=str(agent_home_dir(agent_cfg.id)),
-        shared_fs_dir=str(shared_fs_dir()),
-        inference_level=getattr(agent_cfg.runtime, "inference_level", ""),
-        auto_compact_threshold_pct=configured_compact_pct(
-            harness.name(), agent_cfg.env_overrides
-        ),
-        harness=harness,
-        memory_limit=(
-            agent_cfg.runtime.docker_memory_limit or daemon_cfg.docker_memory_limit
-        ),
-        memory_reservation=(
-            agent_cfg.runtime.docker_memory_reservation
-            or daemon_cfg.docker_memory_reservation
-        ),
-        desired_skills=agent_cfg.desired_skills,
-        desired_mcps=agent_cfg.desired_mcps,
-        env_overrides=agent_cfg.env_overrides,
-        puffo_core_server_url=agent_cfg.puffo_core.server_url,
-        puffo_core_slug=agent_cfg.puffo_core.slug,
-        puffo_core_keys_dir=str(agent_dir(agent_cfg.id) / "keys"),
-        claude_api_key=_claude_cli_api_key(daemon_cfg, harness.name()),
-        memory_dir=str(agent_cfg.resolve_memory_dir()),
-    )
-
-
-def _configure_docker_mcp(
-    adapter: Adapter,
-    daemon_cfg: DaemonConfig,
-    agent_cfg: AgentConfig,
-    harness_name: str,
-) -> None:
-    if not agent_cfg.puffo_core.is_configured():
-        return
-    from ..mcp.config import puffo_core_mcp_env
-
-    core = agent_cfg.puffo_core
-    adapter.puffo_core_mcp_env = puffo_core_mcp_env(
-        slug=core.slug,
-        device_id=core.device_id,
-        server_url=core.server_url,
-        space_id=core.space_id,
-        keystore_dir=str(agent_dir(agent_cfg.id) / "keys"),
-        workspace=str(agent_cfg.resolve_workspace_dir()),
-        shared_workspace="/workspace/shared",
-        agent_id=agent_cfg.id,
-        data_service_url=f"http://host.docker.internal:{daemon_cfg.data_service.port}",
-        rpc_url=f"http://host.docker.internal:{daemon_cfg.rpc_service.port}",
-        runtime_kind="cli-docker",
-        harness=harness_name,
-        memory_dir="/home/agent/.puffo-agent-state/memory",
-        transport=core.transport,
-    )
+    return DockerRuntimePreparer(daemon_cfg, agent_cfg)
 
 
 def _puffo_cli_keystore_dir() -> Path:

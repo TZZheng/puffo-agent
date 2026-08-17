@@ -858,7 +858,7 @@ class ClaudeSession:
         # constrained Docker Desktop VMs (V8 delayed GC, RSS
         # climbed). The real fix for resume contention is serialised
         # warm in worker.py + per-container memory caps in
-        # docker_cli.py.
+        # the Docker Driver runtime.
         env_overrides: dict[str, str] = {}
         cmd = self.build_command(args, env_overrides)
         logger.info(

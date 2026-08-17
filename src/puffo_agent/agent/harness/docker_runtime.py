@@ -1,18 +1,8 @@
-"""Prepare and own the per-agent Docker Codex runtime.
+"""Prepare and own per-Agent Docker runtimes for ratified Drivers.
 
-Runs the pinned Codex CLI's ``codex app-server`` inside the per-Agent
-container through a bounded ``docker exec -i`` transport consumed by
-:class:`~puffo_agent.agent.harness.codex_driver.CodexAppServerDriver`.
-The container is the sandbox, so codex runs with
-``danger-full-access`` and the Driver auto-approves permissions.
-
-Isolation: the agent's Codex home (``CODEX_HOME``), auth view, config,
-skills, and MCPs are synchronized host-side and bind-mounted at the
-container's ``/home/agent/.codex``. The operator's ``~/.codex`` is
-never mounted; bearer/API values cross only as named ``-e`` variables,
-never as argv literals. The owner starts the container on prepare and
-stops it with a bounded ``docker stop -t 5`` after the Driver closes —
-never ``rm -f`` on a live runtime.
+Docker owns process placement, mounts, credentials, and bounded container
+lifecycle. Claude Code and Codex protocol behavior remains in their normal
+Drivers; this module only supplies a ``docker exec -i`` process factory.
 """
 
 from __future__ import annotations
@@ -25,57 +15,68 @@ from pathlib import Path
 from typing import Any
 
 from ..._proc import no_window_kwargs
-from ...mcp.config import puffo_core_mcp_env, write_codex_mcp_config
+from ...mcp.config import (
+    INFERENCE_LEVELS,
+    puffo_core_mcp_env,
+    write_cli_mcp_config,
+    write_codex_mcp_config,
+)
+from ...portal.host_assets import filter_container_mcp_servers
+from ...portal.runtime_matrix import (
+    HARNESS_CLAUDE_CODE,
+    HARNESS_CODEX,
+    resolve_effective_harness,
+    resolve_effective_provider,
+)
 from ...portal.state import (
     AgentConfig,
     DaemonConfig,
     agent_codex_user_dir,
     agent_dir,
     agent_home_dir,
+    claude_cli_api_key,
+    cli_session_json_path,
     read_host_codex_mcp_servers,
+    seed_claude_home,
     shared_fs_dir,
+    strip_claude_api_key_from_settings,
+    sync_host_claude_code_auth_view,
     sync_host_codex_auth_view,
     sync_host_codex_skills,
+    sync_host_enabled_plugins,
+    sync_host_mcp_servers,
+    sync_host_skills,
 )
 from ...portal.workspace_layout import prepare_workspace_shared_access
+from ..adapters.base import anthropic_base_url_env
 from ..adapters.desired_install import run_spawn_install
+from ..cli_bin import resolve_docker_bin
 from .docker_support import (
+    CONTAINER_LAYOUT_VERSION,
     DEFAULT_IMAGE,
-    puffo_agent_pkg_dir,
-    run_cmd,
     container_state,
     ensure_docker_image,
-    CONTAINER_LAYOUT_VERSION,
+    probe_result,
+    puffo_agent_pkg_dir,
+    run_cmd,
 )
-from ..cli_bin import resolve_docker_bin
 from .driver import RuntimeSpec
 from .local_runtime import (
     PreparedLocalRuntime,
     _read_json_object,
     build_codex_gateway_provider,
     compute_session_fingerprint,
+    remove_legacy_permission_hook,
 )
-from ...portal.host_assets import filter_container_mcp_servers
 
 logger = logging.getLogger(__name__)
 
-# Container-local paths for the codex process, its auth/config home, and
-# the puffo-core MCP's per-agent state (keystore + memory). ``agent_home``
-# host dir is bind-mounted at CODEX_CONTAINER_STATE_DIR, exactly like the
-# Claude Docker runtime.
+SUPPORTED_DOCKER_DRIVERS = frozenset({HARNESS_CLAUDE_CODE, HARNESS_CODEX})
+
+CLAUDE_CONTAINER_HOME = "/home/agent/.claude"
 CODEX_CONTAINER_CODEX_HOME = "/home/agent/.codex"
-CODEX_CONTAINER_STATE_DIR = "/home/agent/.puffo-agent-state"
-# The container is the filesystem boundary. A second bubblewrap sandbox
-# cannot create user namespaces under Docker's default seccomp policy, so
-# codex always runs fully open inside the container.
-CODEX_CONTAINER_SANDBOX = "danger-full-access"
-
-# Distinct from DockerCLIAdapter's plain layout marker: the extra ":codex"
-# suffix forces a container rebuild when an agent flips between the Claude
-# and Codex Docker harnesses (mount layouts differ), while a layout-version
-# bump still rebuilds both.
-_CODEX_LAYOUT_MARKER = f"{CONTAINER_LAYOUT_VERSION}:codex"
-
+CONTAINER_STATE_DIR = "/home/agent/.puffo-agent-state"
+CONTAINER_SANDBOX = "danger-full-access"
 _DOCKER_LAYOUT_MARKER = ".docker-layout"
 
 
@@ -84,30 +85,29 @@ def _sanitise_permission_mode(mode: str, agent_id: str) -> str:
         return mode
     if mode:
         logger.warning(
-            "agent %s: permission_mode %r is not supported; using "
-            "'bypassPermissions'",
+            "agent %s: permission_mode %r is not supported; using 'bypassPermissions'",
             agent_id,
             mode,
         )
     return "bypassPermissions"
 
 
-class DockerCodexPreparer:
-    """Prepare, start, and clean up one per-agent Docker Codex runtime.
-
-    Implements the same :class:`RuntimePreparer` contract as
-    :class:`LocalRuntimePreparer` so the durable Runtime Manager assembly
-    in ``local_runtime.build_local_runtime_adapter`` is shared unchanged.
-    The composition boundary additionally wires ``process_factory`` into
-    ``CodexAppServerDriver`` and ``aclose`` as the bounded container stop.
-    """
-
-    harness_name = "codex"
+class DockerRuntimePreparer:
+    """Prepare one Claude Code or Codex Driver inside an Agent container."""
 
     def __init__(self, daemon_cfg: DaemonConfig, agent_cfg: AgentConfig):
         self.daemon_cfg = daemon_cfg
         self.agent_cfg = agent_cfg
         self.agent_id = agent_cfg.id
+        provider = resolve_effective_provider("cli-docker", agent_cfg.runtime.provider)
+        self.harness_name = resolve_effective_harness(
+            "cli-docker", provider, agent_cfg.runtime.harness
+        ).strip()
+        if self.harness_name not in SUPPORTED_DOCKER_DRIVERS:
+            raise RuntimeError(
+                f"agent {self.agent_id!r}: runtime.kind='cli-docker' supports "
+                "only harness='claude-code' or harness='codex'"
+            )
         self.workspace_dir = agent_cfg.resolve_workspace_dir()
         self.claude_dir = agent_cfg.resolve_claude_dir()
         self.agent_home = agent_home_dir(self.agent_id)
@@ -119,7 +119,7 @@ class DockerCodexPreparer:
         self.permission_mode = _sanitise_permission_mode(
             agent_cfg.runtime.permission_mode, self.agent_id
         )
-        self.model = agent_cfg.runtime.model or daemon_cfg.openai.model or ""
+        self.model = self._resolve_model()
         self.memory_limit = (
             agent_cfg.runtime.docker_memory_limit or daemon_cfg.docker_memory_limit
         )
@@ -128,7 +128,7 @@ class DockerCodexPreparer:
             or daemon_cfg.docker_memory_reservation
         )
         self._docker_bin = "docker"
-        self._desired_codex_extras: dict[str, dict] = {}
+        self._desired_extras: dict[str, dict] = {}
         self._desired_installed = False
         self._container_stopped = False
 
@@ -162,9 +162,10 @@ class DockerCodexPreparer:
             )
         if discarded_persisted_session:
             logger.info(
-                "agent %s: starting a fresh codex session because the durable "
+                "agent %s: starting a fresh %s session because the durable "
                 "session fingerprint is missing or incompatible",
                 self.agent_id,
+                self.harness_name,
             )
         await self.ensure_container()
         return PreparedLocalRuntime(
@@ -180,8 +181,6 @@ class DockerCodexPreparer:
 
     def session_fingerprint(self, spec: RuntimeSpec) -> str:
         """Fingerprint only inputs that make a native session incompatible."""
-        from ...portal.runtime_matrix import resolve_effective_provider
-
         return compute_session_fingerprint(
             agent_cfg=self.agent_cfg,
             harness_name=self.harness_name,
@@ -193,12 +192,23 @@ class DockerCodexPreparer:
 
     async def refresh_spec(self, system_prompt: str) -> RuntimeSpec:
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        self.agent_home.mkdir(parents=True, exist_ok=True)
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        if self.harness_name == HARNESS_CLAUDE_CODE:
+            await self._sync_claude_host_assets()
+            return self._prepare_claude_spec(system_prompt)
         self.codex_home.mkdir(parents=True, exist_ok=True)
         agents_md = self.codex_home / "AGENTS.md"
         if not agents_md.exists():
             agents_md.write_text("", encoding="utf-8")
         await self._install_desired_once()
         return self._prepare_codex_spec(system_prompt)
+
+    def _resolve_model(self) -> str:
+        runtime = self.agent_cfg.runtime
+        if self.harness_name == HARNESS_CODEX:
+            return runtime.model or self.daemon_cfg.openai.model or ""
+        return runtime.model or self.daemon_cfg.anthropic.model or ""
 
     async def _install_desired_once(self) -> None:
         if self._desired_installed:
@@ -217,7 +227,141 @@ class DockerCodexPreparer:
             containerized=True,
         )
         if extras:
-            self._desired_codex_extras = extras
+            self._desired_extras = extras
+
+    async def _sync_claude_host_assets(self) -> None:
+        host_home = Path.home()
+        if seed_claude_home(host_home, self.agent_home):
+            logger.info(
+                "agent %s: seeded Docker Claude home from %s",
+                self.agent_id,
+                host_home,
+            )
+        self._strip_claude_api_key_settings()
+        auth_mode = sync_host_claude_code_auth_view(host_home, self.agent_home)
+        logger.info(
+            "agent %s: refreshed Docker Claude credential view (%s)",
+            self.agent_id,
+            auth_mode,
+        )
+        sync_host_skills(host_home, self.agent_home)
+        await self._install_desired_once()
+        merged, unreachable = sync_host_mcp_servers(
+            host_home,
+            self.agent_home,
+            containerized=True,
+        )
+        if merged:
+            logger.info(
+                "agent %s: merged %d container-reachable host MCP server(s)",
+                self.agent_id,
+                merged,
+            )
+        for name, command in unreachable:
+            logger.warning(
+                "agent %s: host MCP %r uses host-local path %r and was "
+                "skipped for Docker",
+                self.agent_id,
+                name,
+                command,
+            )
+        sync_host_enabled_plugins(host_home, self.agent_home)
+        credentials = self.agent_home / ".claude" / ".credentials.json"
+        if not claude_cli_api_key(self.daemon_cfg) and not credentials.exists():
+            logger.warning(
+                "agent %s: Claude Code has no credential view; run `claude "
+                "login` on the host and restart the Agent",
+                self.agent_id,
+            )
+
+    def _strip_claude_api_key_settings(self) -> None:
+        roots = (self.agent_home / ".claude", self.claude_dir)
+        for root in roots:
+            for name in ("settings.json", "settings.local.json"):
+                strip_claude_api_key_from_settings(root / name)
+
+    def _prepare_claude_spec(self, system_prompt: str) -> RuntimeSpec:
+        from ...portal.control.context_telemetry import (
+            claude_autocompact_tokens,
+            configured_compact_pct,
+        )
+
+        launch_args = ["--dangerously-skip-permissions"]
+        compact_pct = configured_compact_pct(
+            HARNESS_CLAUDE_CODE, self.agent_cfg.env_overrides
+        )
+        compact_tokens = claude_autocompact_tokens(
+            model=self.model,
+            pct=compact_pct,
+            env=self.agent_cfg.env_overrides,
+        )
+        if compact_tokens is not None:
+            launch_args.extend(["--autocompact", str(compact_tokens)])
+        inference = self.agent_cfg.runtime.inference_level
+        if inference in INFERENCE_LEVELS:
+            launch_args.extend(["--effort", inference])
+        elif inference:
+            logger.warning(
+                "agent %s: ignoring unsupported Claude inference_level %r",
+                self.agent_id,
+                inference,
+            )
+        mcp_env = self._container_puffo_mcp_env()
+        if mcp_env:
+            config_host = self.workspace_dir / ".puffo-agent" / "mcp-config.json"
+            write_cli_mcp_config(
+                config_host,
+                command="python3",
+                args=["-m", "puffo_agent.mcp.puffo_core_server"],
+                env=mcp_env,
+            )
+            launch_args.extend(
+                ["--mcp-config", "/workspace/.puffo-agent/mcp-config.json"]
+            )
+        else:
+            logger.warning(
+                "agent %s: Docker Claude Puffo MCP tools are unavailable "
+                "because puffo_core is incomplete",
+                self.agent_id,
+            )
+        remove_legacy_permission_hook(self.agent_home / ".claude")
+        environment = {
+            key: value
+            for key, value in self.agent_cfg.env_overrides.items()
+            if key
+            not in {
+                "ANTHROPIC_API_KEY",
+                "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE",
+            }
+        }
+        runtime = self.agent_cfg.runtime
+        llm_env = anthropic_base_url_env(runtime.llm_base_url)
+        if llm_env and runtime.api_key:
+            llm_env["ANTHROPIC_API_KEY"] = runtime.api_key
+        else:
+            configured_key = claude_cli_api_key(self.daemon_cfg)
+            if configured_key:
+                llm_env["ANTHROPIC_API_KEY"] = configured_key
+        environment.update(
+            {
+                "HOME": "/home/agent",
+                "USERPROFILE": "/home/agent",
+                **llm_env,
+            }
+        )
+        return RuntimeSpec(
+            workspace_dir="/workspace",
+            model=self.model,
+            system_prompt=system_prompt,
+            executable="claude",
+            launch_args=tuple(launch_args),
+            environment=environment,
+            permission_mode=self.permission_mode,
+            sandbox=CONTAINER_SANDBOX,
+            task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
+            auto_compact_threshold_pct=compact_pct,
+            auto_compact_threshold_tokens=compact_tokens,
+        )
 
     def _codex_gateway_provider(self) -> dict[str, str] | None:
         return build_codex_gateway_provider(
@@ -235,7 +379,7 @@ class DockerCodexPreparer:
             device_id=pc.device_id,
             server_url=pc.server_url,
             space_id=pc.space_id,
-            keystore_dir=f"{CODEX_CONTAINER_STATE_DIR}/keys",
+            keystore_dir=f"{CONTAINER_STATE_DIR}/keys",
             workspace="/workspace",
             shared_workspace="/workspace/shared",
             agent_id=self.agent_id,
@@ -245,10 +389,11 @@ class DockerCodexPreparer:
             rpc_url=f"http://host.docker.internal:{self.daemon_cfg.rpc_service.port}",
             runtime_kind="cli-docker",
             harness=self.harness_name,
-            memory_dir=f"{CODEX_CONTAINER_STATE_DIR}/memory",
+            memory_dir=f"{CONTAINER_STATE_DIR}/memory",
             transport=pc.transport,
         )
-        env["CODEX_HOME"] = CODEX_CONTAINER_CODEX_HOME
+        if self.harness_name == HARNESS_CODEX:
+            env["CODEX_HOME"] = CODEX_CONTAINER_CODEX_HOME
         env["PYTHONPATH"] = "/opt/puffoagent-pkg"
         return env
 
@@ -266,7 +411,7 @@ class DockerCodexPreparer:
                 name,
                 command,
             )
-        extras = dict(self._desired_codex_extras)
+        extras = dict(self._desired_extras)
         extras.update(reachable_mcps)
         gateway = self._codex_gateway_provider()
         config_kwargs: dict[str, Any] = {
@@ -276,11 +421,13 @@ class DockerCodexPreparer:
         }
         puffo_env = self._container_puffo_mcp_env()
         if puffo_env:
-            config_kwargs.update({
-                "command": "python3",
-                "args": ["-m", "puffo_agent.mcp.puffo_core_server"],
-                "env": puffo_env,
-            })
+            config_kwargs.update(
+                {
+                    "command": "python3",
+                    "args": ["-m", "puffo_agent.mcp.puffo_core_server"],
+                    "env": puffo_env,
+                }
+            )
         else:
             logger.warning(
                 "agent %s: cli-docker codex MCP tools unavailable — "
@@ -322,35 +469,43 @@ class DockerCodexPreparer:
 
         from ...portal.control.context_telemetry import configured_compact_pct
 
-        compact_pct = configured_compact_pct(
-            "codex", self.agent_cfg.env_overrides
-        )
+        compact_pct = configured_compact_pct("codex", self.agent_cfg.env_overrides)
         return RuntimeSpec(
             workspace_dir="/workspace",
             model=self.model,
             system_prompt=system_prompt,
             environment=environment,
             permission_mode=self.permission_mode,
-            sandbox=CODEX_CONTAINER_SANDBOX,
+            sandbox=CONTAINER_SANDBOX,
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
             auto_compact_threshold_pct=compact_pct,
         )
 
     def _legacy_session_path(self) -> Path:
+        if self.harness_name == HARNESS_CLAUDE_CODE:
+            return cli_session_json_path(self.agent_id)
         return self.codex_home / "codex_session.json"
 
     def _load_legacy_session_id(self, path: Path) -> str:
         document = _read_json_object(path)
-        persisted_sandbox = str(
-            document.get("sandbox") or "danger-full-access"
-        )
-        if persisted_sandbox != CODEX_CONTAINER_SANDBOX:
+        if self.harness_name == HARNESS_CLAUDE_CODE:
+            persisted_model = str(document.get("model") or "").strip()
+            if self.model and persisted_model and persisted_model != self.model:
+                logger.info(
+                    "agent %s: not importing legacy Docker Claude session "
+                    "because the model changed",
+                    self.agent_id,
+                )
+                return ""
+            return str(document.get("session_id") or "").strip()
+        persisted_sandbox = str(document.get("sandbox") or "danger-full-access")
+        if persisted_sandbox != CONTAINER_SANDBOX:
             logger.info(
                 "agent %s: not importing legacy Docker Codex session because "
                 "sandbox changed from %s to %s",
                 self.agent_id,
                 persisted_sandbox,
-                CODEX_CONTAINER_SANDBOX,
+                CONTAINER_SANDBOX,
             )
             return ""
         return str(document.get("conversation_id") or "").strip()
@@ -358,8 +513,7 @@ class DockerCodexPreparer:
     # ── Container lifecycle ────────────────────────────────────────────
 
     async def ensure_container(self) -> None:
-        """Start the per-agent container, recreating it when the layout
-        marker is stale (image tag bump or a harness flip)."""
+        """Start and validate the selected harness container."""
         self._require_docker()
         state = await container_state(self._docker_bin, self.container_name)
         if state is None:
@@ -367,29 +521,45 @@ class DockerCodexPreparer:
                 f"could not inspect Docker container {self.container_name!r}; "
                 "refusing to create or replace it while Docker is unavailable"
             )
-        layout_current = await self._layout_is_current()
-        if state != "" and not layout_current:
+        if state != "" and not self._layout_is_current():
             logger.warning(
-                "agent %s: recreating Docker Codex container %r "
-                "(layout=%s)",
+                "agent %s: recreating Docker container %r for layout %s",
                 self.agent_id,
                 self.container_name,
-                layout_current,
+                self._layout_marker_value(),
             )
-            if state == "running":
-                # A live prior container must be stopped through the owned
-                # bounded lifecycle before removal. A failed stop aborts the
-                # replacement instead of falling through to forced removal.
-                await run_cmd(
-                    [self._docker_bin, "stop", "-t", "5", self.container_name],
-                )
-            await run_cmd(
-                [self._docker_bin, "rm", self.container_name],
-            )
+            await self._remove_existing_container(state)
             state = ""
+        await self._activate_container(state)
+        package_ok, harness_ok = await self._probe_container()
+        if package_ok is None or harness_ok is None:
+            raise RuntimeError(
+                f"could not validate Docker container {self.container_name!r}; "
+                "refusing to replace it after a failed probe"
+            )
+        if not package_ok or not harness_ok:
+            logger.warning(
+                "agent %s: recreating stale Docker container %r "
+                "(package=%s harness=%s)",
+                self.agent_id,
+                self.container_name,
+                package_ok,
+                harness_ok,
+            )
+            await self._remove_existing_container("running")
+            await self._activate_container("")
+            package_ok, harness_ok = await self._probe_container()
+        if package_ok is not True or harness_ok is not True:
+            raise RuntimeError(
+                f"docker image {self.image!r} does not provide the Puffo MCP "
+                f"package and {self.harness_name!r} harness"
+            )
+        self._write_layout_marker()
+
+    async def _activate_container(self, state: str) -> None:
         if state == "running":
             logger.info(
-                "agent %s: reusing running Docker Codex container %r",
+                "agent %s: reusing running Docker container %r",
                 self.agent_id,
                 self.container_name,
             )
@@ -418,7 +588,40 @@ class DockerCodexPreparer:
                 f"Docker container {self.container_name!r} is in transient "
                 f"state {state!r}; refusing to replace it"
             )
-        self._write_layout_marker()
+        self._container_stopped = False
+
+    async def _remove_existing_container(self, state: str) -> None:
+        if state in {"running", "paused"}:
+            if state == "paused":
+                await run_cmd([self._docker_bin, "unpause", self.container_name])
+            await run_cmd([self._docker_bin, "stop", "-t", "5", self.container_name])
+        await run_cmd([self._docker_bin, "rm", self.container_name])
+
+    async def _probe_container(self) -> tuple[bool | None, bool | None]:
+        package = await self._probe_command(
+            "test -f /opt/puffoagent-pkg/puffo_agent/__init__.py"
+        )
+        harness = await self._probe_command(
+            f"command -v {self._harness_executable()} >/dev/null"
+        )
+        return package, harness
+
+    async def _probe_command(self, shell_command: str) -> bool | None:
+        rc, _, _ = await run_cmd(
+            [
+                self._docker_bin,
+                "exec",
+                self.container_name,
+                "sh",
+                "-c",
+                f"{shell_command} && exit 0 || exit 42",
+            ],
+            check=False,
+        )
+        return probe_result(rc)
+
+    def _harness_executable(self) -> str:
+        return "codex" if self.harness_name == HARNESS_CODEX else "claude"
 
     def _require_docker(self) -> None:
         docker_bin = resolve_docker_bin()
@@ -431,10 +634,16 @@ class DockerCodexPreparer:
             )
         self._docker_bin = docker_bin
 
-    async def _layout_is_current(self) -> bool:
+    def _layout_marker_value(self) -> str:
+        return f"{CONTAINER_LAYOUT_VERSION}:{self.harness_name}"
+
+    def _layout_is_current(self) -> bool:
         marker = self.agent_home / _DOCKER_LAYOUT_MARKER
         try:
-            return marker.read_text(encoding="utf-8").strip() == _CODEX_LAYOUT_MARKER
+            return (
+                marker.read_text(encoding="utf-8").strip()
+                == self._layout_marker_value()
+            )
         except OSError:
             return False
 
@@ -442,7 +651,7 @@ class DockerCodexPreparer:
         marker = self.agent_home / _DOCKER_LAYOUT_MARKER
         try:
             marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(_CODEX_LAYOUT_MARKER + "\n", encoding="utf-8")
+            marker.write_text(self._layout_marker_value() + "\n", encoding="utf-8")
         except OSError:
             pass
 
@@ -452,9 +661,9 @@ class DockerCodexPreparer:
             self.shared_fs_dir,
             mounted=True,
         )
-        self.codex_home.mkdir(parents=True, exist_ok=True)
         self.agent_home.mkdir(parents=True, exist_ok=True)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
+        harness_mounts = self._prepare_harness_mounts()
         command = [
             self._docker_bin,
             "run",
@@ -465,12 +674,10 @@ class DockerCodexPreparer:
             f"PUFFO_AGENT_ID={self.agent_id}",
             "-v",
             f"{self.workspace_dir}:/workspace",
-            # Agent-scoped Codex home only — never the operator's ~/.codex.
+            *harness_mounts,
+            # Per-agent keystore + memory for the Puffo MCP.
             "-v",
-            f"{self.codex_home}:{CODEX_CONTAINER_CODEX_HOME}",
-            # Per-agent keystore + memory for the puffo-core MCP.
-            "-v",
-            f"{self.agent_home}:{CODEX_CONTAINER_STATE_DIR}",
+            f"{self.agent_home}:{CONTAINER_STATE_DIR}",
             *(
                 ["-v", f"{self.shared_fs_dir}:/workspace/shared"]
                 if shared_status == "mounted"
@@ -487,7 +694,7 @@ class DockerCodexPreparer:
             command.extend(
                 [
                     "-v",
-                    f"{self.memory_dir}:{CODEX_CONTAINER_STATE_DIR}/memory",
+                    f"{self.memory_dir}:{CONTAINER_STATE_DIR}/memory",
                 ]
             )
         command.append("--init")
@@ -503,47 +710,87 @@ class DockerCodexPreparer:
                 f"{stderr.decode('utf-8', errors='replace').strip()[:500]}"
             )
 
+    def _prepare_harness_mounts(self) -> list[str]:
+        if self.harness_name == HARNESS_CODEX:
+            self.codex_home.mkdir(parents=True, exist_ok=True)
+            return [
+                "-v",
+                f"{self.codex_home}:{CODEX_CONTAINER_CODEX_HOME}",
+            ]
+        claude_home = self.agent_home / ".claude"
+        claude_home.mkdir(parents=True, exist_ok=True)
+        claude_json = self.agent_home / ".claude.json"
+        claude_json.touch(exist_ok=True)
+        mounts = [
+            "-v",
+            f"{claude_home}:{CLAUDE_CONTAINER_HOME}",
+            "-v",
+            f"{claude_json}:/home/agent/.claude.json",
+        ]
+        host_plugins = Path.home() / ".claude" / "plugins"
+        if host_plugins.is_dir():
+            mounts.extend(["-v", f"{host_plugins}:{CLAUDE_CONTAINER_HOME}/plugins:ro"])
+        return mounts
+
     # ── Driver transport ───────────────────────────────────────────────
 
-    async def _exec_process(self, spec: RuntimeSpec) -> asyncio.subprocess.Process:
-        """Spawn the bounded ``docker exec -i`` transport for the Driver.
-
-        Only codex-relevant values are forwarded with explicit ``-e`` flags.
-        The bearer/API key crosses by name (value read from the subprocess
-        environment), never as an argv literal.
-        """
+    def _docker_exec_prefix(
+        self, spec: RuntimeSpec
+    ) -> tuple[list[str], dict[str, str]]:
+        """Build an explicit container environment without argv secrets."""
         command = [self._docker_bin, "exec", "-i"]
+        child_env = dict(os.environ)
         for key, value in spec.environment.items():
-            if key == "OPENAI_API_KEY":
+            if key in {"ANTHROPIC_API_KEY", "OPENAI_API_KEY"}:
                 command.extend(["-e", key])
+                if value:
+                    child_env[key] = value
+                else:
+                    child_env.pop(key, None)
             else:
                 command.extend(["-e", f"{key}={value}"])
-        command.extend([self.container_name, "codex", "app-server"])
-        env = dict(os.environ)
-        api_key = spec.environment.get("OPENAI_API_KEY")
-        if api_key:
-            env["OPENAI_API_KEY"] = api_key
+        command.extend(["-w", spec.workspace_dir or "/workspace"])
+        return command, child_env
+
+    async def _spawn_exec(
+        self,
+        command: list[str],
+        child_env: dict[str, str],
+    ) -> asyncio.subprocess.Process:
         return await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=env,
+            env=child_env,
             # One provider frame can carry a large tool result; the default
             # 64 KiB stream limit would terminate the reader mid-session.
             limit=16 * 1024 * 1024,
             **no_window_kwargs(),
         )
 
-    @property
-    def process_factory(self) -> Callable[[RuntimeSpec], Any]:
-        """Driver-compatible transport factory: ``docker exec -i`` spawn.
+    async def _exec_codex_process(
+        self, spec: RuntimeSpec
+    ) -> asyncio.subprocess.Process:
+        command, child_env = self._docker_exec_prefix(spec)
+        command.extend([self.container_name, "codex", "app-server"])
+        return await self._spawn_exec(command, child_env)
 
-        Exposes the bounded exec transport so the composition boundary can
-        inject it into ``CodexAppServerDriver`` without reaching into a
-        private method. The Driver awaits the returned coroutine.
-        """
-        return self._exec_process
+    async def _exec_claude_process(
+        self,
+        args: list[str],
+        spec: RuntimeSpec,
+    ) -> asyncio.subprocess.Process:
+        command, child_env = self._docker_exec_prefix(spec)
+        command.extend([self.container_name, *args])
+        return await self._spawn_exec(command, child_env)
+
+    @property
+    def process_factory(self) -> Callable[..., Any]:
+        """Return the selected Driver's ``docker exec -i`` transport."""
+        if self.harness_name == HARNESS_CLAUDE_CODE:
+            return self._exec_claude_process
+        return self._exec_codex_process
 
     # ── Bounded shutdown ───────────────────────────────────────────────
 
@@ -562,8 +809,9 @@ class DockerCodexPreparer:
 
 
 __all__ = [
-    "DockerCodexPreparer",
+    "DockerRuntimePreparer",
+    "CLAUDE_CONTAINER_HOME",
     "CODEX_CONTAINER_CODEX_HOME",
-    "CODEX_CONTAINER_STATE_DIR",
-    "CODEX_CONTAINER_SANDBOX",
+    "CONTAINER_STATE_DIR",
+    "CONTAINER_SANDBOX",
 ]
