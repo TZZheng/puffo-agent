@@ -218,6 +218,23 @@ async def test_coalescer_deadline_starts_at_notify_before_delayed_waiter():
 
 
 @pytest.mark.asyncio
+async def test_immediate_notifications_share_one_unconsumed_wake():
+    sleeps = []
+
+    async def sleep(delay):
+        sleeps.append(delay)
+
+    coalescer = InboxCoalescer(sleep=sleep, monotonic=lambda: 20.0)
+    coalescer.notify(delay_seconds=0)
+    coalescer.notify(delay_seconds=0)
+
+    await coalescer.wait_for_burst()
+
+    assert sleeps == [pytest.approx(0.0)]
+    assert not coalescer._deadlines
+
+
+@pytest.mark.asyncio
 async def test_coalescer_preserves_notification_for_next_expired_window():
     now = 30.0
     sleeps = []

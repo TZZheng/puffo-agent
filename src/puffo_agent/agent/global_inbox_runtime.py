@@ -259,7 +259,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         self._degraded = False
         self._degraded_until = None
         self._degraded_attempts = 0
-        self.coalescer.notify()
+        delay = self._busy_notice_delay_seconds if self.active.turn_id else 0.0
+        self.coalescer.notify(delay_seconds=delay)
         self._schedule_busy_notice()
 
     async def create_reminder(
@@ -352,20 +353,10 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 # failed durable union through the initial-turn path.
                 await self.coalescer.wait_for_burst()
             elif await self.store.get_pending(limit=1):
-                notice = await self.store.get_notice_state()
                 if await self.store.get_notice_candidates(
                     self.adapter.get_provider_session_id()
                 ):
-                    remaining = (
-                        max(
-                            0.0,
-                            (notice.first_pending_deadline_ms - int(time.time() * 1000))
-                            / 1000,
-                        )
-                        if notice.first_pending_deadline_ms is not None
-                        else 0.0
-                    )
-                    self.coalescer.notify(delay_seconds=remaining)
+                    self.notify()
             while not self._stopping:
                 burst_task = asyncio.create_task(self.coalescer.wait_for_burst())
                 done, _pending = await asyncio.wait(

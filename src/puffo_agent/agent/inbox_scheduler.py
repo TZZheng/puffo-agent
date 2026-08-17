@@ -191,7 +191,7 @@ class InboxPlanner:
 
 
 class InboxCoalescer:
-    """Metadata-free, non-resetting fixed-window wake coalescer."""
+    """Metadata-free, non-resetting deadline wake coalescer."""
 
     def __init__(
         self,
@@ -214,7 +214,17 @@ class InboxCoalescer:
             0.0, delay_seconds
         )
         candidate = now + delay
-        if not self._deadlines or now >= self._deadlines[-1]:
+        if not self._deadlines:
+            self._deadlines.append(candidate)
+        elif delay == 0.0:
+            # One unconsumed immediate wake is enough: the next plan reads the
+            # durable pending set, including every receipt committed before it
+            # starts. A second zero-delay deadline would only create an empty
+            # follow-up planning cycle.
+            if candidate < self._deadlines[0]:
+                self._deadlines[0] = candidate
+                self._pulled.set()
+        elif now >= self._deadlines[-1]:
             self._deadlines.append(candidate)
         elif candidate < self._deadlines[0]:
             # A pending deadline may only move earlier, never later, so the
