@@ -91,6 +91,15 @@ def test_schema_rejects_open_enum_values_and_extra_payload_fields():
             "permission_ref": "perm", "title": "Permission", "state": "maybe",
         }),
         ("turn.finished", {"outcome": "timed_out"}),
+        ("turn.finished", {
+            "outcome": "succeeded", "tokens": {"input": True, "output": 1},
+        }),
+        ("turn.finished", {
+            "outcome": "succeeded", "current_context": 0,
+        }),
+        ("turn.finished", {
+            "outcome": "failed", "tokens": {"input": 1, "output": 0},
+        }),
         ("output.updated", {
             "block_id": "out", "kind": "reasoning", "phase": "start",
         }),
