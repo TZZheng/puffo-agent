@@ -214,7 +214,11 @@ async def save_inbound_attachments(
     strip_wrapper: Callable[[bytes], bytes] = strip_multipart_wrapper,
     scale_image: ImageScaler = downscale_oversized_image,
 ) -> list[str]:
-    """Save decrypted attachments and return model-readable absolute paths."""
+    """Save decrypted attachments and return host paths for durable storage.
+
+    The conversation projection converts these to workspace-relative paths
+    before exposing them to a local or containerized harness.
+    """
     if not workspace or not metas_raw:
         return []
     if not is_safe_path_component(envelope_id):
