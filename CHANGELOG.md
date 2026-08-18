@@ -6,6 +6,25 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a16] - 2026-08-17
+
+> Staging candidate closing the message-contract acceptance gaps and restoring
+> legacy token-usage audit metadata.
+
+### Fixed
+
+- **Inbound attachment paths now work in local and Docker harnesses.** Model
+  context consistently receives workspace-relative paths instead of host-only
+  absolute paths, including the retained compatibility/retry projection.
+- **Message metadata uses one model-facing vocabulary.** Compatibility prompts
+  and send results expose `message_id`, authenticated system messages retain
+  `sender_type="system"`, and native plus keyless self-sent history preserves
+  `human_visible` without weakening approval-prompt redaction.
+- **Completed turns again report the 1.2 token-usage shape.** Runtime history
+  records input/output token counts and an optional current-context value for
+  successful turns, including events recovered from the durable outbox;
+  failed, cancelled, and abandoned turns remain usage-free.
+
 ## [2.0.0a15] - 2026-08-17
 
 > Staging candidate removing the fixed Inbox delay for idle Agents.
