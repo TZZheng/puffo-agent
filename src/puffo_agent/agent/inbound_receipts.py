@@ -19,7 +19,11 @@ from .ingress_policy import (
     foreign_dm_gate,
     operator_control_gate,
 )
-from .message_context import MENTION_RE, maybe_redact_long_text
+from .message_context import (
+    MENTION_RE,
+    content_with_visibility,
+    maybe_redact_long_text,
+)
 from .message_store import ReceiptDisposition, ReceiptWriteStatus
 
 if TYPE_CHECKING:
@@ -379,10 +383,16 @@ class InboundReceiptHandler:
             return None
         if payload.envelope_kind == "dm":
             await self.client._maybe_allowlist_outbound_dm(payload.recipient_slug)
+        replacement = self._echo_redaction(payload)
+        committer.stored_payload["content"] = content_with_visibility(
+            payload.content if replacement is None else replacement,
+            is_visible_to_human=payload.is_visible_to_human,
+        )
+        if replacement is not None:
+            committer.stored_payload["content_type"] = "text/plain"
         return await committer.commit(
             ReceiptDisposition.TERMINAL,
             "self echo",
-            content=self._echo_redaction(payload),
         )
 
     def _echo_redaction(self, payload: MessagePayload) -> str | None:

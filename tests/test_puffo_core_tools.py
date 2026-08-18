@@ -645,7 +645,12 @@ async def test_semantic_out_of_process_uses_structured_rpc_client():
     class Rpc:
         async def send_message(self, **body):
             bodies.append(body)
-            return {"state": "sent", "attempted": True, "seq": 3}
+            return {
+                "state": "sent",
+                "attempted": True,
+                "envelope_id": "msg_sent",
+                "seq": 3,
+            }
 
     cfg.send_coordinator = None
     cfg.rpc_client = Rpc()
@@ -654,6 +659,8 @@ async def test_semantic_out_of_process_uses_structured_rpc_client():
         "send_message", {"channel": "ch_a", "text": "x", "send_anyway": True},
     )
     assert 'state="sent"' in result
+    assert 'message_id="msg_sent"' in result
+    assert "envelope_id=" not in result
     assert bodies == [{
         "channel": "ch_a",
         "root_id": "",

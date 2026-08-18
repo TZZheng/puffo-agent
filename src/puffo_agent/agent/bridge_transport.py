@@ -76,7 +76,11 @@ from .keyless_dm_approval_flow import (
     resume_pending_approvals,
 )
 from .membership_events import invite_poll_loop
-from .message_context import MENTION_RE, maybe_redact_long_text
+from .message_context import (
+    MENTION_RE,
+    content_with_visibility,
+    maybe_redact_long_text,
+)
 from .message_store import ReceiptDisposition, ReceiptWriteStatus
 
 KEYLESS_DM_REPLY_REASON = "handled keyless dm approval reply"
@@ -888,7 +892,15 @@ async def _commit_bridge_verdict(
     foreign DM must not be, since it stays queued server-side until the
     operator answers.
     """
-    if verdict.content is not None:
+    if verdict.gate == "self_echo":
+        row = dict(row)
+        row["content"] = content_with_visibility(
+            payload.content if verdict.content is None else verdict.content,
+            is_visible_to_human=payload.is_visible_to_human,
+        )
+        if verdict.content is not None:
+            row["content_type"] = "text/plain"
+    elif verdict.content is not None:
         row = dict(row)
         row["content"] = verdict.content
         row["content_type"] = "text/plain"

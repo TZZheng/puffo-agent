@@ -215,7 +215,7 @@ Post a message to a Puffo.ai channel or DM a user.
   channel. No `#<name>` shortcut; use `list_channels_in_all_spaces`
   to look up an id.
 - `text` (required) — message body. Markdown preserved on the wire.
-- `root_id` (optional) — envelope_id (`msg_<uuid>`) of the post you
+- `root_id` (optional) — `message_id` (`msg_<uuid>`) of the post you
   are replying to; opens a thread. It must be the true thread root,
   not an arbitrary reply id. Preserve the Inbox target by default:
   omit it for `target_type="channel"`, and pass the supplied
@@ -303,7 +303,7 @@ separate messages).
 - `caption`: optional text posted alongside the files. Empty by
   default; recipients see just the attachments.
 - `root_id`: optional — reply with the attachments inside an
-  existing thread. Pass the true thread-root envelope_id; see the
+  existing thread. Pass the true thread-root `message_id`; see the
   `send-message` skill for validation details.
 - `visibility_level`: same semantics as `send_message` — `"human"` /
   `"default"` / `"agent_only"`. Default `"default"`; the @-mention
@@ -324,10 +324,10 @@ DEFAULT_SKILL_ATTACHMENTS = """\
 
 When a user sends you a file, the daemon decrypts it before your
 turn starts and saves it at
-``<workspace>/.puffo/inbox/<envelope_id>/<filename>``. Its
+``<workspace>/.puffo/inbox/<message_id>/<filename>``. Its
 workspace-relative path shows up in the message's
 `attachment_paths=[...]` field, for example
-``.puffo/inbox/<envelope_id>/<filename>``.
+``.puffo/inbox/<message_id>/<filename>``.
 
 **What to do with them:**
 - Read text-shaped files (`.md`, `.txt`, `.json`, source code, …)
@@ -482,14 +482,14 @@ agents. Use `identity`, not display name, as the unique identity.
 DEFAULT_SKILL_GET_POST = """\
 # Skill: get_post
 
-Fetch a single message by its envelope_id from the daemon's local
+Fetch a single message by its `message_id` from the daemon's local
 message store. Its result uses the shared projection described by the
 `read-messages` skill.
 
 **Tool:** `mcp__puffo__get_post`
 
 **Arguments:**
-- `post_ref` (required) — envelope_id (`msg_<uuid>`). Permalinks
+- `post_ref` (required) — `message_id` (`msg_<uuid>`). Permalinks
   aren't a thing on puffo-core; agents address messages by id.
 
 **Important:** this reads from local storage only. The daemon stores

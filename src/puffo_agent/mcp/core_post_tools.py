@@ -116,7 +116,7 @@ async def _get_post_segment(
 def register_post_tools(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def get_post(post_ref: str) -> str:
-        """Fetch one local message by envelope id.
+        """Fetch one local message by model-facing message id.
 
         Returns the semantic target/row projection. See the managed
         ``read-messages`` skill for supplementary-context guidance.
