@@ -341,14 +341,14 @@ def _attachment_paths(message: Any) -> list[str]:
     )
     if isinstance(attachments, Sequence) and not isinstance(attachments, (str, bytes)):
         return [
-            _model_attachment_path(path)
+            model_attachment_path(path)
             for path in attachments
             if path not in (None, "")
         ]
     return []
 
 
-def _model_attachment_path(value: Any) -> str:
+def model_attachment_path(value: Any) -> str:
     """Project a materialized Inbox file into the harness workspace."""
     raw = str(value)
     parts = raw.replace("\\", "/").split("/")

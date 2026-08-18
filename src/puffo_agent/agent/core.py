@@ -6,6 +6,7 @@ from ._time import ms_to_iso as _ms_to_iso
 from .adapters import Adapter, TurnContext
 from .adapters.base import STATUS_PREVIEW_CHARS, is_silent
 from .errors import AgentAPIError
+from .message_projection import model_attachment_path
 from .memory import MemoryManager
 
 MAX_LOG_ENTRIES = 60
@@ -597,7 +598,8 @@ class PuffoAgent:
                 lines.append(f"  - {m['username']}{suffix}")
         if attachments:
             lines.append("- attachments:")
-            for path in attachments:
+            for raw_path in attachments:
+                path = model_attachment_path(raw_path)
                 lines.append(f"  - {path}")
                 origin = _origin_for_compressed(path)
                 if origin:
@@ -639,7 +641,7 @@ def _user_metadata_lines(
     """Render stable user-message metadata before optional projections."""
     lines: list[str] = []
     if post_id:
-        lines.append(f"- post_id: {post_id}")
+        lines.append(f"- message_id: {post_id}")
     if space_name:
         lines.append("- space: " + space_name)
     if space_id:
@@ -656,15 +658,16 @@ def _user_metadata_lines(
         lines.append(f"- timestamp: {timestamp}")
     lines.append(f"- sender: {sender_display_name or sender}")
     lines.append(f"- sender_slug: {sender}")
-    projected = (
-        sender_type
-        if sender_type in {"human", "agent"}
-        else (
-            "agent"
-            if (sender_is_agent or sender_owner_slug)
-            else ("human" if is_from_operator else "unknown")
-        )
-    )
+    if sender_type in {"human", "agent", "system"}:
+        projected = sender_type
+    elif sender.lstrip("@").lower() == "system":
+        projected = "system"
+    elif sender_is_agent or sender_owner_slug:
+        projected = "agent"
+    elif is_from_operator:
+        projected = "human"
+    else:
+        projected = "unknown"
     lines.append(f"- sender_type: {projected}")
     if sender_owner_slug:
         lines.append(f"- sender_owner_slug: {sender_owner_slug}")

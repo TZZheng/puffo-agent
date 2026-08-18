@@ -25,6 +25,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from puffo_agent.agent.inbound_receipts import InboundReceiptHandler
+from puffo_agent.agent.client_support import DM_GATE_PROMPT_PLACEHOLDER
 from puffo_agent.agent.message_store import MessageStore
 from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 from puffo_agent.crypto.http_client import PuffoCoreHttpClient
@@ -492,8 +493,8 @@ async def test_native_ingress_withholds_uncleared_sender_content(
     await handler.handle(_delivery("env_prompt", SELF_SLUG, 2))
 
     echo = await client.store.get_message_by_envelope("env_prompt")
-    assert echo is not None
-    assert marker not in str(echo.content)
+    assert echo is not None and marker not in str(echo.content)
+    assert echo.content == {"text": DM_GATE_PROMPT_PLACEHOLDER, "is_visible_to_human": True}
 
     operator_anchor = await client.store.store_local_event(
         {
