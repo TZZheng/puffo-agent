@@ -292,6 +292,8 @@ def sender_type(message: Any, *, current_agent_aliases: Sequence[str] = ()) -> s
     explicit = content.get("sender_type") or _value(message, "sender_type", "")
     if explicit in {"human", "agent", "system"}:
         return str(explicit)
+    if _normalized_slug(_value(message, "sender_slug")) == "system":
+        return "system"
     if (
         content.get("sender_is_agent")
         or content.get("sender_is_bot")
@@ -338,8 +340,25 @@ def _attachment_paths(message: Any) -> list[str]:
         "attachment_paths", _content(message).get("attachments"),
     )
     if isinstance(attachments, Sequence) and not isinstance(attachments, (str, bytes)):
-        return [str(path) for path in attachments if path not in (None, "")]
+        return [
+            _model_attachment_path(path)
+            for path in attachments
+            if path not in (None, "")
+        ]
     return []
+
+
+def _model_attachment_path(value: Any) -> str:
+    """Project a materialized Inbox file into the harness workspace."""
+    raw = str(value)
+    parts = raw.replace("\\", "/").split("/")
+    for index in range(len(parts) - 1):
+        if parts[index:index + 2] != [".puffo", "inbox"]:
+            continue
+        relative = parts[index:]
+        if ".." not in relative:
+            return "/".join(relative)
+    return raw
 
 
 def _mentions(message: Any) -> list[dict[str, Any]]:

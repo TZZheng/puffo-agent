@@ -116,6 +116,22 @@ def test_dm_projection_preserves_paths_mentions_visibility_and_reply_count():
         assert field in output
 
 
+def test_attachment_paths_are_projected_relative_to_the_harness_workspace():
+    host_path = (
+        "/home/hanchen/.puffo-agent/agents/linus/workspace/"
+        ".puffo/inbox/msg_attachment/ballerz.jpeg"
+    )
+    output = format_message_group([
+        message(content={"text": "image", "attachment_paths": [host_path]})
+    ])
+
+    assert (
+        'attachment_paths=[".puffo/inbox/msg_attachment/ballerz.jpeg"]'
+        in output
+    )
+    assert "/home/hanchen" not in output
+
+
 def test_sender_type_normalizes_legacy_bot_fields_but_explicit_type_wins():
     rows = [
         message(
@@ -126,6 +142,10 @@ def test_sender_type_normalizes_legacy_bot_fields_but_explicit_type_wins():
             envelope_id="explicit", thread_root_id=None,
             content={"text": "explicit", "sender_type": "human", "sender_is_bot": True},
         ),
+        message(
+            envelope_id="system", thread_root_id=None, sender_slug="system",
+            content={"text": "system"},
+        ),
     ]
     output = format_message_group(rows)
     legacy = output[
@@ -134,8 +154,12 @@ def test_sender_type_normalizes_legacy_bot_fields_but_explicit_type_wins():
     explicit = output[
         output.index('message_id="explicit"'):output.index('\ncontent="explicit"')
     ]
+    system = output[
+        output.index('message_id="system"'):output.index('\ncontent="system"')
+    ]
     assert 'sender_type="agent"' in legacy
     assert 'sender_type="human"' in explicit
+    assert 'sender_type="system"' in system
 
 
 def test_optional_chronological_projection_orders_held_context_by_sequence():

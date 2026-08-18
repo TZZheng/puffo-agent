@@ -324,9 +324,10 @@ DEFAULT_SKILL_ATTACHMENTS = """\
 
 When a user sends you a file, the daemon decrypts it before your
 turn starts and saves it at
-``<workspace>/.puffo/inbox/<envelope_id>/<filename>``. The absolute
-path shows up in the `attachments:` block of the message metadata —
-one line per file.
+``<workspace>/.puffo/inbox/<envelope_id>/<filename>``. Its
+workspace-relative path shows up in the message's
+`attachment_paths=[...]` field, for example
+``.puffo/inbox/<envelope_id>/<filename>``.
 
 **What to do with them:**
 - Read text-shaped files (`.md`, `.txt`, `.json`, source code, …)
