@@ -127,10 +127,28 @@ def validate_runtime_event(event: RuntimeEvent) -> None:
         if payload["state"] not in PERMISSION_STATES:
             raise ValueError("invalid permission state")
     if event.type == "turn.finished":
-        if not set(payload) <= {"outcome", "error"}:
+        if not set(payload) <= {
+            "outcome", "error", "tokens", "current_context",
+        }:
             raise ValueError("turn.finished has unsupported fields")
         if payload.get("outcome") not in TURN_OUTCOMES:
             raise ValueError("invalid turn outcome")
+        tokens = payload.get("tokens")
+        if tokens is not None and (
+            not isinstance(tokens, Mapping)
+            or set(tokens) != {"input", "output"}
+            or any(type(value) is not int or value < 0 for value in tokens.values())
+        ):
+            raise ValueError("turn.finished tokens are invalid")
+        current_context = payload.get("current_context")
+        if current_context is not None and (
+            type(current_context) is not int or current_context <= 0
+        ):
+            raise ValueError("turn.finished current_context is invalid")
+        if payload.get("outcome") != "succeeded" and (
+            tokens is not None or current_context is not None
+        ):
+            raise ValueError("turn.finished usage requires succeeded outcome")
         if payload.get("outcome") != "failed" and "error" in payload:
             raise ValueError("turn.finished error requires failed outcome")
         if payload.get("outcome") == "failed" and "error" in payload:
@@ -217,6 +235,10 @@ def safe_error(
     }
 
 
+def _token_count(value: Any) -> int:
+    return value if type(value) is int and value >= 0 else 0
+
+
 class RuntimeEventProjector:
     """Allowlist-only projection from normalized Driver events."""
 
@@ -282,14 +304,22 @@ class RuntimeEventProjector:
             if outcome not in TURN_OUTCOMES:
                 outcome = "failed"
             payload: dict[str, Any] = {"outcome": outcome}
+            if kind == "turn.completed" and outcome == "succeeded":
+                payload["tokens"] = {
+                    "input": _token_count(data.get("input_tokens")),
+                    "output": _token_count(data.get("output_tokens")),
+                }
+                context_tokens = data.get("context_tokens")
+                if type(context_tokens) is int and context_tokens > 0:
+                    payload["current_context"] = context_tokens
             if outcome == "failed":
                 payload["error"] = safe_error(
                     str(data.get("error_code") or "unknown"),
                     retryable=bool(data.get("retryable")),
                 )
             return self._make(event, "turn.finished", payload)
-        # Deliberate suppression: native frames, reasoning, context/token
-        # diagnostics, tool payloads, credentials, and unrelated messages.
+        # Deliberate suppression: native frames, reasoning, provider diagnostics,
+        # tool payloads, credentials, and unrelated messages.
         return None
 
     def _tool(self, event: HarnessEvent, state: str) -> RuntimeEvent | None:

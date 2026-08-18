@@ -71,7 +71,24 @@ def _metadata_only_event(value: Any) -> RuntimeEvent | None:
         if not isinstance(outcome, str) or outcome not in TURN_OUTCOMES:
             return None
         legacy_error = payload.get("error")
+        legacy_tokens = payload.get("tokens")
+        legacy_context = payload.get("current_context")
         payload = {"outcome": outcome}
+        if outcome == "succeeded" and (
+            isinstance(legacy_tokens, dict)
+            and set(legacy_tokens) == {"input", "output"}
+            and all(
+                type(value) is int and value >= 0
+                for value in legacy_tokens.values()
+            )
+        ):
+            payload["tokens"] = legacy_tokens
+        if (
+            outcome == "succeeded"
+            and type(legacy_context) is int
+            and legacy_context > 0
+        ):
+            payload["current_context"] = legacy_context
         if outcome == "failed" and isinstance(legacy_error, dict):
             payload["error"] = safe_error(
                 str(legacy_error.get("code") or "unknown"),
