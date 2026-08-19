@@ -829,6 +829,50 @@ async def test_context_commands_are_locked_and_fail_closed_after_close():
             await command()
 
 
+class _AutocompactEchoDriver(_ControllableDriver):
+    """Reports back exactly the ceiling it was launched with.
+
+    Models Claude Code's real behavior once --autocompact is active: its
+    live context_window echoes the configured ceiling rather than the
+    model's raw capacity.
+    """
+
+    async def context_status(self):
+        return ContextStatus(used_tokens=1, context_window=300_000)
+
+
+@pytest.mark.asyncio
+async def test_context_snapshot_stays_pinned_once_it_matches_launch():
+    # equation-7256-87f7's real failure: launched with threshold=300_000
+    # (opus-4-7's 1_000_000 static window * 30%, per PR #219's
+    # claude_autocompact_tokens()). Claude Code then echoes context_window
+    # back as 300_000 too -- re-deriving `window * pct / 100` from *that*
+    # on every poll shrank the threshold each time (300k -> 90k -> ...)
+    # until the CLI rejected the value outright. The launch spec must stay
+    # authoritative across later observations.
+    driver = _AutocompactEchoDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec(
+            "/tmp",
+            model="opus-4-7",
+            auto_compact_threshold_pct=30,
+            auto_compact_threshold_tokens=300_000,
+        ),
+        driver_name="claude-code",
+    )
+    await manager.open()
+    adapter = RuntimeManagerAdapter(manager, compaction_wait_seconds=10)
+
+    for _ in range(3):
+        await adapter.get_context_snapshot()
+        assert manager.spec.auto_compact_threshold_tokens == 300_000
+    metadata = {}
+    await adapter._refresh_terminal_context(metadata)
+    assert adapter.context_limits() == (300_000, 300_000)
+    assert driver.open_calls == 1
+
+
 @pytest.mark.asyncio
 async def test_context_rollover_preserves_logical_session_and_opens_fresh_native():
     driver = _ControllableDriver()

@@ -25,6 +25,7 @@ from ..context_controller import (
 from ..errors import AgentAPIError
 from .driver import (
     CompactRequest,
+    ContextStatus,
     Driver,
     DriverCapabilities,
     HarnessEvent,
@@ -870,6 +871,25 @@ class RuntimeManagerAdapter(Adapter):
             None,
         )
 
+    def _context_threshold(
+        self,
+        status: ContextStatus,
+        context_window: int | None,
+    ) -> int | None:
+        configured = (
+            self.manager.spec.auto_compact_threshold_tokens
+            or status.auto_compact_threshold_tokens
+        )
+        pct = self.manager.spec.auto_compact_threshold_pct
+        # Claude echoes the configured --autocompact ceiling as its live
+        # context window. The launch spec is therefore authoritative; applying
+        # the percentage again compounds the threshold on every observation.
+        if pct is None or self.manager.driver_name == "claude-code":
+            return configured
+        if context_window is not None and context_window > 0:
+            return int(context_window * pct / 100)
+        return configured
+
     @staticmethod
     def _current_user_input(ctx: TurnContext) -> str:
         if not ctx.messages:
@@ -969,15 +989,7 @@ class RuntimeManagerAdapter(Adapter):
             and context_window > 0
         ):
             metadata["context_window"] = context_window
-            pct = self.manager.spec.auto_compact_threshold_pct
-            threshold = (
-                int(context_window * pct / 100)
-                if pct is not None
-                else (
-                    self.manager.spec.auto_compact_threshold_tokens
-                    or status.auto_compact_threshold_tokens
-                )
-            )
+            threshold = self._context_threshold(status, context_window)
             self._latest_context_limits = (context_window, threshold)
         if status.measured_at:
             metadata["context_measured_at"] = status.measured_at
@@ -1160,15 +1172,16 @@ class RuntimeManagerAdapter(Adapter):
         if isinstance(status, UnsupportedCapability):
             return await super().get_context_snapshot()
         window = status.context_window
-        threshold = (
-            self.manager.spec.auto_compact_threshold_tokens
-            or status.auto_compact_threshold_tokens
-        )
+        threshold = self._context_threshold(status, window)
         pct = self.manager.spec.auto_compact_threshold_pct
-        if window and pct is not None:
-            threshold = int(window * pct / 100)
+        if (
+            self.manager.driver_name != "claude-code"
+            and window is not None
+            and pct is not None
+        ):
             if (
-                self.manager.active_turn_ref is None
+                threshold is not None
+                and self.manager.active_turn_ref is None
                 and self.manager.spec.auto_compact_threshold_tokens != threshold
             ):
                 await self.manager.reload_resources(
