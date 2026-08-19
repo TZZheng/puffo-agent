@@ -346,9 +346,6 @@ class StandardWorkerRun:
         prepared = await preparer.prepare(
             system_prompt=paths.system_prompt,
             persisted_native_session_id=persisted.get("native_session_id", ""),
-            persisted_session_fingerprint=persisted.get(
-                "session_fingerprint", ""
-            ),
         )
         try:
             return await self._bind_driver_runtime(
@@ -374,20 +371,15 @@ class StandardWorkerRun:
         from ..agent.harness.docker_runtime import DockerRuntimePreparer
         from ..agent.harness.local_runtime import build_local_runtime_adapter
 
-        if prepared.discarded_persisted_session:
-            session_ref = f"session_{uuid.uuid4().hex}"
-            active_turn_ref = None
-        else:
-            session_ref = (
-                persisted.get("session_ref", "")
-                or f"session_{uuid.uuid4().hex}"
-            )
-            active_turn_ref = persisted.get("active_turn_ref") or None
+        session_ref = (
+            persisted.get("session_ref", "")
+            or f"session_{uuid.uuid4().hex}"
+        )
+        active_turn_ref = persisted.get("active_turn_ref") or None
         outbox.set_active_turn(
             active_turn_ref,
             session_ref=session_ref,
             native_session_id=prepared.native_session_id,
-            session_fingerprint=prepared.session_fingerprint,
         )
         driver = None
         cleanup = None
@@ -503,9 +495,6 @@ class StandardWorkerRun:
                 persisted.get("active_turn_ref") or None,
                 session_ref=context.runtime_session_ref,
                 native_session_id=worker._adapter.get_provider_session_id() or "",
-                session_fingerprint=(
-                    context.prepared_local_runtime.session_fingerprint
-                ),
             )
             context.prepared_local_runtime.finalize_legacy_session_migration()
         if warm_ok:

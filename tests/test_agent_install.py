@@ -692,7 +692,7 @@ def test_process_refresh_flags_deletes_flags_after_processing(tmp_path, monkeypa
         refresh_provider_auth_flag=tmp_path / "refresh_provider_auth.flag",
     ))
     assert puffo.system_prompt == "new prompt"
-    assert adapter.reload_calls == [("new prompt", True)]
+    assert adapter.reload_calls == [("new prompt", False)]
     assert not agent_flag.exists()
 
 
