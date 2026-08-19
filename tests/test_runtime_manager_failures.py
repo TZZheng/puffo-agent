@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from puffo_agent.agent.errors import AgentAPIError
+from puffo_agent.agent.adapters.base import TurnContext, TurnResult
 from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
@@ -47,7 +48,9 @@ class _ControllableDriver(Driver):
     async def open(self, spec, resume=None):
         self.open_calls += 1
         self.queue = asyncio.Queue()
-        native_session = f"native-session-{self.open_calls}"
+        native_session = (
+            str(resume) if resume else f"native-session-{self.open_calls}"
+        )
         return RuntimeOpened(
             RuntimeRef(f"runtime-{self.open_calls}"),
             SessionRef(native_session),
@@ -273,8 +276,11 @@ async def test_runtime_exit_abandons_active_turn_and_allows_next_turn():
         session_ref=SessionRef("native-session-1"),
     ))
 
-    with pytest.raises(RuntimeStateError, match="outcome abandoned"):
+    with pytest.raises(AgentAPIError, match="outcome abandoned") as excinfo:
         await asyncio.wait_for(first, timeout=1)
+    # The Global Inbox retry path only fires for is_auth=False AgentAPIError.
+    assert excinfo.value.is_auth is False
+    assert excinfo.value.error_code == "runtime_exited"
     assert manager.active_turn_ref is None
     assert manager.opened is None
     assert [str(event.type) for event in persisted][-1].endswith(
@@ -294,6 +300,246 @@ async def test_runtime_exit_abandons_active_turn_and_allows_next_turn():
     assert (await asyncio.wait_for(second, timeout=1)).reply == ""
     assert driver.start_calls == 2
     await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_first_turn_failure_after_resume_forces_a_fresh_session():
+    driver = _ControllableDriver()
+    durable_session_ids: list[str] = []
+
+    async def persist_terminal(event):
+        if getattr(event.type, "value", event.type) == "turn.completed":
+            durable_session_ids.append(manager.native_session_id)
+
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="claude-code",
+        native_session_id="stale-session-id",
+        event_sink=persist_terminal,
+    )
+    adapter = RuntimeManagerAdapter(manager)
+
+    running = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    assert driver.open_calls == 1
+
+    # claude-code doesn't fail driver.open() on an invalid --resume target --
+    # it reports "No conversation found" as an ordinary failed turn.completed.
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        data={"outcome": "failed", "error_code": "invalid_resume"},
+    ))
+
+    with pytest.raises(AgentAPIError, match="invalid_resume") as excinfo:
+        await asyncio.wait_for(running, timeout=1)
+    assert excinfo.value.is_auth is False
+    assert excinfo.value.error_code == "invalid_resume"
+    assert durable_session_ids == [""]
+    assert manager.native_session_id == ""
+    assert manager.opened is None
+    assert manager._resume_unconfirmed is False
+
+    # The next open is a fresh one: no resume target survives the failure.
+    driver.started = asyncio.Event()
+    second = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    assert driver.open_calls == 2
+    assert manager.opened.resumed is False
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        data={"outcome": "succeeded"},
+    ))
+    assert (await asyncio.wait_for(second, timeout=1)).reply == ""
+    await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_runtime_crash_on_unconfirmed_resume_also_forces_a_fresh_session():
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+        native_session_id="stale-session-id",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+
+    # Some broken resume targets crash the whole process (RUNTIME_EXITED)
+    # instead of returning a clean failed turn.completed like the test above.
+    running = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await driver.queue.put(HarnessEvent(
+        type="runtime.exited",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+    ))
+
+    with pytest.raises(AgentAPIError, match="resume_unconfirmed") as excinfo:
+        await asyncio.wait_for(running, timeout=1)
+    assert excinfo.value.is_auth is False
+    assert excinfo.value.error_code == "resume_unconfirmed"
+    assert manager.native_session_id == ""
+    assert manager.opened is None
+    assert manager._resume_unconfirmed is False
+
+    driver.started = asyncio.Event()
+    second = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    assert driver.open_calls == 2
+    assert manager.opened.resumed is False
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        data={"outcome": "succeeded"},
+    ))
+    assert (await asyncio.wait_for(second, timeout=1)).reply == ""
+    await adapter.aclose()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_resumed_session_keeps_later_failures_non_retryable():
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+        native_session_id="good-session-id",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+
+    running = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        data={"outcome": "succeeded"},
+    ))
+    assert (await asyncio.wait_for(running, timeout=1)).reply == ""
+    assert manager._resume_unconfirmed is False
+
+    # A resource-only reload resumes the same already-confirmed session and
+    # must not make its next ordinary provider failure look like a bad resume.
+    await manager.reload_resources(preserve_session=True)
+    assert manager._resume_unconfirmed is False
+
+    # A confirmed session's later failure must not trigger a fresh-session
+    # reset -- it's a genuine rejection, not proof the resume was bad.
+    driver.started = asyncio.Event()
+    second = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        data={"outcome": "failed"},
+    ))
+    with pytest.raises(RuntimeStateError, match="outcome failed"):
+        await asyncio.wait_for(second, timeout=1)
+    # No additional retire/reopen: unlike an invalid resume, this stays put.
+    assert driver.open_calls == 2
+    assert manager.opened is not None
+    assert manager.native_session_id != ""
+
+    driver.started = asyncio.Event()
+    third = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="claude-code",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        data={"outcome": "failed", "error_code": "invalid_resume"},
+    ))
+    with pytest.raises(AgentAPIError, match="invalid_resume"):
+        await asyncio.wait_for(third, timeout=1)
+    assert manager.native_session_id == ""
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_provider_reported_failure_without_retryable_flag_stays_terminal():
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="claude-code",
+        native_session_id="valid-but-unconfirmed-session",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+
+    running = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        data={"outcome": "failed"},
+    ))
+
+    # No "retryable" hint: stays a non-retryable RuntimeStateError.
+    with pytest.raises(RuntimeStateError, match="outcome failed") as excinfo:
+        await asyncio.wait_for(running, timeout=1)
+    assert excinfo.value.error_code == "failed"
+    assert manager.active_turn_ref is None
+    assert manager.native_session_id == "valid-but-unconfirmed-session"
+    assert manager.opened is not None
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_payload_depends_on_whether_native_session_survived():
+    manager = SimpleNamespace(native_session_id="preserved-session")
+    adapter = RuntimeManagerAdapter(manager)
+    received: list[str] = []
+
+    async def capture(ctx):
+        received.append(ctx.messages[-1]["content"])
+        return TurnResult(reply="")
+
+    adapter.run_turn = capture
+    context = TurnContext(system_prompt="system", messages=[])
+
+    await adapter.run_retry_turn("continue", "full durable input", context)
+    manager.native_session_id = ""
+    await adapter.run_retry_turn("continue", "full durable input", context)
+
+    assert received == ["continue", "full durable input"]
+
+
+@pytest.mark.asyncio
+async def test_abandon_turn_marked_non_retryable_stays_a_runtime_state_error():
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver, RuntimeSpec("/tmp", task_timeout_seconds=1), driver_name="codex"
+    )
+    adapter = RuntimeManagerAdapter(manager)
+
+    running = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    while manager.active_turn_ref is None:
+        await asyncio.sleep(0)
+
+    await manager.abandon_turn(
+        manager.active_turn_ref, reason="policy_rejected", retryable=False
+    )
+
+    with pytest.raises(RuntimeStateError, match="outcome abandoned") as excinfo:
+        await asyncio.wait_for(running, timeout=1)
+    assert excinfo.value.error_code == "policy_rejected"
+    await manager.close()
 
 
 @pytest.mark.asyncio
@@ -346,7 +592,7 @@ async def test_runtime_exit_waits_for_start_registration_before_abandoning():
     await asyncio.sleep(0)
     driver.release_start.set()
 
-    with pytest.raises(RuntimeStateError, match="outcome abandoned"):
+    with pytest.raises(AgentAPIError, match="outcome abandoned"):
         await asyncio.wait_for(running, timeout=1)
     assert manager.active_turn_ref is None
     assert manager.opened is None
@@ -406,7 +652,7 @@ async def test_terminal_persistence_failure_unblocks_turn_and_retires_runtime():
         data={"outcome": "succeeded"},
     ))
 
-    with pytest.raises(RuntimeStateError, match="outcome abandoned"):
+    with pytest.raises(AgentAPIError, match="outcome abandoned"):
         await asyncio.wait_for(running, timeout=1)
     assert manager.active_turn_ref is None
     assert manager.opened is None
@@ -584,6 +830,29 @@ async def test_context_commands_are_locked_and_fail_closed_after_close():
 
 
 @pytest.mark.asyncio
+async def test_context_rollover_preserves_logical_session_and_opens_fresh_native():
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+    await manager.open()
+
+    result = await adapter.rollover_context()
+
+    assert result.completed is True
+    assert result.previous_provider_session_id == "native-old"
+    assert result.provider_session_id == "native-session-2"
+    assert manager.session_ref == SessionRef("logical-session")
+    assert manager.opened is not None and manager.opened.resumed is False
+    assert adapter.get_context_capabilities().rollover is True
+    await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_continuation_failure_persists_terminal_before_next_turn(tmp_path):
     driver = _ControllableDriver()
     outbox = RuntimeEventOutbox(tmp_path / "runtime_events.db")
@@ -644,7 +913,7 @@ async def test_continuation_failure_persists_terminal_before_next_turn(tmp_path)
         },
     ))
 
-    with pytest.raises(RuntimeStateError, match="outcome abandoned"):
+    with pytest.raises(AgentAPIError, match="outcome abandoned"):
         await asyncio.wait_for(first, timeout=1)
     assert manager.active_turn_ref is None
 
