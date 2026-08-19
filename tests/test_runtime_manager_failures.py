@@ -874,6 +874,29 @@ async def test_context_snapshot_stays_pinned_once_it_matches_launch():
 
 
 @pytest.mark.asyncio
+async def test_context_snapshot_corrects_a_stale_claude_threshold_exactly_once():
+    # pct is configured but the spec's token value predates it (e.g. a
+    # live config change after launch). The static-table resolution must
+    # still land on 300_000 and reload once to apply it; every poll after
+    # that already agrees, so no further reload.
+    driver = _AutocompactEchoDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", model="opus-4-7", auto_compact_threshold_pct=30),
+        driver_name="claude-code",
+    )
+    await manager.open()
+    adapter = RuntimeManagerAdapter(manager, compaction_wait_seconds=10)
+
+    await adapter.get_context_snapshot()
+    assert manager.spec.auto_compact_threshold_tokens == 300_000
+    assert driver.open_calls == 2
+
+    await adapter.get_context_snapshot()
+    assert driver.open_calls == 2
+
+
+@pytest.mark.asyncio
 async def test_context_rollover_preserves_logical_session_and_opens_fresh_native():
     driver = _ControllableDriver()
     manager = RuntimeManager(
