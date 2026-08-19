@@ -6,6 +6,25 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a19] - 2026-08-19
+
+> Staging candidate preserving provider conversations while Agent resources and
+> credentials change.
+
+### Fixed
+
+- **Profile and runtime configuration changes no longer discard valid native
+  sessions.** Claude Code and Codex now receive the persisted session ID and
+  decide whether it can be resumed; Puffo falls back to a fresh provider
+  session only when the provider explicitly rejects the saved one.
+- **Puffo logical sessions remain continuous across provider reloads.** The
+  retired configuration-derived session fingerprint is removed from durable
+  runtime state during the existing SQLite migration path.
+- **Managed profile, skill, and MCP changes reload automatically.** Existing
+  mutation paths request the current idle-boundary resource refresh instead of
+  asking the Agent to call `refresh()` manually. Explicit
+  `refresh(session=True)` still starts a new conversation.
+
 ## [2.0.0a18] - 2026-08-19
 
 > Staging candidate making Claude Code and Codex account changes safe for
