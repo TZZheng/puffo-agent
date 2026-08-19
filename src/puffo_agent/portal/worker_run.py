@@ -77,6 +77,12 @@ class WorkerRunServices:
 
 
 class _NoopStatusReporter:
+    async def begin_notice_turn(self, _mid):
+        return None
+
+    async def end_notice_turn(self, **_kwargs):
+        return None
+
     async def begin_turn(self, _mid, *, run_id=None):
         return None
 
@@ -99,30 +105,41 @@ class _NoopStatusReporter:
 class GlobalInboxStatusLifecycle:
     """Mirror one durable Global Inbox turn into Server processing rows.
 
-    ``begin_turn`` fires once for the first admitted real message. Run ids are
+    Provider admission first emits a provisional busy status anchored to the
+    notice's first message without creating a processing row. ``begin_turn``
+    fires only when ``read_inbox`` admits the first real message. Run ids are
     derived from the durable turn and message identities, so crash recovery
-    reopens and settles the same Server row. Later active-union expansions do
-    not reopen rows. Terminal cleanup settles the exact active union in one
-    ``end_turn_batch`` with the same success/error result. State always resets
-    so the next turn cannot inherit runs.
+    reopens and settles the same Server row. Terminal cleanup settles either
+    the exact active union or the provisional status. State always resets so
+    the next turn cannot inherit runs.
     """
 
     def __init__(self, reporter) -> None:
         self._reporter = reporter
+        self._notice_began = False
         self._began = False
         self._turn_id: str | None = None
+
+    async def on_notice_admitted(
+        self, *, turn_id: str, message_ids: tuple[str, ...]
+    ) -> None:
+        if not message_ids:
+            return
+        self._claim_turn(turn_id)
+        if self._notice_began or self._began:
+            return
+        self._notice_began = True
+        await self._reporter.begin_notice_turn(message_ids[0])
 
     async def on_turn_active(
         self, *, turn_id: str, message_ids: tuple[str, ...]
     ) -> None:
         if not message_ids:
             return
+        self._claim_turn(turn_id)
         if self._began:
-            if self._turn_id != turn_id:
-                raise RuntimeError("status lifecycle already owns another turn")
             return
         self._began = True
-        self._turn_id = turn_id
         await self._reporter.begin_turn(
             message_ids[0],
             run_id=self._run_id(turn_id, message_ids[0]),
@@ -136,14 +153,24 @@ class GlobalInboxStatusLifecycle:
         succeeded: bool,
         error_text: str | None,
     ) -> None:
-        if self._began and self._turn_id != turn_id:
+        if (self._notice_began or self._began) and self._turn_id != turn_id:
             raise RuntimeError("status lifecycle terminal turn does not match")
         runs = self._build_runs(turn_id, message_ids, succeeded, error_text)
         try:
             if runs:
                 await self._reporter.end_turn_batch(runs)
+            elif self._notice_began:
+                await self._reporter.end_notice_turn(
+                    succeeded=succeeded,
+                    error_text=error_text,
+                )
         finally:
             self.reset()
+
+    def _claim_turn(self, turn_id: str) -> None:
+        if self._turn_id is not None and self._turn_id != turn_id:
+            raise RuntimeError("status lifecycle already owns another turn")
+        self._turn_id = turn_id
 
     def _build_runs(
         self,
@@ -165,6 +192,7 @@ class GlobalInboxStatusLifecycle:
         return runs
 
     def reset(self) -> None:
+        self._notice_began = False
         self._began = False
         self._turn_id = None
 
