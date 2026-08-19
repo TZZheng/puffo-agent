@@ -875,10 +875,8 @@ async def test_context_snapshot_stays_pinned_once_it_matches_launch():
 
 @pytest.mark.asyncio
 async def test_context_snapshot_corrects_a_stale_claude_threshold_exactly_once():
-    # pct is configured but the spec's token value predates it (e.g. a
-    # live config change after launch). The static-table resolution must
-    # still land on 300_000 and reload once to apply it; every poll after
-    # that already agrees, so no further reload.
+    # pct is configured but spec has no token value yet -- resolve once,
+    # reload, then agree on every later poll.
     driver = _AutocompactEchoDriver()
     manager = RuntimeManager(
         driver,
