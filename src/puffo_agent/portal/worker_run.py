@@ -44,12 +44,13 @@ class WorkerRunPaths:
     system_prompt: str
 
     @property
-    def refresh_flags(self) -> tuple[Path, Path, Path]:
+    def refresh_flags(self) -> tuple[Path, Path, Path, Path]:
         root = Path(self.workspace_path) / ".puffo-agent"
         return (
             root / "refresh_agent.flag",
             root / "refresh_host_sync.flag",
             root / "refresh_session.flag",
+            root / "refresh_provider_auth.flag",
         )
 
 
@@ -609,7 +610,12 @@ class StandardWorkerRun:
         return RuntimeEventUploader(context.runtime_event_outbox, append_transport)
 
     async def _apply_refresh(self, context: WorkerRunContext) -> None:
-        refresh_agent, refresh_host, refresh_session = context.paths.refresh_flags
+        (
+            refresh_agent,
+            refresh_host,
+            refresh_session,
+            refresh_provider_auth,
+        ) = context.paths.refresh_flags
         paths = context.paths
         worker = self.worker
         await worker_module._process_refresh_flags(
@@ -629,6 +635,7 @@ class StandardWorkerRun:
             refresh_agent_flag=refresh_agent,
             refresh_host_sync_flag=refresh_host,
             refresh_session_flag=refresh_session,
+            refresh_provider_auth_flag=refresh_provider_auth,
         )
 
     async def _execute_global_turn(self, context: WorkerRunContext, planned):
