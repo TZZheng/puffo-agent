@@ -842,7 +842,7 @@ class _AutocompactEchoDriver(_ControllableDriver):
 
 
 @pytest.mark.asyncio
-async def test_context_snapshot_stays_pinned_once_it_matches_launch():
+async def test_context_snapshot_stays_pinned_once_it_matches_launch(monkeypatch):
     # equation-7256-87f7's real failure: launched with threshold=300_000
     # (opus-4-7's 1_000_000 static window * 30%, per PR #219's
     # claude_autocompact_tokens()). Claude Code then echoes context_window
@@ -850,6 +850,10 @@ async def test_context_snapshot_stays_pinned_once_it_matches_launch():
     # on every poll shrank the threshold each time (300k -> 90k -> ...)
     # until the CLI rejected the value outright. The launch spec must stay
     # authoritative across later observations.
+    # Docker launch intentionally ignores the daemon's host-level window.
+    # A later telemetry poll must not replace that launch-owned decision by
+    # consulting a different environment.
+    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "500000")
     driver = _AutocompactEchoDriver()
     manager = RuntimeManager(
         driver,
@@ -874,9 +878,13 @@ async def test_context_snapshot_stays_pinned_once_it_matches_launch():
 
 
 @pytest.mark.asyncio
-async def test_context_snapshot_corrects_a_stale_claude_threshold_exactly_once():
+async def test_context_snapshot_corrects_a_stale_claude_threshold_exactly_once(
+    monkeypatch,
+):
     # pct is configured but spec has no token value yet -- resolve once,
-    # reload, then agree on every later poll.
+    # from the spec environment rather than the daemon environment, reload,
+    # then agree on every later poll.
+    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "500000")
     driver = _AutocompactEchoDriver()
     manager = RuntimeManager(
         driver,

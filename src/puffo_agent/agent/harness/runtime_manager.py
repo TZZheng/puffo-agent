@@ -7,7 +7,7 @@ import inspect
 import logging
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
@@ -48,11 +48,17 @@ logger = logging.getLogger(__name__)
 COMPACTION_WAIT_SECONDS = 120.0
 
 
-def _resolve_claude_autocompact_tokens(*, model: str, pct: float) -> int | None:
-    """Same call local_runtime.py makes at launch -- static per-model window."""
+def _resolve_claude_autocompact_tokens(
+    *, model: str, pct: float, environment: Mapping[str, str]
+) -> int | None:
+    """Resolve a missing threshold from the runtime's launch environment."""
     from ...portal.control.context_telemetry import claude_autocompact_tokens
 
-    return claude_autocompact_tokens(model=model, pct=pct)
+    return claude_autocompact_tokens(
+        model=model,
+        pct=pct,
+        env=dict(environment),
+    )
 
 
 class RuntimeStateError(RuntimeError):
@@ -883,21 +889,26 @@ class RuntimeManagerAdapter(Adapter):
         status: ContextStatus,
         context_window: int | None,
     ) -> int | None:
+        spec_threshold = self.manager.spec.auto_compact_threshold_tokens
         configured = (
-            self.manager.spec.auto_compact_threshold_tokens
-            or status.auto_compact_threshold_tokens
+            spec_threshold
+            if spec_threshold is not None
+            else status.auto_compact_threshold_tokens
         )
         pct = self.manager.spec.auto_compact_threshold_pct
         if pct is None:
             return configured
         if self.manager.driver_name == "claude-code":
             # Claude echoes our configured ceiling as its live window, so
-            # window * pct would compound smaller each time (PR #219).
-            return (
-                _resolve_claude_autocompact_tokens(
-                    model=self.manager.spec.model, pct=pct
-                )
-                or configured
+            # window * pct would compound smaller each time (PR #219). The
+            # launch-owned threshold stays authoritative; only repair a spec
+            # where both launch and provider omitted the token value.
+            if configured is not None:
+                return configured
+            return _resolve_claude_autocompact_tokens(
+                model=self.manager.spec.model,
+                pct=pct,
+                environment=self.manager.spec.environment,
             )
         if context_window is not None and context_window > 0:
             return int(context_window * pct / 100)
