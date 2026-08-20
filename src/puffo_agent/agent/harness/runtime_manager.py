@@ -7,7 +7,7 @@ import inspect
 import logging
 import uuid
 import weakref
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
@@ -46,6 +46,19 @@ logger = logging.getLogger(__name__)
 # Compaction is a provider-side summarization pass over the whole thread, so
 # the per-request timeout is far too tight to bound its completion.
 COMPACTION_WAIT_SECONDS = 120.0
+
+
+def _resolve_claude_autocompact_tokens(
+    *, model: str, pct: float, environment: Mapping[str, str]
+) -> int | None:
+    """Resolve a missing threshold from the runtime's launch environment."""
+    from ...portal.control.context_telemetry import claude_autocompact_tokens
+
+    return claude_autocompact_tokens(
+        model=model,
+        pct=pct,
+        env=dict(environment),
+    )
 
 
 class RuntimeStateError(RuntimeError):
@@ -876,16 +889,27 @@ class RuntimeManagerAdapter(Adapter):
         status: ContextStatus,
         context_window: int | None,
     ) -> int | None:
+        spec_threshold = self.manager.spec.auto_compact_threshold_tokens
         configured = (
-            self.manager.spec.auto_compact_threshold_tokens
-            or status.auto_compact_threshold_tokens
+            spec_threshold
+            if spec_threshold is not None
+            else status.auto_compact_threshold_tokens
         )
         pct = self.manager.spec.auto_compact_threshold_pct
-        # Claude echoes the configured --autocompact ceiling as its live
-        # context window. The launch spec is therefore authoritative; applying
-        # the percentage again compounds the threshold on every observation.
-        if pct is None or self.manager.driver_name == "claude-code":
+        if pct is None:
             return configured
+        if self.manager.driver_name == "claude-code":
+            # Claude echoes our configured ceiling as its live window, so
+            # window * pct would compound smaller each time (PR #219). The
+            # launch-owned threshold stays authoritative; only repair a spec
+            # where both launch and provider omitted the token value.
+            if configured is not None:
+                return configured
+            return _resolve_claude_autocompact_tokens(
+                model=self.manager.spec.model,
+                pct=pct,
+                environment=self.manager.spec.environment,
+            )
         if context_window is not None and context_window > 0:
             return int(context_window * pct / 100)
         return configured
@@ -1174,11 +1198,9 @@ class RuntimeManagerAdapter(Adapter):
         window = status.context_window
         threshold = self._context_threshold(status, window)
         pct = self.manager.spec.auto_compact_threshold_pct
-        if (
-            self.manager.driver_name != "claude-code"
-            and window is not None
-            and pct is not None
-        ):
+        # claude-code's static-table resolution doesn't need a live window.
+        needs_window = self.manager.driver_name != "claude-code"
+        if pct is not None and (window is not None or not needs_window):
             if (
                 threshold is not None
                 and self.manager.active_turn_ref is None
