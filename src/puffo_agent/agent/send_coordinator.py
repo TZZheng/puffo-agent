@@ -793,9 +793,25 @@ class SendCoordinator:
                 space_id, channel_id, fingerprint, content_digest
             )
             if not reconsideration.eligible:
+                if reconsideration.reason == "missing_active_identity":
+                    # No admitted daemon turn is bound (background-task
+                    # wakeup) or the provider session changed under the
+                    # coordinator; either way there is no identity to
+                    # validate catch-up against, and pointing at the normal
+                    # held procedure would send the model in circles.
+                    message = (
+                        "this send is not bound to an admitted daemon turn "
+                        "(background-task wakeup, or the provider session "
+                        "changed); send_anyway is unavailable here — the "
+                        "draft can be resent from a newly admitted turn"
+                    )
+                else:
+                    message = (
+                        "send_anyway requires exact held catch-up and an "
+                        "admitted same-Turn read through that boundary"
+                    )
                 result = failed_result(
-                    "send_anyway requires exact held catch-up and an admitted "
-                    "same-Turn read through that boundary",
+                    message,
                     kind="reconsideration_ineligible",
                 )
                 result["_reconsideration_audit"] = reconsideration.audit_fields()
@@ -862,16 +878,10 @@ class SendCoordinator:
                 space_id=space_id,
                 channel_id=channel_id,
                 dm_peer=None,
-                require_encryption=True,
                 materialized=boundary.materialized,
             )
         except Exception as exc:
             return failed_result(str(exc), kind="validation")
-        if not resolved["encrypt"]:
-            return failed_result(
-                "plaintext channel sends are not supported",
-                kind="encryption_required",
-            )
 
         envelope, content_key = encrypt_message_with_content_key(
             resolved["input"],
@@ -1102,7 +1112,6 @@ class SendCoordinator:
                 space_id=None,
                 channel_id=None,
                 dm_peer=recipient_slug,
-                require_encryption=False,
             )
             inp = resolved["input"]
             if resolved["encrypt"]:
@@ -1210,7 +1219,6 @@ class SendCoordinator:
         space_id: str | None,
         channel_id: str | None,
         dm_peer: str | None,
-        require_encryption: bool,
         materialized: Sequence[tuple[str, bytes]] | None = None,
     ) -> dict[str, Any]:
         from ..mcp.puffo_core_tools import (
@@ -1236,15 +1244,15 @@ class SendCoordinator:
             space_id=space_id,
             dm_peer=dm_peer,
         )
-        encrypt = bool(request.attachment_paths) or await _send_encryption_required(
-            coordinator_config(self), root
+        # Channel routes are always E2EE. The daemon-level send-mode decision
+        # only exists to allow the plaintext DM downgrade; consulting it for
+        # channels made turn-unbound sends (background wakeups, where the
+        # turn-scoped bundle flag is already cleared) fail as "plaintext".
+        encrypt = (
+            kind == "channel"
+            or bool(request.attachment_paths)
+            or await _send_encryption_required(coordinator_config(self), root)
         )
-        if require_encryption and not encrypt:
-            return {
-                "encrypt": False,
-                "note": root_note,
-                "recipient_slugs": recipient_slugs,
-            }
 
         attachments, attachment_note = await self._prepare_attachments(
             request, materialized
