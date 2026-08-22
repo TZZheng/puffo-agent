@@ -47,6 +47,15 @@ logger = logging.getLogger(__name__)
 # the per-request timeout is far too tight to bound its completion.
 COMPACTION_WAIT_SECONDS = 120.0
 
+# Signs of forward progress within a turn -- each one pushes the turn
+# timeout's deadline back out (see RuntimeManagerAdapter._consume_turn_events).
+_TURN_ACTIVITY_EVENTS = frozenset({
+    "turn.assistant_delta",
+    "turn.tool_started",
+    "turn.tool_updated",
+    "turn.tool_completed",
+})
+
 
 class RuntimeStateError(RuntimeError):
     """Internal state-machine contract violation, never retried automatically."""
@@ -923,8 +932,17 @@ class RuntimeManagerAdapter(Adapter):
         stream,
         turn: TurnRef,
         metadata: dict[str, Any],
+        *,
+        timeout: asyncio.Timeout | None = None,
+        idle_timeout_seconds: float | None = None,
     ) -> TurnResult | None:
-        """Drain the turn's events; None means the runtime stream ended."""
+        """Drain the turn's events; None means the runtime stream ended.
+
+        A long task that keeps producing output shouldn't die to the turn
+        timeout just because its total wall-clock crossed the ceiling --
+        only real silence should. Any sign of forward progress pushes the
+        deadline out another idle_timeout_seconds.
+        """
         async for event in stream:
             if event.turn_ref != turn:
                 continue
@@ -932,6 +950,14 @@ class RuntimeManagerAdapter(Adapter):
                 event.type.value
                 if isinstance(event.type, HarnessEventType) else event.type
             )
+            if (
+                timeout is not None
+                and idle_timeout_seconds is not None
+                and event_type in _TURN_ACTIVITY_EVENTS
+            ):
+                timeout.reschedule(
+                    asyncio.get_running_loop().time() + idle_timeout_seconds
+                )
             if event_type == "turn.assistant_delta":
                 text = event.data.get("text")
                 if isinstance(text, str):
@@ -1001,7 +1027,7 @@ class RuntimeManagerAdapter(Adapter):
         metadata: dict[str, Any],
     ) -> TurnResult:
         logger.warning(
-            "provider turn %s exceeded %.3fs timeout",
+            "provider turn %s produced nothing for %.3fs; treating as stuck",
             turn,
             timeout_seconds,
         )
@@ -1015,7 +1041,7 @@ class RuntimeManagerAdapter(Adapter):
             else f"{timeout_seconds:g} second"
         )
         return TurnResult(
-            reply=f"Task exceeded the {label} timeout.",
+            reply=f"Task produced no activity for {label} and was stopped.",
             metadata={
                 **metadata,
                 "runtime_turn_timeout": True,
@@ -1052,7 +1078,8 @@ class RuntimeManagerAdapter(Adapter):
                 metadata["turn_ref"] = str(turn)
                 await self._announce_admission(started)
                 completed = await self._consume_turn_events(
-                    ctx, stream, turn, metadata
+                    ctx, stream, turn, metadata,
+                    timeout=timeout, idle_timeout_seconds=timeout_seconds,
                 )
         except TimeoutError:
             if not timeout.expired():
