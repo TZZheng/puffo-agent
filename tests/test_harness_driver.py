@@ -226,14 +226,12 @@ def test_codex_effective_capabilities():
 def test_claude_effective_capabilities():
     baseline = claude_capabilities()
     compact = claude_capabilities(True)
-    lifecycle = claude_capabilities(message_lifecycle_v1=True)
     assert baseline.session_resume is True
     assert baseline.inflight_turn_recovery is False
     assert (baseline.steer, baseline.cancel) == ("none", "none")
     assert baseline.context_status == "pull"
     assert baseline.compact == "none"
     assert compact.compact == "session_command"
-    assert lifecycle.steer == "gated"
     assert baseline.permission_bridge is False
 
 
@@ -1371,174 +1369,6 @@ async def test_claude_driver_exact_replay_trailing_records_and_unsupported_zero_
         driver, started, holder["proc"]
     )
     assert (await driver.compact(CompactRequest("now"))).accepted
-    await driver.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("delivery_shape", ["folded", "separate"])
-async def test_claude_gated_input_stays_in_one_logical_turn(delivery_shape):
-    proc = _FakeProcess()
-    proc.feed({
-        "type": "system",
-        "subtype": "init",
-        "session_id": "claude-lifecycle",
-        "capabilities": ["msg_lifecycle_v1"],
-    })
-    driver = ClaudeCodeCliDriver(
-        lambda _args, _spec: proc,
-        replay_timeout=0.2,
-    )
-    await driver.open(RuntimeSpec("/workspace"))
-    stream = driver.events()
-    await _next_matching(stream, "session.opened")
-    started = await driver.start_turn(
-        TurnInput("first", client_correlation_id="primary-command")
-    )
-    proc.feed({
-        "type": "command_lifecycle",
-        "command_uuid": "primary-command",
-        "state": "queued",
-    })
-    proc.feed({
-        "type": "command_lifecycle",
-        "command_uuid": "primary-command",
-        "state": "started",
-    })
-    proc.feed({
-        "type": "user",
-        "session_id": "claude-lifecycle",
-        "parent_tool_use_id": None,
-        "uuid": "primary-command",
-        "isReplay": True,
-        "message": {"role": "user", "content": "first"},
-    })
-    turn_started = await _next_matching(stream, "turn.started")
-    assert turn_started.native_turn_id == "primary-command"
-    assert driver.current_capabilities().steer == "gated"
-
-    gated = asyncio.create_task(driver.steer_turn(
-        started.turn_ref,
-        TurnInput("new inbox", client_correlation_id="gated-command"),
-    ))
-    await _wait_until(lambda: len(proc.stdin.writes) == 2)
-    proc.feed({
-        "type": "command_lifecycle",
-        "command_uuid": "gated-command",
-        "state": "queued",
-    })
-    receipt = await gated
-    assert receipt.accepted and receipt.delivery == "queued_native_command"
-    duplicate = await driver.steer_turn(started.turn_ref, TurnInput("third"))
-    assert not duplicate.accepted
-
-    if delivery_shape == "folded":
-        proc.feed({
-            "type": "command_lifecycle",
-            "command_uuid": "gated-command",
-            "state": "started",
-        })
-        proc.feed({
-            "type": "command_lifecycle",
-            "command_uuid": "gated-command",
-            "state": "completed",
-        })
-        proc.feed({
-            "type": "result",
-            "subtype": "success",
-            "user_message_uuid": "primary-command",
-            "usage": {"input_tokens": 10, "output_tokens": 1},
-        })
-        proc.feed({
-            "type": "command_lifecycle",
-            "command_uuid": "primary-command",
-            "state": "completed",
-        })
-        expected_usage = (10, 1, 10)
-    else:
-        proc.feed({
-            "type": "result",
-            "subtype": "success",
-            "user_message_uuid": "primary-command",
-            "usage": {"input_tokens": 10, "output_tokens": 1},
-        })
-        proc.feed({
-            "type": "command_lifecycle",
-            "command_uuid": "primary-command",
-            "state": "completed",
-        })
-        proc.feed({
-            "type": "command_lifecycle",
-            "command_uuid": "gated-command",
-            "state": "started",
-        })
-        proc.feed({
-            "type": "result",
-            "subtype": "success",
-            "user_message_uuid": "gated-command",
-            "usage": {"input_tokens": 20, "output_tokens": 2},
-        })
-        proc.feed({
-            "type": "command_lifecycle",
-            "command_uuid": "gated-command",
-            "state": "completed",
-        })
-        expected_usage = (30, 3, 20)
-
-    completed = await _next_matching(stream, "turn.completed")
-    assert completed.native_turn_id == "primary-command"
-    assert (
-        completed.data["input_tokens"],
-        completed.data["output_tokens"],
-        completed.data["context_tokens"],
-    ) == expected_usage
-    assert not driver._active.value
-    await driver.close()
-
-
-@pytest.mark.asyncio
-async def test_claude_gated_input_requires_matching_queue_ack():
-    proc = _FakeProcess()
-    proc.feed({
-        "type": "system",
-        "subtype": "init",
-        "session_id": "claude-no-ack",
-        "capabilities": ["msg_lifecycle_v1"],
-    })
-    driver = ClaudeCodeCliDriver(
-        lambda _args, _spec: proc,
-        replay_timeout=0.01,
-    )
-    await driver.open(RuntimeSpec("/workspace"))
-    stream = driver.events()
-    await _next_matching(stream, "session.opened")
-    started = await driver.start_turn(
-        TurnInput("first", client_correlation_id="primary-command")
-    )
-    proc.feed({
-        "type": "user",
-        "session_id": "claude-no-ack",
-        "parent_tool_use_id": None,
-        "uuid": "primary-command",
-        "isReplay": True,
-        "message": {"role": "user", "content": "first"},
-    })
-    await _next_matching(stream, "turn.started")
-
-    receipt = await driver.steer_turn(started.turn_ref, TurnInput("new inbox"))
-    assert not receipt.accepted
-    assert receipt.delivery == "queue_ack_timeout"
-    proc.feed({
-        "type": "result",
-        "subtype": "success",
-        "user_message_uuid": "primary-command",
-        "usage": {},
-    })
-    proc.feed({
-        "type": "command_lifecycle",
-        "command_uuid": "primary-command",
-        "state": "completed",
-    })
-    await _next_matching(stream, "turn.completed")
     await driver.close()
 
 
