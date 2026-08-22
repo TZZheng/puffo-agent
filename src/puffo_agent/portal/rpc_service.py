@@ -240,6 +240,7 @@ async def send_message_route(request: web.Request) -> web.Response:
         "root_id": body.get("root_id", ""),
         "visibility_level": body.get("visibility_level", "default"),
         "send_anyway": body.get("send_anyway", False),
+        "covers": body.get("covers"),
     }
     try:
         result = await host_mcp_handler.send_message(ctx, **kwargs)
