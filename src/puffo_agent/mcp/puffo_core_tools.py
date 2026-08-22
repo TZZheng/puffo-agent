@@ -489,6 +489,43 @@ async def _outgoing_root_claimant(data_client: Any, root_id: str) -> Any:
     return None
 
 
+async def _resolve_missing_outgoing_root(
+    data_client: Any,
+    current: str,
+    root_id: str,
+    missing_note: str,
+    *,
+    self_slug: str,
+    channel_id: Optional[str],
+    space_id: Optional[str],
+    dm_peer: Optional[str],
+) -> tuple[Optional[str], str]:
+    """Resolve a root whose own row is not locally readable.
+
+    Local replies claiming it (kept unverified on receipt) prove the
+    thread is real in this conversation, so after the claimant passes the
+    same scope validation, keep threading under the claimed id. Without a
+    claimant, degrade to a top-level send with the original note.
+    """
+    claimant = await _outgoing_root_claimant(data_client, current)
+    if claimant is None:
+        return None, missing_note
+    _validate_outgoing_root_scope(
+        claimant,
+        root_id,
+        self_slug=self_slug,
+        channel_id=channel_id,
+        space_id=space_id,
+        dm_peer=dm_peer,
+    )
+    logger.info(
+        "resolve_outgoing_root: kept %s — root not locally "
+        "readable but claimed by local thread replies",
+        current,
+    )
+    return current, ""
+
+
 async def _read_outgoing_root_message(
     data_client: Any,
     root_id: str,
@@ -612,26 +649,16 @@ async def _resolve_outgoing_root(
             current,
         )
         if msg is None:
-            claimant = await _outgoing_root_claimant(data_client, current)
-            if claimant is None:
-                return None, missing_note
-            # The root itself is not locally readable, but local replies
-            # claim it (kept unverified on receipt): the thread is real in
-            # this conversation, so keep threading under the claimed id.
-            _validate_outgoing_root_scope(
-                claimant,
+            return await _resolve_missing_outgoing_root(
+                data_client,
+                current,
                 root_id,
+                missing_note,
                 self_slug=self_slug,
                 channel_id=channel_id,
                 space_id=space_id,
                 dm_peer=dm_peer,
             )
-            logger.info(
-                "resolve_outgoing_root: kept %s — root not locally "
-                "readable but claimed by local thread replies",
-                current,
-            )
-            return current, ""
         # Cross-scope first: rejecting before the system/self-ref wipe
         # keeps misdirected content out of the wrong conversation.
         _validate_outgoing_root_scope(
