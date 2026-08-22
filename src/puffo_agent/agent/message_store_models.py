@@ -372,6 +372,10 @@ class StoredMessage:
     received_at: int
     thread_root_id: Optional[str] = None
     reply_to_id: Optional[str] = None
+    # True when the claimed thread root was not locally verifiable at
+    # receipt time (root not in the local store); grouping still uses the
+    # claimed id, and arrival of the root later settles the flag.
+    thread_root_unverified: bool = False
     # False only for a plaintext (non-E2EE) message; absent/legacy rows are True.
     is_encrypted: bool = True
     server_seq: int | None = None

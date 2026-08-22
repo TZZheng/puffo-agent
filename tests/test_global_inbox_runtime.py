@@ -329,16 +329,14 @@ def _configure_listen_client(client, store, tmp_path, events, blocked):
 
 
 def _install_listen_stubs(client, gate_foreign_dm):
-    async def none(*_args, **_kwargs):
-        return None
+    def returns(value):
+        async def stub(*_args, **_kwargs):
+            return value
+        return stub
 
-    async def false(*_args, **_kwargs):
-        return False
+    none, false, empty = returns(None), returns(False), returns({})
 
-    async def empty(*_args, **_kwargs):
-        return {}
-
-    client._resolve_incoming_thread_root = none
+    client._resolve_incoming_thread_root = returns((None, False))
     client._validate_incoming_parent_id = none
     client._maybe_allowlist_outbound_dm = none
     client._apply_invite_replies = empty
