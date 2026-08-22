@@ -210,4 +210,3 @@ class CoversReconciliationMixin:
             message_count=len(self.active.message_ids),
             duration_ms=int((time.monotonic() - process_started) * 1000),
         )
-
