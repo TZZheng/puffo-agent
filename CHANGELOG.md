@@ -6,6 +6,38 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a24] - 2026-08-22
+
+> Staging candidate closing the audited message-reliability gaps: silent
+> "read but never answered" loss, silent empty-history rendering on data
+> failures, and thread demotion when the root is not locally readable.
+
+### Added
+
+- **Message covers: explicit disposition with finalize reconciliation.**
+  `send_message` / `send_message_with_attachments` / `create_reminder`
+  accept `covers=[message_id...]`; a new `mark_covered` tool settles
+  messages that need no reply. At turn end the daemon reconciles read
+  human messages against declared covers, always emits a
+  `turn.uncovered_messages` observation event, and — behind the
+  `covers_renotice` flag (`PUFFO_COVERS_RENOTICE` env override) —
+  redelivers uncovered rows exactly once. A reconciliation failure emits
+  `turn.cover_reconciliation_failed` and falls back to a durable
+  store-side partition instead of silently settling the turn. (#276)
+
+### Fixed
+
+- **Data-service read failures raise `DataUnavailable` instead of
+  rendering an empty history.** 5xx and transport errors on the five read
+  paths surface as explicit, retryable tool errors; 404 absence semantics
+  are unchanged. (#277)
+- **Locally unverifiable thread roots are preserved, not erased.** A
+  reply whose claimed root is not in the local store keeps the claim with
+  a `thread_root_unverified` mark, the root's later arrival runs the
+  deferred ownership check, and outbound replies into such threads keep
+  threading under the claimed id after scope validation instead of
+  degrading to channel level. (#278)
+
 ## [2.0.0a23] - 2026-08-22
 
 > Staging candidate removing the flat 30-minute turn ceiling so long tasks
