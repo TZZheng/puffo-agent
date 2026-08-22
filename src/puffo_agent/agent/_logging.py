@@ -66,6 +66,7 @@ RUNTIME_EVENT_NAMES = frozenset({
     "turn.failed",
     "turn.finalized",
     "turn.uncovered_messages",
+    "turn.cover_reconciliation_failed",
     "runtime.command",
     "runtime.normalized_event",
     "runtime.projected",

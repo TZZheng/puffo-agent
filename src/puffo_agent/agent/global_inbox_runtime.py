@@ -1358,8 +1358,43 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             )
         except Exception:
             # Reconciliation must never turn a completed turn into a
-            # failure; fall back to plain full completion.
-            logger.exception("cover reconciliation failed; completing turn")
+            # failure — but its own failure must not silently settle every
+            # row either: that would make the safety net's breakage
+            # reproduce exactly the loss it exists to stop. Surface the
+            # failure and fall back to a durable store-side partition that
+            # redelivers whatever still holds its one-shot bound.
+            logger.exception("cover reconciliation failed for turn %s", turn_id)
+            fallback = (
+                "renotice_unrenotified"
+                if self.covers_renotice_enabled
+                else "observed"
+            )
+            log_runtime_event(
+                logger,
+                "turn.cover_reconciliation_failed",
+                level=logging.ERROR,
+                agent_id=self.agent_id,
+                turn_id=turn_id,
+                provider_session_id=self.active.provider_session_id,
+                message_count=len(self.active.message_ids),
+                outcome=fallback,
+            )
+            if self.covers_renotice_enabled:
+                try:
+                    redelivered = (
+                        await self.store.complete_turn_renotice_unrenotified(
+                            turn_id=turn_id,
+                            provider_session_id=(
+                                self.active.provider_session_id
+                            ),
+                        )
+                    )
+                    return redelivered, {}
+                except Exception:
+                    logger.exception(
+                        "fallback renotice failed; completing turn %s plainly",
+                        turn_id,
+                    )
         if renotice_ids and set(self.active.message_ids) != set(rows_by_id):
             # The in-memory turn disagrees with the store's membership.
             # Renotice partitioning would paper over the drift, so fall

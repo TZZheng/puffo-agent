@@ -109,6 +109,79 @@ async def test_covered_and_agent_messages_complete_without_renotice(
 
 
 @pytest.mark.asyncio
+async def test_reconciliation_failure_still_redelivers_once(
+    tmp_path, monkeypatch,
+):
+    """The safety net's own failure must not silently settle the turn."""
+    monkeypatch.setenv("PUFFO_COVERS_RENOTICE", "1")
+    store = await make_store(tmp_path)
+    await receipt(store, "h1", 1, content=_human_content("question"))
+    runtime = _build_runtime(store, tmp_path)
+
+    async def boom(_turn_id):
+        raise RuntimeError("reconciliation read failed")
+
+    original = runtime._reconcile_uncovered_messages
+    runtime._reconcile_uncovered_messages = boom
+    assert await runtime.process_once()
+    row = await store.get_message_by_envelope("h1")
+    assert row.processing_state is ProcessingState.PENDING
+    assert row.renotified
+
+    # Second delivery reconciles normally; the one-shot bit makes it final.
+    runtime._reconcile_uncovered_messages = original
+    assert await runtime.process_once()
+    row = await store.get_message_by_envelope("h1")
+    assert row.processing_state is ProcessingState.PROCESSED
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_failure_without_renotice_completes_plainly(
+    tmp_path,
+):
+    store = await make_store(tmp_path)
+    await receipt(store, "h1", 1, content=_human_content("question"))
+    runtime = _build_runtime(store, tmp_path)
+    assert not runtime.covers_renotice_enabled
+
+    async def boom(_turn_id):
+        raise RuntimeError("reconciliation read failed")
+
+    runtime._reconcile_uncovered_messages = boom
+    assert await runtime.process_once()
+    row = await store.get_message_by_envelope("h1")
+    assert row.processing_state is ProcessingState.PROCESSED
+    assert not row.renotified
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_reconciliation_and_fallback_failure_completes_plainly(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("PUFFO_COVERS_RENOTICE", "1")
+    store = await make_store(tmp_path)
+    await receipt(store, "h1", 1, content=_human_content("question"))
+    runtime = _build_runtime(store, tmp_path)
+
+    async def boom(_turn_id):
+        raise RuntimeError("reconciliation read failed")
+
+    async def boom_fallback(**_kwargs):
+        raise RuntimeError("fallback write failed")
+
+    runtime._reconcile_uncovered_messages = boom
+    monkeypatch.setattr(
+        store, "complete_turn_renotice_unrenotified", boom_fallback,
+    )
+    assert await runtime.process_once()
+    row = await store.get_message_by_envelope("h1")
+    assert row.processing_state is ProcessingState.PROCESSED
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_partial_coverage_renotices_only_the_uncovered_rows(
     tmp_path, monkeypatch,
 ):

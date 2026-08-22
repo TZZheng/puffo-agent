@@ -1284,6 +1284,47 @@ class InboxStoreMixin:
                 provider_session_id=provider_session_id,
             )
 
+    async def complete_turn_renotice_unrenotified(
+        self,
+        *,
+        turn_id: str,
+        provider_session_id: str | None = None,
+    ) -> tuple[str, ...]:
+        """Fallback completion for when cover reconciliation itself failed.
+
+        Partitions the turn durably instead of trusting the failed read:
+        member rows that still hold their one-shot redelivery
+        (``renotified = 0``) return to PENDING, rows already redelivered
+        once complete as PROCESSED. Coarser than reconciliation — agent and
+        system rows get redelivered too — but dup-over-loss with the same
+        once-per-row bound, instead of silently settling every row.
+        Returns the redelivered ids.
+        """
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            member_ids = await self._turn_message_ids(db, turn_id)
+            if not member_ids:
+                await self._complete_turn_unlocked(
+                    (), (), turn_id=turn_id,
+                    provider_session_id=provider_session_id,
+                )
+                return ()
+            unrenotified = await _batched_select_ids(
+                db,
+                "SELECT envelope_id FROM messages "
+                "WHERE envelope_id IN ({ids}) AND renotified = 0",
+                member_ids,
+            )
+            renotice = tuple(i for i in member_ids if i in unrenotified)
+            processed = tuple(i for i in member_ids if i not in unrenotified)
+            await self._complete_turn_unlocked(
+                processed,
+                renotice,
+                turn_id=turn_id,
+                provider_session_id=provider_session_id,
+            )
+            return renotice
+
     async def _turn_message_ids(
         self, db: aiosqlite.Connection, turn_id: str
     ) -> tuple[str, ...]:
