@@ -78,7 +78,7 @@ async def _open_driver(*, ack_timeout: float = 0.2):
     })
     driver = ClaudeCodeCliDriver(
         lambda _args, _spec: proc,
-        replay_timeout=ack_timeout,
+        input_ack_timeout=ack_timeout,
     )
     await driver.open(RuntimeSpec("/workspace"))
     stream = driver.events()
@@ -117,7 +117,10 @@ def test_claude_lifecycle_capability_is_explicit():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("delivery_shape", ["folded", "separate"])
+@pytest.mark.parametrize(
+    "delivery_shape",
+    ["folded", "separate", "cancelled", "discarded", "unknown"],
+)
 async def test_gated_commands_share_one_logical_turn(delivery_shape):
     proc, driver, stream, started = await _open_driver()
     receipt = await _offer_gated(proc, driver, started)
@@ -130,19 +133,34 @@ async def test_gated_commands_share_one_logical_turn(delivery_shape):
         _result(proc, "primary", 10, 1)
         _lifecycle(proc, "primary", "completed")
         expected = (10, 1, 10)
-    else:
+        expected_error = ""
+    elif delivery_shape == "separate":
         _result(proc, "primary", 10, 1)
         _lifecycle(proc, "primary", "completed")
         _lifecycle(proc, "gated", "started")
         _result(proc, "gated", 20, 2)
         _lifecycle(proc, "gated", "completed")
         expected = (30, 3, 20)
+        expected_error = ""
+    elif delivery_shape in {"cancelled", "discarded"}:
+        _result(proc, "primary", 10, 1)
+        _lifecycle(proc, "primary", "completed")
+        _lifecycle(proc, "gated", delivery_shape)
+        expected = (10, 1, 10)
+        expected_error = f"command_{delivery_shape}"
+    else:
+        _result(proc, "primary", 10, 1)
+        _lifecycle(proc, "primary", "completed")
+        _lifecycle(proc, "gated", "future_state")
+        expected = (10, 1, 10)
+        expected_error = "command_lifecycle_protocol"
 
     completed = await _next(stream, "turn.completed")
     assert completed.native_turn_id == "primary"
     assert tuple(completed.data[key] for key in (
         "input_tokens", "output_tokens", "context_tokens"
     )) == expected
+    assert completed.data.get("error_code", "") == expected_error
     await driver.close()
 
 
@@ -151,7 +169,25 @@ async def test_gated_command_without_queue_ack_is_not_accepted():
     proc, driver, stream, started = await _open_driver(ack_timeout=0.01)
     receipt = await driver.steer_turn(started.turn_ref, TurnInput("new inbox"))
     assert not receipt.accepted and receipt.delivery == "queue_ack_timeout"
+    _result(proc, "orphaned-gated-command", 99, 99)
     _result(proc, "primary", 0, 0)
     _lifecycle(proc, "primary", "completed")
-    await _next(stream, "turn.completed")
+    completed = await _next(stream, "turn.completed")
+    assert completed.data["input_tokens"] == 0
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_unknown_lifecycle_dialect_does_not_enable_gated_delivery():
+    proc = _Process()
+    proc.feed({
+        "type": "system",
+        "subtype": "init",
+        "session_id": "claude-v2",
+        "capabilities": ["msg_lifecycle_v2"],
+    })
+    driver = ClaudeCodeCliDriver(lambda _args, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+    await _next(driver.events(), "session.opened")
+    assert driver.current_capabilities().steer == "none"
     await driver.close()

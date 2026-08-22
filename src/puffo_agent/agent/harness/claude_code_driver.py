@@ -47,8 +47,10 @@ class _ContextUsageUnsupported(RuntimeError):
 
 
 _CONTEXT_USAGE_TIMEOUT_SECONDS = 2.0
+_INPUT_ACK_TIMEOUT_SECONDS = 2.0
 _MESSAGE_LIFECYCLE_V1 = "msg_lifecycle_v1"
-_COMMAND_TERMINAL_STATES = frozenset({"completed", "cancelled", "canceled"})
+_COMMAND_TERMINAL_STATES = frozenset({"completed", "cancelled", "discarded"})
+_COMMAND_LIFECYCLE_STATES = _COMMAND_TERMINAL_STATES | {"queued", "started"}
 
 
 def claude_capabilities(
@@ -85,13 +87,11 @@ class ClaudeCodeCliDriver(Driver):
         process_factory: Callable[..., Any] | None = None,
         *,
         executable_version: str = "",
-        replay_timeout: float = 30,
+        input_ack_timeout: float = _INPUT_ACK_TIMEOUT_SECONDS,
     ):
         self.process_factory = process_factory
         self.executable_version = executable_version
-        # Keep the established constructor parameter while using it for the
-        # only bounded input acknowledgement the current protocol requires.
-        self._input_ack_timeout = replay_timeout
+        self._input_ack_timeout = input_ack_timeout
         self._proc: Any = None
         self._reader: asyncio.Task | None = None
         self._stderr_reader: asyncio.Task | None = None
@@ -114,11 +114,10 @@ class ClaudeCodeCliDriver(Driver):
         self._owned_commands: set[str] = set()
         self._terminal_commands: set[str] = set()
         self._gated_command_id = ""
-        self._gated_ack: asyncio.Future[InputReceipt] | None = None
+        self._gated_ack: asyncio.Future[bool] | None = None
         self._result_input_tokens = 0
         self._result_output_tokens = 0
         self._result_context_tokens = 0
-        self._result_failed = False
         self._result_error_code = ""
         self._last_result_payload: dict[str, Any] | None = None
         self._output_block_counter = 0
@@ -209,7 +208,7 @@ class ClaudeCodeCliDriver(Driver):
             self._session_ref,
             self._native_session_id,
             self._resumed,
-            claude_capabilities(self._compact_advertised),
+            self.current_capabilities(),
             ProtocolDiagnostics(
                 executable_version=self.executable_version,
                 schema_source="documented",
@@ -294,30 +293,43 @@ class ClaudeCodeCliDriver(Driver):
                 "content": [{"type": "text", "text": input.content}],
             },
         }
+
+        def receipt(accepted: bool, delivery: str) -> InputReceipt:
+            return InputReceipt(
+                accepted,
+                turn,
+                input.client_correlation_id,
+                delivery,
+            )
+
         try:
             await self._write(frame)
-            return await asyncio.wait_for(
+            accepted = await asyncio.wait_for(
                 asyncio.shield(ack),
                 timeout=self._input_ack_timeout,
             )
+            return receipt(
+                accepted,
+                "queued_native_command"
+                if accepted
+                else "turn_terminal_before_queue_ack",
+            )
         except asyncio.TimeoutError:
+            if ack.done() and not ack.cancelled() and ack.result():
+                return receipt(True, "queued_native_command")
             if self._gated_ack is ack:
                 self._drop_unacknowledged_gated_command(command_id)
                 await self._maybe_complete_lifecycle_turn(frame)
-            return InputReceipt(
-                False,
-                turn,
-                input.client_correlation_id,
-                "queue_ack_timeout",
-            )
-        except BaseException:
+            return receipt(False, "queue_ack_timeout")
+        except asyncio.CancelledError:
+            # The write may already have crossed the process boundary. Keep
+            # ownership until lifecycle or process teardown settles it.
+            raise
+        except Exception:
             if self._gated_ack is ack:
                 self._drop_unacknowledged_gated_command(command_id)
                 await self._maybe_complete_lifecycle_turn(frame)
             raise
-        finally:
-            if self._gated_ack is ack and ack.done():
-                self._gated_ack = None
 
     async def cancel_turn(self, turn: TurnRef):
         return UnsupportedCapability("cancel")
@@ -447,8 +459,7 @@ class ClaudeCodeCliDriver(Driver):
         self._fail_pending_futures("Claude Code CLI closed")
         self._active = TurnRef("")
         self._active_native_turn_id = ""
-        self._pending_content = ""
-        self._pending_uuid = ""
+        self._message_lifecycle_v1 = False
         self._reset_turn_tracking()
         self._tool_calls.clear()
         await self._events.put(None)
@@ -466,7 +477,6 @@ class ClaudeCodeCliDriver(Driver):
         self._tool_calls.clear()
         self._compact_advertised = False
         self._message_lifecycle_v1 = False
-        self._reset_turn_tracking()
         self._resumed = False
         self._init_commands = ()
         self._context_usage_supported = None
@@ -484,13 +494,12 @@ class ClaudeCodeCliDriver(Driver):
     def _fail_pending_futures(self, message: str) -> None:
         for future in (
             self._init,
-            self._gated_ack,
             *self._context_requests.values(),
         ):
             if future is not None and not future.done():
                 future.set_exception(RuntimeError(message))
         self._init = None
-        self._gated_ack = None
+        self._settle_gated_ack(False)
         self._clear_pending_replay()
         self._context_requests.clear()
 
@@ -503,28 +512,26 @@ class ClaudeCodeCliDriver(Driver):
         self._pending_uuid = ""
 
     def _reset_turn_tracking(self, primary_command_id: str = "") -> None:
-        pending = self._gated_ack
-        if pending is not None and not pending.done():
-            pending.cancel()
-        self._gated_ack = None
+        self._settle_gated_ack(False)
         self._gated_command_id = ""
         self._owned_commands = {primary_command_id} if primary_command_id else set()
         self._terminal_commands.clear()
         self._result_input_tokens = 0
         self._result_output_tokens = 0
         self._result_context_tokens = 0
-        self._result_failed = False
         self._result_error_code = ""
         self._last_result_payload = None
 
-    def _drop_unacknowledged_gated_command(self, command_id: str) -> None:
-        pending = self._gated_ack
+    def _settle_gated_ack(self, accepted: bool) -> None:
+        pending, self._gated_ack = self._gated_ack, None
         if pending is not None and not pending.done():
-            pending.cancel()
+            pending.set_result(accepted)
+
+    def _drop_unacknowledged_gated_command(self, command_id: str) -> None:
+        self._settle_gated_ack(False)
         self._owned_commands.discard(command_id)
         self._terminal_commands.discard(command_id)
         self._gated_command_id = ""
-        self._gated_ack = None
 
     async def _write(self, frame: dict[str, Any]) -> None:
         encoded = (
@@ -551,13 +558,7 @@ class ClaudeCodeCliDriver(Driver):
                     continue
                 await self._handle(frame)
         finally:
-            self._clear_pending_replay()
-            pending = self._gated_ack
-            if pending is not None and not pending.done():
-                pending.set_exception(RuntimeError("Claude exited before input ack"))
-            self._gated_ack = None
-            if self._init is not None and not self._init.done():
-                self._init.set_exception(RuntimeError("Claude exited before init"))
+            self._fail_pending_futures("Claude Code CLI exited")
             if not self._closed:
                 await self._log_unexpected_exit()
                 await self._emit(
@@ -590,8 +591,9 @@ class ClaudeCodeCliDriver(Driver):
         if type_ == "control_response":
             self._handle_control_response(frame)
             return
-        if type_ == "command_lifecycle":
-            await self._handle_command_lifecycle(frame)
+        if type_ == "command_lifecycle" and await self._handle_command_lifecycle(
+            frame
+        ):
             return
         if type_ == "system" and subtype == "init":
             await self._complete_init(frame)
@@ -685,33 +687,31 @@ class ClaudeCodeCliDriver(Driver):
             native_payload=frame,
         )
 
-    async def _handle_command_lifecycle(self, frame: dict[str, Any]) -> None:
+    async def _handle_command_lifecycle(self, frame: dict[str, Any]) -> bool:
         command_id = str(frame.get("command_uuid") or "")
         state = str(frame.get("state") or "")
         if not command_id or command_id not in self._owned_commands:
+            return False
+        if state not in _COMMAND_LIFECYCLE_STATES:
+            self._terminal_commands.add(command_id)
+            if not self._result_error_code:
+                self._result_error_code = "command_lifecycle_protocol"
             await self._emit(
-                HarnessEventType.SESSION_UPDATED,
-                data={"record_type": "command_lifecycle"},
+                HarnessEventType.RUNTIME_WARNING,
+                turn_ref=self._active,
+                data={"code": "unknown_command_lifecycle_state", "state": state},
                 native_payload=frame,
             )
-            return
+            await self._maybe_complete_lifecycle_turn(frame)
+            return True
         if state == "queued" and command_id == self._gated_command_id:
-            pending = self._gated_ack
-            if pending is not None and not pending.done():
-                pending.set_result(
-                    InputReceipt(
-                        True,
-                        self._active,
-                        command_id,
-                        "queued_native_command",
-                    )
-                )
+            self._settle_gated_ack(True)
         if state in _COMMAND_TERMINAL_STATES:
             self._terminal_commands.add(command_id)
-            if state != "completed":
-                self._result_failed = True
+            if state != "completed" and not self._result_error_code:
                 self._result_error_code = f"command_{state}"
             await self._maybe_complete_lifecycle_turn(frame)
+        return True
 
     async def _complete_replay(self, frame: dict[str, Any]) -> None:
         pending = self._pending_replay
@@ -829,10 +829,20 @@ class ClaudeCodeCliDriver(Driver):
                 native_payload=frame,
             )
             return
-        self._record_result(frame, subtype)
         if self._message_lifecycle_v1:
-            await self._maybe_complete_lifecycle_turn(frame)
+            command_id = str(frame.get("user_message_uuid") or "")
+            if command_id not in self._owned_commands:
+                await self._emit(
+                    HarnessEventType.SESSION_UPDATED,
+                    data={"record_type": "result"},
+                    native_payload=frame,
+                )
+                return
+            # Lifecycle v1 emits each result before its terminal record; the
+            # terminal record remains the sole turn-completion authority.
+            self._record_result(frame, subtype)
             return
+        self._record_result(frame, subtype)
         await self._finish_turn(frame)
 
     def _record_result(self, frame: dict[str, Any], subtype: str) -> None:
@@ -847,7 +857,6 @@ class ClaudeCodeCliDriver(Driver):
         )
         self._last_result_payload = frame
         if subtype not in {"success", ""}:
-            self._result_failed = True
             if not self._result_error_code:
                 self._result_error_code = _result_error_code(frame, subtype)
 
@@ -856,14 +865,13 @@ class ClaudeCodeCliDriver(Driver):
     ) -> None:
         if (
             not self._active.value
-            or not self._owned_commands
             or not self._owned_commands.issubset(self._terminal_commands)
         ):
             return
         await self._finish_turn(self._last_result_payload or native_payload)
 
     async def _finish_turn(self, native_payload: dict[str, Any]) -> None:
-        outcome = "failed" if self._result_failed else "succeeded"
+        outcome = "failed" if self._result_error_code else "succeeded"
         data: dict[str, Any] = {
             "outcome": outcome,
             "input_tokens": self._result_input_tokens,
@@ -871,7 +879,7 @@ class ClaudeCodeCliDriver(Driver):
             "context_tokens": self._result_context_tokens,
         }
         if outcome == "failed":
-            data["error_code"] = self._result_error_code or "provider_error"
+            data["error_code"] = self._result_error_code
         await self._emit(
             HarnessEventType.TURN_COMPLETED,
             turn_ref=self._active,
