@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 
 from ..agent.send_coordinator import SemanticSendRequest
 from .puffo_core_tools import _dispatch_semantic_send
+from .core_inbox_tools import resolve_inbox_runtime
 from .tool_result_projection import (
     ToolResultSurface,
     project_send_result,
@@ -103,22 +104,15 @@ def register_message_tools(
         (``by_message_id`` names that sent message). Unknown ids come back
         as an explicit error listing exactly which ids failed.
         """
-        runtime = getattr(cfg, "inbox_runtime", None)
-        if runtime is None:
-            runtime = getattr(
-                getattr(cfg, "message_client", None),
-                "global_runtime",
-                None,
-            )
+        runtime = resolve_inbox_runtime(cfg)
         if runtime is not None:
             return await runtime.mark_covered(
                 covers=covers,
                 by_message_id=by_message_id,
                 note=note,
             )
-        rpc = getattr(cfg, "rpc_client", None)
-        if rpc is not None:
-            return await rpc.mark_covered(
+        if cfg.rpc_client is not None:
+            return await cfg.rpc_client.mark_covered(
                 covers=covers,
                 by_message_id=by_message_id,
                 note=note,

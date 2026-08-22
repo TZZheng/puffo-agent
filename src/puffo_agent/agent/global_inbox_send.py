@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, TYPE_CHECKING
 
 from ._logging import log_runtime_event
-from .global_inbox_types import SendAttemptState
+from .global_inbox_types import SendAttemptState, opt_str
 
 if TYPE_CHECKING:
     from .global_inbox_runtime import GlobalInboxRuntime
@@ -45,19 +45,38 @@ class TrackingSendDelegate:
         self.attempts = attempts
         self.runtime = runtime
 
-    def _build_trace(self, request: Any, kwargs: Mapping[str, Any]) -> SendTrace:
+    @staticmethod
+    def _request_field(
+        request: Any,
+        kwargs: Mapping[str, Any],
+        name: str,
+        default: Any = None,
+        *,
+        aliases: tuple[str, ...] = (),
+    ) -> Any:
+        """Read one field off the raw send input, whatever shape it arrived in."""
+        names = (name, *aliases)
         if isinstance(request, Mapping):
-            destination = str(request.get("destination", request.get("channel", "")))
-        elif request is not None:
-            destination = str(getattr(request, "destination", ""))
-        else:
-            destination = str(kwargs.get("destination", kwargs.get("channel", "")))
+            for key in names:
+                if key in request:
+                    return request[key]
+            return default
+        if request is not None:
+            return getattr(request, name, default)
+        for key in names:
+            if key in kwargs:
+                return kwargs[key]
+        return default
+
+    def _build_trace(self, request: Any, kwargs: Mapping[str, Any]) -> SendTrace:
+        destination = str(
+            self._request_field(
+                request, kwargs, "destination", "", aliases=("channel",)
+            )
+            or ""
+        )
         send_anyway = bool(
-            request.get("send_anyway", False)
-            if isinstance(request, Mapping)
-            else getattr(request, "send_anyway", False)
-            if request is not None
-            else kwargs.get("send_anyway", False)
+            self._request_field(request, kwargs, "send_anyway", False)
         )
         prior_held = any(
             prior_destination == destination and prior_state == "held"
@@ -291,6 +310,13 @@ class TrackingSendDelegate:
         runtime = trace.runtime
         if state == "held":
             runtime = self._stage_held_result(trace, result)
+            held_covers = self._request_field(request, kwargs, "covers", ()) or ()
+            if held_covers:
+                # A held send is not visible participation, so its covers
+                # are not recorded — but the caller must learn that its
+                # disposition claim did not land.
+                result["covers_recorded"] = []
+                result["covers_dropped"] = [str(item) for item in held_covers]
         if state == "sent":
             await self._record_covers(request, kwargs, result)
         self._log_result(trace, result, state, runtime)
@@ -303,12 +329,7 @@ class TrackingSendDelegate:
         result: dict[str, Any],
     ) -> None:
         """Persist a committed send's disposition claims; never fail the send."""
-        if isinstance(request, Mapping):
-            covers = request.get("covers", ()) or ()
-        elif request is not None:
-            covers = getattr(request, "covers", ()) or ()
-        else:
-            covers = kwargs.get("covers", ()) or ()
+        covers = self._request_field(request, kwargs, "covers", ()) or ()
         if not covers:
             return
         store = getattr(self.runtime, "store", None)
@@ -320,7 +341,7 @@ class TrackingSendDelegate:
                 covers,
                 source="send",
                 by_envelope_id=result.get("envelope_id"),
-                turn_id=str(getattr(active, "turn_id", "") or "") or None,
+                turn_id=opt_str(getattr(active, "turn_id", "")),
             )
         except Exception:
             logger.exception("recording send covers failed")

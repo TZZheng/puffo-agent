@@ -59,6 +59,7 @@ from .shared_content import INBOX_TURN_CUE
 
 logger = logging.getLogger(__name__)
 
+
 # A degrade is a transient provider incident, never a durable verdict about
 # pending Inbox work.  Recovery is a bounded backoff window the runtime re-arms
 # itself, so requeued rows stay retryable without depending on unrelated ingress.
@@ -69,6 +70,7 @@ from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
 from .global_inbox_admission import InboxAdmissionMixin
 from .global_inbox_types import (
+    opt_str,
     ActiveBoundaryAdapter,
     ActiveExactUnion,
     BaselineAdapter,
@@ -176,6 +178,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         reminder_scheduler: ReminderScheduler | None = None,
         status_lifecycle: TurnStatusLifecycle | None = None,
         channel_audience_loader: ChannelAudienceLoader | None = None,
+        covers_renotice_enabled: bool | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -215,10 +218,14 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         self.agent_id = agent_id
         # Uncovered-message redelivery is observed unconditionally but only
         # acted on behind this flag, so test environments can lead adoption.
-        self.covers_renotice_enabled = (
-            os.environ.get("PUFFO_COVERS_RENOTICE", "").strip().lower()
-            in {"1", "true", "yes", "on"}
-        )
+        # daemon.yml (``covers_renotice``) is the operator surface; the
+        # environment variable remains as an override for tests.
+        if covers_renotice_enabled is None:
+            covers_renotice_enabled = (
+                os.environ.get("PUFFO_COVERS_RENOTICE", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+        self.covers_renotice_enabled = bool(covers_renotice_enabled)
         # ``send_mode_keys`` is the existing runtime identity-alias set used
         # by the send-mode guard (normally the configured agent id and the
         # wire slug).  Inbox attribution is derived from the same identities;
@@ -294,8 +301,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 outcome = await self.store.add_message_covers(
                     covers,
                     source="reminder",
-                    note=str(result.get("reminder_id") or "") or None,
-                    turn_id=str(self.active.turn_id or "") or None,
+                    note=opt_str(result.get("reminder_id")),
+                    turn_id=opt_str(self.active.turn_id),
                 )
             except Exception:
                 logger.exception("recording reminder covers failed")
@@ -318,14 +325,15 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         reminder covers, unknown ids surface as an explicit error listing
         exactly which ids failed (known ids are still recorded).
         """
-        if not covers:
+        cleaned = [str(item) for item in covers if str(item or "").strip()]
+        if not cleaned:
             raise ValueError("covers must be a non-empty list of message ids")
         outcome = await self.store.add_message_covers(
-            covers,
+            cleaned,
             source="mark",
-            by_envelope_id=str(by_message_id or "") or None,
-            note=str(note or "") or None,
-            turn_id=str(self.active.turn_id or "") or None,
+            by_envelope_id=opt_str(by_message_id),
+            note=opt_str(note),
+            turn_id=opt_str(self.active.turn_id),
         )
         result: dict[str, object] = {
             "covers_recorded": list(outcome["recorded"]),

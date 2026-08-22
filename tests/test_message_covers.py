@@ -160,4 +160,49 @@ async def test_renotified_row_is_annotated_in_message_projection():
     assert "uncovered_redelivery=true" in format_message_group([row])
     plain_row = await store.get_message_by_envelope("plain")
     assert "uncovered_redelivery" not in format_message_group([plain_row])
+
+    # Once the redelivered row settles, history reads stop carrying the
+    # marker — it describes a live redelivery attempt, not row history.
+    await store.admit_messages(
+        ["redelivered"], turn_id="turn-2", provider_session_id="session-1",
+    )
+    settled = await store.get_message_by_envelope("redelivered")
+    assert "uncovered_redelivery=true" in format_message_group([settled])
+    await store.mark_processed(
+        ["redelivered"], turn_id="turn-2", provider_session_id="session-1",
+    )
+    settled = await store.get_message_by_envelope("redelivered")
+    assert settled.renotified
+    assert "uncovered_redelivery" not in format_message_group([settled])
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_cover_on_renoticed_pending_row_settles_it():
+    """mark_covered during the redelivery window terminates the redelivery."""
+    store = _temp_store()
+    await _seed(store, "asked", 1)
+    await store.admit_messages(
+        ["asked"], turn_id="turn-1", provider_session_id="session-1",
+    )
+    await store.complete_turn_with_renotice(
+        [], ["asked"], turn_id="turn-1", provider_session_id="session-1",
+    )
+    row = await store.get_message_by_envelope("asked")
+    assert row.processing_state is ProcessingState.PENDING
+    assert row.renotified
+
+    outcome = await store.add_message_covers(
+        ["asked"], source="mark", note="no reply needed",
+    )
+    assert outcome["recorded"] == ["asked"]
+    row = await store.get_message_by_envelope("asked")
+    assert row.processing_state is ProcessingState.PROCESSED
+
+    # A plain PENDING row (never redelivered) is NOT settled by a cover —
+    # it still gets its normal first presentation.
+    await _seed(store, "fresh", 2)
+    await store.add_message_covers(["fresh"], source="mark", note="x")
+    fresh = await store.get_message_by_envelope("fresh")
+    assert fresh.processing_state is ProcessingState.PENDING
     await store.close()

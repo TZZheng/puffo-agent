@@ -41,6 +41,16 @@ def _inbox_tool_arguments(*, target: str, cursor: str, limit: int) -> dict[str, 
     return arguments
 
 
+def resolve_inbox_runtime(cfg):
+    """The in-process runtime when wired, else None (callers fall back to RPC)."""
+    runtime = getattr(cfg, "inbox_runtime", None)
+    if runtime is None:
+        runtime = getattr(
+            getattr(cfg, "message_client", None), "global_runtime", None
+        )
+    return runtime
+
+
 def register_message_read_tools(
     mcp: FastMCP,
     cfg: Any,
@@ -69,11 +79,7 @@ def register_message_read_tools(
                 parse_inbox_target(target)
             except ValueError as exc:
                 raise RuntimeError(str(exc)) from None
-        runtime = getattr(cfg, "inbox_runtime", None)
-        if runtime is None:
-            runtime = getattr(
-                getattr(cfg, "message_client", None), "global_runtime", None
-            )
+        runtime = resolve_inbox_runtime(cfg)
         if runtime is not None:
             result = await runtime.read_inbox(
                 target=target,
@@ -146,13 +152,7 @@ def register_reminder_tools(mcp: FastMCP, cfg: Any) -> None:
         object. A due occurrence enters the ordinary durable Inbox and
         leaves any action decision to the model.
         """
-        runtime = getattr(cfg, "inbox_runtime", None)
-        if runtime is None:
-            runtime = getattr(
-                getattr(cfg, "message_client", None),
-                "global_runtime",
-                None,
-            )
+        runtime = resolve_inbox_runtime(cfg)
         if runtime is not None:
             return await runtime.create_reminder(
                 content=content,
@@ -175,13 +175,7 @@ def register_reminder_tools(mcp: FastMCP, cfg: Any) -> None:
         limit: int = 50,
     ) -> dict[str, Any]:
         """List durable reminders, including target, content, time, and state."""
-        runtime = getattr(cfg, "inbox_runtime", None)
-        if runtime is None:
-            runtime = getattr(
-                getattr(cfg, "message_client", None),
-                "global_runtime",
-                None,
-            )
+        runtime = resolve_inbox_runtime(cfg)
         if runtime is not None:
             return await runtime.list_reminders(state=state, limit=limit)
         if cfg.rpc_client is not None:
@@ -191,13 +185,7 @@ def register_reminder_tools(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def cancel_reminder(reminder_id: str) -> dict[str, Any]:
         """Idempotently cancel a reminder whose delivery has not started."""
-        runtime = getattr(cfg, "inbox_runtime", None)
-        if runtime is None:
-            runtime = getattr(
-                getattr(cfg, "message_client", None),
-                "global_runtime",
-                None,
-            )
+        runtime = resolve_inbox_runtime(cfg)
         if runtime is not None:
             return await runtime.cancel_reminder(reminder_id=reminder_id)
         if cfg.rpc_client is not None:
@@ -220,13 +208,7 @@ def register_reminder_replace_tool(mcp: FastMCP, cfg: Any) -> None:
         the cancelled reminder and its scheduled replacement. Delivery that
         already started is never revoked.
         """
-        runtime = getattr(cfg, "inbox_runtime", None)
-        if runtime is None:
-            runtime = getattr(
-                getattr(cfg, "message_client", None),
-                "global_runtime",
-                None,
-            )
+        runtime = resolve_inbox_runtime(cfg)
         if runtime is not None:
             return await runtime.replace_reminder(
                 reminder_id=reminder_id,

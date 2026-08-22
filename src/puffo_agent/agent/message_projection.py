@@ -514,7 +514,13 @@ def format_message_row(
     if reply_count is not None:
         fields.append(f"reply_count={reply_count}")
     if bool(_value(message, "renotified", False)):
-        fields.append("uncovered_redelivery=true")
+        # The marker describes one live redelivery attempt, not permanent
+        # row history: once the row settles (PROCESSED), history reads must
+        # stop asking the model to settle it again.
+        state = _value(message, "processing_state", "")
+        state = getattr(state, "value", state)
+        if state in ("pending", "in_turn"):
+            fields.append("uncovered_redelivery=true")
     return f"[message {' '.join(fields)}]\n{_content_field(message_text(message))}"
 
 

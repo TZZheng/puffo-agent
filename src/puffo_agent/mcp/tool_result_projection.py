@@ -182,6 +182,7 @@ def _send_result_header(
                 "status",
                 "covers_recorded",
                 "covers_unknown",
+                "covers_dropped",
             ),
         )
     )

@@ -729,6 +729,9 @@ class StandardWorkerRun:
                 http=client.http,
                 log=logger,
             ),
+            covers_renotice_enabled=(
+                True if worker.daemon_cfg.covers_renotice else None
+            ),
         )
         coordinator = SendCoordinator(
             slug=client.slug,

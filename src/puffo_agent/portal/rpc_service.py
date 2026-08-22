@@ -173,6 +173,37 @@ def _validate_model_visible_boundary(
     return None
 
 
+def _parse_covers(
+    body: dict, *, required: bool = False
+) -> tuple[list[str] | None, web.Response | None]:
+    """One wire contract for ``covers`` on every route that accepts it.
+
+    Returns ``(covers, None)`` on success or ``(None, error_response)``.
+    A present-but-wrong-typed value is always a 400 — including falsy
+    variants like ``false`` or ``""`` — because silently dropping a
+    disposition claim is worse than rejecting the call.
+    """
+    if "covers" not in body or body["covers"] is None:
+        if required:
+            return None, web.json_response(
+                {"error": "covers must be a non-empty list of message-id strings"},
+                status=400,
+            )
+        return [], None
+    covers = body["covers"]
+    if (
+        not isinstance(covers, list)
+        or not all(isinstance(item, str) and item for item in covers)
+        or (required and not covers)
+    ):
+        noun = "a non-empty list" if required else "a list"
+        return None, web.json_response(
+            {"error": f"covers must be {noun} of message-id strings"},
+            status=400,
+        )
+    return list(covers), None
+
+
 async def send_message_route(request: web.Request) -> web.Response:
     """Strict structured semantic send RPC.
 
@@ -212,13 +243,9 @@ async def send_message_route(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "send_anyway must be a boolean"}, status=400,
         )
-    if "covers" in body and (
-        not isinstance(body["covers"], list)
-        or not all(isinstance(item, str) for item in body["covers"])
-    ):
-        return web.json_response(
-            {"error": "covers must be a list of message-id strings"}, status=400,
-        )
+    _covers, covers_error = _parse_covers(body)
+    if covers_error is not None:
+        return covers_error
     if "paths" in body and "text" in body:
         return web.json_response(
             {"error": "send body must contain text or paths, not both"}, status=400,
@@ -403,13 +430,9 @@ async def create_reminder_route(request: web.Request) -> web.Response:
             },
             status=400,
         )
-    covers = body.get("covers", []) or []
-    if not isinstance(covers, list) or not all(
-        isinstance(item, str) for item in covers
-    ):
-        return web.json_response(
-            {"error": "covers must be a list of message-id strings"}, status=400,
-        )
+    covers, covers_error = _parse_covers(body)
+    if covers_error is not None:
+        return covers_error
     content, target, intended_at = (
         body["content"], body["target"], body["intended_at"],
     )
@@ -461,16 +484,9 @@ async def mark_covered_route(request: web.Request) -> web.Response:
             },
             status=400,
         )
-    covers = body.get("covers")
-    if (
-        not isinstance(covers, list)
-        or not covers
-        or not all(isinstance(item, str) and item for item in covers)
-    ):
-        return web.json_response(
-            {"error": "covers must be a non-empty list of message-id strings"},
-            status=400,
-        )
+    covers, covers_error = _parse_covers(body, required=True)
+    if covers_error is not None:
+        return covers_error
     for key in ("by_message_id", "note"):
         if key in body and not isinstance(body[key], str):
             return web.json_response(

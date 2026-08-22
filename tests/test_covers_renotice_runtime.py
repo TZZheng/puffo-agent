@@ -221,3 +221,45 @@ async def test_unidentified_sender_counts_as_human_for_renotice(
     row = await store.get_message_by_envelope("dm1")
     assert row.processing_state is ProcessingState.PENDING
     assert row.renotified
+
+
+@pytest.mark.asyncio
+async def test_held_send_reports_covers_dropped(tmp_path):
+    """Covers on a held send are not recorded, and the result says so."""
+    from puffo_agent.agent.global_inbox_runtime import (
+        SendAttemptState, TrackingSendDelegate,
+    )
+
+    class HoldingCoordinator:
+        async def send(self, request=None, **_kwargs):
+            return {"state": "held", "reason": "reconsideration"}
+
+    store = await make_store(tmp_path)
+    await receipt(store, "q1", 1, content=_human_content("question"))
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=Adapter(), run_turn=lambda _p: None,
+        workspace=tmp_path,
+    )
+    delegate = TrackingSendDelegate(
+        HoldingCoordinator(), SendAttemptState(), runtime=runtime,
+    )
+    result = await delegate.send(
+        {"destination": "ch-1", "text": "answer", "covers": ["q1"]}
+    )
+    assert result["state"] == "held"
+    assert result["covers_recorded"] == []
+    assert result["covers_dropped"] == ["q1"]
+    assert await store.get_covered_ids(["q1"]) == set()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_mark_covered_rejects_blank_ids(tmp_path):
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=Adapter(), run_turn=lambda _p: None,
+        workspace=tmp_path,
+    )
+    with pytest.raises(ValueError):
+        await runtime.mark_covered(covers=["", "  "])
+    await store.close()
