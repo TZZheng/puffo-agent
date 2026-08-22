@@ -10,6 +10,7 @@ from puffo_agent.agent.harness.claude_code_driver import (
     claude_capabilities,
 )
 from puffo_agent.agent.harness.driver import RuntimeSpec, TurnInput
+from puffo_agent.agent.harness.runtime_manager import RuntimeManager
 
 
 class _Stdin:
@@ -169,6 +170,7 @@ async def test_gated_command_without_queue_ack_is_not_accepted():
     proc, driver, stream, started = await _open_driver(ack_timeout=0.01)
     receipt = await driver.steer_turn(started.turn_ref, TurnInput("new inbox"))
     assert not receipt.accepted and receipt.delivery == "queue_ack_timeout"
+    assert not receipt.session_reusable
     _result(proc, "orphaned-gated-command", 99, 99)
     _result(proc, "primary", 0, 0)
     _lifecycle(proc, "primary", "completed")
@@ -178,16 +180,51 @@ async def test_gated_command_without_queue_ack_is_not_accepted():
 
 
 @pytest.mark.asyncio
-async def test_unknown_lifecycle_dialect_does_not_enable_gated_delivery():
+@pytest.mark.parametrize(
+    "capabilities",
+    [["msg_lifecycle_v2"], ["msg_lifecycle_v1", "msg_lifecycle_v2"]],
+)
+async def test_unknown_lifecycle_dialect_does_not_enable_gated_delivery(
+    capabilities,
+):
     proc = _Process()
     proc.feed({
         "type": "system",
         "subtype": "init",
         "session_id": "claude-v2",
-        "capabilities": ["msg_lifecycle_v2"],
+        "capabilities": capabilities,
     })
     driver = ClaudeCodeCliDriver(lambda _args, _spec: proc)
     await driver.open(RuntimeSpec("/workspace"))
     await _next(driver.events(), "session.opened")
     assert driver.current_capabilities().steer == "none"
     await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_gated_receipt_retires_native_session():
+    proc = _Process()
+    proc.feed({
+        "type": "system",
+        "subtype": "init",
+        "session_id": "ambiguous-session",
+        "capabilities": ["msg_lifecycle_v1"],
+    })
+    driver = ClaudeCodeCliDriver(
+        lambda _args, _spec: proc,
+        input_ack_timeout=0.01,
+    )
+    manager = RuntimeManager(driver, RuntimeSpec("/workspace"))
+    await manager.open()
+    started = await manager.start_turn(
+        TurnInput("first", client_correlation_id="primary")
+    )
+
+    receipt = await manager.steer_turn(started.turn_ref, TurnInput("new inbox"))
+
+    assert not receipt.accepted and not receipt.session_reusable
+    assert manager.active_turn_ref is None
+    assert manager.opened is None
+    assert manager.native_session_id == ""
+    assert proc.returncode == 0
+    await manager.close()

@@ -294,12 +294,18 @@ class ClaudeCodeCliDriver(Driver):
             },
         }
 
-        def receipt(accepted: bool, delivery: str) -> InputReceipt:
+        def receipt(
+            accepted: bool,
+            delivery: str,
+            *,
+            session_reusable: bool = True,
+        ) -> InputReceipt:
             return InputReceipt(
                 accepted,
                 turn,
                 input.client_correlation_id,
                 delivery,
+                session_reusable,
             )
 
         try:
@@ -320,7 +326,11 @@ class ClaudeCodeCliDriver(Driver):
             if self._gated_ack is ack:
                 self._drop_unacknowledged_gated_command(command_id)
                 await self._maybe_complete_lifecycle_turn(frame)
-            return receipt(False, "queue_ack_timeout")
+            return receipt(
+                False,
+                "queue_ack_timeout",
+                session_reusable=False,
+            )
         except asyncio.CancelledError:
             # The write may already have crossed the process boundary. Keep
             # ownership until lifecycle or process teardown settles it.
@@ -665,11 +675,13 @@ class ClaudeCodeCliDriver(Driver):
         commands = frame.get("slash_commands") or ()
         self._init_commands = tuple(str(value) for value in commands)
         capabilities = tuple(str(value) for value in frame.get("capabilities") or ())
-        self._message_lifecycle_v1 = _MESSAGE_LIFECYCLE_V1 in capabilities
         unknown_lifecycle = tuple(
             value
             for value in capabilities
             if value.startswith("msg_lifecycle_") and value != _MESSAGE_LIFECYCLE_V1
+        )
+        self._message_lifecycle_v1 = (
+            _MESSAGE_LIFECYCLE_V1 in capabilities and not unknown_lifecycle
         )
         if unknown_lifecycle:
             logger.warning(
