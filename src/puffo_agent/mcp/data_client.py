@@ -40,7 +40,10 @@ class StoredMessageDict:
 # DataClient and the in-process MessageStore (used as a duck-type
 # drop-in in tests) raise the same type — the MCP tool layer can
 # ``except DataNotFound`` regardless of which one it has.
-from ..agent.message_store import DataNotFound  # noqa: E402  (intentional placement)
+from ..agent.message_store import (  # noqa: E402  (intentional placement)
+    DataNotFound,
+    DataUnavailable,
+)
 from ..portal.local_service_auth import local_service_headers
 
 
@@ -157,13 +160,18 @@ class DataClient:
                         "data-service: get_channel_history %s -> %d %s",
                         path, resp.status, body,
                     )
-                    return []
+                    raise DataUnavailable(
+                        f"data service failed answering get_channel_history "
+                        f"(status {resp.status})"
+                    )
                 data = await resp.json()
                 msgs = data.get("messages") or []
                 return [_msg_from_dict(m) for m in msgs]
         except aiohttp.ClientError as exc:
             logger.warning("data-service: get_channel_history transport: %s", exc)
-            return []
+            raise DataUnavailable(
+                f"data service unreachable answering get_channel_history: {exc}"
+            ) from exc
 
     async def get_dm_history(
         self,
@@ -200,13 +208,18 @@ class DataClient:
                         "data-service: get_dm_history %s -> %d %s",
                         path, resp.status, body,
                     )
-                    return []
+                    raise DataUnavailable(
+                        f"data service failed answering get_dm_history "
+                        f"(status {resp.status})"
+                    )
                 data = await resp.json()
                 msgs = data.get("messages") or []
                 return [_msg_from_dict(m) for m in msgs]
         except aiohttp.ClientError as exc:
             logger.warning("data-service: get_dm_history transport: %s", exc)
-            return []
+            raise DataUnavailable(
+                f"data service unreachable answering get_dm_history: {exc}"
+            ) from exc
 
     async def get_channel_roots(
         self,
@@ -257,7 +270,10 @@ class DataClient:
                         "data-service: get_channel_roots %s -> %d %s",
                         path, resp.status, body,
                     )
-                    return []
+                    raise DataUnavailable(
+                        f"data service failed answering get_channel_roots "
+                        f"(status {resp.status})"
+                    )
                 data = await resp.json()
                 roots = data.get("roots") or []
                 return [
@@ -269,7 +285,9 @@ class DataClient:
                 ]
         except aiohttp.ClientError as exc:
             logger.warning("data-service: get_channel_roots transport: %s", exc)
-            return []
+            raise DataUnavailable(
+                f"data service unreachable answering get_channel_roots: {exc}"
+            ) from exc
 
     async def get_thread_messages(
         self,
@@ -314,13 +332,18 @@ class DataClient:
                         "data-service: get_thread_messages %s -> %d %s",
                         path, resp.status, body,
                     )
-                    return []
+                    raise DataUnavailable(
+                        f"data service failed answering get_thread_messages "
+                        f"(status {resp.status})"
+                    )
                 data = await resp.json()
                 msgs = data.get("messages") or []
                 return [_msg_from_dict(m) for m in msgs]
         except aiohttp.ClientError as exc:
             logger.warning("data-service: get_thread_messages transport: %s", exc)
-            return []
+            raise DataUnavailable(
+                f"data service unreachable answering get_thread_messages: {exc}"
+            ) from exc
 
     async def get_message_by_envelope(
         self, envelope_id: str,
@@ -343,7 +366,10 @@ class DataClient:
                         "data-service: get_message_by_envelope %s -> %d %s",
                         path, resp.status, body,
                     )
-                    return None
+                    raise DataUnavailable(
+                        f"data service failed answering get_message_by_envelope "
+                        f"(status {resp.status})"
+                    )
                 data = await resp.json()
                 m = data.get("message")
                 if not isinstance(m, dict):
@@ -353,7 +379,9 @@ class DataClient:
             logger.warning(
                 "data-service: get_message_by_envelope transport: %s", exc,
             )
-            return None
+            raise DataUnavailable(
+                f"data service unreachable answering get_message_by_envelope: {exc}"
+            ) from exc
 
     async def get_send_encryption(
         self, slug: str, thread_root_id: str | None,

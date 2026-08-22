@@ -61,6 +61,14 @@ class DataNotFound(Exception):
     """
 
 
+class DataUnavailable(RuntimeError):
+    """Raised when a read could not be answered at all — the data
+    service errored or was unreachable. Distinct from an empty
+    result: rendering a failure as "no messages" would hand the
+    model a confidently wrong fact with no error trace.
+    """
+
+
 class ReceiptDisposition(str, Enum):
     ELIGIBLE = "eligible"
     TERMINAL = "terminal"
