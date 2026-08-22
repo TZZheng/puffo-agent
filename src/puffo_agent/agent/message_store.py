@@ -20,6 +20,7 @@ from .reminder_store import ReminderStoreMixin
 PRIOR_CONTEXT_MAX_ITEMS = _models.PRIOR_CONTEXT_MAX_ITEMS
 PRIOR_CONTEXT_MAX_BYTES = _models.PRIOR_CONTEXT_MAX_BYTES
 DataNotFound = _models.DataNotFound
+DataUnavailable = _models.DataUnavailable
 ReceiptDisposition = _models.ReceiptDisposition
 ProcessingState = _models.ProcessingState
 ReceiptWriteStatus = _models.ReceiptWriteStatus
