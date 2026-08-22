@@ -856,7 +856,7 @@ class PuffoCoreMessageClient:
         *,
         expected_envelope_kind: str = "",
         expected_dm_peer: str = "",
-    ) -> Optional[str]:
+    ) -> tuple[Optional[str], bool]:
         """Resolve an inbound reply reference to its canonical thread root."""
         return await resolve_incoming_thread_root(
             store=self.store,

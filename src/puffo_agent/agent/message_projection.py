@@ -507,6 +507,8 @@ def format_message_row(
         fields.append(f"mentions={_json(mentions)}")
     if reply_count is not None:
         fields.append(f"reply_count={reply_count}")
+    if bool(_value(message, "thread_root_unverified", False)):
+        fields.append("thread_root_unverified=true")
     return f"[message {' '.join(fields)}]\n{_content_field(message_text(message))}"
 
 
