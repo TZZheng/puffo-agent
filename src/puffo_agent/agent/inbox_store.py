@@ -1137,6 +1137,18 @@ class InboxStoreMixin:
                 await db.commit()
             return {"recorded": recorded, "unknown": unknown}
 
+    async def count_unaddressed_pending(self) -> int:
+        """Count pending rows awaiting their one unaddressed redelivery."""
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            async with db.execute(
+                "SELECT COUNT(*) AS n FROM messages "
+                "WHERE processing_state = ? AND renotified = 1",
+                (ProcessingState.PENDING.value,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            return int(row["n"])
+
     async def get_covered_ids(self, message_ids: Iterable[str]) -> set[str]:
         """Return the subset of ``message_ids`` with any cover declaration."""
         ids = tuple(dict.fromkeys(str(item) for item in message_ids if item))

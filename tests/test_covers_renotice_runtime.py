@@ -19,8 +19,10 @@ class _ReadingRunner:
         self.adapter = adapter
         self.covers = tuple(covers)
         self.runtime = None
+        self.provider_inputs = []
 
-    async def __call__(self, _planned):
+    async def __call__(self, planned):
+        self.provider_inputs.append(planned.provider_input)
         await self.adapter.admit()
         await self.runtime.read_inbox(limit=50, tool_arguments={"limit": 50})
         if self.covers:
@@ -39,6 +41,7 @@ def _build_runtime(store, tmp_path, *, covers=()):
         workspace=tmp_path,
     )
     runner.runtime = runtime
+    runtime.test_runner = runner
     return runtime
 
 
@@ -77,6 +80,12 @@ async def test_uncovered_human_message_is_renoticed_exactly_once(
     assert await runtime.process_once()
     row = await store.get_message_by_envelope("h1")
     assert row.processing_state is ProcessingState.PROCESSED
+
+    # The first notice carried no unaddressed section; the redelivery
+    # notice announced the backlog in metadata before any read.
+    first, second = runtime.test_runner.provider_inputs
+    assert "[unaddressed" not in first
+    assert "[unaddressed context_version=1 message_count=1]" in second
     await store.close()
 
 

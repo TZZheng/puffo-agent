@@ -613,6 +613,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             ),
             latest_seq=latest_seq,
             read_tool="read_inbox",
+            unaddressed_message_count=(
+                await self.store.count_unaddressed_pending()
+            ),
         )
         provider_input = (
             "<global_inbox_notice>\n"
