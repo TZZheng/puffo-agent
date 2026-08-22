@@ -151,6 +151,15 @@ async def test_dm_root_arrival_from_other_conversation_wipes_claim():
 
 
 @pytest.mark.asyncio
+async def test_thread_read_works_without_the_root_row():
+    store = _temp_store()
+    await _receive(store, "reply-1", 1, root="ghost-root", root_unverified=True)
+    rows = await store.get_thread_messages("ghost-root")
+    assert [r.envelope_id for r in rows] == ["reply-1"]
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_verified_rows_are_untouched_by_arrivals():
     store = _temp_store()
     await _receive(store, "root-a", 1)

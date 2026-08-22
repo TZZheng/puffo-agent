@@ -1376,9 +1376,16 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         """
         if not root_id:
             raise DataNotFound("thread root not found: (empty)")
-        if not await self.has_message(root_id):
-            raise DataNotFound(f"thread root not found: {root_id}")
         db = await self._ensure_db()
+        if not await self.has_message(root_id):
+            # The root itself may not be locally readable (kept unverified
+            # on receipt); local replies claiming it still form a thread.
+            async with db.execute(
+                "SELECT 1 FROM messages WHERE thread_root_id = ? LIMIT 1",
+                (root_id,),
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    raise DataNotFound(f"thread root not found: {root_id}")
         since_resolved = await self._resolve_since_sent_at(since_envelope_id)
         before_resolved = await self._resolve_since_sent_at(before_envelope_id)
 
