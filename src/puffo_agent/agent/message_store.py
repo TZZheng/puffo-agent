@@ -196,6 +196,8 @@ CREATE INDEX IF NOT EXISTS idx_messages_pending_fifo
     ON messages (processing_state, server_seq, after_server_seq, local_ordinal);
 CREATE INDEX IF NOT EXISTS idx_messages_turn
     ON messages (processing_turn_id, processing_state);
+CREATE INDEX IF NOT EXISTS idx_messages_renotified_pending
+    ON messages (processing_state) WHERE renotified = 1;
 CREATE INDEX IF NOT EXISTS idx_messages_channel_pending
     ON messages (space_id, channel_id, processing_state, server_seq);
 

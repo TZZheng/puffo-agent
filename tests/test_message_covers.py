@@ -52,13 +52,13 @@ async def test_add_message_covers_partitions_known_and_unknown():
     outcome = await store.add_message_covers(
         ["m1", "m2", "ghost"], source="send", by_envelope_id="reply-1",
     )
-    assert outcome == {"recorded": ("m1", "m2"), "unknown": ("ghost",)}
+    assert outcome == {"recorded": ["m1", "m2"], "unknown": ["ghost"]}
     assert await store.get_covered_ids(["m1", "m2", "ghost"]) == {"m1", "m2"}
     # Duplicate declarations collapse instead of erroring.
     again = await store.add_message_covers(
         ["m1"], source="send", by_envelope_id="reply-1",
     )
-    assert again["recorded"] == ("m1",)
+    assert again["recorded"] == ["m1"]
     assert await store.get_covered_ids(["m1"]) == {"m1"}
     await store.close()
 
@@ -94,7 +94,9 @@ async def test_complete_turn_with_renotice_partitions_the_turn():
     assert renotice_row.processing_state is ProcessingState.PENDING
     assert renotice_row.renotified
     assert renotice_row.processing_turn_id is None
-    assert renotice_row.model_visible_at is None
+    # Visibility evidence survives renotice: the plaintext already crossed
+    # the provider boundary, so the row must not become a freshness blocker.
+    assert renotice_row.model_visible_at is not None
 
     # The renoticed row is deliverable again and completes normally.
     await store.admit_messages(

@@ -124,3 +124,100 @@ async def test_partial_coverage_renotices_only_the_uncovered_rows(
     assert forgotten.processing_state is ProcessingState.PENDING
     assert forgotten.renotified
     await store.close()
+
+
+class _ScriptedRunner:
+    """Run a scripted sequence of per-turn behaviors."""
+
+    def __init__(self, adapter, behaviors):
+        self.adapter = adapter
+        self.behaviors = list(behaviors)
+        self.runtime = None
+        self.reads = []
+
+    async def __call__(self, planned):
+        behavior = self.behaviors.pop(0) if self.behaviors else ("read", 50, ())
+        kind, limit, covers = behavior
+        await self.adapter.admit()
+        if kind == "defer":
+            return
+        page = await self.runtime.read_inbox(
+            limit=limit, tool_arguments={"limit": limit},
+        )
+        import re as _re
+        ids = []
+        for block in page["messages"]:
+            ids.extend(_re.findall(r'message_id="([^"]+)"', block))
+        self.reads.append(ids)
+        if covers:
+            await self.runtime.store.add_message_covers(
+                covers, source="send", by_envelope_id="reply-s",
+            )
+
+
+@pytest.mark.asyncio
+async def test_renotice_survives_contribution_from_earlier_generation(
+    tmp_path, monkeypatch,
+):
+    """A renoticed row mentioned by an *earlier* notice must still redeliver.
+
+    Message A is claimed by notice gen N and deferred unread. A later turn
+    reads A alongside newer message B (covering only B) while a third
+    pending message C stays unread — so pending never drains to zero and
+    nothing incidentally wipes the contributions table. A's stale
+    contribution from gen N must not filter its redelivery out of every
+    future notice for the session.
+    """
+    monkeypatch.setenv("PUFFO_COVERS_RENOTICE", "1")
+    store = await make_store(tmp_path)
+    await receipt(store, "a", 1, content=_human_content("first question"))
+
+    # Turn 1 at the store level: the session claims the notice naming A,
+    # then defers without reading (finalize_empty_turn keeps the claim).
+    state, items = await store.get_notice_snapshot("provider-1")
+    assert [item.envelope_id for item in items] == ["a"]
+    await store.start_turn(
+        turn_id="turn-defer", provider_session_id="provider-1",
+        notice_generation=state.generation,
+        notice_message_ids=("a",),
+    )
+    await store.finalize_empty_turn(turn_id="turn-defer")
+
+    await receipt(store, "b", 2, content=_human_content("second question"))
+    await receipt(store, "c", 3, content=_human_content("third question"))
+    adapter = Adapter()
+    runner = _ScriptedRunner(
+        adapter, [("read", 2, ("b",)), ("read", 50, ())],
+    )
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=runner, workspace=tmp_path,
+    )
+    runner.runtime = runtime
+
+    # Turn 2: reads A+B (C stays on the back page), covers only B.
+    assert await runtime.process_once()
+    assert runner.reads[0] == ["a", "b"]
+    row = await store.get_message_by_envelope("a")
+    assert row.processing_state is ProcessingState.PENDING
+    assert row.renotified
+
+    # Turn 3: the same session must be woken again and redeliver A.
+    assert await runtime.process_once()
+    assert "a" in runner.reads[1]
+    row = await store.get_message_by_envelope("a")
+    assert row.processing_state is ProcessingState.PROCESSED
+
+
+@pytest.mark.asyncio
+async def test_unidentified_sender_counts_as_human_for_renotice(
+    tmp_path, monkeypatch,
+):
+    """A row with no sender classification is not exempt from reconciliation."""
+    monkeypatch.setenv("PUFFO_COVERS_RENOTICE", "1")
+    store = await make_store(tmp_path)
+    await receipt(store, "dm1", 1, content={"text": "hey, are you there?"})
+    runtime = _build_runtime(store, tmp_path)
+    assert await runtime.process_once()
+    row = await store.get_message_by_envelope("dm1")
+    assert row.processing_state is ProcessingState.PENDING
+    assert row.renotified
