@@ -155,7 +155,7 @@ async def test_renotified_row_is_annotated_in_message_projection():
         turn_id="turn-1", provider_session_id="session-1",
     )
     row = await store.get_message_by_envelope("redelivered")
-    assert "unaddressed_redelivery=true" in format_message_group([row])
+    assert "uncovered_redelivery=true" in format_message_group([row])
     plain_row = await store.get_message_by_envelope("plain")
-    assert "unaddressed_redelivery" not in format_message_group([plain_row])
+    assert "uncovered_redelivery" not in format_message_group([plain_row])
     await store.close()

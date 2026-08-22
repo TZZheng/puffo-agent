@@ -36,7 +36,7 @@ def register_message_tools(
         is an explicit held-send flag. ``covers`` lists the inbound
         message ids this send disposes of — declare them on every reply;
         messages left uncovered at turn end may be redelivered once as
-        unaddressed. Results are ``sent``, ``held``, or an error. See the
+        uncovered. Results are ``sent``, ``held``, or an error. See the
         managed ``send-message`` skill for routing, visibility, thread-root
         validation, and held-send guidance.
         """

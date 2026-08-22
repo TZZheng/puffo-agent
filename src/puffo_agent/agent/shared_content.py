@@ -92,7 +92,7 @@ reply handles in its `covers` argument (`send_message` and `create_reminder`
 both accept it), and use `mcp__puffo__mark_covered` for a message that needs
 no reply or to backfill a forgotten declaration. A turn that reads human
 messages and leaves some uncovered may get them redelivered once, marked
-`unaddressed_redelivery=true`; settle those immediately.
+`uncovered_redelivery=true`; settle those immediately.
 
 For multi-step work, keep people informed with concise, useful updates. When
 finished, report the outcome, including a blocker or negative result. Before

@@ -181,7 +181,7 @@ def format_inbox_notice(
     targets: Sequence[Mapping[str, Any]],
     latest_seq: int | None,
     read_tool: str,
-    unaddressed_message_count: int = 0,
+    uncovered_message_count: int = 0,
 ) -> str:
     """Render a content-free notice in the shared conversation grammar."""
     fields = [
@@ -195,10 +195,10 @@ def format_inbox_notice(
         f"latest_seq={latest_seq if latest_seq is not None else 'null'}",
     ]
     lines = [f"[inbox {' '.join(fields)}]"]
-    if unaddressed_message_count > 0:
+    if uncovered_message_count > 0:
         lines.append(
-            f"[unaddressed context_version={CONTEXT_VERSION} "
-            f"message_count={int(unaddressed_message_count)}]"
+            f"[uncovered context_version={CONTEXT_VERSION} "
+            f"message_count={int(uncovered_message_count)}]"
         )
     for row in targets:
         target_ref = str(row["target"])
@@ -514,7 +514,7 @@ def format_message_row(
     if reply_count is not None:
         fields.append(f"reply_count={reply_count}")
     if bool(_value(message, "renotified", False)):
-        fields.append("unaddressed_redelivery=true")
+        fields.append("uncovered_redelivery=true")
     return f"[message {' '.join(fields)}]\n{_content_field(message_text(message))}"
 
 

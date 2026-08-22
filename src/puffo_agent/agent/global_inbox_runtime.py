@@ -613,8 +613,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             ),
             latest_seq=latest_seq,
             read_tool="read_inbox",
-            unaddressed_message_count=(
-                await self.store.count_unaddressed_pending()
+            uncovered_message_count=(
+                await self.store.count_uncovered_pending()
             ),
         )
         provider_input = (
@@ -1311,7 +1311,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             return ()
         log_runtime_event(
             logger,
-            "turn.unaddressed_messages",
+            "turn.uncovered_messages",
             level=logging.WARNING,
             agent_id=self.agent_id,
             turn_id=planned.turn_id,

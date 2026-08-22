@@ -375,7 +375,7 @@ class StoredMessage:
     processed_at: int | None = None
     local_ordinal: int | None = None
     after_server_seq: int | None = None
-    # True once this row has been redelivered as an unaddressed message; a
+    # True once this row has been redelivered as an uncovered message; a
     # row is redelivered at most once, so this bit terminates the cycle.
     renotified: bool = False
 

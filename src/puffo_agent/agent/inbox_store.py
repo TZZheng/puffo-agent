@@ -1137,8 +1137,8 @@ class InboxStoreMixin:
                 await db.commit()
             return {"recorded": recorded, "unknown": unknown}
 
-    async def count_unaddressed_pending(self) -> int:
-        """Count pending rows awaiting their one unaddressed redelivery."""
+    async def count_uncovered_pending(self) -> int:
+        """Count pending rows awaiting their one uncovered redelivery."""
         async with self._inbox_lock:
             db = await self._ensure_db()
             async with db.execute(

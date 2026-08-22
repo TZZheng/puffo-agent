@@ -81,11 +81,11 @@ async def test_uncovered_human_message_is_renoticed_exactly_once(
     row = await store.get_message_by_envelope("h1")
     assert row.processing_state is ProcessingState.PROCESSED
 
-    # The first notice carried no unaddressed section; the redelivery
+    # The first notice carried no uncovered section; the redelivery
     # notice announced the backlog in metadata before any read.
     first, second = runtime.test_runner.provider_inputs
-    assert "[unaddressed" not in first
-    assert "[unaddressed context_version=1 message_count=1]" in second
+    assert "[uncovered" not in first
+    assert "[uncovered context_version=1 message_count=1]" in second
     await store.close()
 
 
