@@ -160,6 +160,25 @@ async def test_thread_read_works_without_the_root_row():
 
 
 @pytest.mark.asyncio
+async def test_inbound_preserved_root_is_replyable_outbound():
+    """End-to-end flow closure: receive a reply whose root is locally
+    unknown (kept unverified), then resolve an outbound reply into the
+    same thread — it must keep the claimed root, not degrade to a
+    channel-level send."""
+    from puffo_agent.mcp.puffo_core_tools import _resolve_outgoing_root
+
+    store = _temp_store()
+    await _receive(store, "reply-1", 1, root="missing-root",
+                   root_unverified=True)
+    resolved, note = await _resolve_outgoing_root(
+        "missing-root", store, self_slug="agent-0001",
+        channel_id="ch_1", space_id="sp_1", dm_peer=None,
+    )
+    assert (resolved, note) == ("missing-root", "")
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_verified_rows_are_untouched_by_arrivals():
     store = _temp_store()
     await _receive(store, "root-a", 1)
