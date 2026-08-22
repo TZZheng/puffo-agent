@@ -1056,35 +1056,7 @@ class InboxStoreMixin:
                         "completion changed fewer rows than requested"
                     )
             if renotice:
-                placeholders = ",".join("?" for _ in renotice)
-                cursor = await db.execute(
-                    f"""UPDATE messages
-                        SET processing_state = ?, processing_turn_id = NULL,
-                            processed_at = NULL, renotified = 1
-                        WHERE envelope_id IN ({placeholders})
-                          AND processing_state = ? AND processing_turn_id = ?""",
-                    (
-                        ProcessingState.PENDING.value,
-                        *renotice,
-                        ProcessingState.IN_TURN.value,
-                        turn_id,
-                    ),
-                )
-                if cursor.rowcount != len(renotice):
-                    raise LifecycleConflict(
-                        "renotice changed fewer rows than requested"
-                    )
-                # A renoticed row may have been mentioned to the session by
-                # an *earlier* notice generation than the one this turn
-                # claimed; releasing only the latest delta would leave that
-                # contribution in place and filter the row out of every
-                # future notice for the session. Release by row, not by
-                # notice.
-                await db.execute(
-                    f"DELETE FROM inbox_notice_contributions "
-                    f"WHERE envelope_id IN ({placeholders})",
-                    renotice,
-                )
+                await self._renotice_rows_unlocked(db, renotice, turn_id)
             cursor = await db.execute(
                 "UPDATE turn_runs SET state = ?, completed_at = ? "
                 "WHERE turn_id = ? AND state = ?",
@@ -1105,6 +1077,42 @@ class InboxStoreMixin:
         run = await self._get_turn_run_unlocked(db, turn_id)
         assert run is not None
         return run
+
+    async def _renotice_rows_unlocked(
+        self,
+        db: aiosqlite.Connection,
+        renotice: tuple[str, ...],
+        turn_id: str,
+    ) -> None:
+        """Send uncovered rows back to PENDING with the one-shot bit set."""
+        placeholders = ",".join("?" for _ in renotice)
+        cursor = await db.execute(
+            f"""UPDATE messages
+                SET processing_state = ?, processing_turn_id = NULL,
+                    processed_at = NULL, renotified = 1
+                WHERE envelope_id IN ({placeholders})
+                  AND processing_state = ? AND processing_turn_id = ?""",
+            (
+                ProcessingState.PENDING.value,
+                *renotice,
+                ProcessingState.IN_TURN.value,
+                turn_id,
+            ),
+        )
+        if cursor.rowcount != len(renotice):
+            raise LifecycleConflict(
+                "renotice changed fewer rows than requested"
+            )
+        # A renoticed row may have been mentioned to the session by an
+        # *earlier* notice generation than the one this turn claimed;
+        # releasing only the latest delta would leave that contribution in
+        # place and filter the row out of every future notice for the
+        # session. Release by row, not by notice.
+        await db.execute(
+            f"DELETE FROM inbox_notice_contributions "
+            f"WHERE envelope_id IN ({placeholders})",
+            renotice,
+        )
 
     async def requeue_messages(
         self,

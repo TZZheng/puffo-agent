@@ -91,6 +91,10 @@ def register_message_tools(
             surface=result_surface,
         )
 
+    _register_mark_covered(mcp, cfg)
+
+
+def _register_mark_covered(mcp: FastMCP, cfg: Any) -> None:
     @mcp.tool()
     async def mark_covered(
         covers: list[str],
