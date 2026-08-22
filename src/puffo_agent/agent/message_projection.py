@@ -521,6 +521,8 @@ def format_message_row(
         state = getattr(state, "value", state)
         if state in ("pending", "in_turn"):
             fields.append("uncovered_redelivery=true")
+    if bool(_value(message, "thread_root_unverified", False)):
+        fields.append("thread_root_unverified=true")
     return f"[message {' '.join(fields)}]\n{_content_field(message_text(message))}"
 
 

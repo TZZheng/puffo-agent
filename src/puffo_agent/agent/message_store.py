@@ -20,6 +20,7 @@ from .reminder_store import ReminderStoreMixin
 PRIOR_CONTEXT_MAX_ITEMS = _models.PRIOR_CONTEXT_MAX_ITEMS
 PRIOR_CONTEXT_MAX_BYTES = _models.PRIOR_CONTEXT_MAX_BYTES
 DataNotFound = _models.DataNotFound
+DataUnavailable = _models.DataUnavailable
 ReceiptDisposition = _models.ReceiptDisposition
 ProcessingState = _models.ProcessingState
 ReceiptWriteStatus = _models.ReceiptWriteStatus
@@ -124,6 +125,7 @@ CREATE TABLE IF NOT EXISTS messages (
     received_at INTEGER NOT NULL,
     thread_root_id TEXT,
     reply_to_id TEXT,
+    thread_root_unverified INTEGER NOT NULL DEFAULT 0,
     is_encrypted INTEGER NOT NULL DEFAULT 1
 );
 
@@ -370,6 +372,9 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
                             "model_visible_at": "model_visible_at INTEGER",
                             "processed_at": "processed_at INTEGER",
                             "local_ordinal": "local_ordinal INTEGER",
+                            "thread_root_unverified": (
+                                "thread_root_unverified INTEGER NOT NULL DEFAULT 0"
+                            ),
                             "after_server_seq": "after_server_seq INTEGER",
                             "renotified": "renotified INTEGER NOT NULL DEFAULT 0",
                         }
@@ -528,6 +533,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             received_at if received_at is not None else _now_ms(),
             value("thread_root_id"),
             value("reply_to_id"),
+            1 if value("thread_root_unverified", False) else 0,
             1 if value("is_encrypted", True) else 0,
         )
 
@@ -896,9 +902,10 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             """INSERT INTO messages
                (envelope_id, envelope_kind, sender_slug, channel_id, space_id,
                 recipient_slug, content_type, content, sent_at, received_at,
-                thread_root_id, reply_to_id, is_encrypted, receipt_disposition,
+                thread_root_id, reply_to_id, thread_root_unverified,
+                is_encrypted, receipt_disposition,
                 receipt_reason, processing_state, local_ordinal, after_server_seq)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             values
             + (
                 ReceiptDisposition.LOCAL_RUNTIME.value,
@@ -1390,9 +1397,16 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
         """
         if not root_id:
             raise DataNotFound("thread root not found: (empty)")
-        if not await self.has_message(root_id):
-            raise DataNotFound(f"thread root not found: {root_id}")
         db = await self._ensure_db()
+        if not await self.has_message(root_id):
+            # The root itself may not be locally readable (kept unverified
+            # on receipt); local replies claiming it still form a thread.
+            async with db.execute(
+                "SELECT 1 FROM messages WHERE thread_root_id = ? LIMIT 1",
+                (root_id,),
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    raise DataNotFound(f"thread root not found: {root_id}")
         since_resolved = await self._resolve_since_sent_at(since_envelope_id)
         before_resolved = await self._resolve_since_sent_at(before_envelope_id)
 
@@ -1667,6 +1681,11 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             received_at=row["received_at"],
             thread_root_id=row["thread_root_id"],
             reply_to_id=row["reply_to_id"],
+            thread_root_unverified=bool(
+                row["thread_root_unverified"]
+                if "thread_root_unverified" in row.keys()
+                else 0
+            ),
             is_encrypted=bool(row["is_encrypted"]),
             server_seq=row["server_seq"],
             receipt_disposition=(

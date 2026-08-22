@@ -658,6 +658,15 @@ async def _bridge_storage_row(client, payload: MessagePayload) -> dict[str, Any]
         if payload.sender_slug == client.slug
         else payload.sender_slug
     ) if payload.envelope_kind == "dm" else ""
+    thread_root_id, thread_root_unverified = (
+        await client._resolve_incoming_thread_root(
+            payload.thread_root_id,
+            payload.channel_id,
+            payload.space_id,
+            expected_envelope_kind=payload.envelope_kind,
+            expected_dm_peer=dm_peer,
+        )
+    )
     return {
         "envelope_id": payload.envelope_id,
         "envelope_kind": payload.envelope_kind,
@@ -668,13 +677,8 @@ async def _bridge_storage_row(client, payload: MessagePayload) -> dict[str, Any]
         "content_type": payload.content_type,
         "content": payload.content,
         "sent_at": payload.sent_at,
-        "thread_root_id": await client._resolve_incoming_thread_root(
-            payload.thread_root_id,
-            payload.channel_id,
-            payload.space_id,
-            expected_envelope_kind=payload.envelope_kind,
-            expected_dm_peer=dm_peer,
-        ),
+        "thread_root_id": thread_root_id,
+        "thread_root_unverified": thread_root_unverified,
         "reply_to_id": await client._validate_incoming_parent_id(
             payload.reply_to_id,
             payload.channel_id,

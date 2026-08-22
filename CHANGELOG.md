@@ -6,6 +6,25 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a23] - 2026-08-22
+
+> Staging candidate removing the flat 30-minute turn ceiling so long tasks
+> are never killed while still producing output.
+
+### Fixed
+
+- **The turn timeout extends on activity instead of capping total wall-clock
+  time.** `task_timeout_seconds` (default 1800s) was enforced as a hard cap on
+  the whole provider turn, silently truncating long tasks that were still
+  actively working — the canned timeout reply was dropped by the no-send
+  guard, the in-turn messages were marked processed, and nothing surfaced in
+  any failure stat. Every assistant delta and tool event now pushes the
+  deadline back out, so the timeout only fires after genuine end-to-end
+  silence — a runtime that is actually stuck (for example a resumed child
+  process that died before init), which is what the timeout existed to catch.
+  A task that keeps producing output can now run indefinitely; stopping it is
+  the operator's call, not the daemon's. (#273)
+
 ## [2.0.0a22] - 2026-08-21
 
 > Staging candidate fixing turn-unbound sends (background-task wakeups after

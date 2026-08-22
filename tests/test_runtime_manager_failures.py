@@ -561,7 +561,7 @@ async def test_turn_timeout_interrupts_abandons_and_retires_runtime():
     )
 
     assert result.metadata["runtime_turn_timeout"] is True
-    assert result.reply == "Task exceeded the 0.01 second timeout."
+    assert result.reply == "Task produced no activity for 0.01 second and was stopped."
     assert driver.cancel_calls == 1
     assert driver.close_calls == 1
     assert manager.active_turn_ref is None
@@ -569,6 +569,43 @@ async def test_turn_timeout_interrupts_abandons_and_retires_runtime():
     terminal = persisted[-1]
     assert str(terminal.type).endswith("TURN_ABANDONED")
     assert terminal.data["error_code"] == "turn_timeout"
+
+
+@pytest.mark.asyncio
+async def test_turn_timeout_extends_on_activity_and_never_fires():
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=0.05),
+        driver_name="claude-code",
+    )
+    running = asyncio.create_task(
+        RuntimeManagerAdapter(manager).run_turn(_context())
+    )
+    await driver.started.wait()
+
+    # Three gaps, each shorter than the timeout but summing to well over
+    # it -- would time out if activity didn't keep pushing the deadline out.
+    for _ in range(3):
+        await asyncio.sleep(0.03)
+        await driver.queue.put(HarnessEvent(
+            type="turn.tool_started",
+            driver="claude-code",
+            session_ref=SessionRef(manager.native_session_id),
+            turn_ref=driver.turn,
+            data={},
+        ))
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="claude-code",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        data={"outcome": "succeeded"},
+    ))
+
+    result = await asyncio.wait_for(running, timeout=2)
+    assert "runtime_turn_timeout" not in result.metadata
+    await manager.close()
 
 
 @pytest.mark.asyncio

@@ -305,12 +305,14 @@ class InboundReceiptHandler:
             if payload.sender_slug == self.client.slug
             else payload.sender_slug
         ) if payload.envelope_kind == "dm" else ""
-        thread_root_id = await self.client._resolve_incoming_thread_root(
-            payload.thread_root_id,
-            payload.channel_id,
-            payload.space_id,
-            expected_envelope_kind=payload.envelope_kind,
-            expected_dm_peer=dm_peer,
+        thread_root_id, thread_root_unverified = (
+            await self.client._resolve_incoming_thread_root(
+                payload.thread_root_id,
+                payload.channel_id,
+                payload.space_id,
+                expected_envelope_kind=payload.envelope_kind,
+                expected_dm_peer=dm_peer,
+            )
         )
         reply_to_id = await self.client._validate_incoming_parent_id(
             payload.reply_to_id,
@@ -331,6 +333,7 @@ class InboundReceiptHandler:
             "sent_at": payload.sent_at,
             "thread_root_id": thread_root_id,
             "reply_to_id": reply_to_id,
+            "thread_root_unverified": thread_root_unverified,
             "is_encrypted": not is_plaintext,
         }
         return _ReceiptCommitter(
