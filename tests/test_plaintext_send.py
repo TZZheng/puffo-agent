@@ -67,7 +67,7 @@ def test_wrong_key_fails_verification():
 # ── outbound DMs always encrypt (no turn/lifecycle input) ────────────
 
 
-def _make_client(devices=True):
+def _make_client(device_slugs=None):
     from puffo_agent.agent.puffo_core_client import PuffoCoreMessageClient
 
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
@@ -99,12 +99,14 @@ def _make_client(devices=True):
 
     async def _fetch(slugs):
         fetched.append(slugs)
-        if not devices:
-            return []
         from puffo_agent.crypto.message import RecipientDevice
         import os as _os
 
-        return [RecipientDevice(device_id="dev_1", kem_public_key=_os.urandom(32))]
+        return [
+            RecipientDevice(device_id=f"dev_{slug}", kem_public_key=_os.urandom(32))
+            for slug in slugs
+            if device_slugs is None or slug in device_slugs
+        ]
 
     client._fetch_device_keys = _fetch
     return client, posts, fetched
@@ -116,13 +118,17 @@ async def test_send_dm_always_encrypts():
     env = await client._send_dm("op-1", "hi", "")
     assert env["type"] == "message_envelope"
     assert posts[0][0] == "/messages"
-    assert fetched  # devices resolved for sealing
+    # The recipient's reachability is checked on its own devices first.
+    assert fetched[0] == ["op-1"]
 
 
 @pytest.mark.asyncio
-async def test_send_dm_without_devices_drops_rather_than_downgrades():
-    client, posts, fetched = _make_client(devices=False)
-    env = await client._send_dm("op-1", "hi", "")
-    assert env is None
-    assert posts == []  # nothing left the process unsealed
-    assert fetched  # device resolution was attempted
+async def test_send_dm_fails_when_recipient_has_no_devices():
+    # The sender's own devices must not mask an unreachable recipient:
+    # only agent-1 resolves devices here, so the send raises instead of
+    # posting an envelope sealed to the sender alone.
+    client, posts, fetched = _make_client(device_slugs={"agent-1"})
+    with pytest.raises(RuntimeError, match="op-1 has no encryption devices"):
+        await client._send_dm("op-1", "hi", "")
+    assert posts == []  # nothing left the process
+    assert fetched == [["op-1"]]  # failed before the sender fetch

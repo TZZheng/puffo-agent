@@ -146,7 +146,6 @@ async def _daemon_dm_path():
         is_visible_to_human=True,
         keystore=keystore,
         fetch_devices=fetch_devices,
-        log=MagicMock(),
     )
     return path
 

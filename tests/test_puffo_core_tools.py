@@ -949,7 +949,7 @@ async def test_send_message_agent_only_dm_stays_hidden_with_warning():
     so the agent can reconsider without being overridden."""
     cfg, http, ms = _setup()
     recipient_kem = KemKeyPair.generate()
-    http.responses["/certs/sync?slugs=agent-0001,alice-0001"] = {
+    http.responses["/certs/sync?slugs=alice-0001"] = {
         "entries": [
             {
                 "seq": 1, "kind": "device_cert", "slug": "agent-0001",
@@ -1172,7 +1172,7 @@ async def test_send_message_dm():
     recipient_kem = KemKeyPair.generate()
     sender_kem = KemKeyPair.generate()
     # DM fans to recipient + sender's own devices via /certs/sync.
-    http.responses["/certs/sync?slugs=agent-0001,alice-0001"] = {
+    http.responses["/certs/sync?slugs=alice-0001"] = {
         "entries": [
             {
                 "seq": 1, "kind": "device_cert", "slug": "agent-0001",

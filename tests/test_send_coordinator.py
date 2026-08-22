@@ -55,9 +55,6 @@ async def coordinator_fixture(*, baseline=0, active=None):
         async def get_message_by_envelope(self, _envelope_id):
             raise DataNotFound("not found")
 
-        async def get_send_encryption(self, _slug, _root):
-            return True
-
     data = Data()
     device = KemKeyPair.generate()
     for channel in ("ch_a", "ch_b"):
@@ -817,7 +814,7 @@ async def test_native_held_response_rejects_adversarial_matrix_before_recording(
 async def test_dm_route_has_no_freshness():
     coordinator, _, http = await coordinator_fixture()
     device = KemKeyPair.generate()
-    http.responses["/certs/sync?slugs=agent-0001,alice-1"] = {
+    http.responses["/certs/sync?slugs=alice-1"] = {
         "entries": [{
             "seq": 1, "kind": "device_cert",
             "cert": {
@@ -834,6 +831,32 @@ async def test_dm_route_has_no_freshness():
     path, body = [(p, b) for m, p, b in http.calls if m == "POST"][-1]
     assert path == "/messages"
     assert "freshness" not in body
+
+
+@pytest.mark.asyncio
+async def test_dm_fails_when_recipient_has_no_devices():
+    """The sender's own devices must not mask an unreachable DM peer."""
+    coordinator, _, http = await coordinator_fixture()
+    device = KemKeyPair.generate()
+    http.responses["/certs/sync?slugs=alice-1"] = {
+        "entries": [], "has_more": False,
+    }
+    http.responses["/certs/sync?slugs=agent-0001"] = {
+        "entries": [{
+            "seq": 1, "kind": "device_cert",
+            "cert": {
+                "device_id": "dev_sender",
+                "kem_public_key": base64url_encode(device.public_key_bytes()),
+            },
+        }],
+        "has_more": False,
+    }
+    result = await coordinator.send(SemanticSendRequest(
+        destination="@alice-1", text="hi", visibility_level="human",
+    ))
+    assert result["state"] == "failed"
+    assert "no encryption devices" in result["error"]
+    assert not [c for c in http.calls if c[0] == "POST" and c[1] == "/messages"]
 
 
 @pytest.mark.asyncio
@@ -881,7 +904,7 @@ async def test_legacy_dm_transports_preserve_optional_metadata(
     else:
         coordinator, _, http = await coordinator_fixture()
         device = KemKeyPair.generate()
-        http.responses["/certs/sync?slugs=agent-0001,alice-1"] = {
+        http.responses["/certs/sync?slugs=alice-1"] = {
             "entries": [{
                 "seq": 1, "kind": "device_cert",
                 "cert": {

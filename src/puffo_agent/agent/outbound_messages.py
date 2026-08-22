@@ -47,6 +47,17 @@ async def fetch_device_keys(*, http: Any, slugs: list[str]) -> list[RecipientDev
             return devices
 
 
+def _merge_devices(
+    *groups: list[RecipientDevice],
+) -> list[RecipientDevice]:
+    """Concatenate device lists, dropping duplicate device ids."""
+    merged: dict[str, RecipientDevice] = {}
+    for group in groups:
+        for device in group:
+            merged.setdefault(device.device_id, device)
+    return list(merged.values())
+
+
 def _recipient_device(
     cert: Mapping[str, Any],
     seen_ids: set[str],
@@ -89,10 +100,7 @@ async def send_direct_message(
             is_visible_to_human=True,
             keystore=keystore,
             fetch_devices=fetch_devices,
-            log=log,
         )
-        if envelope is None:
-            return None
         await http.post(path, envelope)
     except HttpError:
         log.exception("DM send to %s failed", recipient_slug)
@@ -127,10 +135,7 @@ async def send_native_fallback_dm(
         is_visible_to_human=visible,
         keystore=keystore,
         fetch_devices=fetch_devices,
-        log=log,
     )
-    if envelope is None:
-        return
     try:
         response = await http.post(path, envelope)
     except Exception:  # noqa: BLE001 - retain transport diagnostics before bubbling
@@ -174,19 +179,21 @@ async def _build_native_dm(
     is_visible_to_human: bool,
     keystore: Any,
     fetch_devices: DeviceFetcher,
-    log: Log,
-) -> tuple[dict[str, Any] | None, str]:
+) -> tuple[dict[str, Any], str]:
     session = keystore.load_session(slug)
     signing_key = Ed25519KeyPair.from_secret_bytes(
         decode_secret(session.subkey_secret_key)
     )
-    devices = await fetch_devices([slug, recipient_slug])
-    if not devices:
-        log.warning(
-            "no recipient devices for DM to %s - dropping",
-            recipient_slug,
+    # The recipient is fetched alone: a combined [sender, recipient] fetch
+    # cannot tell "recipient unreachable" from "reachable" once the sender's
+    # own devices make the list non-empty.
+    recipient_devices = await fetch_devices([recipient_slug])
+    if not recipient_devices:
+        raise RuntimeError(
+            f"recipient @{recipient_slug} has no encryption devices - "
+            f"DM not sent"
         )
-        return None, ""
+    devices = _merge_devices(recipient_devices, await fetch_devices([slug]))
 
     message = EncryptInput(
         envelope_kind="dm",

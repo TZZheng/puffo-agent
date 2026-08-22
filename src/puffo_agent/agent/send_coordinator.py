@@ -1249,9 +1249,24 @@ class SendCoordinator:
         else:
             content = request.text
             content_type = "text/plain"
-        devices = await _fetch_device_keys(self.http_client, recipient_slugs)
-        if not devices:
-            raise RuntimeError("no recipient devices found")
+        if kind == "dm":
+            # Fetch the peer alone: a combined [self, peer] fetch cannot
+            # tell "peer unreachable" from "reachable" once the sender's
+            # own devices make the list non-empty.
+            peer_devices = await _fetch_device_keys(self.http_client, [dm_peer])
+            if not peer_devices:
+                raise RuntimeError(
+                    f"recipient @{dm_peer} has no encryption devices"
+                )
+            self_devices = await _fetch_device_keys(self.http_client, [self.slug])
+            merged: dict[str, Any] = {}
+            for device in (*peer_devices, *self_devices):
+                merged.setdefault(device.device_id, device)
+            devices = list(merged.values())
+        else:
+            devices = await _fetch_device_keys(self.http_client, recipient_slugs)
+            if not devices:
+                raise RuntimeError("no recipient devices found")
         visible, visibility_note = await resolve_visibility(
             request.visibility_level,
             destination,

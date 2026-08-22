@@ -330,14 +330,22 @@ async def _send_dm_to_operator(
     signing_key = Ed25519KeyPair.from_secret_bytes(
         decode_secret(sess.subkey_secret_key)
     )
-    devices = await _fetch_device_keys(
+    # The operator is fetched alone so their reachability is checked on
+    # its own — the agent's own devices must not mask an operator with
+    # zero encryption devices.
+    operator_devices = await _fetch_device_keys(
         ctx.http_client,
-        [ctx.slug, ctx.operator_slug],
+        [ctx.operator_slug],
     )
-    if not devices:
+    if not operator_devices:
         raise RuntimeError(
             f"no recipient devices resolved for @{ctx.operator_slug}"
         )
+    self_devices = await _fetch_device_keys(ctx.http_client, [ctx.slug])
+    merged: dict[str, RecipientDevice] = {}
+    for device in (*operator_devices, *self_devices):
+        merged.setdefault(device.device_id, device)
+    devices = list(merged.values())
     inp = EncryptInput(
         envelope_kind="dm",
         sender_slug=ctx.slug,
