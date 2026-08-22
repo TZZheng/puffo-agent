@@ -120,7 +120,7 @@ def test_claude_lifecycle_capability_is_explicit():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "delivery_shape",
-    ["folded", "separate", "cancelled", "discarded", "unknown"],
+    ["folded", "separate", "discarded", "unknown"],
 )
 async def test_gated_commands_share_one_logical_turn(delivery_shape):
     proc, driver, stream, started = await _open_driver()
@@ -143,7 +143,7 @@ async def test_gated_commands_share_one_logical_turn(delivery_shape):
         _lifecycle(proc, "gated", "completed")
         expected = (30, 3, 20)
         expected_error = ""
-    elif delivery_shape in {"cancelled", "discarded"}:
+    elif delivery_shape == "discarded":
         _result(proc, "primary", 10, 1)
         _lifecycle(proc, "primary", "completed")
         _lifecycle(proc, "gated", delivery_shape)
@@ -176,6 +176,44 @@ async def test_gated_command_without_queue_ack_is_not_accepted():
     _lifecycle(proc, "primary", "completed")
     completed = await _next(stream, "turn.completed")
     assert completed.data["input_tokens"] == 0
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_process_exit_makes_pending_input_admission_ambiguous():
+    proc, driver, _stream, started = await _open_driver()
+    pending = asyncio.create_task(driver.steer_turn(
+        started.turn_ref,
+        TurnInput("new inbox", client_correlation_id="gated"),
+    ))
+    while len(proc.stdin.writes) < 2:
+        await asyncio.sleep(0)
+    proc.stdout.feed_eof()
+
+    receipt = await pending
+    assert not receipt.accepted and not receipt.session_reusable
+    assert receipt.delivery == "queue_ack_ambiguous"
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_gated_command_rejected_before_queue_keeps_session_usable():
+    proc, driver, stream, started = await _open_driver()
+    pending = asyncio.create_task(driver.steer_turn(
+        started.turn_ref,
+        TurnInput("new inbox", client_correlation_id="gated"),
+    ))
+    while len(proc.stdin.writes) < 2:
+        await asyncio.sleep(0)
+    _lifecycle(proc, "gated", "discarded")
+
+    receipt = await pending
+    assert not receipt.accepted and receipt.session_reusable
+    assert receipt.delivery == "native_command_rejected"
+    _result(proc, "primary", 10, 1)
+    _lifecycle(proc, "primary", "completed")
+    completed = await _next(stream, "turn.completed")
+    assert completed.data["outcome"] == "succeeded"
     await driver.close()
 
 

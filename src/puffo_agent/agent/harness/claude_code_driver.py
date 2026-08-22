@@ -9,6 +9,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
 
 from ..cli_bin import normalize_launch_argv
@@ -44,6 +45,12 @@ logger = logging.getLogger(__name__)
 
 class _ContextUsageUnsupported(RuntimeError):
     pass
+
+
+class _InputAckOutcome(str, Enum):
+    QUEUED = "queued"
+    REJECTED = "rejected"
+    AMBIGUOUS = "ambiguous"
 
 
 _CONTEXT_USAGE_TIMEOUT_SECONDS = 2.0
@@ -114,7 +121,7 @@ class ClaudeCodeCliDriver(Driver):
         self._owned_commands: set[str] = set()
         self._terminal_commands: set[str] = set()
         self._gated_command_id = ""
-        self._gated_ack: asyncio.Future[bool] | None = None
+        self._gated_ack: asyncio.Future[_InputAckOutcome] | None = None
         self._result_input_tokens = 0
         self._result_output_tokens = 0
         self._result_context_tokens = 0
@@ -308,21 +315,27 @@ class ClaudeCodeCliDriver(Driver):
                 session_reusable,
             )
 
+        def receipt_for(outcome: _InputAckOutcome) -> InputReceipt:
+            if outcome is _InputAckOutcome.QUEUED:
+                return receipt(True, "queued_native_command")
+            if outcome is _InputAckOutcome.REJECTED:
+                return receipt(False, "native_command_rejected")
+            return receipt(
+                False,
+                "queue_ack_ambiguous",
+                session_reusable=False,
+            )
+
         try:
             await self._write(frame)
-            accepted = await asyncio.wait_for(
+            outcome = await asyncio.wait_for(
                 asyncio.shield(ack),
                 timeout=self._input_ack_timeout,
             )
-            return receipt(
-                accepted,
-                "queued_native_command"
-                if accepted
-                else "turn_terminal_before_queue_ack",
-            )
+            return receipt_for(outcome)
         except asyncio.TimeoutError:
-            if ack.done() and not ack.cancelled() and ack.result():
-                return receipt(True, "queued_native_command")
+            if ack.done() and not ack.cancelled():
+                return receipt_for(ack.result())
             if self._gated_ack is ack:
                 self._drop_unacknowledged_gated_command(command_id)
                 await self._maybe_complete_lifecycle_turn(frame)
@@ -331,10 +344,6 @@ class ClaudeCodeCliDriver(Driver):
                 "queue_ack_timeout",
                 session_reusable=False,
             )
-        except asyncio.CancelledError:
-            # The write may already have crossed the process boundary. Keep
-            # ownership until lifecycle or process teardown settles it.
-            raise
         except Exception:
             if self._gated_ack is ack:
                 self._drop_unacknowledged_gated_command(command_id)
@@ -509,7 +518,7 @@ class ClaudeCodeCliDriver(Driver):
             if future is not None and not future.done():
                 future.set_exception(RuntimeError(message))
         self._init = None
-        self._settle_gated_ack(False)
+        self._settle_gated_ack(_InputAckOutcome.AMBIGUOUS)
         self._clear_pending_replay()
         self._context_requests.clear()
 
@@ -522,7 +531,7 @@ class ClaudeCodeCliDriver(Driver):
         self._pending_uuid = ""
 
     def _reset_turn_tracking(self, primary_command_id: str = "") -> None:
-        self._settle_gated_ack(False)
+        self._settle_gated_ack(_InputAckOutcome.REJECTED)
         self._gated_command_id = ""
         self._owned_commands = {primary_command_id} if primary_command_id else set()
         self._terminal_commands.clear()
@@ -532,13 +541,13 @@ class ClaudeCodeCliDriver(Driver):
         self._result_error_code = ""
         self._last_result_payload = None
 
-    def _settle_gated_ack(self, accepted: bool) -> None:
+    def _settle_gated_ack(self, outcome: _InputAckOutcome) -> None:
         pending, self._gated_ack = self._gated_ack, None
         if pending is not None and not pending.done():
-            pending.set_result(accepted)
+            pending.set_result(outcome)
 
     def _drop_unacknowledged_gated_command(self, command_id: str) -> None:
-        self._settle_gated_ack(False)
+        self._settle_gated_ack(_InputAckOutcome.REJECTED)
         self._owned_commands.discard(command_id)
         self._terminal_commands.discard(command_id)
         self._gated_command_id = ""
@@ -601,8 +610,10 @@ class ClaudeCodeCliDriver(Driver):
         if type_ == "control_response":
             self._handle_control_response(frame)
             return
-        if type_ == "command_lifecycle" and await self._handle_command_lifecycle(
-            frame
+        if (
+            type_ == "command_lifecycle"
+            and self._message_lifecycle_v1
+            and await self._handle_command_lifecycle(frame)
         ):
             return
         if type_ == "system" and subtype == "init":
@@ -705,6 +716,8 @@ class ClaudeCodeCliDriver(Driver):
         if not command_id or command_id not in self._owned_commands:
             return False
         if state not in _COMMAND_LIFECYCLE_STATES:
+            if command_id == self._gated_command_id and self._gated_ack is not None:
+                self._settle_gated_ack(_InputAckOutcome.AMBIGUOUS)
             self._terminal_commands.add(command_id)
             if not self._result_error_code:
                 self._result_error_code = "command_lifecycle_protocol"
@@ -717,8 +730,12 @@ class ClaudeCodeCliDriver(Driver):
             await self._maybe_complete_lifecycle_turn(frame)
             return True
         if state == "queued" and command_id == self._gated_command_id:
-            self._settle_gated_ack(True)
+            self._settle_gated_ack(_InputAckOutcome.QUEUED)
         if state in _COMMAND_TERMINAL_STATES:
+            if command_id == self._gated_command_id and self._gated_ack is not None:
+                self._drop_unacknowledged_gated_command(command_id)
+                await self._maybe_complete_lifecycle_turn(frame)
+                return True
             self._terminal_commands.add(command_id)
             if state != "completed" and not self._result_error_code:
                 self._result_error_code = f"command_{state}"
