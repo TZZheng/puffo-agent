@@ -621,6 +621,7 @@ async def send_message(
     root_id: str = "",
     visibility_level: str = "default",
     send_anyway: bool = False,
+    covers: list[str] | None = None,
 ) -> dict[str, Any]:
     """Dispatch a semantic model send through the worker-owned coordinator."""
     coordinator = ctx.send_coordinator
@@ -637,6 +638,7 @@ async def send_message(
         root_id=str(root_id or ""),
         visibility_level=str(visibility_level or "default"),
         send_anyway=send_anyway is True,
+        covers=tuple(covers or ()),
     )
     result = await coordinator.send(request)
     if not isinstance(result, dict):
@@ -717,6 +719,7 @@ async def create_reminder(
     content: str,
     target: str,
     intended_at: str,
+    covers: list[str] | None = None,
 ) -> dict[str, object]:
     """Resolve reminder creation against the warm worker's one Inbox runtime."""
     runtime = getattr(ctx.message_client, "global_runtime", None)
@@ -726,6 +729,25 @@ async def create_reminder(
         content=content,
         target=target,
         intended_at=intended_at,
+        covers=covers,
+    )
+
+
+async def mark_covered(
+    ctx: HostMcpContext,
+    *,
+    covers: list[str],
+    by_message_id: str = "",
+    note: str = "",
+) -> dict[str, object]:
+    """Resolve standalone cover marking against the warm worker's runtime."""
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global Inbox runtime is unavailable")
+    return await runtime.mark_covered(
+        covers=covers,
+        by_message_id=by_message_id,
+        note=note,
     )
 
 

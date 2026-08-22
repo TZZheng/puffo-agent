@@ -122,7 +122,7 @@ async def permission_request_route(request: web.Request) -> web.Response:
 
 _SEND_BODY_KEYS = frozenset({
     "channel", "text", "paths", "caption", "root_id",
-    "visibility_level", "send_anyway",
+    "visibility_level", "send_anyway", "covers",
 })
 
 _MODEL_VISIBLE_READ_BODY_KEYS = frozenset({
@@ -173,6 +173,37 @@ def _validate_model_visible_boundary(
     return None
 
 
+def _parse_covers(
+    body: dict, *, required: bool = False
+) -> tuple[list[str] | None, web.Response | None]:
+    """One wire contract for ``covers`` on every route that accepts it.
+
+    Returns ``(covers, None)`` on success or ``(None, error_response)``.
+    A present-but-wrong-typed value is always a 400 — including falsy
+    variants like ``false`` or ``""`` — because silently dropping a
+    disposition claim is worse than rejecting the call.
+    """
+    if "covers" not in body or body["covers"] is None:
+        if required:
+            return None, web.json_response(
+                {"error": "covers must be a non-empty list of message-id strings"},
+                status=400,
+            )
+        return [], None
+    covers = body["covers"]
+    if (
+        not isinstance(covers, list)
+        or not all(isinstance(item, str) and item for item in covers)
+        or (required and not covers)
+    ):
+        noun = "a non-empty list" if required else "a list"
+        return None, web.json_response(
+            {"error": f"covers must be {noun} of message-id strings"},
+            status=400,
+        )
+    return list(covers), None
+
+
 async def send_message_route(request: web.Request) -> web.Response:
     """Strict structured semantic send RPC.
 
@@ -212,6 +243,9 @@ async def send_message_route(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "send_anyway must be a boolean"}, status=400,
         )
+    _covers, covers_error = _parse_covers(body)
+    if covers_error is not None:
+        return covers_error
     if "paths" in body and "text" in body:
         return web.json_response(
             {"error": "send body must contain text or paths, not both"}, status=400,
@@ -233,6 +267,7 @@ async def send_message_route(request: web.Request) -> web.Response:
         "root_id": body.get("root_id", ""),
         "visibility_level": body.get("visibility_level", "default"),
         "send_anyway": body.get("send_anyway", False),
+        "covers": body.get("covers"),
     }
     try:
         result = await host_mcp_handler.send_message(ctx, **kwargs)
@@ -385,11 +420,19 @@ async def create_reminder_route(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "body must be JSON"}, status=400)
-    if not isinstance(body, dict) or set(body) != {"content", "target", "intended_at"}:
+    if not isinstance(body, dict) or (
+        set(body) - {"covers"} != {"content", "target", "intended_at"}
+    ):
         return web.json_response(
-            {"error": "create_reminder accepts only content, target, and intended_at"},
+            {
+                "error": "create_reminder accepts only content, target, "
+                "intended_at, and covers"
+            },
             status=400,
         )
+    covers, covers_error = _parse_covers(body)
+    if covers_error is not None:
+        return covers_error
     content, target, intended_at = (
         body["content"], body["target"], body["intended_at"],
     )
@@ -415,11 +458,54 @@ async def create_reminder_route(request: web.Request) -> web.Response:
             content=content,
             target=target,
             intended_at=canonical_intended_at,
+            covers=covers,
         )
     except (RuntimeError, ValueError) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
         logger.exception("rpc-service: create reminder failed")
+        return web.json_response({"error": f"handler raised: {exc}"}, status=500)
+    return web.json_response(result)
+
+
+async def mark_covered_route(request: web.Request) -> web.Response:
+    """Strict loopback route for standalone cover marking."""
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "body must be JSON"}, status=400)
+    if not isinstance(body, dict) or (
+        set(body) - {"by_message_id", "note"} != {"covers"}
+    ):
+        return web.json_response(
+            {
+                "error": "mark_covered accepts only covers, by_message_id, "
+                "and note"
+            },
+            status=400,
+        )
+    covers, covers_error = _parse_covers(body, required=True)
+    if covers_error is not None:
+        return covers_error
+    for key in ("by_message_id", "note"):
+        if key in body and not isinstance(body[key], str):
+            return web.json_response(
+                {"error": f"{key} must be a string"}, status=400,
+            )
+    ctx = _warm_context(request.match_info["agent_id"])
+    if ctx is None:
+        return web.json_response({"error": "no warm worker"}, status=503)
+    try:
+        result = await host_mcp_handler.mark_covered(
+            ctx,
+            covers=covers,
+            by_message_id=body.get("by_message_id", ""),
+            note=body.get("note", ""),
+        )
+    except (RuntimeError, ValueError) as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    except Exception as exc:
+        logger.exception("rpc-service: mark covered failed")
         return web.json_response({"error": f"handler raised: {exc}"}, status=500)
     return web.json_response(result)
 
@@ -569,6 +655,10 @@ def build_app(cfg: RpcServiceConfig) -> web.Application:
     app.router.add_post(
         "/v1/rpc/{agent_id}/create-reminder",
         create_reminder_route,
+    )
+    app.router.add_post(
+        "/v1/rpc/{agent_id}/mark-covered",
+        mark_covered_route,
     )
     app.router.add_post(
         "/v1/rpc/{agent_id}/list-reminders",

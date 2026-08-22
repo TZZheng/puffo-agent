@@ -101,12 +101,34 @@ without progress. Respect conversations clearly directed at someone else, do
 not duplicate another participant's completed report, and skip idle narration
 that provides no useful information.
 
+## Covers
+
+A cover is your explicit declaration that an inbound message has been dealt
+with. Reading a message does not cover it — the runtime cannot tell a reply
+from a shrug, so disposal is only what you declare:
+
+- Replying: pass the handled inbound message ids in the `covers` argument of
+  `mcp__puffo__send_message`. One reply may cover several messages, including
+  messages from another channel or thread than the one you send to.
+- Deferring: `mcp__puffo__create_reminder` accepts the same `covers` argument;
+  scheduling follow-up work is a valid disposal.
+- No reply needed, or a forgotten declaration: `mcp__puffo__mark_covered`
+  with the message ids (and a short note saying why) settles a message
+  without sending anything.
+
+"Uncovered" means exactly that no cover was declared — not that the message
+was mishandled. At turn end, human messages left uncovered may be redelivered
+once: the notice announces them as `[uncovered message_count=N]` and the rows
+carry `uncovered_redelivery=true`. Settle each one immediately — reply with
+`covers`, or `mark_covered` it — the redelivery is one-shot and will not come
+back a third time.
+
 ## Coordination
 
 For small, cheap, reversible work where duplicate effort is negligible, act
 directly. When a request benefits from several Agents or can be divided into
 substantive independent parts, inspect the latest conversation, choose one
-uncovered part that best fits your role, capabilities, and available tools,
+unclaimed part that best fits your role, capabilities, and available tools,
 and send a concise claim before beginning that work. A claim becomes visible
 only after it is successfully sent and remains provisional as context changes.
 
@@ -168,6 +190,10 @@ The notice above contains metadata only; pending messages exist. Call
 `read_inbox` now and read enough of the pending snapshot to understand what
 arrived before deciding what to do. Do not finish this turn from notice
 metadata alone. Use `read_history` only if earlier context is needed.
+
+Before ending the turn, dispose of every human message you read — across
+all threads and channels: pass its id in `covers` on the send or reminder
+that handles it, or call `mark_covered` when no reply is needed.
 </puffo_runtime_instruction>"""
 
 
@@ -187,7 +213,7 @@ revise toward the next useful contribution rather than treating overlapping
 peer content as your participation.
 
 If the draft was a claim, it did not establish ownership. Inspect newer claims
-and select an uncovered part before investing significant effort.
+and select an unclaimed part before investing significant effort.
 
 Read the returned context and any additional target history you need, then
 reconsider what response, clarification, or follow-up still advances the

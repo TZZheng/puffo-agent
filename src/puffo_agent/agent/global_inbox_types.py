@@ -280,3 +280,9 @@ class ActiveBoundaryAdapter:
             channel_id,
         ):
             self.active.through_by_channel[key] = seq
+
+
+def opt_str(value: object) -> str | None:
+    """Coerce to str and fold empty to None (NULL in the covers table)."""
+    text = str(value or "")
+    return text or None

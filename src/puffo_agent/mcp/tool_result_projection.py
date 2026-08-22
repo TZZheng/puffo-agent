@@ -34,6 +34,8 @@ def _field(name: str, value: Any) -> str:
         return f"{name}={'true' if value else 'false'}"
     if isinstance(value, int) and not isinstance(value, bool):
         return f"{name}={value}"
+    if isinstance(value, (list, tuple)):
+        return f"{name}={_json(list(value))}"
     return f"{name}={_json(str(value))}"
 
 
@@ -178,6 +180,9 @@ def _send_result_header(
                 "recovery_more_pending",
                 "error_kind",
                 "status",
+                "covers_recorded",
+                "covers_unknown",
+                "covers_dropped",
             ),
         )
     )

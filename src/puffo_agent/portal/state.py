@@ -338,6 +338,9 @@ class DaemonConfig:
     segment_chars: int = 2000
     # Catch-up older than this is stored but skips the LLM; <= 0 disables.
     catchup_stale_hours: float = DEFAULT_CATCHUP_STALE_HOURS
+    # Redeliver uncovered human messages once at turn end. Observation
+    # events fire regardless; this only gates the redelivery itself.
+    covers_renotice: bool = False
     ws_local_service: WsLocalServiceConfig = field(
         default_factory=WsLocalServiceConfig,
     )
@@ -373,6 +376,7 @@ class DaemonConfig:
             catchup_stale_hours=float(
                 raw.get("catchup_stale_hours", DEFAULT_CATCHUP_STALE_HOURS)
             ),
+            covers_renotice=raw.get("covers_renotice") is True,
         )
         p = raw.get("anthropic") or {}
         cfg.anthropic = AnthropicProviderConfig(

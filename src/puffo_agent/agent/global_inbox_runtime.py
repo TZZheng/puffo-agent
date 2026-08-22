@@ -58,6 +58,7 @@ from .shared_content import INBOX_TURN_CUE
 
 logger = logging.getLogger(__name__)
 
+
 # A degrade is a transient provider incident, never a durable verdict about
 # pending Inbox work.  Recovery is a bounded backoff window the runtime re-arms
 # itself, so requeued rows stay retryable without depending on unrelated ingress.
@@ -67,7 +68,9 @@ DEGRADED_RECOVERY_MAX_SECONDS = 300.0
 from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
 from .global_inbox_admission import InboxAdmissionMixin
+from .global_inbox_covers import CoversReconciliationMixin
 from .global_inbox_types import (
+    opt_str,
     ActiveBoundaryAdapter,
     ActiveExactUnion,
     BaselineAdapter,
@@ -147,7 +150,7 @@ class TurnStatusLifecycle(Protocol):
         """Settle the exact active union in one terminal status batch."""
 
 
-class GlobalInboxRuntime(InboxAdmissionMixin):
+class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
     """One serial provider boundary over the durable global Inbox."""
 
     def __init__(
@@ -175,6 +178,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         reminder_scheduler: ReminderScheduler | None = None,
         status_lifecycle: TurnStatusLifecycle | None = None,
         channel_audience_loader: ChannelAudienceLoader | None = None,
+        covers_renotice_enabled: bool | None = None,
     ) -> None:
         self.store = store
         self.adapter = adapter
@@ -212,6 +216,16 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         self.retry_sleep = retry_sleep
         self.send_mode_keys = tuple(dict.fromkeys(key for key in send_mode_keys if key))
         self.agent_id = agent_id
+        # Uncovered-message redelivery is observed unconditionally but only
+        # acted on behind this flag, so test environments can lead adoption.
+        # daemon.yml (``covers_renotice``) is the operator surface; the
+        # environment variable remains as an override for tests.
+        if covers_renotice_enabled is None:
+            covers_renotice_enabled = (
+                os.environ.get("PUFFO_COVERS_RENOTICE", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+        self.covers_renotice_enabled = bool(covers_renotice_enabled)
         # ``send_mode_keys`` is the existing runtime identity-alias set used
         # by the send-mode guard (normally the configured agent id and the
         # wire slug).  Inbox attribution is derived from the same identities;
@@ -274,13 +288,62 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         content: str,
         target: str,
         intended_at: str,
+        covers: list[str] | None = None,
     ) -> dict[str, object]:
         """Create local reminder intent without introducing provider policy."""
-        return await self.reminder_scheduler.create_reminder(
+        result = await self.reminder_scheduler.create_reminder(
             content=content,
             target=target,
             intended_at=intended_at,
         )
+        if covers:
+            try:
+                outcome = await self.store.add_message_covers(
+                    covers,
+                    source="reminder",
+                    note=opt_str(result.get("reminder_id")),
+                    turn_id=opt_str(self.active.turn_id),
+                )
+            except Exception:
+                logger.exception("recording reminder covers failed")
+            else:
+                result["covers_recorded"] = list(outcome["recorded"])
+                if outcome["unknown"]:
+                    result["covers_unknown"] = list(outcome["unknown"])
+        return result
+
+    async def mark_covered(
+        self,
+        *,
+        covers: list[str],
+        by_message_id: str = "",
+        note: str = "",
+    ) -> dict[str, object]:
+        """Record standalone disposition claims for inbound messages.
+
+        The whole point of this call is precise marking, so unlike send and
+        reminder covers, unknown ids surface as an explicit error listing
+        exactly which ids failed (known ids are still recorded).
+        """
+        cleaned = [str(item) for item in covers if str(item or "").strip()]
+        if not cleaned:
+            raise ValueError("covers must be a non-empty list of message ids")
+        outcome = await self.store.add_message_covers(
+            cleaned,
+            source="mark",
+            by_envelope_id=opt_str(by_message_id),
+            note=opt_str(note),
+            turn_id=opt_str(self.active.turn_id),
+        )
+        result: dict[str, object] = {
+            "covers_recorded": list(outcome["recorded"]),
+            "covers_unknown": list(outcome["unknown"]),
+        }
+        if outcome["unknown"]:
+            result["error"] = (
+                "unknown message id(s): " + ", ".join(outcome["unknown"])
+            )
+        return result
 
     async def list_reminders(
         self,
@@ -558,6 +621,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             ),
             latest_seq=latest_seq,
             read_tool="read_inbox",
+            uncovered_message_count=(
+                await self.store.count_uncovered_pending()
+                if self.covers_renotice_enabled
+                else 0
+            ),
         )
         provider_input = (
             "<global_inbox_notice>\n"
@@ -1224,57 +1292,6 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         )
         return attempt
 
-    async def _mark_active_processed(
-        self,
-        planned: PlannedTurn,
-        process_started: float,
-    ) -> None:
-        # A processed turn ends the incident: consecutive-degrade backoff must
-        # not carry across unrelated later incidents.
-        self._degraded_attempts = 0
-        if self.active.message_ids:
-            await self.store.mark_processed(
-                tuple(self.active.message_ids),
-                turn_id=planned.turn_id,
-                provider_session_id=self.active.provider_session_id,
-            )
-            await self.store.release_notice_delivery(
-                self.active.provider_session_id,
-                tuple(self.active.notice_message_ids),
-            )
-        else:
-            # The provider received the notice but chose not to read Inbox.
-            # That is a normal deferred outcome, not a transport failure and
-            # therefore must not create another generation for the same set.
-            await self.store.finalize_empty_turn(turn_id=planned.turn_id)
-        for item_id in self.active.message_ids:
-            row = await self.store.get_message_by_envelope(item_id)
-            log_runtime_event(
-                logger,
-                "inbox.row_processed",
-                agent_id=self.agent_id,
-                turn_id=planned.turn_id,
-                provider_session_id=self.active.provider_session_id,
-                message_id=item_id,
-                server_seq=row.server_seq if row is not None else None,
-                outcome="processed",
-            )
-        log_runtime_event(
-            logger,
-            "turn.processed",
-            agent_id=self.agent_id,
-            turn_id=planned.turn_id,
-            provider_session_id=self.active.provider_session_id,
-            provider_turn_id=self.active.provider_turn_id,
-            envelope_id=(
-                self.active.message_ids[0]
-                if len(self.active.message_ids) == 1
-                else None
-            ),
-            state=ProcessingState.PROCESSED.value,
-            message_count=len(self.active.message_ids),
-            duration_ms=int((time.monotonic() - process_started) * 1000),
-        )
 
     async def _requeue_active_turn(
         self,
@@ -1808,11 +1825,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         turn_id: str,
         recovery_started: float,
     ) -> bool:
-        await self.store.mark_processed(
-            tuple(self.active.message_ids),
-            turn_id=turn_id,
-            provider_session_id=self.active.provider_session_id,
-        )
+        await self._finalize_active_messages(turn_id)
         await self.store.release_notice_delivery(self.active.provider_session_id)
         log_runtime_event(
             logger,

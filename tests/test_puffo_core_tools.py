@@ -332,10 +332,11 @@ async def test_hidden_schema_semantic_send_fields_only():
     expected = {
         "send_message": {
             "channel", "text", "root_id", "visibility_level", "send_anyway",
+            "covers",
         },
         "send_message_with_attachments": {
             "paths", "channel", "caption", "root_id",
-            "visibility_level", "send_anyway",
+            "visibility_level", "send_anyway", "covers",
         },
     }
     forbidden = {
@@ -481,7 +482,7 @@ async def test_reminder_tools_have_exact_semantic_schemas_and_live_dispatch():
         "create_reminder", "list_reminders", "cancel_reminder", "replace_reminder",
     })
     assert set(tools["create_reminder"].inputSchema["properties"]) == {
-        "content", "target", "intended_at",
+        "content", "target", "intended_at", "covers",
     }
     assert set(tools["list_reminders"].inputSchema["properties"]) == {
         "state", "limit",
@@ -518,7 +519,7 @@ async def test_reminder_tools_have_exact_semantic_schemas_and_live_dispatch():
     assert calls == [
         ("create", {
             "content": "exact content", "target": "channel:sp:ch",
-            "intended_at": "2026-08-02T12:00:00Z",
+            "intended_at": "2026-08-02T12:00:00Z", "covers": None,
         }),
         ("list", {"state": "scheduled", "limit": 3}),
         ("cancel", {"reminder_id": "reminder-1"}),
@@ -591,7 +592,7 @@ async def test_reminder_tools_fall_back_to_configured_loopback_rpc_client():
     assert calls == [
         ("create", {
             "content": "exact content", "target": "channel:sp:ch",
-            "intended_at": "2026-08-02T12:00:00Z",
+            "intended_at": "2026-08-02T12:00:00Z", "covers": None,
         }),
         ("list", {"state": "scheduled", "limit": 3}),
         ("cancel", {"reminder_id": "reminder-1"}),

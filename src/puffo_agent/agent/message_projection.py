@@ -181,6 +181,7 @@ def format_inbox_notice(
     targets: Sequence[Mapping[str, Any]],
     latest_seq: int | None,
     read_tool: str,
+    uncovered_message_count: int = 0,
 ) -> str:
     """Render a content-free notice in the shared conversation grammar."""
     fields = [
@@ -194,6 +195,11 @@ def format_inbox_notice(
         f"latest_seq={latest_seq if latest_seq is not None else 'null'}",
     ]
     lines = [f"[inbox {' '.join(fields)}]"]
+    if uncovered_message_count > 0:
+        lines.append(
+            f"[uncovered context_version={CONTEXT_VERSION} "
+            f"message_count={int(uncovered_message_count)}]"
+        )
     for row in targets:
         target_ref = str(row["target"])
         lines.append(f"## {target_label_from_ref(target_ref)}")
@@ -507,6 +513,14 @@ def format_message_row(
         fields.append(f"mentions={_json(mentions)}")
     if reply_count is not None:
         fields.append(f"reply_count={reply_count}")
+    if bool(_value(message, "renotified", False)):
+        # The marker describes one live redelivery attempt, not permanent
+        # row history: once the row settles (PROCESSED), history reads must
+        # stop asking the model to settle it again.
+        state = _value(message, "processing_state", "")
+        state = getattr(state, "value", state)
+        if state in ("pending", "in_turn"):
+            fields.append("uncovered_redelivery=true")
     if bool(_value(message, "thread_root_unverified", False)):
         fields.append("thread_root_unverified=true")
     return f"[message {' '.join(fields)}]\n{_content_field(message_text(message))}"
