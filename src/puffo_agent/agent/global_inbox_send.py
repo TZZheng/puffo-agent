@@ -291,8 +291,43 @@ class TrackingSendDelegate:
         runtime = trace.runtime
         if state == "held":
             runtime = self._stage_held_result(trace, result)
+        if state == "sent":
+            await self._record_covers(request, kwargs, result)
         self._log_result(trace, result, state, runtime)
         return result
+
+    async def _record_covers(
+        self,
+        request: Any,
+        kwargs: Mapping[str, Any],
+        result: dict[str, Any],
+    ) -> None:
+        """Persist a committed send's disposition claims; never fail the send."""
+        if isinstance(request, Mapping):
+            covers = request.get("covers", ()) or ()
+        elif request is not None:
+            covers = getattr(request, "covers", ()) or ()
+        else:
+            covers = kwargs.get("covers", ()) or ()
+        if not covers:
+            return
+        store = getattr(self.runtime, "store", None)
+        if store is None:
+            return
+        active = getattr(self.runtime, "active", None)
+        try:
+            outcome = await store.add_message_covers(
+                covers,
+                source="send",
+                by_envelope_id=result.get("envelope_id"),
+                turn_id=str(getattr(active, "turn_id", "") or "") or None,
+            )
+        except Exception:
+            logger.exception("recording send covers failed")
+            return
+        result["covers_recorded"] = list(outcome["recorded"])
+        if outcome["unknown"]:
+            result["covers_unknown"] = list(outcome["unknown"])
 
     async def send_message(self, **kwargs: Any) -> dict[str, Any]:
         return await self.send(kwargs)

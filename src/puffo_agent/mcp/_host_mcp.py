@@ -163,6 +163,7 @@ class PuffoRpcClient:
         root_id: str = "",
         visibility_level: str = "default",
         send_anyway: bool = False,
+        covers: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "channel": channel,
@@ -174,6 +175,8 @@ class PuffoRpcClient:
             body.update(paths=paths, caption=caption)
         else:
             body["text"] = text
+        if covers:
+            body["covers"] = covers
         return await self._post_structured("send-message", body)
 
     async def stage_model_visible_read(
@@ -277,7 +280,8 @@ class PuffoRpcClient:
             "intended_at", "actual_fire_at", "created_at", "cancelled_at",
             "delivered_at",
         }
-        if set(data) != required or data.get("state") not in {
+        optional = {"covers_recorded", "covers_unknown"}
+        if set(data) - optional != required or data.get("state") not in {
             "scheduled", "cancelled", "delivered",
         } or not all(
             isinstance(data.get(key), str)
@@ -290,12 +294,35 @@ class PuffoRpcClient:
         return data
 
     async def create_reminder(
-        self, *, content: str, target: str, intended_at: str,
+        self,
+        *,
+        content: str,
+        target: str,
+        intended_at: str,
+        covers: Optional[list[str]] = None,
     ) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "content": content, "target": target, "intended_at": intended_at,
+        }
+        if covers:
+            body["covers"] = covers
         return self._validate_reminder_object(await self._post_object(
-            "create-reminder",
-            {"content": content, "target": target, "intended_at": intended_at},
+            "create-reminder", body,
         ))
+
+    async def mark_covered(
+        self,
+        *,
+        covers: list[str],
+        by_message_id: str = "",
+        note: str = "",
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"covers": covers}
+        if by_message_id:
+            body["by_message_id"] = by_message_id
+        if note:
+            body["note"] = note
+        return await self._post_object("mark-covered", body)
 
     async def list_reminders(
         self, *, state: str = "", limit: int = 50,

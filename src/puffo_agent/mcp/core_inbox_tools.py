@@ -136,12 +136,15 @@ def register_reminder_tools(mcp: FastMCP, cfg: Any) -> None:
         content: str,
         target: str,
         intended_at: str,
+        covers: list[str] | None = None,
     ) -> dict[str, Any]:
         """Create one durable local reminder for a canonical Inbox target.
 
-        ``intended_at`` is an explicit-offset RFC3339 timestamp. The result
-        is a provider-neutral reminder object. A due occurrence enters the
-        ordinary durable Inbox and leaves any action decision to the model.
+        ``intended_at`` is an explicit-offset RFC3339 timestamp. ``covers``
+        lists inbound message ids this deferral disposes of, exactly like
+        ``send_message`` covers. The result is a provider-neutral reminder
+        object. A due occurrence enters the ordinary durable Inbox and
+        leaves any action decision to the model.
         """
         runtime = getattr(cfg, "inbox_runtime", None)
         if runtime is None:
@@ -155,12 +158,14 @@ def register_reminder_tools(mcp: FastMCP, cfg: Any) -> None:
                 content=content,
                 target=target,
                 intended_at=intended_at,
+                covers=covers,
             )
         if cfg.rpc_client is not None:
             return await cfg.rpc_client.create_reminder(
                 content=content,
                 target=target,
                 intended_at=intended_at,
+                covers=covers,
             )
         raise RuntimeError("global Inbox runtime is unavailable")
 

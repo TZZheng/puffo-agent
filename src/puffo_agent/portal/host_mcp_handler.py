@@ -717,6 +717,7 @@ async def create_reminder(
     content: str,
     target: str,
     intended_at: str,
+    covers: list[str] | None = None,
 ) -> dict[str, object]:
     """Resolve reminder creation against the warm worker's one Inbox runtime."""
     runtime = getattr(ctx.message_client, "global_runtime", None)
@@ -726,6 +727,25 @@ async def create_reminder(
         content=content,
         target=target,
         intended_at=intended_at,
+        covers=covers,
+    )
+
+
+async def mark_covered(
+    ctx: HostMcpContext,
+    *,
+    covers: list[str],
+    by_message_id: str = "",
+    note: str = "",
+) -> dict[str, object]:
+    """Resolve standalone cover marking against the warm worker's runtime."""
+    runtime = getattr(ctx.message_client, "global_runtime", None)
+    if runtime is None:
+        raise RuntimeError("global Inbox runtime is unavailable")
+    return await runtime.mark_covered(
+        covers=covers,
+        by_message_id=by_message_id,
+        note=note,
     )
 
 

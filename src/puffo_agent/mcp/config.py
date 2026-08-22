@@ -48,6 +48,7 @@ _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 PUFFO_CORE_TOOL_NAMES = (
     "send_message",
     "send_message_with_attachments",
+    "mark_covered",
     "list_spaces",
     "list_channels_in_all_spaces",
     "list_channels_in_space",

@@ -158,6 +158,23 @@ CREATE TABLE IF NOT EXISTS dm_notices (
     sender_slug TEXT PRIMARY KEY,
     last_notified_at INTEGER NOT NULL
 );
+
+-- One row per explicit disposition declaration: an outbound send, a
+-- reminder, or a standalone mark_covered call declared that it disposed
+-- of ``covered_envelope_id``. Existence is what finalize reconciliation
+-- checks; duplicates are collapsed by the unique index below.
+CREATE TABLE IF NOT EXISTS message_covers (
+    covered_envelope_id TEXT NOT NULL,
+    by_envelope_id TEXT,
+    source TEXT NOT NULL CHECK (source IN ('send','reminder','mark')),
+    note TEXT,
+    turn_id TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_covers_covered
+    ON message_covers (covered_envelope_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_message_covers_unique
+    ON message_covers (covered_envelope_id, ifnull(by_envelope_id, ''), source);
 """
 
 _DEPENDENT_SCHEMA = """
@@ -352,6 +369,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
                             "processed_at": "processed_at INTEGER",
                             "local_ordinal": "local_ordinal INTEGER",
                             "after_server_seq": "after_server_seq INTEGER",
+                            "renotified": "renotified INTEGER NOT NULL DEFAULT 0",
                         }
                         for name, declaration in additions.items():
                             if name not in cols:
@@ -1665,4 +1683,7 @@ class MessageStore(ReminderStoreMixin, InboxStoreMixin):
             processed_at=row["processed_at"],
             local_ordinal=row["local_ordinal"],
             after_server_seq=row["after_server_seq"],
+            renotified=bool(
+                row["renotified"] if "renotified" in row.keys() else 0
+            ),
         )

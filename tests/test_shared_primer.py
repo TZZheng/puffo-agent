@@ -139,7 +139,10 @@ def test_inbox_turn_cue_is_short_and_reinforces_the_standing_default():
     assert "do not finish this turn from notice metadata alone" in cue.lower()
     assert "use `read_history` only if earlier context is needed" in cue.lower()
     assert "decide-response" not in cue
-    assert len(INBOX_TURN_CUE.encode()) < 360
+    assert "dispose of every human message" in cue.lower()
+    assert "`covers`" in cue
+    assert "`mark_covered`" in cue
+    assert len(INBOX_TURN_CUE.encode()) < 640
 
 
 def test_held_send_applies_the_shared_judgment_to_the_attempted_draft():

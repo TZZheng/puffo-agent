@@ -1086,6 +1086,187 @@ class InboxStoreMixin:
         assert run is not None
         return run
 
+    async def add_message_covers(
+        self,
+        covered_ids: Iterable[str],
+        *,
+        source: str,
+        by_envelope_id: str | None = None,
+        note: str | None = None,
+        turn_id: str | None = None,
+    ) -> dict[str, tuple[str, ...]]:
+        """Record disposition declarations; unknown ids are reported, not fatal.
+
+        A cover is a claim about an inbound message, so each id must name a
+        locally known row. The declaration itself must never block the send
+        or reminder that carries it, which is why unknown ids come back in
+        the result instead of raising.
+        """
+        if source not in ("send", "reminder", "mark"):
+            raise ValueError("cover source must be send, reminder, or mark")
+        ids = tuple(dict.fromkeys(str(item) for item in covered_ids if item))
+        if not ids:
+            return {"recorded": (), "unknown": ()}
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            known: set[str] = set()
+            for start in range(0, len(ids), _SQLITE_ID_BATCH_SIZE):
+                batch = ids[start:start + _SQLITE_ID_BATCH_SIZE]
+                placeholders = ",".join("?" for _ in batch)
+                async with db.execute(
+                    f"SELECT envelope_id FROM messages "
+                    f"WHERE envelope_id IN ({placeholders})",
+                    batch,
+                ) as cursor:
+                    known.update(
+                        row["envelope_id"] for row in await cursor.fetchall()
+                    )
+            recorded = tuple(item for item in ids if item in known)
+            unknown = tuple(item for item in ids if item not in known)
+            if recorded:
+                now = _now_ms()
+                await db.executemany(
+                    "INSERT OR IGNORE INTO message_covers ("
+                    "covered_envelope_id, by_envelope_id, source, note, "
+                    "turn_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    [
+                        (item, by_envelope_id, source, note, turn_id, now)
+                        for item in recorded
+                    ],
+                )
+                await db.commit()
+            return {"recorded": recorded, "unknown": unknown}
+
+    async def get_covered_ids(self, message_ids: Iterable[str]) -> set[str]:
+        """Return the subset of ``message_ids`` with any cover declaration."""
+        ids = tuple(dict.fromkeys(str(item) for item in message_ids if item))
+        if not ids:
+            return set()
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            covered: set[str] = set()
+            for start in range(0, len(ids), _SQLITE_ID_BATCH_SIZE):
+                batch = ids[start:start + _SQLITE_ID_BATCH_SIZE]
+                placeholders = ",".join("?" for _ in batch)
+                async with db.execute(
+                    f"SELECT DISTINCT covered_envelope_id FROM message_covers "
+                    f"WHERE covered_envelope_id IN ({placeholders})",
+                    batch,
+                ) as cursor:
+                    covered.update(
+                        row["covered_envelope_id"]
+                        for row in await cursor.fetchall()
+                    )
+            return covered
+
+    async def complete_turn_with_renotice(
+        self,
+        processed_ids: Iterable[str],
+        renotice_ids: Iterable[str],
+        *,
+        turn_id: str,
+        provider_session_id: str | None = None,
+    ) -> TurnRun:
+        """Finalize a turn while sending uncovered rows back to PENDING.
+
+        The union of both id sets must exactly match the turn membership,
+        mirroring ``mark_processed``. Renotice rows return to PENDING with
+        ``renotified`` set so the redelivery can happen at most once; the
+        turn itself still terminates as PROCESSED.
+        """
+        processed_tuple = tuple(processed_ids)
+        processed = self._exact_ids(processed_tuple) if processed_tuple else ()
+        renotice_tuple = tuple(renotice_ids)
+        if not renotice_tuple:
+            raise ValueError("renotice_ids must be non-empty; use mark_processed")
+        renotice = self._exact_ids(renotice_tuple)
+        overlap = set(processed) & set(renotice)
+        if overlap:
+            raise LifecycleConflict("processed and renotice ids overlap")
+        completed = _now_ms()
+        async with self._inbox_lock:
+            db = await self._ensure_db()
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                if provider_session_id is not None:
+                    async with db.execute(
+                        "SELECT provider_session_id FROM turn_runs "
+                        "WHERE turn_id = ?",
+                        (turn_id,),
+                    ) as cursor:
+                        owner = await cursor.fetchone()
+                    if (
+                        owner is None
+                        or owner["provider_session_id"] != provider_session_id
+                    ):
+                        raise LifecycleConflict(
+                            "turn belongs to another provider session"
+                        )
+                expected = await self._turn_message_ids(db, turn_id)
+                union = set(processed) | set(renotice)
+                if len(expected) != len(union) or set(expected) != union:
+                    raise LifecycleConflict(
+                        "completion IDs do not exactly match the turn"
+                    )
+                if processed:
+                    placeholders = ",".join("?" for _ in processed)
+                    cursor = await db.execute(
+                        f"""UPDATE messages
+                            SET processing_state = ?, processed_at = ?
+                            WHERE envelope_id IN ({placeholders})
+                              AND processing_state = ? AND processing_turn_id = ?""",
+                        (
+                            ProcessingState.PROCESSED.value,
+                            completed,
+                            *processed,
+                            ProcessingState.IN_TURN.value,
+                            turn_id,
+                        ),
+                    )
+                    if cursor.rowcount != len(processed):
+                        raise LifecycleConflict(
+                            "completion changed fewer rows than requested"
+                        )
+                placeholders = ",".join("?" for _ in renotice)
+                cursor = await db.execute(
+                    f"""UPDATE messages
+                        SET processing_state = ?, processing_turn_id = NULL,
+                            model_visible_at = NULL, processed_at = NULL,
+                            renotified = 1
+                        WHERE envelope_id IN ({placeholders})
+                          AND processing_state = ? AND processing_turn_id = ?""",
+                    (
+                        ProcessingState.PENDING.value,
+                        *renotice,
+                        ProcessingState.IN_TURN.value,
+                        turn_id,
+                    ),
+                )
+                if cursor.rowcount != len(renotice):
+                    raise LifecycleConflict(
+                        "renotice changed fewer rows than requested"
+                    )
+                cursor = await db.execute(
+                    "UPDATE turn_runs SET state = ?, completed_at = ? "
+                    "WHERE turn_id = ? AND state = ?",
+                    (
+                        ProcessingState.PROCESSED.value,
+                        completed,
+                        turn_id,
+                        ProcessingState.IN_TURN.value,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise LifecycleConflict("turn is not active")
+                await self._refresh_notice_state(db)
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+            run = await self._get_turn_run_unlocked(db, turn_id)
+            assert run is not None
+            return run
+
     async def _turn_message_ids(
         self, db: aiosqlite.Connection, turn_id: str
     ) -> tuple[str, ...]:

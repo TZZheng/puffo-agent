@@ -52,6 +52,7 @@ from .message_projection import (
     CONTEXT_VERSION,
     format_inbox_notice,
     format_message_group,
+    sender_type,
 )
 from .reminder_scheduler import ReminderScheduler
 from .shared_content import INBOX_TURN_CUE
@@ -212,6 +213,12 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         self.retry_sleep = retry_sleep
         self.send_mode_keys = tuple(dict.fromkeys(key for key in send_mode_keys if key))
         self.agent_id = agent_id
+        # Uncovered-message redelivery is observed unconditionally but only
+        # acted on behind this flag, so test environments can lead adoption.
+        self.covers_renotice_enabled = (
+            os.environ.get("PUFFO_COVERS_RENOTICE", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         # ``send_mode_keys`` is the existing runtime identity-alias set used
         # by the send-mode guard (normally the configured agent id and the
         # wire slug).  Inbox attribution is derived from the same identities;
@@ -274,13 +281,61 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         content: str,
         target: str,
         intended_at: str,
+        covers: list[str] | None = None,
     ) -> dict[str, object]:
         """Create local reminder intent without introducing provider policy."""
-        return await self.reminder_scheduler.create_reminder(
+        result = await self.reminder_scheduler.create_reminder(
             content=content,
             target=target,
             intended_at=intended_at,
         )
+        if covers:
+            try:
+                outcome = await self.store.add_message_covers(
+                    covers,
+                    source="reminder",
+                    note=str(result.get("reminder_id") or "") or None,
+                    turn_id=str(self.active.turn_id or "") or None,
+                )
+            except Exception:
+                logger.exception("recording reminder covers failed")
+            else:
+                result["covers_recorded"] = list(outcome["recorded"])
+                if outcome["unknown"]:
+                    result["covers_unknown"] = list(outcome["unknown"])
+        return result
+
+    async def mark_covered(
+        self,
+        *,
+        covers: list[str],
+        by_message_id: str = "",
+        note: str = "",
+    ) -> dict[str, object]:
+        """Record standalone disposition claims for inbound messages.
+
+        The whole point of this call is precise marking, so unlike send and
+        reminder covers, unknown ids surface as an explicit error listing
+        exactly which ids failed (known ids are still recorded).
+        """
+        if not covers:
+            raise ValueError("covers must be a non-empty list of message ids")
+        outcome = await self.store.add_message_covers(
+            covers,
+            source="mark",
+            by_envelope_id=str(by_message_id or "") or None,
+            note=str(note or "") or None,
+            turn_id=str(self.active.turn_id or "") or None,
+        )
+        result: dict[str, object] = {
+            "covers_recorded": list(outcome["recorded"]),
+            "covers_unknown": list(outcome["unknown"]),
+        }
+        if outcome["unknown"]:
+            result["error"] = (
+                "unknown message id(s): " + ", ".join(outcome["unknown"])
+            )
+        return result
 
     async def list_reminders(
         self,
@@ -1224,6 +1279,47 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         )
         return attempt
 
+    async def _reconcile_uncovered_messages(
+        self, planned: PlannedTurn
+    ) -> tuple[str, ...]:
+        """Return this turn's human messages with no cover declaration.
+
+        The observation event fires unconditionally; the returned ids drive
+        redelivery only when the renotice flag is on. Rows already
+        redelivered once (``renotified``) are excluded, which is what bounds
+        the cycle to a single extra presentation per message.
+        """
+        rows = await self.store.get_in_turn_messages(
+            planned.turn_id, self.active.provider_session_id
+        )
+        human_ids = [
+            row.envelope_id
+            for row in rows
+            if not row.renotified
+            and sender_type(
+                row, current_agent_aliases=self.send_mode_keys
+            ) == "human"
+        ]
+        if not human_ids:
+            return ()
+        covered = await self.store.get_covered_ids(human_ids)
+        uncovered = tuple(item for item in human_ids if item not in covered)
+        if not uncovered:
+            return ()
+        log_runtime_event(
+            logger,
+            "turn.unaddressed_messages",
+            level=logging.WARNING,
+            agent_id=self.agent_id,
+            turn_id=planned.turn_id,
+            provider_session_id=self.active.provider_session_id,
+            provider_turn_id=self.active.provider_turn_id,
+            message_count=len(uncovered),
+            envelope_ids=list(uncovered),
+            outcome="renotice" if self.covers_renotice_enabled else "observed",
+        )
+        return uncovered if self.covers_renotice_enabled else ()
+
     async def _mark_active_processed(
         self,
         planned: PlannedTurn,
@@ -1232,12 +1328,32 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
         # A processed turn ends the incident: consecutive-degrade backoff must
         # not carry across unrelated later incidents.
         self._degraded_attempts = 0
+        renotice_ids: tuple[str, ...] = ()
         if self.active.message_ids:
-            await self.store.mark_processed(
-                tuple(self.active.message_ids),
-                turn_id=planned.turn_id,
-                provider_session_id=self.active.provider_session_id,
-            )
+            try:
+                renotice_ids = await self._reconcile_uncovered_messages(planned)
+            except Exception:
+                # Reconciliation must never turn a completed turn into a
+                # failure; fall back to plain full completion.
+                logger.exception("cover reconciliation failed; completing turn")
+            if renotice_ids:
+                renotice_set = set(renotice_ids)
+                await self.store.complete_turn_with_renotice(
+                    tuple(
+                        item
+                        for item in self.active.message_ids
+                        if item not in renotice_set
+                    ),
+                    renotice_ids,
+                    turn_id=planned.turn_id,
+                    provider_session_id=self.active.provider_session_id,
+                )
+            else:
+                await self.store.mark_processed(
+                    tuple(self.active.message_ids),
+                    turn_id=planned.turn_id,
+                    provider_session_id=self.active.provider_session_id,
+                )
             await self.store.release_notice_delivery(
                 self.active.provider_session_id,
                 tuple(self.active.notice_message_ids),
@@ -1247,6 +1363,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
             # That is a normal deferred outcome, not a transport failure and
             # therefore must not create another generation for the same set.
             await self.store.finalize_empty_turn(turn_id=planned.turn_id)
+        renotice_set = set(renotice_ids)
         for item_id in self.active.message_ids:
             row = await self.store.get_message_by_envelope(item_id)
             log_runtime_event(
@@ -1257,7 +1374,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin):
                 provider_session_id=self.active.provider_session_id,
                 message_id=item_id,
                 server_seq=row.server_seq if row is not None else None,
-                outcome="processed",
+                outcome="renoticed" if item_id in renotice_set else "processed",
             )
         log_runtime_event(
             logger,

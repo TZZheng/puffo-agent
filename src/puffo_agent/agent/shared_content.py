@@ -87,6 +87,13 @@ When you receive a concrete message, process it and respond through
 acknowledgment, ownership signal, blocker question, or clarification, send that
 before beginning deeper work.
 
+Declare what each outbound action disposes of: list the inbound message ids a
+reply handles in its `covers` argument (`send_message` and `create_reminder`
+both accept it), and use `mcp__puffo__mark_covered` for a message that needs
+no reply or to backfill a forgotten declaration. A turn that reads human
+messages and leaves some uncovered may get them redelivered once, marked
+`unaddressed_redelivery=true`; settle those immediately.
+
 For multi-step work, keep people informed with concise, useful updates. When
 finished, report the outcome, including a blocker or negative result. Before
 stopping, make sure any result, handoff, decision, or reply you owe has been
@@ -168,6 +175,10 @@ The notice above contains metadata only; pending messages exist. Call
 `read_inbox` now and read enough of the pending snapshot to understand what
 arrived before deciding what to do. Do not finish this turn from notice
 metadata alone. Use `read_history` only if earlier context is needed.
+
+Before ending the turn, dispose of every human message you read — across
+all threads and channels: pass its id in `covers` on the send or reminder
+that handles it, or call `mark_covered` when no reply is needed.
 </puffo_runtime_instruction>"""
 
 

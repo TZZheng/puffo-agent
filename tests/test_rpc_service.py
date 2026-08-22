@@ -383,7 +383,7 @@ async def test_reminder_routes_are_strict_and_return_structured_objects(
     assert captured == [
         ("create", {
             "content": "exact content", "target": "channel:sp:ch",
-            "intended_at": "2026-08-02T12:00:00.000Z",
+            "intended_at": "2026-08-02T12:00:00.000Z", "covers": [],
         }),
         ("list", {"state": "scheduled", "limit": 3}),
         ("cancel", {"reminder_id": "reminder-1"}),
@@ -486,7 +486,7 @@ async def test_puffo_rpc_client_round_trips_all_reminder_objects(
     assert captured == [
         ("create", {
             "content": "exact content", "target": "channel:sp:ch",
-            "intended_at": "2026-08-02T12:00:00.000Z",
+            "intended_at": "2026-08-02T12:00:00.000Z", "covers": [],
         }),
         ("list", {"state": "scheduled", "limit": 3}),
         ("cancel", {"reminder_id": "reminder-1"}),
