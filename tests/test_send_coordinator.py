@@ -837,59 +837,6 @@ async def test_dm_route_has_no_freshness():
 
 
 @pytest.mark.asyncio
-async def test_plaintext_dm_route_has_no_freshness():
-    coordinator, _, http = await coordinator_fixture()
-
-    async def plaintext(_slug, _root):
-        return False
-
-    coordinator.data_client.get_send_encryption = plaintext
-    result = await coordinator.send(SemanticSendRequest(
-        destination="@alice-1", text="hi", visibility_level="human",
-    ))
-    assert result["state"] == "sent"
-    path, body = [(p, b) for m, p, b in http.calls if m == "POST"][-1]
-    assert path == "/v2/messages/plaintext"
-    assert "freshness" not in body
-
-
-@pytest.mark.asyncio
-async def test_plaintext_dm_policy_cannot_expose_attachment_keys(tmp_path):
-    """A DM attachment stays E2EE when text-only DMs permit plaintext."""
-    coordinator, _, http = await coordinator_fixture()
-    coordinator.workspace = str(tmp_path)
-    (tmp_path / "evidence.txt").write_text("proof", encoding="utf-8")
-
-    async def plaintext(_slug, _root):
-        return False
-
-    coordinator.data_client.get_send_encryption = plaintext
-    device = KemKeyPair.generate()
-    http.responses["/certs/sync?slugs=agent-0001,alice-1"] = {
-        "entries": [{
-            "seq": 1,
-            "kind": "device_cert",
-            "cert": {
-                "device_id": "dev_dm_attachment",
-                "kem_public_key": base64url_encode(device.public_key_bytes()),
-            },
-        }],
-        "has_more": False,
-    }
-    result = await coordinator.send(SemanticSendRequest(
-        destination="@alice-1",
-        attachment_paths=("evidence.txt",),
-        caption="evidence",
-    ))
-    assert result["state"] == "sent", result
-    message_posts = [
-        path for method, path, _body in http.calls
-        if method == "POST" and path in {"/messages", "/v2/messages/plaintext"}
-    ]
-    assert message_posts == ["/messages"]
-
-
-@pytest.mark.asyncio
 async def test_channel_roster_path_encodes_model_selected_channel_segment():
     """A destination containing slashes cannot retarget the roster request."""
     coordinator, _, http = await coordinator_fixture()
@@ -902,7 +849,7 @@ async def test_channel_roster_path_encodes_model_selected_channel_segment():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("transport", ["encrypted", "plaintext", "keyless"])
+@pytest.mark.parametrize("transport", ["encrypted", "keyless"])
 @pytest.mark.parametrize("include_metadata", [True, False])
 async def test_legacy_dm_transports_preserve_optional_metadata(
     transport, include_metadata, monkeypatch,
@@ -933,22 +880,17 @@ async def test_legacy_dm_transports_preserve_optional_metadata(
         )
     else:
         coordinator, _, http = await coordinator_fixture()
-        if transport == "plaintext":
-            async def plaintext(_slug, _root):
-                return False
-            coordinator.data_client.get_send_encryption = plaintext
-        else:
-            device = KemKeyPair.generate()
-            http.responses["/certs/sync?slugs=agent-0001,alice-1"] = {
-                "entries": [{
-                    "seq": 1, "kind": "device_cert",
-                    "cert": {
-                        "device_id": "metadata-device",
-                        "kem_public_key": base64url_encode(device.public_key_bytes()),
-                    },
-                }],
-                "has_more": False,
-            }
+        device = KemKeyPair.generate()
+        http.responses["/certs/sync?slugs=agent-0001,alice-1"] = {
+            "entries": [{
+                "seq": 1, "kind": "device_cert",
+                "cert": {
+                    "device_id": "metadata-device",
+                    "kem_public_key": base64url_encode(device.public_key_bytes()),
+                },
+            }],
+            "has_more": False,
+        }
 
         async def post(_path, _body):
             return metadata
@@ -973,15 +915,8 @@ async def test_legacy_dm_transports_preserve_optional_metadata(
 
 @pytest.mark.asyncio
 async def test_plaintext_channel_no_downgrade():
-    """A channel send never downgrades: even when the daemon-level send-mode
-    decision says plaintext (turn bundle cleared, e.g. a turn-unbound
-    background wakeup), the channel envelope still goes out encrypted."""
+    """A channel send never goes out as a plaintext envelope."""
     coordinator, _, http = await coordinator_fixture()
-
-    async def plaintext(_slug, _root):
-        return False
-
-    coordinator.data_client.get_send_encryption = plaintext
     result = await coordinator.send(SemanticSendRequest(
         destination="ch_a", text="must not downgrade",
     ))

@@ -719,7 +719,7 @@ class StandardWorkerRun:
             run_turn=self._build_global_turn_handler(context),
             workspace=paths.workspace_path,
             held_catchup=client.recover_pending_delivery,
-            send_mode_keys=(paths.agent_id, client.slug),
+            identity_aliases=(paths.agent_id, client.slug),
             agent_id=paths.agent_id,
             runtime_event_outbox=context.runtime_event_outbox,
             status_lifecycle=status_lifecycle,

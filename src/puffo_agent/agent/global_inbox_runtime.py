@@ -171,7 +171,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         max_api_retries: int = 2,
         retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         held_catchup: Callable[[str], Awaitable[bool]] | None = None,
-        send_mode_keys: Sequence[str] = (),
+        identity_aliases: Sequence[str] = (),
         agent_id: str = "",
         notice_delivery: InboxNoticeDelivery | None = None,
         runtime_event_outbox: Any | None = None,
@@ -214,7 +214,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         self.max_context_decisions = max_context_decisions
         self.max_api_retries = max_api_retries
         self.retry_sleep = retry_sleep
-        self.send_mode_keys = tuple(dict.fromkeys(key for key in send_mode_keys if key))
+        self.identity_aliases = tuple(dict.fromkeys(key for key in identity_aliases if key))
         self.agent_id = agent_id
         # Uncovered-message redelivery is observed unconditionally but only
         # acted on behind this flag, so test environments can lead adoption.
@@ -226,10 +226,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 in {"1", "true", "yes", "on"}
             )
         self.covers_renotice_enabled = bool(covers_renotice_enabled)
-        # ``send_mode_keys`` is the existing runtime identity-alias set used
-        # by the send-mode guard (normally the configured agent id and the
-        # wire slug).  Inbox attribution is derived from the same identities;
-        # no durable or provider state is introduced.
+        # ``identity_aliases`` is the runtime identity-alias set (normally
+        # the configured agent id and the wire slug); inbox attribution is
+        # derived from these identities.
         self.formatter = self._format_for_provider
         capability = getattr(adapter, "inbox_notice_delivery_capability", None)
         self.notice_delivery = notice_delivery or InboxNoticeDelivery(
@@ -253,7 +252,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
 
     def _current_agent_identity_aliases(self) -> tuple[str, ...]:
         """Return only runtime-owned identities usable for self attribution."""
-        values: list[str] = [self.agent_id, *self.send_mode_keys]
+        values: list[str] = [self.agent_id, *self.identity_aliases]
         for owner in (self.adapter, self.coordinator):
             for name in ("slug", "agent_id", "agent_slug", "self_slug"):
                 value = getattr(owner, name, "")
@@ -1341,9 +1340,6 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         return True
 
     def _finalize_process(self, planned: PlannedTurn, terminal: bool) -> None:
-        from . import send_mode
-
-        send_mode.clear_turn_bundle(list(self.send_mode_keys))
         self.adapter.register_admission_callback(None, "")
         was_active = self.active.turn_id == planned.turn_id
         if terminal:
@@ -1406,13 +1402,6 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 planned.planning_cycle_key,
             )
             self.health = RuntimeHealth("in_progress", "")
-            from . import send_mode
-
-            send_mode.note_turn_bundle(
-                list(self.send_mode_keys),
-                planned.requires_encryption
-                or any(item.is_encrypted for item in planned.items),
-            )
             terminal = False
             terminal_succeeded = False
             terminal_error: str | None = None
@@ -1929,24 +1918,12 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
             )
         self._activate_recovery(planned, durable_ids, run.provider_session_id)
         await self._notify_status_active()
-        from . import send_mode
-
-        # A resumed turn establishes the same send-mode facts ``process_once``
-        # does; the module dict is process-local and therefore empty here.
-        send_mode.note_turn_bundle(
-            list(self.send_mode_keys),
-            planned.requires_encryption
-            or any(item.is_encrypted for item in planned.items),
+        return await self._resume_activated_turn(
+            planned=planned,
+            turn_id=turn_id,
+            recovery_started=recovery_started,
+            unwind=unwind,
         )
-        try:
-            return await self._resume_activated_turn(
-                planned=planned,
-                turn_id=turn_id,
-                recovery_started=recovery_started,
-                unwind=unwind,
-            )
-        finally:
-            send_mode.clear_turn_bundle(list(self.send_mode_keys))
 
     async def _resume_activated_turn(
         self,

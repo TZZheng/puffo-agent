@@ -49,12 +49,6 @@ class _FakeDataClient:
         self.messages: dict[str, object] = {}
         self.exc: Exception | None = None
         self.calls: list[str] = []
-        # Existing tool tests exercise the E2EE branch; plaintext-branch
-        # tests flip this to False.
-        self.send_encryption = True
-
-    async def get_send_encryption(self, slug, thread_root_id):
-        return self.send_encryption
 
     def add(
         self,

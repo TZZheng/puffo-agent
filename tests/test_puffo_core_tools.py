@@ -743,10 +743,6 @@ async def test_send_message_encrypts_when_daemon_says_unencrypted():
         "has_more": False,
     }
 
-    async def _no_encrypt(slug, root):
-        return False
-
-    ms.get_send_encryption = _no_encrypt
     mcp = _build_tools(cfg)
     result = await _call(
         mcp,

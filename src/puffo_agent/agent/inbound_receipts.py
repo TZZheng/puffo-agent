@@ -489,7 +489,6 @@ class InboundReceiptHandler:
                 self.client,
                 committer.payload,
                 raw_text,
-                bool(committer.stored_payload.get("is_encrypted")),
             ),
         )
 

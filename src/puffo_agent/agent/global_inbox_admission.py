@@ -6,7 +6,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping
 
 from ._logging import log_runtime_event
 from .context_controller import (
@@ -61,19 +61,6 @@ class InboxAdmissionMixin:
     The runtime remains the only lifecycle and mutable-state owner. This trait
     exists solely to keep the compatibility facade readable and bounded.
     """
-
-    def _raise_send_mode_for(self, rows: Sequence[Any]) -> None:
-        """Raise the turn's E2EE obligation for a mid-turn admission.
-
-        The bundle flag was established from the planned batch. Admitting an
-        encrypted row afterwards extends that obligation to the rest of the
-        turn; a plaintext admission must never lower it.
-        """
-        if not any(getattr(row, "is_encrypted", False) for row in rows if row):
-            return
-        from . import send_mode
-
-        send_mode.raise_turn_bundle(list(self.send_mode_keys))
 
     def _validate_held_admission_turn(
         self,
@@ -181,7 +168,6 @@ class InboxAdmissionMixin:
             if row is not None and row.processing_state is ProcessingState.PENDING
         ]
         fired[0] = True
-        self._raise_send_mode_for(rows)
         try:
             if pending_ids:
                 await self.store.admit_messages(
@@ -722,7 +708,6 @@ class InboxAdmissionMixin:
                     }
                 )
                 if admitted_rows:
-                    self._raise_send_mode_for(admitted_rows)
                     await self.store.admit_messages(
                         (row.envelope_id for row in admitted_rows),
                         turn_id=context.active_turn_id,
@@ -969,7 +954,6 @@ class InboxAdmissionMixin:
                 turn_id=turn_id,
                 provider_session_id=provider_session_id,
             )
-            self._raise_send_mode_for(projection.selected)
             self.active.message_ids[:] = list(run.message_ids)
             await self._add_visible_message_ids(list(ids))
             self.active.routes.extend(routes)

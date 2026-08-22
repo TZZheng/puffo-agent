@@ -17,11 +17,9 @@ from ..crypto.keystore import decode_secret
 from ..crypto.message import (
     EncryptInput,
     RecipientDevice,
-    build_plaintext_message,
     encrypt_message,
 )
 from ..crypto.primitives import Ed25519KeyPair
-from . import send_mode
 from ._visibility import resolve_visibility
 
 Log = logging.Logger | logging.LoggerAdapter
@@ -75,11 +73,9 @@ async def send_direct_message(
     text: str,
     root_id: str,
     keystore: Any,
-    store: Any,
     http: Any,
     fetch_devices: DeviceFetcher,
     log: Log,
-    require_encryption: bool = False,
 ) -> dict[str, Any] | None:
     """Send one always-visible operator-facing DM."""
     if recipient_slug == slug:
@@ -92,10 +88,8 @@ async def send_direct_message(
             root_id=root_id,
             is_visible_to_human=True,
             keystore=keystore,
-            store=store,
             fetch_devices=fetch_devices,
             log=log,
-            require_encryption=require_encryption,
         )
         if envelope is None:
             return None
@@ -113,7 +107,6 @@ async def send_native_fallback_dm(
     text: str,
     root_id: str,
     keystore: Any,
-    store: Any,
     http: Any,
     fetch_devices: DeviceFetcher,
     log: Log,
@@ -133,7 +126,6 @@ async def send_native_fallback_dm(
         root_id=root_id,
         is_visible_to_human=visible,
         keystore=keystore,
-        store=store,
         fetch_devices=fetch_devices,
         log=log,
     )
@@ -181,30 +173,20 @@ async def _build_native_dm(
     root_id: str,
     is_visible_to_human: bool,
     keystore: Any,
-    store: Any,
     fetch_devices: DeviceFetcher,
     log: Log,
-    require_encryption: bool = False,
 ) -> tuple[dict[str, Any] | None, str]:
     session = keystore.load_session(slug)
     signing_key = Ed25519KeyPair.from_secret_bytes(
         decode_secret(session.subkey_secret_key)
     )
-    # A daemon-authored DM that quotes decrypted inbound content inherits that
-    # trigger's confidentiality. ``root_id`` is "" for these sends, so the
-    # thread-root rule alone would answer plaintext.
-    encrypt = require_encryption or await send_mode.encryption_required(
-        slug, store, root_id or None
-    )
-    devices: list[RecipientDevice] = []
-    if encrypt:
-        devices = await fetch_devices([slug, recipient_slug])
-        if not devices:
-            log.warning(
-                "no recipient devices for DM to %s - dropping",
-                recipient_slug,
-            )
-            return None, ""
+    devices = await fetch_devices([slug, recipient_slug])
+    if not devices:
+        log.warning(
+            "no recipient devices for DM to %s - dropping",
+            recipient_slug,
+        )
+        return None, ""
 
     message = EncryptInput(
         envelope_kind="dm",
@@ -217,6 +199,4 @@ async def _build_native_dm(
         content=text,
         recipients=devices,
     )
-    if encrypt:
-        return encrypt_message(message, signing_key), "/messages"
-    return build_plaintext_message(message, signing_key), "/v2/messages/plaintext"
+    return encrypt_message(message, signing_key), "/messages"

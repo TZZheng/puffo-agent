@@ -383,33 +383,6 @@ class DataClient:
                 f"data service unreachable answering get_message_by_envelope: {exc}"
             ) from exc
 
-    async def get_send_encryption(
-        self, slug: str, thread_root_id: str | None,
-    ) -> bool:
-        """Ask the daemon whether the next send must be E2EE.
-        Fail-safe: any transport/decode problem answers encrypt."""
-        path = (
-            f"/v1/data/{urllib.parse.quote(self.agent_id, safe='')}"
-            f"/send-encryption"
-        )
-        params = {"slug": slug}
-        if thread_root_id:
-            params["thread_root_id"] = thread_root_id
-        session = await self._get_session()
-        try:
-            async with session.get(
-                f"{self.base_url}{path}", params=params,
-            ) as resp:
-                if resp.status >= 400:
-                    return True
-                data = await resp.json()
-                return bool(data.get("encrypt", True))
-        except aiohttp.ClientError as exc:
-            logger.warning(
-                "data-service: get_send_encryption transport: %s", exc,
-            )
-            return True
-
     async def update_profile_cache(
         self, slug: str, display_name: str, avatar_url: str,
     ) -> None:

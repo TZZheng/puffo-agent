@@ -1468,7 +1468,7 @@ class PuffoCoreMessageClient:
             )
 
     async def _maybe_gate_foreign_dm(
-        self, *, sender_slug: str, text: str, trigger_encrypted: bool = False
+        self, *, sender_slug: str, text: str
     ) -> bool:
         from . import dm_gate
 
@@ -1476,7 +1476,6 @@ class PuffoCoreMessageClient:
             self,
             sender_slug=sender_slug,
             text=text,
-            trigger_encrypted=trigger_encrypted,
         )
 
     async def _maybe_handle_dm_approval_reply(
@@ -1830,7 +1829,6 @@ class PuffoCoreMessageClient:
         recipient_slug: str,
         text: str,
         root_id: str,
-        require_encryption: bool = False,
     ) -> dict[str, Any] | None:
         return await send_direct_message(
             slug=self.slug,
@@ -1838,11 +1836,9 @@ class PuffoCoreMessageClient:
             text=text,
             root_id=root_id,
             keystore=self.keystore,
-            store=self.store,
             http=self.http,
             fetch_devices=self._fetch_device_keys,
             log=self._log,
-            require_encryption=require_encryption,
         )
 
     async def _fetch_device_keys(
@@ -1919,7 +1915,6 @@ class PuffoCoreMessageClient:
             text=text,
             root_id=root_id,
             keystore=self.keystore,
-            store=self.store,
             http=self.http,
             fetch_devices=self._fetch_device_keys,
             log=self._log,
