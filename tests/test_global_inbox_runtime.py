@@ -2198,3 +2198,72 @@ async def test_adoption_waits_for_startup_recovery(tmp_path):
     assert runtime.active.turn_id == ""
     assert await runtime.finish_autonomous_turn() is False
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_settle_failure_keeps_the_owner(tmp_path):
+    """A failed durable settle must not be reported as a finished turn: the
+    rows stay in_turn, so dropping the owner here strands them with nothing
+    left in this process to retry before a restart."""
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime._autonomous_ready = True
+    assert await runtime.adopt_autonomous_turn(provider_session_id="p-1")
+    turn_id = runtime.active.turn_id
+
+    async def failing_finalize(**_kwargs):
+        raise RuntimeError("durable store unavailable")
+
+    store.finalize_empty_turn = failing_finalize  # type: ignore[method-assign]
+
+    assert await runtime.finish_autonomous_turn() is False
+    # Ownership survives: the turn is still adopted and still active.
+    assert runtime._autonomous_turn_id == turn_id
+    assert runtime.active.turn_id == turn_id
+    assert runtime.health.state == "degraded"
+    run = await store.get_turn_run(turn_id)
+    assert run is not None and run.state == "in_turn"
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expect_succeeded"), [("succeeded", True), ("abandoned", False)]
+)
+async def test_autonomous_terminal_settles_status_lifecycle(
+    tmp_path, outcome, expect_succeeded,
+):
+    """read_inbox during the run marks status active; without a terminal here
+    that status hangs for the rest of the process."""
+    store = await make_store(tmp_path)
+    settled: list[dict] = []
+
+    class _Status:
+        async def on_turn_active(self, **kwargs):
+            settled.append({"event": "active", **kwargs})
+
+        async def on_turn_terminal(self, **kwargs):
+            settled.append({"event": "terminal", **kwargs})
+
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+        status_lifecycle=_Status(),
+    )
+    runtime._autonomous_ready = True
+    assert await runtime.adopt_autonomous_turn(provider_session_id="p-1")
+    turn_id = runtime.active.turn_id
+
+    assert await runtime.finish_autonomous_turn(outcome=outcome) is True
+    terminals = [row for row in settled if row["event"] == "terminal"]
+    assert len(terminals) == 1
+    assert terminals[0]["turn_id"] == turn_id
+    assert terminals[0]["succeeded"] is expect_succeeded
+    await store.close()

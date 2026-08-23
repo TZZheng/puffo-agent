@@ -1063,48 +1063,87 @@ async def test_continuation_failure_persists_terminal_before_next_turn(tmp_path)
     outbox.close()
 
 
-@pytest.mark.asyncio
-async def test_runtime_exit_releases_an_adopted_autonomous_turn():
-    """An adopted autonomous turn is not in the driver's turn state, so the
-    TURN_ABANDONED path cannot reach it. Without a direct notification the
-    daemon would hold that turn in_turn until the process restarted."""
-    driver = _ControllableDriver()
-    manager = RuntimeManager(
-        driver,
-        RuntimeSpec("/tmp", task_timeout_seconds=1),
-        driver_name="claude-code",
+def _autonomous_manager(driver_name="claude-code", *, event_sink=None):
+    return RuntimeManager(
+        driver=_ControllableDriver(),
+        spec=RuntimeSpec("/tmp", task_timeout_seconds=5),
+        driver_name=driver_name,
+        event_sink=event_sink,
     )
-    adapter = RuntimeManagerAdapter(manager)
-    reported: list[tuple[str, dict]] = []
 
+
+async def _start_autonomous(manager, reported):
     async def on_autonomous(event):
-        event_type = getattr(event.type, "value", event.type)
-        reported.append((event_type, dict(event.data)))
+        reported.append((
+            getattr(event.type, "value", event.type), dict(event.data),
+        ))
 
-    assert adapter.register_autonomous_callback(on_autonomous) is True
-
-    running = asyncio.create_task(adapter.run_turn(_context()))
-    await asyncio.wait_for(driver.started.wait(), timeout=1)
-    # The harness woke the model on its own, then the runtime died.
-    await driver.queue.put(HarnessEvent(
+    manager.autonomous_callback = on_autonomous
+    await manager._consume_event_locked(HarnessEvent(
         type="turn.autonomous_started",
-        driver="claude-code",
-        session_ref=SessionRef(manager.native_session_id),
+        driver=manager.driver_name,
+        session_ref=SessionRef("native"),
+        turn_ref=TurnRef("driver-turn"),
+        native_turn_id="native-turn-1",
     ))
-    await driver.queue.put(HarnessEvent(
-        type="runtime.exited",
-        driver="claude-code",
-        session_ref=SessionRef(manager.native_session_id),
-    ))
-    with pytest.raises((AgentAPIError, RuntimeStateError)):
-        await asyncio.wait_for(running, timeout=1)
+    assert manager.active_turn_ref is not None
 
-    assert [kind for kind, _ in reported] == [
-        "turn.autonomous_started",
-        "turn.autonomous_completed",
-    ]
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["runtime_exited", "stream_ended", "closed"])
+async def test_every_terminal_path_releases_an_adopted_autonomous_turn(ending):
+    """A background run must end exactly once however the runtime goes away.
+    Without this the daemon holds its durable turn in_turn past a refresh or
+    an ordinary shutdown, blocking later turns until the process restarts."""
+    manager = _autonomous_manager()
+    reported: list[tuple[str, dict]] = []
+    await _start_autonomous(manager, reported)
+
+    if ending == "runtime_exited":
+        await manager._consume_event_locked(HarnessEvent(
+            type="runtime.exited",
+            driver="claude-code",
+            session_ref=SessionRef("native"),
+        ))
+    elif ending == "stream_ended":
+        await manager._fail_runtime_locked("event_stream_ended")
+    else:
+        await manager.close()
+
+    terminals = [kind for kind, _ in reported[1:]]
+    assert len(terminals) == 1, reported
     assert reported[-1][1]["outcome"] == "abandoned"
-    assert reported[-1][1]["error_code"] == "runtime_exited"
+    assert manager.active_turn_ref is None
+    assert manager._autonomous_turn is None
+
+
+@pytest.mark.asyncio
+async def test_autonomous_terminal_follows_persistence_conversion():
+    """When persisting the terminal fails the manager converts it to an
+    abandon. The daemon must settle on that same conversion -- reporting the
+    raw success would mark Inbox rows processed for a turn everyone else
+    treats as abandoned."""
+    async def failing_sink(event):
+        if getattr(event.type, "value", event.type) == "turn.autonomous_completed":
+            raise RuntimeError("event store unavailable")
+
+    manager = _autonomous_manager(event_sink=failing_sink)
+    reported: list[tuple[str, dict]] = []
+    await _start_autonomous(manager, reported)
+
+    with pytest.raises(RuntimeError, match="event store unavailable"):
+        await manager._consume_event_locked(HarnessEvent(
+            type="turn.autonomous_completed",
+            driver="claude-code",
+            session_ref=SessionRef("native"),
+            turn_ref=TurnRef("driver-turn"),
+            native_turn_id="native-turn-1",
+            data={"outcome": "succeeded"},
+        ))
+
+    assert reported[-1][1]["outcome"] == "abandoned"
+    assert reported[-1][1]["error_code"] == "event_persistence_failed"
+    assert manager.active_turn_ref is None
 
 
 @pytest.mark.asyncio

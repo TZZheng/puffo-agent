@@ -161,6 +161,8 @@ class RuntimeManager:
         self.autonomous_callback: (
             Callable[[HarnessEvent], Awaitable[None]] | None
         ) = None
+        # Logical turn of a provider run the driver opened on its own.
+        self._autonomous_turn: TurnRef | None = None
         self.before_start = before_start
         self.session_ref = session_ref or SessionRef(
             f"session_{uuid.uuid4().hex}"
@@ -525,6 +527,32 @@ class RuntimeManager:
             await self._stop_reader()
             await self.driver.close()
             self.opened = None
+            autonomous = self._autonomous_turn
+            if autonomous is not None:
+                # Refresh and ordinary shutdown reach here; without a terminal
+                # the daemon would hold that turn in_turn past the restart.
+                try:
+                    await self._publish_terminal_locked(
+                        HarnessEvent(
+                            type=HarnessEventType.TURN_ABANDONED,
+                            driver=self.driver_name,
+                            session_ref=self.session_ref,
+                            turn_ref=autonomous,
+                            native_session_id=self.native_session_id,
+                            native_turn_id=self.native_turn_id,
+                            data={
+                                "outcome": "abandoned",
+                                "error_code": "runtime_closed",
+                                "retryable": True,
+                            },
+                        ),
+                        autonomous,
+                    )
+                except Exception:  # noqa: BLE001 - close must still finish
+                    logger.warning(
+                        "autonomous terminal failed during close",
+                        exc_info=True,
+                    )
             for future in tuple(self._terminal.values()):
                 if not future.done():
                     future.set_exception(RuntimeStateError("runtime is closed"))
@@ -615,14 +643,6 @@ class RuntimeManager:
         }:
             self._fail_compaction_locked("runtime exited")
             await self._publish_event(event)
-            # An adopted autonomous turn is never in the driver's turn state,
-            # so the TURN_ABANDONED below cannot reach it. Without this the
-            # daemon would keep that turn in_turn forever.
-            await self._notify_autonomous(replace(
-                event,
-                type=HarnessEventType.AUTONOMOUS_COMPLETED,
-                data={"outcome": "abandoned", "error_code": "runtime_exited"},
-            ))
             active = self.active_turn_ref
             # A crash before this resumed session's first success is
             # treated the same as the turn.completed case below: discard
@@ -701,6 +721,7 @@ class RuntimeManager:
             return
         logical = TurnRef(f"turn_{uuid.uuid4().hex}")
         self.active_turn_ref = logical
+        self._autonomous_turn = logical
         self._active_driver_turn_ref = native.turn_ref
         self._turn_refs[native.turn_ref] = logical
         self.native_turn_id = native.native_turn_id or ""
@@ -775,7 +796,14 @@ class RuntimeManager:
             )
         finally:
             self._fanout_event(delivered)
+            autonomous = self._autonomous_turn == turn
             self._complete_turn(delivered, turn)
+            if autonomous:
+                # The daemon must settle on the same terminal every other
+                # consumer saw: if persistence turned this into an abandon,
+                # it requeues rather than marking Inbox rows processed.
+                self._autonomous_turn = None
+                await self._notify_autonomous(delivered)
         if persistence_error is not None:
             raise persistence_error
 

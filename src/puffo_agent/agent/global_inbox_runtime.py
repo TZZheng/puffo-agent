@@ -1825,10 +1825,13 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 ),
                 provider_turn_id=getattr(event, "native_turn_id", "") or None,
             )
-        elif event_type == "turn.autonomous_completed":
-            await self.finish_autonomous_turn(
-                outcome=str(event.data.get("outcome") or "succeeded"),
-            )
+            return
+        # Any terminal delivered for the adopted turn ends it, whatever the
+        # manager converted it into: an abandon (runtime exit, close, event
+        # persistence failure) must requeue rather than mark rows processed.
+        await self.finish_autonomous_turn(
+            outcome=str(event.data.get("outcome") or "succeeded"),
+        )
 
     async def adopt_autonomous_turn(
         self,
@@ -1934,27 +1937,45 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                     await self._requeue_active_turn(
                         planned, time.monotonic(), error_category=outcome,
                     )
-            except Exception as exc:  # noqa: BLE001 - never break the reader
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                # The durable settle is the only gate for cleanup. Clearing
+                # here would drop the owner of rows still in_turn, with no
+                # pending wake to retry them before the next restart.
+                self._autonomous_turn_id = turn_id
+                self._autonomous_planned = planned
+                self._degrade(f"autonomous turn settle failed: {exc}")
                 log_runtime_event(
                     logger,
                     "turn.autonomous_finalized",
+                    level=logging.ERROR,
                     agent_id=self.agent_id,
                     turn_id=turn_id,
                     message_count=len(self.active.message_ids),
                     outcome="failed",
                     error_category=type(exc).__name__,
                 )
-            else:
-                log_runtime_event(
-                    logger,
-                    "turn.autonomous_finalized",
-                    agent_id=self.agent_id,
-                    turn_id=turn_id,
-                    provider_session_id=self.active.provider_session_id,
-                    message_count=len(self.active.message_ids),
-                    state="processed" if succeeded else "requeued",
-                    outcome=outcome,
-                )
+                return False
+            log_runtime_event(
+                logger,
+                "turn.autonomous_finalized",
+                agent_id=self.agent_id,
+                turn_id=turn_id,
+                provider_session_id=self.active.provider_session_id,
+                message_count=len(self.active.message_ids),
+                state="processed" if succeeded else "requeued",
+                outcome=outcome,
+            )
+            # Status was made active by any read_inbox during the run; settle
+            # it on the same union the durable paths just used, and before
+            # _finalize_process clears that union.
+            self.health = RuntimeHealth(
+                "in_progress" if succeeded else "degraded", ""
+            )
+            await self._notify_status_terminal(
+                terminal=True,
+                succeeded=succeeded,
+                error_text=None if succeeded else outcome,
+            )
             self._finalize_process(planned, terminal=True)
             self.active.clear()
             self.attempts.reset()
