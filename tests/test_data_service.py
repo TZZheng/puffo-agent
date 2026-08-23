@@ -299,5 +299,3 @@ async def test_thread_messages_404_for_unknown_root() -> None:
         assert resp.status == 404
         body = await resp.json()
         assert body == {"error": "thread root not found"}
-
-
