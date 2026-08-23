@@ -79,6 +79,11 @@ class _WsLocalContextAdapter:
         self._callback = callback
         self._planning_cycle_key = planning_cycle_key
 
+    def register_autonomous_callback(self, callback) -> bool:
+        """WS-local attachments do not expose autonomous provider turns."""
+        del callback
+        return False
+
     def register_continuation_callback(
         self,
         callback,

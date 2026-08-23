@@ -641,44 +641,7 @@ class RuntimeManager:
             HarnessEventType.RUNTIME_EXITED,
             "runtime.exited",
         }:
-            self._fail_compaction_locked("runtime exited")
-            await self._publish_event(event)
-            active = self.active_turn_ref
-            # A crash before this resumed session's first success is
-            # treated the same as the turn.completed case below: discard
-            # the session id so the retry gets a fresh session.
-            unconfirmed = self._resume_unconfirmed
-            self._resume_unconfirmed = False
-            failed_native_session_id = self.native_session_id
-            if unconfirmed:
-                # The event retains the failed native id for diagnostics, but
-                # durable manager state must already point at a fresh session.
-                self._clear_native_session()
-            try:
-                if active is not None:
-                    abandoned = HarnessEvent(
-                        type=HarnessEventType.TURN_ABANDONED,
-                        driver=self.driver_name,
-                        session_ref=self.session_ref,
-                        turn_ref=active,
-                        native_session_id=failed_native_session_id,
-                        native_turn_id=self.native_turn_id,
-                        occurred_at=event.occurred_at,
-                        data={
-                            "outcome": "abandoned",
-                            "error_code": (
-                                "resume_unconfirmed" if unconfirmed
-                                else "runtime_exited"
-                            ),
-                            "retryable": True,
-                        },
-                    )
-                    await self._publish_terminal_locked(abandoned, active)
-            finally:
-                try:
-                    await self.driver.close()
-                finally:
-                    self.opened = None
+            await self._handle_runtime_exit_locked(event)
             return True
         if event.type in {
             HarnessEventType.TURN_COMPLETED, "turn.completed",
@@ -711,6 +674,40 @@ class RuntimeManager:
         else:
             await self._publish_event(event)
         return False
+
+    async def _handle_runtime_exit_locked(self, event: HarnessEvent) -> None:
+        self._fail_compaction_locked("runtime exited")
+        await self._publish_event(event)
+        active = self.active_turn_ref
+        unconfirmed = self._resume_unconfirmed
+        self._resume_unconfirmed = False
+        failed_native_session_id = self.native_session_id
+        if unconfirmed:
+            self._clear_native_session()
+        try:
+            if active is not None:
+                abandoned = HarnessEvent(
+                    type=HarnessEventType.TURN_ABANDONED,
+                    driver=self.driver_name,
+                    session_ref=self.session_ref,
+                    turn_ref=active,
+                    native_session_id=failed_native_session_id,
+                    native_turn_id=self.native_turn_id,
+                    occurred_at=event.occurred_at,
+                    data={
+                        "outcome": "abandoned",
+                        "error_code": (
+                            "resume_unconfirmed" if unconfirmed else "runtime_exited"
+                        ),
+                        "retryable": True,
+                    },
+                )
+                await self._publish_terminal_locked(abandoned, active)
+        finally:
+            try:
+                await self.driver.close()
+            finally:
+                self.opened = None
 
     def _adopt_driver_turn_locked(self, native: HarnessEvent) -> None:
         """Track a provider turn the driver opened on its own.

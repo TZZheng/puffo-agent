@@ -16,7 +16,7 @@ import uuid
 from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Protocol, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 
 from .channel_audience import (
     ChannelAudienceLoader,
@@ -69,6 +69,7 @@ from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
 from .global_inbox_admission import InboxAdmissionMixin
 from .global_inbox_covers import CoversReconciliationMixin
+from .autonomous_turns import AutonomousTurnLifecycleMixin, TurnStatusLifecycle
 from .global_inbox_types import (
     opt_str,
     ActiveBoundaryAdapter,
@@ -121,36 +122,11 @@ TurnRunner = Callable[[PlannedTurn], Awaitable[Any]]
 UnfitPolicy = Callable[..., bool | Awaitable[bool]]
 
 
-class TurnStatusLifecycle(Protocol):
-    """Optional worker-owned mirror of the active Global Inbox turn.
-
-    The runtime owns only the durable turn lifecycle; it notifies this
-    callback with immutable notice and active-union snapshots so the worker
-    can drive Server status without moving status policy in here.
-    """
-
-    async def on_notice_admitted(
-        self, *, turn_id: str, message_ids: tuple[str, ...]
-    ) -> None:
-        """Report that a provider accepted an Inbox notice for this turn."""
-
-    async def on_turn_active(
-        self, *, turn_id: str, message_ids: tuple[str, ...]
-    ) -> None:
-        """Report that the active union is (or has grown to) ``message_ids``."""
-
-    async def on_turn_terminal(
-        self,
-        *,
-        turn_id: str,
-        message_ids: tuple[str, ...],
-        succeeded: bool,
-        error_text: str | None,
-    ) -> None:
-        """Settle the exact active union in one terminal status batch."""
-
-
-class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
+class GlobalInboxRuntime(
+    AutonomousTurnLifecycleMixin,
+    InboxAdmissionMixin,
+    CoversReconciliationMixin,
+):
     """One serial provider boundary over the durable global Inbox."""
 
     def __init__(
@@ -192,19 +168,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         self.unfit_policy = unfit_policy or (lambda *_args, **_kwargs: True)
         self.coordinator = coordinator
         self.active = ActiveExactUnion()
-        # Turn id of an adopted autonomous (daemon-unstarted) provider run.
-        self._autonomous_turn_id = ""
-        self._autonomous_planned: PlannedTurn | None = None
-        # Adoption stays shut until startup recovery has run. A turn adopted
-        # before that barrier writes no crash-join file, so recover_current_turn
-        # cannot see it and recover_orphaned_turns would retire a run that is
-        # still executing -- while driver, manager and this runtime all still
-        # believe it is active.
-        self._autonomous_ready = False
-        self._deferred_autonomous_start: Any | None = None
-        # Outcome of a terminal whose durable settle failed; the degraded wake
-        # retries it instead of leaving the turn owned but unreachable.
-        self._autonomous_settle_pending: str | None = None
+        self._initialize_autonomous_lifecycle()
         self.attempts = SendAttemptState()
         self.health = RuntimeHealth()
         # Per ``(space_id, channel_id)``: sends serialize per target, so two
@@ -429,13 +393,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         try:
             await self.recover_current_turn()
             await self.recover_orphaned_turns()
-            # Past the barrier: adopting a provider run is now safe.
-            self._autonomous_ready = True
-            deferred, self._deferred_autonomous_start = (
-                self._deferred_autonomous_start, None,
-            )
-            if deferred is not None:
-                await self._on_autonomous_event(deferred)
+            await self._enable_autonomous_adoption()
             if self._defer_requeued_recovery:
                 # Consume the recovery wake without immediately feeding the same
                 # failed durable union through the initial-turn path.
@@ -1414,10 +1372,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 outcome=self._autonomous_settle_pending
             ):
                 return False
+        await self._replay_deferred_autonomous_start()
         if self._autonomous_turn_id:
-            # The provider is mid-run on a turn it started itself. Starting a
-            # daemon turn now would be rejected by the driver anyway (one turn
-            # at a time); queue instead and re-notify when that turn ends.
+            # Queue while the provider is mid-run on its autonomous turn.
             return False
         async with self._boundary:
             process_started = time.monotonic()
@@ -1500,6 +1457,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                     error_text=terminal_error,
                 )
                 self._finalize_process(planned, terminal)
+                await self._replay_deferred_autonomous_start()
             await self._wake_remaining_pending()
             return True
 
@@ -1808,208 +1766,6 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         ):
             return None
         return planned
-
-    def register_autonomous_adoption(self) -> bool:
-        """Ask the adapter to report provider turns the daemon didn't start.
-
-        Harness background tasks wake the model after the daemon finalized
-        its turn. Those runs used to proceed unbound: sends could not resolve
-        freshness or recover from held, and Inbox reads were refused. Binding
-        a turn to them puts the model back on the normal lifecycle.
-        """
-        register = getattr(self.adapter, "register_autonomous_callback", None)
-        if register is None:
-            return False
-        return bool(register(self._on_autonomous_event))
-
-    async def _on_autonomous_event(self, event: Any) -> None:
-        event_type = getattr(event.type, "value", event.type)
-        if not self._autonomous_ready:
-            # Startup recovery owns the durable turn table right now. The
-            # provider announces a run once, so dropping the start would leave
-            # the driver and manager running a turn this daemon never adopts;
-            # hold it and replay once the barrier lifts. A terminal arriving
-            # first means the run already ended -- nothing left to adopt.
-            self._deferred_autonomous_start = (
-                event if event_type == "turn.autonomous_started" else None
-            )
-            log_runtime_event(
-                logger,
-                "turn.autonomous_adoption",
-                agent_id=self.agent_id,
-                outcome="deferred",
-                error_category="startup_recovery",
-            )
-            return
-        if event_type == "turn.autonomous_started":
-            await self.adopt_autonomous_turn(
-                provider_session_id=(
-                    getattr(event, "native_session_id", "")
-                    or self.adapter.get_provider_session_id()
-                ),
-                provider_turn_id=getattr(event, "native_turn_id", "") or None,
-            )
-            return
-        # Any terminal delivered for the adopted turn ends it, whatever the
-        # manager converted it into: an abandon (runtime exit, close, event
-        # persistence failure) must requeue rather than mark rows processed.
-        await self.finish_autonomous_turn(
-            outcome=str(event.data.get("outcome") or "succeeded"),
-        )
-
-    async def adopt_autonomous_turn(
-        self,
-        *,
-        provider_session_id: str | None,
-        provider_turn_id: str | None = None,
-    ) -> bool:
-        """Bind a daemon turn to a provider run the daemon did not start."""
-        async with self._turn_state_lock:
-            if self.active.turn_id:
-                # A daemon-started turn owns the session; nothing to adopt.
-                return False
-            turn_id = f"turn_{uuid.uuid4().hex}"
-            try:
-                await self.store.start_turn(
-                    turn_id=turn_id,
-                    provider_session_id=provider_session_id or None,
-                )
-            except Exception as exc:  # noqa: BLE001 - adoption is best-effort
-                log_runtime_event(
-                    logger,
-                    "turn.autonomous_adoption",
-                    agent_id=self.agent_id,
-                    turn_id=turn_id,
-                    provider_session_id=provider_session_id,
-                    outcome="rejected",
-                    error_category=type(exc).__name__,
-                )
-                return False
-            self.active.clear()
-            self.active.turn_id = turn_id
-            self.active.provider_session_id = provider_session_id or None
-            self.active.provider_turn_id = provider_turn_id
-            self._autonomous_turn_id = turn_id
-            # The terminal reuses the ordinary exact-union finalize, which is
-            # driven by a PlannedTurn. An autonomous run starts with no Inbox
-            # rows, but read_inbox during it admits real ones into this union.
-            self._autonomous_planned = PlannedTurn(
-                turn_id=turn_id,
-                planning_cycle_key=f"autonomous_{turn_id}",
-                message_ids=(),
-                items=(),
-                routes=(),
-                targets=(),
-                pending_targets=(),
-                target_summary="",
-                formatted_blocks=(),
-                provider_input="",
-                formatted_tokens=0,
-                wrapper_overhead_tokens=0,
-                formatted_bytes=0,
-                wrapper_overhead_bytes=0,
-            )
-            if self.coordinator is not None:
-                self.coordinator.provider_session_id = provider_session_id or None
-            self.attempts.reset()
-            self.health = RuntimeHealth("in_progress", "autonomous provider turn")
-            log_runtime_event(
-                logger,
-                "turn.autonomous_adoption",
-                agent_id=self.agent_id,
-                turn_id=turn_id,
-                provider_session_id=provider_session_id,
-                provider_turn_id=provider_turn_id,
-                state="in_turn",
-                outcome="adopted",
-            )
-            return True
-
-    async def _release_autonomous_turn(self, *, reason: str) -> bool:
-        """Finalize an adopted turn before something else claims the session."""
-        if not self._autonomous_turn_id:
-            return False
-        return await self.finish_autonomous_turn(outcome=reason)
-
-    async def finish_autonomous_turn(self, *, outcome: str = "succeeded") -> bool:
-        """Close the turn opened by :meth:`adopt_autonomous_turn`."""
-        async with self._turn_state_lock:
-            turn_id = self._autonomous_turn_id
-            if not turn_id or self.active.turn_id != turn_id:
-                # A daemon turn superseded the adoption; it owns the ending.
-                self._autonomous_turn_id = ""
-                return False
-            self._autonomous_turn_id = ""
-            self._autonomous_settle_pending = None
-            planned = self._autonomous_planned or PlannedTurn(
-                turn_id=turn_id,
-                planning_cycle_key=f"autonomous_{turn_id}",
-                message_ids=(), items=(), routes=(), targets=(),
-                pending_targets=(), target_summary="", formatted_blocks=(),
-                provider_input="", formatted_tokens=0,
-                wrapper_overhead_tokens=0, formatted_bytes=0,
-                wrapper_overhead_bytes=0,
-            )
-            self._autonomous_planned = None
-            succeeded = outcome in {"succeeded", ""}
-            try:
-                # Rows admitted by read_inbox during the run make this union
-                # non-empty; the ordinary paths settle them as processed or
-                # requeued instead of conflicting with an empty-only finalize.
-                if succeeded:
-                    await self._mark_active_processed(planned, time.monotonic())
-                else:
-                    await self._requeue_active_turn(
-                        planned, time.monotonic(), error_category=outcome,
-                    )
-            except Exception as exc:  # noqa: BLE001 - reported, never raised
-                # The durable settle is the only gate for cleanup. Clearing
-                # here would drop the owner of rows still in_turn, with no
-                # pending wake to retry them before the next restart.
-                self._autonomous_turn_id = turn_id
-                self._autonomous_planned = planned
-                self._autonomous_settle_pending = outcome
-                self._degrade(f"autonomous turn settle failed: {exc}")
-                log_runtime_event(
-                    logger,
-                    "turn.autonomous_finalized",
-                    level=logging.ERROR,
-                    agent_id=self.agent_id,
-                    turn_id=turn_id,
-                    message_count=len(self.active.message_ids),
-                    outcome="failed",
-                    error_category=type(exc).__name__,
-                )
-                return False
-            log_runtime_event(
-                logger,
-                "turn.autonomous_finalized",
-                agent_id=self.agent_id,
-                turn_id=turn_id,
-                provider_session_id=self.active.provider_session_id,
-                message_count=len(self.active.message_ids),
-                state="processed" if succeeded else "requeued",
-                outcome=outcome,
-            )
-            # Status was made active by any read_inbox during the run; settle
-            # it on the same union the durable paths just used, and before
-            # _finalize_process clears that union.
-            self.health = RuntimeHealth(
-                "in_progress" if succeeded else "degraded", ""
-            )
-            await self._notify_status_terminal(
-                terminal=True,
-                succeeded=succeeded,
-                error_text=None if succeeded else outcome,
-            )
-            self._finalize_process(planned, terminal=True)
-            self.active.clear()
-            self.attempts.reset()
-            self.health = RuntimeHealth()
-        # Outside the lock: anything that queued while the provider was busy
-        # would otherwise wait for an unrelated inbound message.
-        self.notify()
-        return True
 
     def _activate_recovery(
         self,
