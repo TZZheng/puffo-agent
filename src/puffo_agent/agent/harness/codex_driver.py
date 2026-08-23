@@ -12,7 +12,12 @@ from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from ..errors import AgentAPIError
+from ..errors import AgentAPIError, ProviderFailureError
+from ..provider_failures import (
+    classify_provider_failure,
+    provider_failure,
+    provider_failure_message,
+)
 from .driver import (
     CancelCapability,
     CancelReceipt,
@@ -74,16 +79,6 @@ _TOKENISH = re.compile(
     r"(?i)\b(?:sk[_-][a-z0-9_-]{12,}|eyJ[a-zA-Z0-9_-]{12,}"
     r"\.[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)?)"
 )
-_AUTH_ERROR = re.compile(
-    r"(?i)(?:\b401\b|\b403\b|authentication|authenticate|unauthori[sz]ed|"
-    r"invalid(?:ated)?[ _-]?(?:api[ _-]?key|token|credential)|"
-    r"token[ _-]?(?:invalidated|revoked)|(?:re-)?login)"
-)
-_RETRYABLE_PROVIDER_ERROR = re.compile(
-    r"(?i)(?:\b408\b|\b425\b|\b429\b|\b5\d\d\b|rate[ _-]?limit|"
-    r"too many requests|quota|temporar(?:y|ily)|timed? ?out|timeout|"
-    r"unavailable|overloaded|connection (?:reset|refused))"
-)
 _TOOL_ITEM_TYPES = frozenset(
     {"mcpToolCall", "dynamicToolCall", "functionCall", "toolCall"}
 )
@@ -136,6 +131,23 @@ def _jsonrpc_error_context(error: Any) -> str:
     return " ".join(values)[:2048]
 
 
+def _jsonrpc_error_status(error: Any) -> int | None:
+    if not isinstance(error, dict):
+        return None
+    candidates = [error.get("status"), error.get("code")]
+    data = error.get("data")
+    if isinstance(data, dict):
+        candidates.extend((data.get("status"), data.get("code")))
+    for candidate in candidates:
+        if type(candidate) is int and 400 <= candidate <= 599:
+            return candidate
+        if isinstance(candidate, str) and candidate.isdigit():
+            parsed = int(candidate)
+            if 400 <= parsed <= 599:
+                return parsed
+    return None
+
+
 def _classify_jsonrpc_error(error: Any) -> Exception:
     """Translate a Codex JSON-RPC error into Global Inbox recovery semantics."""
     error_obj = error if isinstance(error, dict) else {}
@@ -143,11 +155,20 @@ def _classify_jsonrpc_error(error: Any) -> Exception:
     message = _safe_jsonrpc_error_message(error_obj.get("message", error))
     detail = f"Codex JSON-RPC error code={code}: {message}"
     context = _jsonrpc_error_context(error)
-    if _AUTH_ERROR.search(context):
-        return AgentAPIError(detail, is_auth=True)
-    if _RETRYABLE_PROVIDER_ERROR.search(context):
-        return AgentAPIError(detail, is_auth=False)
-    return RuntimeError(detail)
+    error_code = classify_provider_failure(
+        status=_jsonrpc_error_status(error),
+        diagnostic=context,
+    )
+    failure = provider_failure(error_code)
+    logger.warning("codex provider request failed (%s): %s", error_code, detail)
+    public_message = provider_failure_message(error_code)
+    if failure.is_auth or failure.retryable:
+        return AgentAPIError(
+            public_message,
+            is_auth=failure.is_auth,
+            error_code=error_code,
+        )
+    return ProviderFailureError(public_message, error_code=error_code)
 
 
 def _permission_response(
@@ -513,10 +534,17 @@ class CodexAppServerDriver(Driver):
         except asyncio.TimeoutError:
             # Provider silence must surface as a bounded, retryable failure so
             # Global Inbox recovery re-enqueues instead of waiting forever.
+            logger.warning(
+                "Codex request %s timed out after %ss",
+                method,
+                f"{self.request_timeout_seconds:g}",
+            )
             raise AgentAPIError(
+                f"{provider_failure_message('provider_unavailable')} "
                 f"Codex request {method} timed out after "
-                f"{self.request_timeout_seconds:g}s",
+                f"{self.request_timeout_seconds:g}s.",
                 is_auth=False,
+                error_code="provider_unavailable",
             ) from None
         finally:
             self._pending.pop(request_id, None)

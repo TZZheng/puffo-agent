@@ -1350,8 +1350,8 @@ class CredentialRefresher:
             if rs is None:
                 continue
             if rs.health in (
-                "auth_failed", "api_error_abandoned", "refresh_broken",
-                "in_progress", "unhandled_error",
+                "auth_failed", "api_error_abandoned", "provider_error",
+                "refresh_broken", "in_progress", "unhandled_error",
             ):
                 continue
             rs.health = "refresh_broken"

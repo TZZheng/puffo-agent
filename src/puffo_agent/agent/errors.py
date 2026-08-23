@@ -18,3 +18,11 @@ class AgentAPIError(Exception):
         super().__init__(message)
         self.is_auth = is_auth
         self.error_code = error_code
+
+
+class ProviderFailureError(RuntimeError):
+    """A categorized provider failure that must not be retried immediately."""
+
+    def __init__(self, message: str, *, error_code: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code

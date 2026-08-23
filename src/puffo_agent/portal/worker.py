@@ -9,8 +9,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import random
-import re
 import shutil
 import sys
 import time
@@ -20,6 +18,7 @@ from typing import Awaitable, Callable, Optional
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError as AgentAPIError
 from ..agent.core import PuffoAgent as PuffoAgent
+from ..agent.provider_failures import provider_failure_message
 from ..limits import (
     DEFAULT_CATCHUP_STALE_HOURS,
     MAX_INLINE_MESSAGE_CHARS,
@@ -292,209 +291,8 @@ def _build_puffo_core_client(
     )
 
 
-# Auth-class patterns: definitive OAuth/API-key failure only. Shared by
-# the leak filter and the auth_failed health flip. High-FP markers
-# (401, unauthorized, api_error) stay out; they collide with agent prose.
-_AUTH_ERROR_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"^\s*Not logged in[\s\S]*Please run /login", re.IGNORECASE),
-    re.compile(r"^\s*OAuth token (?:revoked|has expired)\b", re.IGNORECASE),
-    re.compile(r"^\s*Invalid API key\b", re.IGNORECASE),
-    re.compile(r"\bThis organization has been disabled\b", re.IGNORECASE),
-    re.compile(r"\bauthentication_error\b", re.IGNORECASE),
-)
-
-# Worker-layer leak patterns NOT in the auth-class set. Sources:
-# Claude Code error reference (CLI message-to-recovery table) +
-# Claude API platform docs (canonical <type>_error identifiers).
-_NON_AUTH_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # Internal kick message echoed back as a reply.
-    re.compile(
-        r"^\s*\[puffo-agent system message\]\s+session errored on rate",
-        re.IGNORECASE,
-    ),
-    # Subscription-plan quotas (the prod miss the reviewer surfaced).
-    re.compile(r"^\s*You've hit your\b.*?\blimit\b", re.IGNORECASE),
-    # Model-usage-cap fallback ("reached your <Model> limit …"); model-agnostic + apostrophe-robust (`.?`).
-    re.compile(r"^\s*You.?ve reached your\b.*?\blimit\b", re.IGNORECASE),
-    re.compile(r"^\s*Credit balance is too low\b", re.IGNORECASE),
-    # CLI-emitted server 429 / 5xx.
-    re.compile(r"\bAPI Error: Request rejected \(429\)", re.IGNORECASE),
-    re.compile(
-        r"\bAPI Error: Server is temporarily limiting requests\b", re.IGNORECASE
-    ),
-    re.compile(r"\bAPI Error: Repeated 529 Overloaded errors\b", re.IGNORECASE),
-    re.compile(r"\bAPI Error: 500\b[\s\S]*Internal server error\b", re.IGNORECASE),
-    # API-canonical <type>_error identifiers, minus high-FP entries
-    # (invalid_request_error / not_found_error / api_error) per audit.
-    re.compile(r"\brate[_ -]limit[_ -]error\b", re.IGNORECASE),
-    re.compile(r"\boverloaded_error\b", re.IGNORECASE),
-    re.compile(r"\bbilling_error\b", re.IGNORECASE),
-    re.compile(r"\bpermission_error\b", re.IGNORECASE),
-    re.compile(r"\btimeout_error\b", re.IGNORECASE),
-)
-
-_WORKER_ERROR_LEAK_PATTERNS: tuple[re.Pattern[str], ...] = (
-    *_AUTH_ERROR_PATTERNS,
-    *_NON_AUTH_LEAK_PATTERNS,
-)
-
-# Post-leak backoff: random 15-60s samples sustained limits instead of
-# hammering; single-batch leaks self-clear during the sleep.
-_SUPPRESSION_BACKOFF_MIN_SECONDS = 15.0
-_SUPPRESSION_BACKOFF_MAX_SECONDS = 60.0
-
-
-def _looks_like_auth_error(reply: str) -> bool:
-    """True iff ``reply`` is one of the definitive auth-class
-    failure strings (Claude CLI re-login prompt, OAuth-token
-    revoked/expired, invalid API key, disabled org, or the
-    ``authentication_error`` API identifier). Drives the
-    ``runtime.health=auth_failed`` flip alongside PUF-207's
-    startup-paused signal."""
-    if not reply:
-        return False
-    for pattern in _AUTH_ERROR_PATTERNS:
-        if pattern.search(reply):
-            return True
-    return False
-
-
-def _suppress_worker_error_leak(reply: str) -> str | None:
-    """Return ``None`` when ``reply`` matches a worker-error
-    pattern, signalling the caller to suppress the channel post and
-    surface to the operator instead. Returns the reply unchanged
-    otherwise. Mirrors ``_coerce_root_visibility``'s shape."""
-    if not reply:
-        return reply
-    for pattern in _WORKER_ERROR_LEAK_PATTERNS:
-        if pattern.search(reply):
-            return None
-    return reply
-
-
-def _handle_suppressed_reply(
-    reply: str,
-    runtime: RuntimeState,
-    agent_id: str,
-    *,
-    scope: str,
-    on_auth_failure: Optional[Callable[[], None]] = None,
-    on_auth_failed_enter: Optional[Callable[[], None]] = None,
-    auth_error_message: str | None = None,
-) -> tuple[bool, float]:
-    """Shared landing for a suppressed worker-error leak. Returns
-    ``(suppressed, backoff_seconds)``:
-
-    - Clean prose: ``(False, 0.0)``; caller proceeds normally.
-    - Leak detected: ``(True, uniform(15, 60))``; caller skips
-      ``send_fallback_message`` and ``asyncio.sleep(backoff)`` so
-      the next batch doesn't immediately re-leak in tight loops.
-
-    On suppression: log the truncated payload, populate
-    ``runtime.error`` with a scope-tagged + leak-class-tagged
-    message, and (if auth-class) flip ``runtime.health="auth_failed"``
-    — that signal is definitive regardless of which scope surfaced
-    it. ``on_auth_failure`` fires on the auth-class branch only;
-    PUF-221 hooks the daemon's ``CredentialRefresher.notify_refresh_needed``
-    here so a 401-leak short-circuits the 2-min poll instead of
-    waiting for the next tick. ``on_auth_failed_enter`` fires ONLY on
-    the was-ok→auth_failed transition (not re-entries), giving the
-    per-session DM dedup a natural firing edge."""
-    safe_reply = _suppress_worker_error_leak(reply)
-    if safe_reply is not None:
-        return False, 0.0
-    is_auth = _looks_like_auth_error(reply)
-    backoff = random.uniform(
-        _SUPPRESSION_BACKOFF_MIN_SECONDS,
-        _SUPPRESSION_BACKOFF_MAX_SECONDS,
-    )
-    logger.warning(
-        "agent %s: suppressed worker-error leak in %s reply (backoff %.1fs): %s",
-        agent_id,
-        scope,
-        backoff,
-        reply[:200],
-    )
-    if is_auth:
-        was_ok = runtime.health != "auth_failed"
-        runtime.health = "auth_failed"
-        if on_auth_failure is not None:
-            try:
-                on_auth_failure()
-            except Exception as exc:
-                logger.warning(
-                    "agent %s: on_auth_failure callback raised: %s",
-                    agent_id,
-                    exc,
-                )
-        if was_ok and on_auth_failed_enter is not None:
-            try:
-                on_auth_failed_enter()
-            except Exception as exc:
-                logger.warning(
-                    "agent %s: on_auth_failed_enter callback raised: %s",
-                    agent_id,
-                    exc,
-                )
-    if scope == "api-error-retry":
-        if is_auth:
-            runtime.error = auth_error_message or (
-                "Claude Code sign-in expired. On the computer running "
-                "puffo-agent, open a terminal and run `claude auth "
-                "login`, then send this agent a message."
-            )
-        else:
-            runtime.error = (
-                "Rate-limit / quota / server error — usually self-"
-                "recovers. Check the puffo-agent daemon log if it "
-                "persists."
-            )
-    else:
-        runtime.error = (
-            auth_error_message
-            if is_auth and auth_error_message
-            else (
-                "Worker emitted an auth / rate-limit / quota error string "
-                "instead of a real reply. Check the puffo-agent daemon log."
-            )
-        )
-    runtime.save(agent_id)
-    return True, backoff
-
-
 class Worker:
     """Runs a single AI agent inside the daemon event loop."""
-
-    @staticmethod
-    def _clear_api_error_abandoned_if_recoverable(
-        runtime: RuntimeState,
-        agent_id: str,
-        root_id: str,
-        log: logging.Logger,
-    ) -> None:
-        """Clear ``runtime.health = "api_error_abandoned"`` back to
-        ``"ok"`` on the next successful turn. ``auth_failed`` is
-        deliberately left alone — PUF-221's CredentialRefresher
-        owns that lifecycle and a single lucky turn shouldn't
-        substitute for the refresh-success-ping.
-
-        Known granularity mismatch (PUF-253 design input):
-        ``api_error_abandoned`` is a thread-level event but
-        ``runtime.health`` is an agent-global flag, so a success
-        on thread B clears it even if thread A is still stuck.
-        Last-write-wins until ``runtime.error`` becomes a list.
-        """
-        if runtime.health != "api_error_abandoned":
-            return
-        runtime.health = "ok"
-        runtime.error = ""
-        runtime.save(agent_id)
-        log.info(
-            "agent %s: api-error-recovery on thread %s; "
-            "runtime.health cleared back to ok",
-            agent_id,
-            root_id,
-        )
 
     @staticmethod
     def _clear_auth_failed_if_recoverable(
@@ -502,9 +300,8 @@ class Worker:
         agent_id: str,
         log: logging.Logger,
     ) -> None:
-        # Symmetric to _clear_api_error_abandoned_if_recoverable but
-        # fired on refresh-success (not turn-success). Optimistic: if
-        # the next request still 401s, _handle_suppressed_reply re-sets.
+        # Fired on refresh-success, before the next provider turn. Optimistic:
+        # if the next request still 401s, the adapter auth path re-sets it.
         if runtime.health != "auth_failed":
             return
         runtime.health = "ok"
@@ -691,11 +488,7 @@ class Worker:
                 "in daemon.yml, keep anthropic.cli_use_api_key enabled, "
                 "restart puffo-agent, then send this agent a message."
             )
-        return (
-            "Claude Code sign-in expired. On the computer running "
-            "puffo-agent, open a terminal and run `claude auth "
-            "login`, then send this agent a message."
-        )
+        return provider_failure_message("authentication")
 
     @staticmethod
     def _flip_health_in_progress(
@@ -765,6 +558,44 @@ class Worker:
         runtime.save(agent_id)
         log.warning(
             "agent %s: runtime.health → unhandled_error (%s)",
+            agent_id,
+            runtime.error,
+        )
+
+    @staticmethod
+    def _mark_api_error_abandoned_if_in_progress(
+        runtime: RuntimeState,
+        agent_id: str,
+        turn_error: str | None,
+        log: logging.Logger,
+    ) -> None:
+        """Record a bounded provider retry budget reaching its terminal edge."""
+        if runtime.health != "in_progress":
+            return
+        runtime.health = "api_error_abandoned"
+        runtime.error = turn_error or "provider retry budget exhausted"
+        runtime.save(agent_id)
+        log.warning(
+            "agent %s: runtime.health → api_error_abandoned (%s)",
+            agent_id,
+            runtime.error,
+        )
+
+    @staticmethod
+    def _mark_provider_failure_if_in_progress(
+        runtime: RuntimeState,
+        agent_id: str,
+        turn_error: str | None,
+        log: logging.Logger,
+    ) -> None:
+        """Record a categorized provider failure without calling it unhandled."""
+        if runtime.health != "in_progress":
+            return
+        runtime.health = "provider_error"
+        runtime.error = turn_error or "provider could not complete the turn"
+        runtime.save(agent_id)
+        log.warning(
+            "agent %s: runtime.health → provider_error (%s)",
             agent_id,
             runtime.error,
         )

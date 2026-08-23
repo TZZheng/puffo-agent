@@ -654,16 +654,12 @@ class StandardWorkerRun:
         worker = self.worker
         worker._turn_active = True
         try:
-            try:
-                reply = await context.puffo.handle_global_inbox_retry(planned)
-            finally:
-                worker._turn_active = False
-        except worker_module.AgentAPIError as exc:
-            if exc.is_auth:
-                worker._enter_auth_failed(context.paths.agent_id)
-            raise
-        else:
-            worker._resolve_health_after_success(context.paths.agent_id)
+            worker_module.Worker._flip_health_in_progress(
+                worker.runtime, context.paths.agent_id, logger
+            )
+            reply = await context.puffo.handle_global_inbox_retry(planned)
+        finally:
+            worker._turn_active = False
         if reply:
             logger.warning(
                 "agent %s: suppressed global retry plain output; outbound "
@@ -675,14 +671,7 @@ class StandardWorkerRun:
         worker = self.worker
 
         async def run_global_turn(planned):
-            try:
-                reply = await self._execute_global_turn(context, planned)
-            except worker_module.AgentAPIError as exc:
-                if exc.is_auth:
-                    worker._enter_auth_failed(context.paths.agent_id)
-                raise
-            else:
-                worker._resolve_health_after_success(context.paths.agent_id)
+            reply = await self._execute_global_turn(context, planned)
             worker.runtime.msg_count += 1
             worker.runtime.last_event_at = int(time.time())
             if reply:
@@ -698,7 +687,13 @@ class StandardWorkerRun:
         run_global_turn.handle_global_inbox_retry = retry_global_turn
         return run_global_turn
 
-    def _build_global_runtime(self, context: WorkerRunContext, *, status_lifecycle=None):
+    def _build_global_runtime(
+        self,
+        context: WorkerRunContext,
+        *,
+        status_lifecycle=None,
+        process_outcome=None,
+    ):
         from ..agent.channel_audience import read_channel_audience
         from ..agent.global_inbox_runtime import (
             ActiveBoundaryAdapter,
@@ -722,6 +717,7 @@ class StandardWorkerRun:
             agent_id=paths.agent_id,
             runtime_event_outbox=context.runtime_event_outbox,
             status_lifecycle=status_lifecycle,
+            process_outcome=process_outcome,
             channel_audience_loader=lambda space_id, channel_id: read_channel_audience(
                 space_id,
                 channel_id,
@@ -806,9 +802,37 @@ class StandardWorkerRun:
         worker = self.worker
         uploader = self._build_runtime_event_uploader(context)
         reporter = self._build_reporter(context.client)
+
+        def settle_process_health(outcome: str, error_text: str | None) -> None:
+            try:
+                agent_id = context.paths.agent_id
+                if outcome == "succeeded":
+                    worker._resolve_health_after_success(agent_id)
+                elif outcome == "cancelled":
+                    worker_module.Worker._resolve_health_on_success(
+                        worker.runtime, agent_id, logger
+                    )
+                elif outcome == "auth_failed":
+                    worker._enter_auth_failed(agent_id)
+                elif outcome == "api_error_abandoned":
+                    worker_module.Worker._mark_api_error_abandoned_if_in_progress(
+                        worker.runtime, agent_id, error_text, logger
+                    )
+                elif outcome == "provider_failed":
+                    worker_module.Worker._mark_provider_failure_if_in_progress(
+                        worker.runtime, agent_id, error_text, logger
+                    )
+                else:
+                    worker_module.Worker._fallback_unhandled_error_if_stuck_in_progress(
+                        worker.runtime, agent_id, error_text, logger
+                    )
+            except Exception:
+                logger.warning("process health settlement failed", exc_info=True)
+
         global_runtime = self._build_global_runtime(
             context,
             status_lifecycle=GlobalInboxStatusLifecycle(reporter),
+            process_outcome=settle_process_health,
         )
         reminder_sync = await self._prepare_reminder_sync(context, global_runtime)
         global_task = asyncio.ensure_future(global_runtime.run())

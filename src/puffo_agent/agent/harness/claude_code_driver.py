@@ -13,6 +13,7 @@ from enum import Enum
 from typing import Any
 
 from ..cli_bin import normalize_launch_argv
+from ..provider_failures import classify_provider_failure
 from .driver import (
     CancelCapability,
     CompactCapability,
@@ -115,6 +116,7 @@ class ClaudeCodeCliDriver(Driver):
         self._init_commands: tuple[str, ...] = ()
         self._active = TurnRef("")
         self._active_native_turn_id = ""
+        self._active_provider_error: dict[str, Any] | None = None
         self._closed = False
         self._compact_advertised = False
         self._message_lifecycle_v1 = False
@@ -253,6 +255,7 @@ class ClaudeCodeCliDriver(Driver):
         except BaseException:
             self._active = TurnRef("")
             self._active_native_turn_id = ""
+            self._active_provider_error = None
             self._clear_pending_replay()
             self._reset_turn_tracking()
             raise
@@ -493,6 +496,7 @@ class ClaudeCodeCliDriver(Driver):
         self._pending_uuid = ""
         self._active = TurnRef("")
         self._active_native_turn_id = ""
+        self._active_provider_error = None
         self._tool_calls.clear()
         self._compact_advertised = False
         self._message_lifecycle_v1 = False
@@ -533,6 +537,7 @@ class ClaudeCodeCliDriver(Driver):
     def _reset_turn_tracking(self, primary_command_id: str = "") -> None:
         self._settle_gated_ack(_InputAckOutcome.REJECTED)
         self._gated_command_id = ""
+        self._active_provider_error = None
         self._owned_commands = {primary_command_id} if primary_command_id else set()
         self._terminal_commands.clear()
         self._result_input_tokens = 0
@@ -583,6 +588,7 @@ class ClaudeCodeCliDriver(Driver):
                 await self._emit(
                     HarnessEventType.RUNTIME_EXITED,
                     turn_ref=self._active if self._active.value else None,
+                    data=dict(self._active_provider_error or {}),
                 )
 
     async def _log_unexpected_exit(self) -> None:
@@ -621,6 +627,10 @@ class ClaudeCodeCliDriver(Driver):
             return
         if self._is_exact_replay(frame):
             await self._complete_replay(frame)
+            return
+        provider_error = _provider_error(frame)
+        if provider_error is not None:
+            await self._handle_provider_error(frame, provider_error)
             return
         if type_ == "assistant":
             await self._handle_assistant(frame)
@@ -761,9 +771,20 @@ class ClaudeCodeCliDriver(Driver):
                 native_payload=frame,
             )
             return
-        for index, block in enumerate(
-            (frame.get("message") or {}).get("content") or ()
-        ):
+        blocks = (frame.get("message") or {}).get("content") or ()
+        has_output = any(
+            isinstance(block, dict)
+            and (
+                block.get("type") == "tool_use"
+                or (block.get("type") == "text" and str(block.get("text") or "").strip())
+            )
+            for block in blocks
+        )
+        if frame.get("parent_tool_use_id") is None and has_output:
+            # A later root assistant frame proves Claude recovered from an
+            # earlier synthetic API-error frame within the same native turn.
+            self._active_provider_error = None
+        for index, block in enumerate(blocks):
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "text":
@@ -907,7 +928,12 @@ class ClaudeCodeCliDriver(Driver):
             "output_tokens": self._result_output_tokens,
             "context_tokens": self._result_context_tokens,
         }
-        if outcome == "failed":
+        if self._active_provider_error is not None:
+            data.update({
+                "outcome": "failed",
+                **self._active_provider_error,
+            })
+        elif outcome == "failed":
             data["error_code"] = self._result_error_code
         await self._emit(
             HarnessEventType.TURN_COMPLETED,
@@ -922,6 +948,24 @@ class ClaudeCodeCliDriver(Driver):
         # id would report the stale call.
         self._tool_calls.clear()
         self._reset_turn_tracking()
+
+    async def _handle_provider_error(
+        self,
+        frame: dict[str, Any],
+        provider_error: dict[str, Any],
+    ) -> None:
+        """Remember Claude's synthetic failure until its real result boundary."""
+        if not self._active.value:
+            await self._emit(
+                HarnessEventType.SESSION_UPDATED,
+                data={
+                    "record_type": "provider_error",
+                    "error_code": provider_error["error_code"],
+                },
+                native_payload=frame,
+            )
+            return
+        self._active_provider_error = provider_error
 
     def _is_exact_replay(self, frame: dict[str, Any]) -> bool:
         if self._pending_replay is None or self._pending_replay.done():
@@ -1009,6 +1053,49 @@ def _result_error_code(frame: dict[str, Any], subtype: str) -> str:
         return "invalid_resume"
     normalized = subtype.strip().lower()
     return normalized or "execution_error"
+
+
+def _provider_error(frame: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize Claude's model-visible synthetic API errors.
+
+    Claude emits quota and API failures as ``type=assistant`` frames whose text
+    looks like a normal reply. The explicit outer fields are authoritative; raw
+    provider text remains in the driver's opaque native diagnostic only.
+    """
+    if (
+        frame.get("type") != "assistant"
+        or frame.get("parent_tool_use_id") is not None
+    ):
+        return None
+    raw_status = frame.get("apiErrorStatus")
+    status = raw_status if type(raw_status) is int else None
+    if frame.get("isApiErrorMessage") is not True and not (
+        status is not None and status >= 400
+    ):
+        return None
+
+    fragments = [
+        str(frame.get("error") or ""),
+        json.dumps(
+            frame.get("errorDetails") or {},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    ]
+    message = frame.get("message")
+    if isinstance(message, dict):
+        for block in message.get("content") or ():
+            if isinstance(block, dict) and block.get("type") == "text":
+                fragments.append(str(block.get("text") or ""))
+    diagnostic = "\n".join(fragments).lower()
+
+    return {
+        "error_code": classify_provider_failure(
+            status=status,
+            diagnostic=diagnostic,
+        )
+    }
 
 
 ClaudeDriver = ClaudeCodeCliDriver

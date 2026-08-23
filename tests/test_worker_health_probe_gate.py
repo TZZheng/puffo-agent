@@ -32,13 +32,10 @@ def test_reassert_flips_ok_back_to_auth_failed():
     )
 
     assert rt.health == "auth_failed"
-    assert "Claude Code sign-in expired" in rt.error
-    assert "claude auth login" in rt.error
+    assert rt.error == "Provider authentication failed; sign in again and retry."
     assert rt.saved == [(
         "agent-a", "auth_failed",
-        "Claude Code sign-in expired. On the computer running "
-        "puffo-agent, open a terminal and run `claude auth "
-        "login`, then send this agent a message.",
+        "Provider authentication failed; sign in again and retry.",
     )]
 
 

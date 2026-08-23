@@ -22,7 +22,13 @@ from ..context_controller import (
     ToolResultAdmission,
     normalize_context_snapshot,
 )
-from ..errors import AgentAPIError
+from ..errors import AgentAPIError, ProviderFailureError
+from ..provider_failures import (
+    is_provider_failure_code,
+    provider_failure,
+    provider_failure_message,
+    provider_failure_retryable,
+)
 from .driver import (
     CompactRequest,
     ContextStatus,
@@ -637,6 +643,20 @@ class RuntimeManager:
                 self._clear_native_session()
             try:
                 if active is not None:
+                    provider_error_code = str(event.data.get("error_code") or "")
+                    if provider_error_code:
+                        failure_data: dict[str, Any] = {
+                            "outcome": "abandoned",
+                            "error_code": provider_error_code,
+                        }
+                    else:
+                        failure_data = {
+                            "outcome": "abandoned",
+                            "error_code": (
+                                "resume_unconfirmed" if unconfirmed
+                                else "runtime_exited"
+                            ),
+                        }
                     abandoned = HarnessEvent(
                         type=HarnessEventType.TURN_ABANDONED,
                         driver=self.driver_name,
@@ -645,14 +665,7 @@ class RuntimeManager:
                         native_session_id=failed_native_session_id,
                         native_turn_id=self.native_turn_id,
                         occurred_at=event.occurred_at,
-                        data={
-                            "outcome": "abandoned",
-                            "error_code": (
-                                "resume_unconfirmed" if unconfirmed
-                                else "runtime_exited"
-                            ),
-                            "retryable": True,
-                        },
+                        data=failure_data,
                     )
                     await self._publish_terminal_locked(abandoned, active)
             finally:
@@ -1010,12 +1023,21 @@ class RuntimeManagerAdapter(Adapter):
                 outcome = str(event.data.get("outcome") or "succeeded")
                 if event_type == "turn.abandoned" or outcome != "succeeded":
                     error_code = str(event.data.get("error_code") or outcome)
-                    message = (
-                        f"provider turn ended with outcome {outcome} "
-                        f"(error_code={error_code})"
+                    failure = provider_failure(error_code)
+                    message = provider_failure_message(error_code, outcome=outcome)
+                    is_auth = failure.is_auth
+                    retryable = provider_failure_retryable(
+                        error_code,
+                        explicitly_retryable=bool(event.data.get("retryable")),
                     )
-                    if event.data.get("retryable"):
-                        raise AgentAPIError(message, error_code=error_code)
+                    if retryable or is_auth:
+                        raise AgentAPIError(
+                            message,
+                            is_auth=is_auth,
+                            error_code=error_code,
+                        )
+                    if is_provider_failure_code(error_code):
+                        raise ProviderFailureError(message, error_code=error_code)
                     raise RuntimeStateError(message, error_code=error_code)
                 metadata.update({
                     key: value for key, value in event.data.items()

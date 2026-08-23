@@ -14,6 +14,7 @@ import asyncio
 import pytest
 
 from puffo_agent.agent.core import AgentAPIError
+from puffo_agent.agent.errors import ProviderFailureError
 from puffo_agent.agent.global_inbox_runtime import GlobalInboxRuntime
 from puffo_agent.agent.status_reporter import StatusReporter
 from puffo_agent.portal.worker_run import GlobalInboxStatusLifecycle
@@ -44,12 +45,14 @@ class _LifecycleRunner:
         if self.outcome == "failure":
             raise self.error
         if self.outcome == "cancelled":
-            raise asyncio.CancelledError()
-        if self.outcome == "retry":
+            raise AgentAPIError("rate limit", is_auth=False)
+        if self.outcome in {"retry", "retry_exhausted"}:
             raise AgentAPIError("rate limit", is_auth=False)
         return None
 
     async def handle_global_inbox_retry(self, _planned):
+        if self.outcome == "retry_exhausted":
+            raise AgentAPIError("rate limit", is_auth=False)
         return None
 
 
@@ -59,6 +62,7 @@ _CASES = [
     {"id": "provider_failure", "outcome": "failure", "expand": False},
     {"id": "cancelled", "outcome": "cancelled", "expand": False},
     {"id": "retry_same_turn", "outcome": "retry", "expand": False},
+    {"id": "retry_exhausted", "outcome": "retry_exhausted", "expand": False},
     {"id": "success_without_read", "outcome": "no_read", "expand": False},
     {"id": "synthetic_intro", "outcome": "success", "expand": False, "synthetic": True},
 ]
@@ -156,6 +160,7 @@ async def test_global_inbox_turn_owns_one_status_lifecycle(tmp_path, monkeypatch
     )
     store = await make_store(tmp_path)
     http = FakeHttp()
+    process_outcomes = []
     lifecycle = GlobalInboxStatusLifecycle(
         StatusReporter(http, heartbeat_interval_s=999)
     )
@@ -182,16 +187,27 @@ async def test_global_inbox_turn_owns_one_status_lifecycle(tmp_path, monkeypatch
         adapter,
         expand=case["expand"],
         outcome=case["outcome"],
-        error=RuntimeError("provider exploded"),
+        error=ProviderFailureError(
+            "The selected provider model has reached its usage limit.",
+            error_code="quota_exhausted",
+        ),
     )
+    async def retry_sleep(_delay):
+        if case["outcome"] == "cancelled":
+            raise asyncio.CancelledError()
+        await asyncio.sleep(0)
+
     runtime = GlobalInboxRuntime(
         store=store,
         adapter=adapter,
         run_turn=runner,
         workspace=tmp_path,
         status_lifecycle=lifecycle,
+        process_outcome=lambda outcome, error: process_outcomes.append(
+            (outcome, error)
+        ),
         max_api_retries=1,
-        retry_sleep=lambda _delay: asyncio.sleep(0),
+        retry_sleep=retry_sleep,
     )
     runner.runtime = runtime
 
@@ -204,6 +220,12 @@ async def test_global_inbox_turn_owns_one_status_lifecycle(tmp_path, monkeypatch
         await receipt(store, "m3", 3)
         assert await runtime.process_once() is True
     _assert_status_wire(case, http, lifecycle)
+    expected_outcome = {
+        "failure": "provider_failed",
+        "cancelled": "cancelled",
+        "retry_exhausted": "api_error_abandoned",
+    }.get(case["outcome"], "succeeded")
+    assert process_outcomes[0][0] == expected_outcome
     await store.close()
 
 
@@ -237,6 +259,7 @@ async def test_crash_recovery_reuses_and_settles_original_processing_run(tmp_pat
         async def handle_global_inbox_retry(self, _planned):
             return None
 
+    process_outcomes = []
     recovered = GlobalInboxRuntime(
         store=store,
         adapter=_ContinuationAdapter(),
@@ -245,9 +268,13 @@ async def test_crash_recovery_reuses_and_settles_original_processing_run(tmp_pat
         status_lifecycle=GlobalInboxStatusLifecycle(
             StatusReporter(http, heartbeat_interval_s=999)
         ),
+        process_outcome=lambda outcome, error: process_outcomes.append(
+            (outcome, error)
+        ),
     )
 
     assert await recovered.recover_current_turn() is True
+    assert process_outcomes == [("succeeded", None)]
     starts = [
         body
         for path, body in http.calls

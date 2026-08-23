@@ -148,7 +148,12 @@ def test_spawn_background_reports_readiness_failure(monkeypatch, tmp_path, capsy
 
 
 def _ns(**kw) -> argparse.Namespace:
-    base = {"ui": False, "background": False, "tray_runner": False}
+    base = {
+        "ui": False,
+        "background": False,
+        "detach": False,
+        "tray_runner": False,
+    }
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -164,6 +169,13 @@ def test_cmd_start_routes_background(monkeypatch):
     monkeypatch.setattr(bg, "spawn_background", lambda **kw: 5)
     from puffo_agent.portal.cli import cmd_start
     assert cmd_start(_ns(background=True)) == 5
+
+
+def test_cmd_start_routes_headless_detach(monkeypatch):
+    monkeypatch.setattr(bg, "spawn_headless_background", lambda **kw: 6)
+    from puffo_agent.portal.cli import cmd_start
+
+    assert cmd_start(_ns(detach=True)) == 6
 
 
 def test_cmd_start_tray_runner_takes_priority_over_background(monkeypatch):

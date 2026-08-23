@@ -980,7 +980,8 @@ async def _log_outdated_version_warning() -> None:
         logger.warning(
             "puffo-agent %s is behind the latest release (%s). "
             "this daemon may be missing features or fixes documented "
-            "on github. to upgrade: %s",
+            "on github. stop this daemon, run `%s`, then restart it with "
+            "`puffo-agent start --detach`.",
             local,
             remote,
             upgrade_command_for_install_mode(),
