@@ -1995,3 +1995,82 @@ async def test_ordinary_human_channel_sender_projects_as_human(
     )
     assert "- sender_type: human" in lines
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_provider_turn_is_adopted_and_finalized(tmp_path):
+    """A harness background wakeup runs after the daemon turn is finalized.
+    Adopting it restores the identity that sends and Inbox reads require."""
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    assert runtime.active.turn_id == ""
+
+    adopted = await runtime.adopt_autonomous_turn(
+        provider_session_id="provider-1", provider_turn_id="native-turn",
+    )
+    assert adopted is True
+    turn_id = runtime.active.turn_id
+    assert turn_id
+    assert runtime.active.provider_session_id == "provider-1"
+    assert runtime.active.provider_turn_id == "native-turn"
+    run = await store.get_turn_run(turn_id)
+    assert run is not None and run.state == "in_turn"
+
+    assert await runtime.finish_autonomous_turn() is True
+    assert runtime.active.turn_id == ""
+    run = await store.get_turn_run(turn_id)
+    assert run is not None and run.state == "processed"
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_adoption_never_displaces_a_daemon_started_turn(tmp_path):
+    """A daemon turn owns the session: a racing autonomous report must not
+    overwrite its identity, or the running turn loses its own binding."""
+    store = await make_store(tmp_path)
+    adapter = Adapter()
+    observed: dict[str, object] = {}
+
+    async def run(planned):
+        observed["adopted"] = await runtime.adopt_autonomous_turn(
+            provider_session_id="other-session",
+        )
+        observed["turn_id"] = runtime.active.turn_id
+        await adapter.admit()
+
+    await receipt(store, "inbound", 1)
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=run, workspace=tmp_path,
+    )
+    assert await runtime.process_once()
+    assert observed["adopted"] is False
+    # The daemon turn kept its own binding while the report was refused.
+    assert observed["turn_id"] and observed["turn_id"] != "other-session"
+    assert runtime._autonomous_turn_id == ""
+    assert runtime.active.turn_id == ""
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_autonomous_turn_ignores_a_superseded_adoption(tmp_path):
+    """If a daemon turn took over, the autonomous terminal frame must not
+    clear the daemon's active state."""
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    assert await runtime.adopt_autonomous_turn(provider_session_id="p-1")
+    # Simulate a daemon turn replacing the adopted one.
+    runtime.active.turn_id = "turn_daemon_owned"
+
+    assert await runtime.finish_autonomous_turn() is False
+    assert runtime.active.turn_id == "turn_daemon_owned"
+    await store.close()

@@ -95,6 +95,9 @@ class ClaudeCodeCliDriver(Driver):
         self._resumed = False
         self._init_commands: tuple[str, ...] = ()
         self._active = TurnRef("")
+        # True between the first assistant frame and the result frame of a
+        # turn the daemon did not start (harness background-task wakeup).
+        self._autonomous = False
         self._active_native_turn_id = ""
         self._closed = False
         self._compact_advertised = False
@@ -196,6 +199,9 @@ class ClaudeCodeCliDriver(Driver):
             raise RuntimeError("one turn is already active")
         local = TurnRef(f"turn_{uuid.uuid4().hex}")
         replay_uuid = input.client_correlation_id or str(uuid.uuid4())
+        # A daemon-started turn supersedes any autonomous run in flight; its
+        # frames take the bound path, so the unbound pair must not stay armed.
+        self._autonomous = False
         self._active = local
         self._pending_content = _normalize_content(input.content)
         self._pending_uuid = replay_uuid
@@ -563,11 +569,18 @@ class ClaudeCodeCliDriver(Driver):
 
     async def _handle_assistant(self, frame: dict[str, Any]) -> None:
         if not self._active.value:
+            # No daemon-started turn is open, yet the CLI is producing
+            # assistant output: a background task woke the model after the
+            # daemon finalized its turn. Report it so the daemon can bind a
+            # turn rather than leave the model running unbound.
             await self._emit(
-                HarnessEventType.SESSION_UPDATED,
+                HarnessEventType.AUTONOMOUS_STARTED
+                if not self._autonomous
+                else HarnessEventType.SESSION_UPDATED,
                 data={"record_type": "assistant"},
                 native_payload=frame,
             )
+            self._autonomous = True
             return
         for index, block in enumerate(
             (frame.get("message") or {}).get("content") or ()
@@ -660,9 +673,18 @@ class ClaudeCodeCliDriver(Driver):
 
     async def _handle_result(self, frame: dict[str, Any], subtype: str) -> None:
         if not self._active.value:
+            # Terminal frame of an autonomous (daemon-unbound) turn; pairs
+            # with the AUTONOMOUS_STARTED emitted for its first assistant
+            # frame so the daemon can close the turn it bound.
+            reported = self._autonomous
+            self._autonomous = False
             await self._emit(
-                HarnessEventType.SESSION_UPDATED,
-                data={"record_type": "result"},
+                HarnessEventType.AUTONOMOUS_COMPLETED
+                if reported
+                else HarnessEventType.SESSION_UPDATED,
+                data={"record_type": "result", "outcome": (
+                    "succeeded" if subtype in {"success", ""} else "failed"
+                )},
                 native_payload=frame,
             )
             return

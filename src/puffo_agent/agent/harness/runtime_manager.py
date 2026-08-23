@@ -156,6 +156,11 @@ class RuntimeManager:
         self.spec = spec
         self.agent_id = agent_id
         self.event_sink = event_sink
+        # Long-lived (not one-shot): the daemon registers this once and is
+        # called whenever the provider runs a turn the daemon did not start.
+        self.autonomous_callback: (
+            Callable[[HarnessEvent], Awaitable[None]] | None
+        ) = None
         self.before_start = before_start
         self.session_ref = session_ref or SessionRef(
             f"session_{uuid.uuid4().hex}"
@@ -654,6 +659,13 @@ class RuntimeManager:
                 await self._retire_invalid_resume_locked(event, logical_turn)
                 return True
         if event.type in {
+            HarnessEventType.AUTONOMOUS_STARTED,
+            HarnessEventType.AUTONOMOUS_COMPLETED,
+            "turn.autonomous_started",
+            "turn.autonomous_completed",
+        }:
+            await self._notify_autonomous(event)
+        if event.type in {
             HarnessEventType.TURN_COMPLETED,
             HarnessEventType.TURN_ABANDONED,
             "turn.completed",
@@ -663,6 +675,21 @@ class RuntimeManager:
         else:
             await self._publish_event(event)
         return False
+
+    async def _notify_autonomous(self, event: HarnessEvent) -> None:
+        """Hand an unbound provider turn to the daemon. Best-effort: a
+        failure here must not take down the event reader."""
+        callback = self.autonomous_callback
+        if callback is None:
+            return
+        try:
+            await callback(event)
+        except Exception:  # noqa: BLE001 - never break the reader loop
+            logger.warning(
+                "autonomous turn callback failed for %s",
+                self.agent_id or "<agent>",
+                exc_info=True,
+            )
 
     async def _retire_invalid_resume_locked(
         self, event: HarnessEvent, logical_turn: TurnRef
@@ -936,6 +963,11 @@ class RuntimeManagerAdapter(Adapter):
         if not isinstance(message, str) or not message.strip():
             raise RuntimeStateError("current user input must be non-empty text")
         return message
+
+    def register_autonomous_callback(self, callback) -> bool:
+        """Route unbound provider turns to the daemon (see base adapter)."""
+        self.manager.autonomous_callback = callback
+        return True
 
     async def _announce_admission(self, started) -> None:
         callback = getattr(self, "_context_admission_callback", None)

@@ -347,6 +347,7 @@ def _make_owned_runtime(point: AttachPoint, bridge, holder: dict[str, WsLocalSes
     )
     runtime.coordinator = coordinator
     runtime.send_delegate = TrackingSendDelegate(coordinator, runtime.attempts, runtime)
+    runtime.register_autonomous_adoption()
     return runtime
 
 

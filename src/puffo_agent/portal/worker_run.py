@@ -753,6 +753,10 @@ class StandardWorkerRun:
         client.global_runtime = global_runtime
         client.send_coordinator = coordinator
         client.send_delegate = global_runtime.send_delegate
+        # Harness background tasks wake the model after the daemon turn is
+        # finalized; adopting those runs keeps sends and Inbox reads on the
+        # normal lifecycle instead of leaving them unbound.
+        global_runtime.register_autonomous_adoption()
         return global_runtime
 
     async def _prepare_reminder_sync(self, context: WorkerRunContext, runtime):

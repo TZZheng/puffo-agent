@@ -192,6 +192,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         self.unfit_policy = unfit_policy or (lambda *_args, **_kwargs: True)
         self.coordinator = coordinator
         self.active = ActiveExactUnion()
+        # Turn id of an adopted autonomous (daemon-unstarted) provider run.
+        self._autonomous_turn_id = ""
         self.attempts = SendAttemptState()
         self.health = RuntimeHealth()
         # Per ``(space_id, channel_id)``: sends serialize per target, so two
@@ -1775,6 +1777,118 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         ):
             return None
         return planned
+
+    def register_autonomous_adoption(self) -> bool:
+        """Ask the adapter to report provider turns the daemon didn't start.
+
+        Harness background tasks wake the model after the daemon finalized
+        its turn. Those runs used to proceed unbound: sends could not resolve
+        freshness or recover from held, and Inbox reads were refused. Binding
+        a turn to them puts the model back on the normal lifecycle.
+        """
+        register = getattr(self.adapter, "register_autonomous_callback", None)
+        if register is None:
+            return False
+        return bool(register(self._on_autonomous_event))
+
+    async def _on_autonomous_event(self, event: Any) -> None:
+        event_type = getattr(event.type, "value", event.type)
+        if event_type == "turn.autonomous_started":
+            await self.adopt_autonomous_turn(
+                provider_session_id=(
+                    getattr(event, "native_session_id", "")
+                    or self.adapter.get_provider_session_id()
+                ),
+                provider_turn_id=getattr(event, "native_turn_id", "") or None,
+            )
+        elif event_type == "turn.autonomous_completed":
+            await self.finish_autonomous_turn(
+                outcome=str(event.data.get("outcome") or "succeeded"),
+            )
+
+    async def adopt_autonomous_turn(
+        self,
+        *,
+        provider_session_id: str | None,
+        provider_turn_id: str | None = None,
+    ) -> bool:
+        """Bind a daemon turn to a provider run the daemon did not start."""
+        async with self._turn_state_lock:
+            if self.active.turn_id:
+                # A daemon-started turn owns the session; nothing to adopt.
+                return False
+            turn_id = f"turn_{uuid.uuid4().hex}"
+            try:
+                await self.store.start_turn(
+                    turn_id=turn_id,
+                    provider_session_id=provider_session_id or None,
+                )
+            except Exception as exc:  # noqa: BLE001 - adoption is best-effort
+                log_runtime_event(
+                    logger,
+                    "turn.autonomous_adoption",
+                    agent_id=self.agent_id,
+                    turn_id=turn_id,
+                    provider_session_id=provider_session_id,
+                    outcome="rejected",
+                    error_category=type(exc).__name__,
+                )
+                return False
+            self.active.clear()
+            self.active.turn_id = turn_id
+            self.active.provider_session_id = provider_session_id or None
+            self.active.provider_turn_id = provider_turn_id
+            self._autonomous_turn_id = turn_id
+            if self.coordinator is not None:
+                self.coordinator.provider_session_id = provider_session_id or None
+            self.attempts.reset()
+            self.health = RuntimeHealth("in_progress", "autonomous provider turn")
+            log_runtime_event(
+                logger,
+                "turn.autonomous_adoption",
+                agent_id=self.agent_id,
+                turn_id=turn_id,
+                provider_session_id=provider_session_id,
+                provider_turn_id=provider_turn_id,
+                state="in_turn",
+                outcome="adopted",
+            )
+            return True
+
+    async def finish_autonomous_turn(self, *, outcome: str = "succeeded") -> bool:
+        """Close the turn opened by :meth:`adopt_autonomous_turn`."""
+        async with self._turn_state_lock:
+            turn_id = self._autonomous_turn_id
+            if not turn_id or self.active.turn_id != turn_id:
+                # A daemon turn superseded the adoption; it owns the ending.
+                self._autonomous_turn_id = ""
+                return False
+            self._autonomous_turn_id = ""
+            try:
+                await self.store.finalize_empty_turn(turn_id=turn_id)
+            except Exception as exc:  # noqa: BLE001 - never break the reader
+                log_runtime_event(
+                    logger,
+                    "turn.autonomous_finalized",
+                    agent_id=self.agent_id,
+                    turn_id=turn_id,
+                    outcome="failed",
+                    error_category=type(exc).__name__,
+                )
+            else:
+                log_runtime_event(
+                    logger,
+                    "turn.autonomous_finalized",
+                    agent_id=self.agent_id,
+                    turn_id=turn_id,
+                    provider_session_id=self.active.provider_session_id,
+                    state="processed",
+                    outcome=outcome,
+                )
+            self.active.clear()
+            self.attempts.reset()
+            self.health = RuntimeHealth()
+            return True
 
     def _activate_recovery(
         self,

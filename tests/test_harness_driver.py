@@ -1998,3 +1998,67 @@ async def test_local_sink_projects_only_bounded_safe_legacy_status(
         assert sentinel not in serialized
     await adapter.aclose()
     outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_unbound_provider_frames_report_an_autonomous_turn():
+    """A harness background task waking the model after the daemon turn was
+    finalized must be reported, not swallowed as an opaque session update."""
+    driver = ClaudeCodeCliDriver()
+    driver._session_ref = SessionRef("native")
+    driver._native_session_id = "native-session"
+    # No daemon-started turn: this is exactly the unbound state.
+    assert driver._active.value == ""
+
+    await driver._handle({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "background task finished"},
+    ]}})
+    # Further assistant frames belong to the same autonomous turn.
+    await driver._handle({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "still the same run"},
+    ]}})
+    await driver._handle({"type": "result", "subtype": "success", "message": {}})
+
+    events = []
+    while not driver._events.empty():
+        events.append(driver._events.get_nowait())
+    kinds = [
+        event.type.value if hasattr(event.type, "value") else event.type
+        for event in events
+    ]
+    assert kinds == [
+        "turn.autonomous_started",
+        "session.updated",
+        "turn.autonomous_completed",
+    ]
+    assert events[-1].data["outcome"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_daemon_started_turn_disarms_the_autonomous_pair():
+    """An adopted run followed by a real daemon turn must not leave the
+    unbound reporting armed, or the next autonomous run goes unreported."""
+    driver = ClaudeCodeCliDriver()
+    driver._session_ref = SessionRef("native")
+    driver._native_session_id = "native-session"
+    await driver._handle({"type": "assistant", "message": {"content": []}})
+    assert driver._autonomous is True
+
+    driver._write = _noop_write  # type: ignore[method-assign]
+    await driver.start_turn(TurnInput(content="daemon turn"))
+    assert driver._autonomous is False
+
+    driver._active = TurnRef("")
+    driver._clear_pending_replay()
+    while not driver._events.empty():
+        driver._events.get_nowait()
+    await driver._handle({"type": "assistant", "message": {"content": []}})
+    kinds = [
+        event.type.value if hasattr(event.type, "value") else event.type
+        for event in [driver._events.get_nowait()]
+    ]
+    assert kinds == ["turn.autonomous_started"]
+
+
+async def _noop_write(frame):
+    del frame

@@ -208,6 +208,11 @@ class HarnessEventType(str, Enum):
     CONTEXT_UPDATED = "turn.context_updated"
     TURN_COMPLETED = "turn.completed"
     TURN_ABANDONED = "turn.abandoned"
+    # A provider turn the daemon did not start: a harness background task
+    # woke the model after the daemon's turn was finalized. Reported so the
+    # daemon can bind a turn to it instead of leaving the model unbound.
+    AUTONOMOUS_STARTED = "turn.autonomous_started"
+    AUTONOMOUS_COMPLETED = "turn.autonomous_completed"
     COMPACTION_STARTED = "compaction.started"
     COMPACTION_COMPLETED = "compaction.completed"
 
