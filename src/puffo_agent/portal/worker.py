@@ -18,6 +18,7 @@ from typing import Awaitable, Callable, Optional
 from ..agent.adapters import Adapter
 from ..agent.core import AgentAPIError as AgentAPIError
 from ..agent.core import PuffoAgent as PuffoAgent
+from ..agent.provider_failures import provider_failure_message
 from ..limits import (
     DEFAULT_CATCHUP_STALE_HOURS,
     MAX_INLINE_MESSAGE_CHARS,
@@ -487,11 +488,7 @@ class Worker:
                 "in daemon.yml, keep anthropic.cli_use_api_key enabled, "
                 "restart puffo-agent, then send this agent a message."
             )
-        return (
-            "Claude Code sign-in expired. On the computer running "
-            "puffo-agent, open a terminal and run `claude auth "
-            "login`, then send this agent a message."
-        )
+        return provider_failure_message("authentication")
 
     @staticmethod
     def _flip_health_in_progress(

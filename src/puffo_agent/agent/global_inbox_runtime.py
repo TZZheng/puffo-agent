@@ -124,6 +124,12 @@ TurnRunner = Callable[[PlannedTurn], Awaitable[Any]]
 UnfitPolicy = Callable[..., bool | Awaitable[bool]]
 
 
+def _operator_error_text(exc: Exception) -> str:
+    if isinstance(exc, (AgentAPIError, ProviderFailureError)):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
 class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
     """One serial provider boundary over the durable global Inbox."""
 
@@ -1422,7 +1428,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                     terminal = await self._requeue_active_turn(
                         planned, process_started, "provider_error"
                     )
-                terminal_error = f"{type(exc).__name__}: {exc}"
+                terminal_error = _operator_error_text(exc)
                 diagnostic = (
                     "turn failed and was requeued"
                     if terminal
