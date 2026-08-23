@@ -6,6 +6,37 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0a25] - 2026-08-23
+
+> Staging candidate hardening Claude turn delivery, runtime recovery, and
+> durable processing acknowledgements across provider and daemon restarts.
+
+### Added
+
+- **Claude lifecycle-gated Inbox delivery.** When the CLI advertises the
+  supported lifecycle capability, steering waits for the native command's
+  queued acknowledgement and fails closed for unknown lifecycle dialects.
+  Ambiguous queue timeouts retire the native session before retry. (#274)
+- **Durable processed-receipt replay.** Failed server acknowledgements are
+  queued locally, retried with bounded backoff, and replayed after restart;
+  acknowledgements conditionally remove only the exact payload sent. (#280)
+- **Autonomous provider-run adoption.** Harness runs started by background
+  tasks are bound to durable daemon turns, including deferred adoption,
+  Inbox reads, freshness-aware sends, and idempotent terminal recovery. (#283)
+
+### Changed
+
+- **Outbound encryption is decided per send.** Turn-scoped send-mode state was
+  removed so one route cannot leak its encryption decision into another. (#281)
+
+### Fixed
+
+- **Provider failures retain their recovery semantics.** Authentication,
+  permission, quota, rate-limit, availability, invalid-resume, and runtime-exit
+  outcomes now use one operator-safe classification path without converting
+  permission errors into sign-in failures or losing retry boundaries. The CLI
+  also exposes detached headless startup for safe upgrade restart flows. (#282)
+
 ## [2.0.0a24] - 2026-08-22
 
 > Staging candidate closing the audited message-reliability gaps: silent
