@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
 
-from ._auth_markers import looks_like_auth_error
+from ._auth_markers import looks_like_provider_auth_error
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,18 +82,6 @@ RUNTIME_EVENT_FAILURE_MESSAGES: Mapping[str, str] = MappingProxyType({
 
 _DEFAULT_PROVIDER_FAILURE = PROVIDER_FAILURES["provider_error"]
 _DIAGNOSTIC_HTTP_STATUS = re.compile(r"(?<!\d)(401|403|408|425|429|5\d\d)(?!\d)")
-_PROVIDER_AUTH_DIAGNOSTIC_MARKERS = (
-    "unauthorized",
-    "unauthorised",
-    "please run codex login",
-    "run `codex login`",
-    "run codex login",
-    "authentication required",
-    "login required",
-    "invalid token",
-    "invalid credential",
-    "token revoked",
-)
 
 
 def provider_failure(error_code: str) -> ProviderFailure:
@@ -129,11 +117,7 @@ def classify_provider_failure(*, status: int | None, diagnostic: str) -> str:
     if status is None:
         match = _DIAGNOSTIC_HTTP_STATUS.search(normalized)
         status = int(match.group(1)) if match is not None else None
-    if (
-        status == 401
-        or looks_like_auth_error(normalized)
-        or any(marker in normalized for marker in _PROVIDER_AUTH_DIAGNOSTIC_MARKERS)
-    ):
+    if status == 401 or looks_like_provider_auth_error(normalized):
         return "authentication"
     if (
         ("reached your" in normalized and "limit" in normalized)

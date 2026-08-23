@@ -926,8 +926,8 @@ class RuntimeState:
     #                           operator-safe detail is stored in ``error``
     #   "refresh_broken"      — daemon saw N consecutive non-success
     #                           refresh outcomes; cleared by next
-    #                           REFRESHED. Does not overwrite the two
-    #                           stronger downstream signals above.
+    #                           REFRESHED. Does not overwrite the stronger
+    #                           provider and authentication signals above.
     #   "unhandled_error"     — non-AgentAPIError raised in the turn and
     #                           no category red was set; cleared by
     #                           next successful turn

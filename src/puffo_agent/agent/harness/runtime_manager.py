@@ -638,7 +638,6 @@ class RuntimeManager:
                                 "resume_unconfirmed" if unconfirmed
                                 else "runtime_exited"
                             ),
-                            "retryable": True,
                         }
                     abandoned = HarnessEvent(
                         type=HarnessEventType.TURN_ABANDONED,

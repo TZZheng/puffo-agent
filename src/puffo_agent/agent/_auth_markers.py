@@ -25,9 +25,30 @@ AUTH_ERROR_MARKERS: tuple[str, ...] = (
     '"type":"authentication_error"',
 )
 
+_PROVIDER_DIAGNOSTIC_AUTH_MARKERS: tuple[str, ...] = (
+    "unauthorized",
+    "unauthorised",
+    "please run codex login",
+    "run `codex login`",
+    "run codex login",
+    "authentication required",
+    "login required",
+    "invalid token",
+    "invalid credential",
+    "token revoked",
+)
+
 
 def looks_like_auth_error(text: str) -> bool:
     if not text:
         return False
     low = text.lower()
     return any(marker in low for marker in AUTH_ERROR_MARKERS)
+
+
+def looks_like_provider_auth_error(text: str) -> bool:
+    """Match explicit provider diagnostics without widening prose checks."""
+    if looks_like_auth_error(text):
+        return True
+    low = text.lower()
+    return any(marker in low for marker in _PROVIDER_DIAGNOSTIC_AUTH_MARKERS)
