@@ -1061,3 +1061,47 @@ async def test_continuation_failure_persists_terminal_before_next_turn(tmp_path)
 
     await adapter.aclose()
     outbox.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_exit_releases_an_adopted_autonomous_turn():
+    """An adopted autonomous turn is not in the driver's turn state, so the
+    TURN_ABANDONED path cannot reach it. Without a direct notification the
+    daemon would hold that turn in_turn until the process restarted."""
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="claude-code",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+    reported: list[tuple[str, dict]] = []
+
+    async def on_autonomous(event):
+        event_type = getattr(event.type, "value", event.type)
+        reported.append((event_type, dict(event.data)))
+
+    assert adapter.register_autonomous_callback(on_autonomous) is True
+
+    running = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    # The harness woke the model on its own, then the runtime died.
+    await driver.queue.put(HarnessEvent(
+        type="turn.autonomous_started",
+        driver="claude-code",
+        session_ref=SessionRef(manager.native_session_id),
+    ))
+    await driver.queue.put(HarnessEvent(
+        type="runtime.exited",
+        driver="claude-code",
+        session_ref=SessionRef(manager.native_session_id),
+    ))
+    with pytest.raises((AgentAPIError, RuntimeStateError)):
+        await asyncio.wait_for(running, timeout=1)
+
+    assert [kind for kind, _ in reported] == [
+        "turn.autonomous_started",
+        "turn.autonomous_completed",
+    ]
+    assert reported[-1][1]["outcome"] == "abandoned"
+    assert reported[-1][1]["error_code"] == "runtime_exited"

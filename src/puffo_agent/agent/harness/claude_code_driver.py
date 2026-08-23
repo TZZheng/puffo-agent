@@ -366,6 +366,7 @@ class ClaudeCodeCliDriver(Driver):
         self._fail_pending_futures("Claude Code CLI closed")
         self._active = TurnRef("")
         self._active_native_turn_id = ""
+        self._autonomous = False
         self._pending_content = ""
         self._pending_uuid = ""
         self._tool_calls.clear()
@@ -381,6 +382,7 @@ class ClaudeCodeCliDriver(Driver):
         self._pending_uuid = ""
         self._active = TurnRef("")
         self._active_native_turn_id = ""
+        self._autonomous = False
         self._tool_calls.clear()
         self._compact_advertised = False
         self._resumed = False

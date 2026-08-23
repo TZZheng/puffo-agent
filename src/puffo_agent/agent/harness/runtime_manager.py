@@ -611,6 +611,14 @@ class RuntimeManager:
         }:
             self._fail_compaction_locked("runtime exited")
             await self._publish_event(event)
+            # An adopted autonomous turn is never in the driver's turn state,
+            # so the TURN_ABANDONED below cannot reach it. Without this the
+            # daemon would keep that turn in_turn forever.
+            await self._notify_autonomous(replace(
+                event,
+                type=HarnessEventType.AUTONOMOUS_COMPLETED,
+                data={"outcome": "abandoned", "error_code": "runtime_exited"},
+            ))
             active = self.active_turn_ref
             # A crash before this resumed session's first success is
             # treated the same as the turn.completed case below: discard
