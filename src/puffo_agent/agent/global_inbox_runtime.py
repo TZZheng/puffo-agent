@@ -201,6 +201,10 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         # still executing -- while driver, manager and this runtime all still
         # believe it is active.
         self._autonomous_ready = False
+        self._deferred_autonomous_start: Any | None = None
+        # Outcome of a terminal whose durable settle failed; the degraded wake
+        # retries it instead of leaving the turn owned but unreachable.
+        self._autonomous_settle_pending: str | None = None
         self.attempts = SendAttemptState()
         self.health = RuntimeHealth()
         # Per ``(space_id, channel_id)``: sends serialize per target, so two
@@ -427,6 +431,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
             await self.recover_orphaned_turns()
             # Past the barrier: adopting a provider run is now safe.
             self._autonomous_ready = True
+            deferred, self._deferred_autonomous_start = (
+                self._deferred_autonomous_start, None,
+            )
+            if deferred is not None:
+                await self._on_autonomous_event(deferred)
             if self._defer_requeued_recovery:
                 # Consume the recovery wake without immediately feeding the same
                 # failed durable union through the initial-turn path.
@@ -1397,6 +1406,14 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
     async def process_once(self) -> bool:
         if not self._try_degraded_recovery():
             return False
+        if self._autonomous_settle_pending is not None:
+            # A terminal arrived but its durable settle failed. The manager has
+            # already released its side and the callback is spent, so this wake
+            # is the only thing left that can finish the turn.
+            if not await self.finish_autonomous_turn(
+                outcome=self._autonomous_settle_pending
+            ):
+                return False
         if self._autonomous_turn_id:
             # The provider is mid-run on a turn it started itself. Starting a
             # daemon turn now would be rejected by the driver anyway (one turn
@@ -1808,7 +1825,14 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
     async def _on_autonomous_event(self, event: Any) -> None:
         event_type = getattr(event.type, "value", event.type)
         if not self._autonomous_ready:
-            # Startup recovery owns the durable turn table right now.
+            # Startup recovery owns the durable turn table right now. The
+            # provider announces a run once, so dropping the start would leave
+            # the driver and manager running a turn this daemon never adopts;
+            # hold it and replay once the barrier lifts. A terminal arriving
+            # first means the run already ended -- nothing left to adopt.
+            self._deferred_autonomous_start = (
+                event if event_type == "turn.autonomous_started" else None
+            )
             log_runtime_event(
                 logger,
                 "turn.autonomous_adoption",
@@ -1916,6 +1940,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 self._autonomous_turn_id = ""
                 return False
             self._autonomous_turn_id = ""
+            self._autonomous_settle_pending = None
             planned = self._autonomous_planned or PlannedTurn(
                 turn_id=turn_id,
                 planning_cycle_key=f"autonomous_{turn_id}",
@@ -1943,6 +1968,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 # pending wake to retry them before the next restart.
                 self._autonomous_turn_id = turn_id
                 self._autonomous_planned = planned
+                self._autonomous_settle_pending = outcome
                 self._degrade(f"autonomous turn settle failed: {exc}")
                 log_runtime_event(
                     logger,

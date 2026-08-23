@@ -691,11 +691,13 @@ class RuntimeManager:
                 await self._retire_invalid_resume_locked(event, logical_turn)
                 return True
         if event.type in {
-            HarnessEventType.AUTONOMOUS_STARTED,
-            HarnessEventType.AUTONOMOUS_COMPLETED,
-            "turn.autonomous_started",
-            "turn.autonomous_completed",
+            HarnessEventType.AUTONOMOUS_STARTED, "turn.autonomous_started",
         }:
+            # Only the start is announced here. Every terminal goes out from
+            # _publish_terminal_locked so the daemon sees the delivered event
+            # exactly once -- announcing a raw success first would let it mark
+            # rows processed before a persistence failure converts the terminal
+            # into an abandon.
             await self._notify_autonomous(event)
         if event.type in {
             HarnessEventType.TURN_COMPLETED,

@@ -1141,6 +1141,11 @@ async def test_autonomous_terminal_follows_persistence_conversion():
             data={"outcome": "succeeded"},
         ))
 
+    # Exactly one terminal, and it is the converted one. Announcing the raw
+    # success first would have let the daemon mark rows processed before the
+    # abandon arrived -- too late to requeue them.
+    terminals = [kind for kind, _ in reported[1:]]
+    assert len(terminals) == 1, reported
     assert reported[-1][1]["outcome"] == "abandoned"
     assert reported[-1][1]["error_code"] == "event_persistence_failed"
     assert manager.active_turn_ref is None

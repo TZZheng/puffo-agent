@@ -2153,21 +2153,21 @@ async def test_messages_read_during_an_autonomous_run_settle_normally(
 
 
 @pytest.mark.asyncio
-async def test_adoption_waits_for_startup_recovery(tmp_path):
-    """A turn adopted before startup recovery writes no crash-join file, so
-    recover_orphaned_turns would retire a run that is still executing while
-    driver, manager and runtime all still believe it active. Adoption must
-    therefore stay shut until both recovery passes are done."""
+async def test_a_single_start_before_recovery_is_replayed_after_it(tmp_path):
+    """The provider announces a run once. Adopting before startup recovery
+    would let the orphan scan retire a turn that is still executing, but
+    dropping the announcement strands it the other way: driver and manager
+    keep running a turn this daemon never adopted. Hold it, replay it once
+    the barrier lifts, and settle on the single real terminal."""
     store = await make_store(tmp_path)
-    adapter = Adapter()
     runtime = GlobalInboxRuntime(
         store=store,
-        adapter=adapter,
+        adapter=Adapter(),
         run_turn=lambda _planned: None,
         workspace=tmp_path,
     )
-    assert runtime.register_autonomous_adoption() is False  # stub adapter
-    # Registration is not permission: the gate is still shut.
+
+    # The one and only start, arriving before recovery.
     await runtime._on_autonomous_event(
         SimpleNamespace(type="turn.autonomous_started", data={},
                         native_session_id="p-1", native_turn_id="n-1"),
@@ -2176,19 +2176,14 @@ async def test_adoption_waits_for_startup_recovery(tmp_path):
     assert await store.get_active_turn_runs() == ()
 
     runtime._stopping = True
-    await runtime.run()  # runs both recovery passes, then opens the gate
-    assert runtime._autonomous_ready is True
+    await runtime.run()  # both recovery passes, then the replay
 
-    await runtime._on_autonomous_event(
-        SimpleNamespace(type="turn.autonomous_started", data={},
-                        native_session_id="p-1", native_turn_id="n-1"),
-    )
     adopted_id = runtime.active.turn_id
-    assert adopted_id
+    assert adopted_id, "the held start must be replayed, not dropped"
     run = await store.get_turn_run(adopted_id)
     assert run is not None and run.state == "in_turn"
 
-    # The terminal settles it exactly once.
+    # The single real terminal settles it exactly once.
     await runtime._on_autonomous_event(
         SimpleNamespace(type="turn.autonomous_completed",
                         data={"outcome": "succeeded"}),
@@ -2196,7 +2191,32 @@ async def test_adoption_waits_for_startup_recovery(tmp_path):
     run = await store.get_turn_run(adopted_id)
     assert run is not None and run.state == "processed"
     assert runtime.active.turn_id == ""
-    assert await runtime.finish_autonomous_turn() is False
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_ended_before_recovery_is_not_adopted(tmp_path):
+    """If the terminal also arrived before the barrier the run is over --
+    replaying its start would adopt a turn nothing will ever end."""
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    await runtime._on_autonomous_event(
+        SimpleNamespace(type="turn.autonomous_started", data={},
+                        native_session_id="p-1", native_turn_id="n-1"),
+    )
+    await runtime._on_autonomous_event(
+        SimpleNamespace(type="turn.autonomous_completed",
+                        data={"outcome": "succeeded"}),
+    )
+    runtime._stopping = True
+    await runtime.run()
+    assert runtime.active.turn_id == ""
+    assert await store.get_active_turn_runs() == ()
     await store.close()
 
 
@@ -2216,6 +2236,8 @@ async def test_autonomous_settle_failure_keeps_the_owner(tmp_path):
     assert await runtime.adopt_autonomous_turn(provider_session_id="p-1")
     turn_id = runtime.active.turn_id
 
+    original_finalize = store.finalize_empty_turn
+
     async def failing_finalize(**_kwargs):
         raise RuntimeError("durable store unavailable")
 
@@ -2228,6 +2250,18 @@ async def test_autonomous_settle_failure_keeps_the_owner(tmp_path):
     assert runtime.health.state == "degraded"
     run = await store.get_turn_run(turn_id)
     assert run is not None and run.state == "in_turn"
+
+    # Retained is not enough: the manager has released its side and the
+    # terminal callback is spent, so the degraded wake is the only thing left
+    # that can finish this turn. It must actually retry the settle.
+    store.finalize_empty_turn = original_finalize  # type: ignore[method-assign]
+    runtime._degraded = False
+    runtime._degraded_until = None
+    assert await runtime.process_once() is False  # no Inbox work, but...
+    run = await store.get_turn_run(turn_id)
+    assert run is not None and run.state == "processed"
+    assert runtime._autonomous_turn_id == ""
+    assert runtime._autonomous_settle_pending is None
     await store.close()
 
 
@@ -2266,4 +2300,52 @@ async def test_autonomous_terminal_settles_status_lifecycle(
     assert len(terminals) == 1
     assert terminals[0]["turn_id"] == turn_id
     assert terminals[0]["succeeded"] is expect_succeeded
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["succeeded", "abandoned"])
+async def test_settle_failure_with_admitted_rows_retries(tmp_path, outcome):
+    """The empty-turn path is not the only settle. Rows admitted by read_inbox
+    route through mark_processed / requeue_messages instead, and a failure
+    there must retain and retry the same way."""
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    runtime._autonomous_ready = True
+    await receipt(store, "admitted-row", 1)
+    assert await runtime.adopt_autonomous_turn(provider_session_id="p-1")
+    turn_id = runtime.active.turn_id
+    rows = await store.get_pending()
+    await runtime._admit_inbox_page(
+        SimpleNamespace(selected=rows, remaining_count=0),
+        snapshot_generation=0,
+        requesting_turn_id=turn_id,
+        requesting_provider_session_id="p-1",
+        requesting_provider_turn_id=None,
+    )
+
+    failing = "mark_processed" if outcome == "succeeded" else "requeue_messages"
+    original = getattr(store, failing)
+
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError("durable store unavailable")
+
+    setattr(store, failing, boom)
+    assert await runtime.finish_autonomous_turn(outcome=outcome) is False
+    assert runtime._autonomous_turn_id == turn_id
+    row = await store.get_message_by_envelope("admitted-row")
+    assert row.processing_state == "in_turn"
+
+    setattr(store, failing, original)
+    runtime._degraded = False
+    runtime._degraded_until = None
+    await runtime.process_once()
+    row = await store.get_message_by_envelope("admitted-row")
+    assert row.processing_state == ("processed" if outcome == "succeeded" else "pending")
+    assert runtime._autonomous_settle_pending is None
     await store.close()
