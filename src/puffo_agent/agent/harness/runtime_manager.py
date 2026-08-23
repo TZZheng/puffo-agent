@@ -162,6 +162,13 @@ class RuntimeManager:
         self.spec = spec
         self.agent_id = agent_id
         self.event_sink = event_sink
+        # Long-lived (not one-shot): the daemon registers this once and is
+        # called whenever the provider runs a turn the daemon did not start.
+        self.autonomous_callback: (
+            Callable[[HarnessEvent], Awaitable[None]] | None
+        ) = None
+        # Logical turn of a provider run the driver opened on its own.
+        self._autonomous_turn: TurnRef | None = None
         self.before_start = before_start
         self.session_ref = session_ref or SessionRef(
             f"session_{uuid.uuid4().hex}"
@@ -544,6 +551,32 @@ class RuntimeManager:
             await self._stop_reader()
             await self.driver.close()
             self.opened = None
+            autonomous = self._autonomous_turn
+            if autonomous is not None:
+                # Refresh and ordinary shutdown reach here; without a terminal
+                # the daemon would hold that turn in_turn past the restart.
+                try:
+                    await self._publish_terminal_locked(
+                        HarnessEvent(
+                            type=HarnessEventType.TURN_ABANDONED,
+                            driver=self.driver_name,
+                            session_ref=self.session_ref,
+                            turn_ref=autonomous,
+                            native_session_id=self.native_session_id,
+                            native_turn_id=self.native_turn_id,
+                            data={
+                                "outcome": "abandoned",
+                                "error_code": "runtime_closed",
+                                "retryable": True,
+                            },
+                        ),
+                        autonomous,
+                    )
+                except Exception:  # noqa: BLE001 - close must still finish
+                    logger.warning(
+                        "autonomous terminal failed during close",
+                        exc_info=True,
+                    )
             for future in tuple(self._terminal.values()):
                 if not future.done():
                     future.set_exception(RuntimeStateError("runtime is closed"))
@@ -601,6 +634,10 @@ class RuntimeManager:
 
     async def _consume_event_locked(self, native: HarnessEvent) -> bool:
         self.driver_name = native.driver or self.driver_name
+        if native.type in {
+            HarnessEventType.AUTONOMOUS_STARTED, "turn.autonomous_started",
+        }:
+            self._adopt_driver_turn_locked(native)
         logical_turn = (
             self._turn_refs.get(native.turn_ref)
             if native.turn_ref is not None
@@ -628,51 +665,7 @@ class RuntimeManager:
             HarnessEventType.RUNTIME_EXITED,
             "runtime.exited",
         }:
-            self._fail_compaction_locked("runtime exited")
-            await self._publish_event(event)
-            active = self.active_turn_ref
-            # A crash before this resumed session's first success is
-            # treated the same as the turn.completed case below: discard
-            # the session id so the retry gets a fresh session.
-            unconfirmed = self._resume_unconfirmed
-            self._resume_unconfirmed = False
-            failed_native_session_id = self.native_session_id
-            if unconfirmed:
-                # The event retains the failed native id for diagnostics, but
-                # durable manager state must already point at a fresh session.
-                self._clear_native_session()
-            try:
-                if active is not None:
-                    provider_error_code = str(event.data.get("error_code") or "")
-                    if provider_error_code:
-                        failure_data: dict[str, Any] = {
-                            "outcome": "abandoned",
-                            "error_code": provider_error_code,
-                        }
-                    else:
-                        failure_data = {
-                            "outcome": "abandoned",
-                            "error_code": (
-                                "resume_unconfirmed" if unconfirmed
-                                else "runtime_exited"
-                            ),
-                        }
-                    abandoned = HarnessEvent(
-                        type=HarnessEventType.TURN_ABANDONED,
-                        driver=self.driver_name,
-                        session_ref=self.session_ref,
-                        turn_ref=active,
-                        native_session_id=failed_native_session_id,
-                        native_turn_id=self.native_turn_id,
-                        occurred_at=event.occurred_at,
-                        data=failure_data,
-                    )
-                    await self._publish_terminal_locked(abandoned, active)
-            finally:
-                try:
-                    await self.driver.close()
-                finally:
-                    self.opened = None
+            await self._handle_runtime_exit_locked(event)
             return True
         if event.type in {
             HarnessEventType.TURN_COMPLETED, "turn.completed",
@@ -685,15 +678,105 @@ class RuntimeManager:
                 await self._retire_invalid_resume_locked(event, logical_turn)
                 return True
         if event.type in {
+            HarnessEventType.AUTONOMOUS_STARTED, "turn.autonomous_started",
+        }:
+            # Only the start is announced here. Every terminal goes out from
+            # _publish_terminal_locked so the daemon sees the delivered event
+            # exactly once -- announcing a raw success first would let it mark
+            # rows processed before a persistence failure converts the terminal
+            # into an abandon.
+            await self._notify_autonomous(event)
+        if event.type in {
             HarnessEventType.TURN_COMPLETED,
             HarnessEventType.TURN_ABANDONED,
+            HarnessEventType.AUTONOMOUS_COMPLETED,
             "turn.completed",
             "turn.abandoned",
+            "turn.autonomous_completed",
         } and logical_turn is not None:
             await self._publish_terminal_locked(event, logical_turn)
         else:
             await self._publish_event(event)
         return False
+
+    async def _handle_runtime_exit_locked(self, event: HarnessEvent) -> None:
+        self._fail_compaction_locked("runtime exited")
+        await self._publish_event(event)
+        active = self.active_turn_ref
+        unconfirmed = self._resume_unconfirmed
+        self._resume_unconfirmed = False
+        failed_native_session_id = self.native_session_id
+        if unconfirmed:
+            self._clear_native_session()
+        try:
+            if active is not None:
+                provider_error_code = str(event.data.get("error_code") or "")
+                if provider_error_code:
+                    failure_data: dict[str, Any] = {
+                        "outcome": "abandoned",
+                        "error_code": provider_error_code,
+                    }
+                else:
+                    failure_data = {
+                        "outcome": "abandoned",
+                        "error_code": (
+                            "resume_unconfirmed" if unconfirmed else "runtime_exited"
+                        ),
+                        "retryable": True,
+                    }
+                abandoned = HarnessEvent(
+                    type=HarnessEventType.TURN_ABANDONED,
+                    driver=self.driver_name,
+                    session_ref=self.session_ref,
+                    turn_ref=active,
+                    native_session_id=failed_native_session_id,
+                    native_turn_id=self.native_turn_id,
+                    occurred_at=event.occurred_at,
+                    data=failure_data,
+                )
+                await self._publish_terminal_locked(abandoned, active)
+        finally:
+            try:
+                await self.driver.close()
+            finally:
+                self.opened = None
+
+    def _adopt_driver_turn_locked(self, native: HarnessEvent) -> None:
+        """Track a provider turn the driver opened on its own.
+
+        Held-send admission and tool-result correlation both key off
+        ``active_turn_ref``/``native_turn_id``; without this the autonomous
+        turn would be visible in the event stream but unusable by them.
+        """
+        if native.turn_ref is None or self.active_turn_ref is not None:
+            return
+        logical = TurnRef(f"turn_{uuid.uuid4().hex}")
+        self.active_turn_ref = logical
+        self._autonomous_turn = logical
+        self._active_driver_turn_ref = native.turn_ref
+        self._turn_refs[native.turn_ref] = logical
+        self.native_turn_id = native.native_turn_id or ""
+        for settled, future in tuple(self._terminal.items()):
+            if future.done():
+                self._terminal.pop(settled, None)
+        self._terminal[logical] = (
+            asyncio.get_running_loop().create_future()
+        )
+
+    async def _notify_autonomous(self, event: HarnessEvent) -> None:
+        """Hand an unbound provider turn to the daemon. Best-effort: a
+        failure here must not take down the event reader."""
+        callback = self.autonomous_callback
+        if callback is None:
+            return
+        try:
+            await callback(event)
+        except Exception:  # noqa: BLE001 - never break the reader loop
+            logger.warning(
+                "autonomous turn callback failed for %s",
+                self.agent_id or "<agent>",
+                exc_info=True,
+            )
 
     async def _retire_invalid_resume_locked(
         self, event: HarnessEvent, logical_turn: TurnRef
@@ -744,7 +827,14 @@ class RuntimeManager:
             )
         finally:
             self._fanout_event(delivered)
+            autonomous = self._autonomous_turn == turn
             self._complete_turn(delivered, turn)
+            if autonomous:
+                # The daemon must settle on the same terminal every other
+                # consumer saw: if persistence turned this into an abandon,
+                # it requeues rather than marking Inbox rows processed.
+                self._autonomous_turn = None
+                await self._notify_autonomous(delivered)
         if persistence_error is not None:
             raise persistence_error
 
@@ -967,6 +1057,11 @@ class RuntimeManagerAdapter(Adapter):
         if not isinstance(message, str) or not message.strip():
             raise RuntimeStateError("current user input must be non-empty text")
         return message
+
+    def register_autonomous_callback(self, callback) -> bool:
+        """Route unbound provider turns to the daemon (see base adapter)."""
+        self.manager.autonomous_callback = callback
+        return True
 
     async def _announce_admission(self, started) -> None:
         callback = getattr(self, "_context_admission_callback", None)

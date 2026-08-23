@@ -56,6 +56,7 @@ from .message_projection import (
 )
 from .reminder_scheduler import ReminderScheduler
 from .shared_content import INBOX_TURN_CUE
+from .provider_failures import operator_failure_text
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
 from .global_inbox_admission import InboxAdmissionMixin
 from .global_inbox_covers import CoversReconciliationMixin
+from .autonomous_turns import AutonomousTurnLifecycleMixin
 from .global_inbox_types import (
     opt_str,
     ActiveBoundaryAdapter,
@@ -124,13 +126,11 @@ TurnRunner = Callable[[PlannedTurn], Awaitable[Any]]
 UnfitPolicy = Callable[..., bool | Awaitable[bool]]
 
 
-def _operator_error_text(exc: Exception) -> str:
-    if isinstance(exc, (AgentAPIError, ProviderFailureError)):
-        return str(exc)
-    return f"{type(exc).__name__}: {exc}"
-
-
-class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
+class GlobalInboxRuntime(
+    AutonomousTurnLifecycleMixin,
+    InboxAdmissionMixin,
+    CoversReconciliationMixin,
+):
     """One serial provider boundary over the durable global Inbox."""
 
     def __init__(
@@ -173,6 +173,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         self.unfit_policy = unfit_policy or (lambda *_args, **_kwargs: True)
         self.coordinator = coordinator
         self.active = ActiveExactUnion()
+        self._initialize_autonomous_lifecycle()
         self.attempts = SendAttemptState()
         self.health = RuntimeHealth()
         # Per ``(space_id, channel_id)``: sends serialize per target, so two
@@ -397,6 +398,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         try:
             await self.recover_current_turn()
             await self.recover_orphaned_turns()
+            await self._enable_autonomous_adoption()
             if self._defer_requeued_recovery:
                 # Consume the recovery wake without immediately feeding the same
                 # failed durable union through the initial-turn path.
@@ -1359,8 +1361,55 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         ):
             self.notify()
 
+    async def _handle_process_failure(
+        self, planned: PlannedTurn, process_started: float, exc: Exception
+    ) -> tuple[bool, str, str]:
+        process_outcome = "failed"
+        if isinstance(exc, AgentAPIError):
+            process_outcome = "auth_failed" if exc.is_auth else "api_error_abandoned"
+        elif isinstance(exc, ProviderFailureError):
+            process_outcome = "provider_failed"
+        async with self._turn_state_lock:
+            terminal = await self._requeue_active_turn(
+                planned, process_started, "provider_error"
+            )
+        terminal_error = operator_failure_text(exc)
+        self._degrade(
+            "turn failed and was requeued"
+            if terminal
+            else "turn failed outside the active durable turn"
+        )
+        log_runtime_event(
+            logger,
+            "turn.failed",
+            level=logging.ERROR,
+            agent_id=self.agent_id,
+            turn_id=planned.turn_id,
+            provider_session_id=self.active.provider_session_id,
+            provider_turn_id=self.active.provider_turn_id,
+            notice_generation=planned.notice_generation,
+            target_count=len(planned.targets),
+            error_category="provider_error",
+            error_type=type(exc).__name__,
+            error_code=getattr(exc, "error_code", None),
+            outcome="requeued" if terminal else "degraded",
+        )
+        return terminal, process_outcome, terminal_error
+
     async def process_once(self) -> bool:
         if not self._try_degraded_recovery():
+            return False
+        if self._autonomous_settle_pending is not None:
+            # A terminal arrived but its durable settle failed. The manager has
+            # already released its side and the callback is spent, so this wake
+            # is the only thing left that can finish the turn.
+            if not await self.finish_autonomous_turn(
+                outcome=self._autonomous_settle_pending
+            ):
+                return False
+        await self._replay_deferred_autonomous_start()
+        if self._autonomous_turn_id:
+            # Queue while the provider is mid-run on its autonomous turn.
             return False
         async with self._boundary:
             process_started = time.monotonic()
@@ -1407,37 +1456,10 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 terminal_error = "global inbox turn cancelled before completion"
                 raise
             except Exception as exc:
-                if isinstance(exc, AgentAPIError):
-                    process_outcome = (
-                        "auth_failed" if exc.is_auth else "api_error_abandoned"
+                terminal, process_outcome, terminal_error = (
+                    await self._handle_process_failure(
+                        planned, process_started, exc
                     )
-                elif isinstance(exc, ProviderFailureError):
-                    process_outcome = "provider_failed"
-                async with self._turn_state_lock:
-                    terminal = await self._requeue_active_turn(
-                        planned, process_started, "provider_error"
-                    )
-                terminal_error = _operator_error_text(exc)
-                diagnostic = (
-                    "turn failed and was requeued"
-                    if terminal
-                    else "turn failed outside the active durable turn"
-                )
-                self._degrade(diagnostic)
-                log_runtime_event(
-                    logger,
-                    "turn.failed",
-                    level=logging.ERROR,
-                    agent_id=self.agent_id,
-                    turn_id=planned.turn_id,
-                    provider_session_id=self.active.provider_session_id,
-                    provider_turn_id=self.active.provider_turn_id,
-                    notice_generation=planned.notice_generation,
-                    target_count=len(planned.targets),
-                    error_category="provider_error",
-                    error_type=type(exc).__name__,
-                    error_code=getattr(exc, "error_code", None),
-                    outcome="requeued" if terminal else "degraded",
                 )
             finally:
                 await self._notify_status_terminal(
@@ -1448,6 +1470,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 if self.process_outcome is not None:
                     self.process_outcome(process_outcome, terminal_error)
                 self._finalize_process(planned, terminal)
+                await self._replay_deferred_autonomous_start()
             await self._wake_remaining_pending()
             return True
 
@@ -1923,6 +1946,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 **unwind,
                 diagnostic="crash join identity, route, or target mismatch",
             )
+        # Same rule as the normal start path: a resumed crash join takes the
+        # session, so any adopted turn is closed exactly once first.
+        await self._release_autonomous_turn(reason="abandoned")
         self._activate_recovery(planned, durable_ids, run.provider_session_id)
         await self._notify_status_active()
         return await self._resume_activated_turn(

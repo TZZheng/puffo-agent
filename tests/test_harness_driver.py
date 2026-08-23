@@ -136,7 +136,6 @@ async def test_provider_events_project_valid_terminal(tmp_path, driver_name, sha
         assert not any(row["type"] == "output.updated" for row in rows)
     outbox.close()
 
-
 class _FakeStdin:
     def __init__(self, on_frame=None):
         self.writes: list[bytes] = []

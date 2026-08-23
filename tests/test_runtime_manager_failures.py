@@ -1208,3 +1208,139 @@ async def test_continuation_failure_persists_terminal_before_next_turn(tmp_path)
 
     await adapter.aclose()
     outbox.close()
+
+
+def _autonomous_manager(driver_name="claude-code", *, event_sink=None):
+    return RuntimeManager(
+        driver=_ControllableDriver(),
+        spec=RuntimeSpec("/tmp", task_timeout_seconds=5),
+        driver_name=driver_name,
+        event_sink=event_sink,
+    )
+
+
+async def _start_autonomous(manager, reported):
+    async def on_autonomous(event):
+        reported.append((
+            getattr(event.type, "value", event.type), dict(event.data),
+        ))
+
+    manager.autonomous_callback = on_autonomous
+    await manager._consume_event_locked(HarnessEvent(
+        type="turn.autonomous_started",
+        driver=manager.driver_name,
+        session_ref=SessionRef("native"),
+        turn_ref=TurnRef("driver-turn"),
+        native_turn_id="native-turn-1",
+    ))
+    assert manager.active_turn_ref is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["runtime_exited", "stream_ended", "closed"])
+async def test_every_terminal_path_releases_an_adopted_autonomous_turn(ending):
+    """A background run must end exactly once however the runtime goes away.
+    Without this the daemon holds its durable turn in_turn past a refresh or
+    an ordinary shutdown, blocking later turns until the process restarts."""
+    manager = _autonomous_manager()
+    reported: list[tuple[str, dict]] = []
+    await _start_autonomous(manager, reported)
+
+    if ending == "runtime_exited":
+        await manager._consume_event_locked(HarnessEvent(
+            type="runtime.exited",
+            driver="claude-code",
+            session_ref=SessionRef("native"),
+        ))
+    elif ending == "stream_ended":
+        await manager._fail_runtime_locked("event_stream_ended")
+    else:
+        await manager.close()
+
+    terminals = [kind for kind, _ in reported[1:]]
+    assert len(terminals) == 1, reported
+    assert reported[-1][1]["outcome"] == "abandoned"
+    assert manager.active_turn_ref is None
+    assert manager._autonomous_turn is None
+
+
+@pytest.mark.asyncio
+async def test_autonomous_terminal_follows_persistence_conversion():
+    """When persisting the terminal fails the manager converts it to an
+    abandon. The daemon must settle on that same conversion -- reporting the
+    raw success would mark Inbox rows processed for a turn everyone else
+    treats as abandoned."""
+    async def failing_sink(event):
+        if getattr(event.type, "value", event.type) == "turn.autonomous_completed":
+            raise RuntimeError("event store unavailable")
+
+    manager = _autonomous_manager(event_sink=failing_sink)
+    reported: list[tuple[str, dict]] = []
+    await _start_autonomous(manager, reported)
+
+    with pytest.raises(RuntimeError, match="event store unavailable"):
+        await manager._consume_event_locked(HarnessEvent(
+            type="turn.autonomous_completed",
+            driver="claude-code",
+            session_ref=SessionRef("native"),
+            turn_ref=TurnRef("driver-turn"),
+            native_turn_id="native-turn-1",
+            data={"outcome": "succeeded"},
+        ))
+
+    # Exactly one terminal, and it is the converted one. Announcing the raw
+    # success first would have let the daemon mark rows processed before the
+    # abandon arrived -- too late to requeue them.
+    terminals = [kind for kind, _ in reported[1:]]
+    assert len(terminals) == 1, reported
+    assert reported[-1][1]["outcome"] == "abandoned"
+    assert reported[-1][1]["error_code"] == "event_persistence_failed"
+    assert manager.active_turn_ref is None
+
+
+@pytest.mark.asyncio
+async def test_autonomous_turn_supports_held_send_admission():
+    """The point of adopting an autonomous run is that platform behaviour
+    keeps working inside it. Held-send admission needs the manager to have a
+    real active turn and native turn id, so registering a continuation during
+    an autonomous run must succeed rather than raise."""
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=5),
+        driver_name="claude-code",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+
+    # No daemon turn: exactly the state a background wakeup runs in.
+    assert manager.active_turn_ref is None
+    with pytest.raises(RuntimeStateError, match="no active provider turn"):
+        manager.register_continuation(lambda _event: None, "cycle")
+
+    await manager._consume_event_locked(HarnessEvent(
+        type="turn.autonomous_started",
+        driver="claude-code",
+        session_ref=SessionRef("native"),
+        turn_ref=TurnRef("driver-turn"),
+        native_turn_id="native-turn-1",
+    ))
+    assert manager.active_turn_ref is not None
+    assert manager.native_turn_id == "native-turn-1"
+
+    # This is the call that used to raise, taking held-send recovery with it.
+    manager.register_continuation(lambda _event: None, "cycle")
+    assert manager._continuation_admissions
+
+    await manager._consume_event_locked(HarnessEvent(
+        type="turn.autonomous_completed",
+        driver="claude-code",
+        session_ref=SessionRef("native"),
+        turn_ref=TurnRef("driver-turn"),
+        native_turn_id="native-turn-1",
+        data={"outcome": "succeeded"},
+    ))
+    # The terminal runs the same cleanup a normal turn does.
+    assert manager.active_turn_ref is None
+    assert manager.native_turn_id == ""
+    assert not manager._continuation_admissions
+    del adapter

@@ -115,6 +115,9 @@ class ClaudeCodeCliDriver(Driver):
         self._resumed = False
         self._init_commands: tuple[str, ...] = ()
         self._active = TurnRef("")
+        # True between the first assistant frame and the result frame of a
+        # turn the daemon did not start (harness background-task wakeup).
+        self._autonomous = False
         self._active_native_turn_id = ""
         self._active_provider_error: dict[str, Any] | None = None
         self._closed = False
@@ -482,6 +485,7 @@ class ClaudeCodeCliDriver(Driver):
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         self._message_lifecycle_v1 = False
+        self._autonomous = False
         self._reset_turn_tracking()
         self._tool_calls.clear()
         await self._events.put(None)
@@ -496,6 +500,7 @@ class ClaudeCodeCliDriver(Driver):
         self._pending_uuid = ""
         self._active = TurnRef("")
         self._active_native_turn_id = ""
+        self._autonomous = False
         self._active_provider_error = None
         self._tool_calls.clear()
         self._compact_advertised = False
@@ -765,12 +770,22 @@ class ClaudeCodeCliDriver(Driver):
 
     async def _handle_assistant(self, frame: dict[str, Any]) -> None:
         if not self._active.value:
+            # No daemon-started turn is open, yet the CLI is producing
+            # assistant output: a background task woke the model after the
+            # daemon finalized its turn. Open a real turn for it -- the rest
+            # of this method then projects its tool lifecycle exactly like a
+            # daemon-started turn, which is what held-send admission needs.
+            self._active = TurnRef(f"turn_{uuid.uuid4().hex}")
+            self._active_native_turn_id = str(frame.get("uuid") or "") or (
+                f"autonomous_{uuid.uuid4().hex}"
+            )
+            self._autonomous = True
             await self._emit(
-                HarnessEventType.SESSION_UPDATED,
+                HarnessEventType.AUTONOMOUS_STARTED,
+                turn_ref=self._active,
                 data={"record_type": "assistant"},
                 native_payload=frame,
             )
-            return
         blocks = (frame.get("message") or {}).get("content") or ()
         has_output = any(
             isinstance(block, dict)
@@ -936,11 +951,14 @@ class ClaudeCodeCliDriver(Driver):
         elif outcome == "failed":
             data["error_code"] = self._result_error_code
         await self._emit(
-            HarnessEventType.TURN_COMPLETED,
+            HarnessEventType.AUTONOMOUS_COMPLETED
+            if self._autonomous
+            else HarnessEventType.TURN_COMPLETED,
             turn_ref=self._active,
             data=data,
             native_payload=native_payload,
         )
+        self._autonomous = False
         self._clear_pending_replay()
         self._active, self._active_native_turn_id = TurnRef(""), ""
         # A `tool_use` whose `tool_result` never arrives would otherwise keep

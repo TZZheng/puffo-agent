@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Mapping
 
 from ._auth_markers import looks_like_provider_auth_error
+from .errors import AgentAPIError, ProviderFailureError
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +108,12 @@ def provider_failure_message(error_code: str, *, outcome: str | None = None) -> 
     if outcome is not None:
         return f"provider turn ended with outcome {outcome} (error_code={error_code})"
     return _DEFAULT_PROVIDER_FAILURE.message
+
+
+def operator_failure_text(exc: Exception) -> str:
+    if isinstance(exc, (AgentAPIError, ProviderFailureError)):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
 
 
 def runtime_event_failure_code(error_code: str) -> str:
