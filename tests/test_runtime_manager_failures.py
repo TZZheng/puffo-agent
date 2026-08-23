@@ -1105,3 +1105,51 @@ async def test_runtime_exit_releases_an_adopted_autonomous_turn():
     ]
     assert reported[-1][1]["outcome"] == "abandoned"
     assert reported[-1][1]["error_code"] == "runtime_exited"
+
+
+@pytest.mark.asyncio
+async def test_autonomous_turn_supports_held_send_admission():
+    """The point of adopting an autonomous run is that platform behaviour
+    keeps working inside it. Held-send admission needs the manager to have a
+    real active turn and native turn id, so registering a continuation during
+    an autonomous run must succeed rather than raise."""
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=5),
+        driver_name="claude-code",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+
+    # No daemon turn: exactly the state a background wakeup runs in.
+    assert manager.active_turn_ref is None
+    with pytest.raises(RuntimeStateError, match="no active provider turn"):
+        manager.register_continuation(lambda _event: None, "cycle")
+
+    await manager._consume_event_locked(HarnessEvent(
+        type="turn.autonomous_started",
+        driver="claude-code",
+        session_ref=SessionRef("native"),
+        turn_ref=TurnRef("driver-turn"),
+        native_turn_id="native-turn-1",
+    ))
+    assert manager.active_turn_ref is not None
+    assert manager.native_turn_id == "native-turn-1"
+
+    # This is the call that used to raise, taking held-send recovery with it.
+    manager.register_continuation(lambda _event: None, "cycle")
+    assert manager._continuation_admissions
+
+    await manager._consume_event_locked(HarnessEvent(
+        type="turn.autonomous_completed",
+        driver="claude-code",
+        session_ref=SessionRef("native"),
+        turn_ref=TurnRef("driver-turn"),
+        native_turn_id="native-turn-1",
+        data={"outcome": "succeeded"},
+    ))
+    # The terminal runs the same cleanup a normal turn does.
+    assert manager.active_turn_ref is None
+    assert manager.native_turn_id == ""
+    assert not manager._continuation_admissions
+    del adapter

@@ -194,6 +194,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         self.active = ActiveExactUnion()
         # Turn id of an adopted autonomous (daemon-unstarted) provider run.
         self._autonomous_turn_id = ""
+        self._autonomous_planned: PlannedTurn | None = None
         self.attempts = SendAttemptState()
         self.health = RuntimeHealth()
         # Per ``(space_id, channel_id)``: sends serialize per target, so two
@@ -1388,6 +1389,11 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
     async def process_once(self) -> bool:
         if not self._try_degraded_recovery():
             return False
+        if self._autonomous_turn_id:
+            # The provider is mid-run on a turn it started itself. Starting a
+            # daemon turn now would be rejected by the driver anyway (one turn
+            # at a time); queue instead and re-notify when that turn ends.
+            return False
         async with self._boundary:
             process_started = time.monotonic()
             planned = await self.plan_pending()
@@ -1401,10 +1407,6 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 self.health = RuntimeHealth()
                 return False
             self.attempts.reset()
-            # An adopted autonomous turn must be closed exactly once before a
-            # daemon turn takes the session, or its durable row stays in_turn
-            # and its identity leaks into the turn starting here.
-            await self._release_autonomous_turn(reason="superseded")
             async with self._turn_state_lock:
                 await self._start_local_turn(planned)
             self.adapter.register_admission_callback(
@@ -1843,6 +1845,25 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
             self.active.provider_session_id = provider_session_id or None
             self.active.provider_turn_id = provider_turn_id
             self._autonomous_turn_id = turn_id
+            # The terminal reuses the ordinary exact-union finalize, which is
+            # driven by a PlannedTurn. An autonomous run starts with no Inbox
+            # rows, but read_inbox during it admits real ones into this union.
+            self._autonomous_planned = PlannedTurn(
+                turn_id=turn_id,
+                planning_cycle_key=f"autonomous_{turn_id}",
+                message_ids=(),
+                items=(),
+                routes=(),
+                targets=(),
+                pending_targets=(),
+                target_summary="",
+                formatted_blocks=(),
+                provider_input="",
+                formatted_tokens=0,
+                wrapper_overhead_tokens=0,
+                formatted_bytes=0,
+                wrapper_overhead_bytes=0,
+            )
             if self.coordinator is not None:
                 self.coordinator.provider_session_id = provider_session_id or None
             self.attempts.reset()
@@ -1874,14 +1895,34 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 self._autonomous_turn_id = ""
                 return False
             self._autonomous_turn_id = ""
+            planned = self._autonomous_planned or PlannedTurn(
+                turn_id=turn_id,
+                planning_cycle_key=f"autonomous_{turn_id}",
+                message_ids=(), items=(), routes=(), targets=(),
+                pending_targets=(), target_summary="", formatted_blocks=(),
+                provider_input="", formatted_tokens=0,
+                wrapper_overhead_tokens=0, formatted_bytes=0,
+                wrapper_overhead_bytes=0,
+            )
+            self._autonomous_planned = None
+            succeeded = outcome in {"succeeded", ""}
             try:
-                await self.store.finalize_empty_turn(turn_id=turn_id)
+                # Rows admitted by read_inbox during the run make this union
+                # non-empty; the ordinary paths settle them as processed or
+                # requeued instead of conflicting with an empty-only finalize.
+                if succeeded:
+                    await self._mark_active_processed(planned, time.monotonic())
+                else:
+                    await self._requeue_active_turn(
+                        planned, time.monotonic(), error_category=outcome,
+                    )
             except Exception as exc:  # noqa: BLE001 - never break the reader
                 log_runtime_event(
                     logger,
                     "turn.autonomous_finalized",
                     agent_id=self.agent_id,
                     turn_id=turn_id,
+                    message_count=len(self.active.message_ids),
                     outcome="failed",
                     error_category=type(exc).__name__,
                 )
@@ -1892,13 +1933,18 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                     agent_id=self.agent_id,
                     turn_id=turn_id,
                     provider_session_id=self.active.provider_session_id,
-                    state="processed",
+                    message_count=len(self.active.message_ids),
+                    state="processed" if succeeded else "requeued",
                     outcome=outcome,
                 )
+            self._finalize_process(planned, terminal=True)
             self.active.clear()
             self.attempts.reset()
             self.health = RuntimeHealth()
-            return True
+        # Outside the lock: anything that queued while the provider was busy
+        # would otherwise wait for an unrelated inbound message.
+        self.notify()
+        return True
 
     def _activate_recovery(
         self,
@@ -2053,7 +2099,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
             )
         # Same rule as the normal start path: a resumed crash join takes the
         # session, so any adopted turn is closed exactly once first.
-        await self._release_autonomous_turn(reason="superseded")
+        await self._release_autonomous_turn(reason="abandoned")
         self._activate_recovery(planned, durable_ids, run.provider_session_id)
         await self._notify_status_active()
         from . import send_mode

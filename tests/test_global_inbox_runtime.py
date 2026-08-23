@@ -2057,9 +2057,11 @@ async def test_adoption_never_displaces_a_daemon_started_turn(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_daemon_turn_finalizes_an_adopted_turn_before_starting(tmp_path):
-    """A daemon turn taking the session must close the adopted turn exactly
-    once: leaving it in_turn strands the durable row and its identity."""
+async def test_daemon_turn_queues_behind_an_in_flight_autonomous_run(tmp_path):
+    """The provider runs one turn at a time. While it is mid-autonomous-run
+    the daemon must queue, not start a turn the driver would reject -- and it
+    must pick the work up once that run ends rather than wait for unrelated
+    traffic."""
     store = await make_store(tmp_path)
     adapter = Adapter()
     await receipt(store, "inbound", 1)
@@ -2073,13 +2075,17 @@ async def test_daemon_turn_finalizes_an_adopted_turn_before_starting(tmp_path):
     assert await runtime.adopt_autonomous_turn(provider_session_id="p-1")
     adopted_id = runtime.active.turn_id
 
-    assert await runtime.process_once()
+    # Pending Inbox work exists, but the provider is busy.
+    assert await runtime.process_once() is False
+    row = await store.get_message_by_envelope("inbound")
+    assert row.processing_state == "pending"
 
+    assert await runtime.finish_autonomous_turn() is True
     adopted = await store.get_turn_run(adopted_id)
     assert adopted is not None and adopted.state == "processed"
-    assert runtime._autonomous_turn_id == ""
-    # The autonomous terminal arriving late is a no-op, not a second finalize.
-    assert await runtime.finish_autonomous_turn() is False
+
+    # The queued message is now processable.
+    assert await runtime.process_once() is True
     await store.close()
 
 
@@ -2100,4 +2106,47 @@ async def test_finish_autonomous_turn_ignores_a_superseded_adoption(tmp_path):
 
     assert await runtime.finish_autonomous_turn() is False
     assert runtime.active.turn_id == "turn_daemon_owned"
+    await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "expected_turn_state", "expected_row_state"),
+    [("succeeded", "processed", "processed"), ("failed", "requeued", "pending")],
+)
+async def test_messages_read_during_an_autonomous_run_settle_normally(
+    tmp_path, outcome, expected_turn_state, expected_row_state,
+):
+    """read_inbox during an autonomous run admits real rows into the turn.
+    Finalizing it as an empty turn would conflict and strand both the rows
+    and the turn in_turn, so the terminal must use the ordinary paths."""
+    store = await make_store(tmp_path)
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=Adapter(),
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    await receipt(store, "read-during-run", 1)
+    assert await runtime.adopt_autonomous_turn(provider_session_id="p-1")
+    turn_id = runtime.active.turn_id
+
+    rows = await store.get_pending()
+    selected = tuple(row for row in rows if row.envelope_id == "read-during-run")
+    assert selected
+    await runtime._admit_inbox_page(
+        SimpleNamespace(selected=selected, remaining_count=0),
+        snapshot_generation=0,
+        requesting_turn_id=turn_id,
+        requesting_provider_session_id="p-1",
+        requesting_provider_turn_id=None,
+    )
+    assert runtime.active.message_ids == ["read-during-run"]
+
+    assert await runtime.finish_autonomous_turn(outcome=outcome) is True
+
+    run = await store.get_turn_run(turn_id)
+    assert run is not None and run.state == expected_turn_state
+    row = await store.get_message_by_envelope("read-during-run")
+    assert row.processing_state == expected_row_state
     await store.close()

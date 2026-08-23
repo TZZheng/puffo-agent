@@ -199,8 +199,6 @@ class ClaudeCodeCliDriver(Driver):
             raise RuntimeError("one turn is already active")
         local = TurnRef(f"turn_{uuid.uuid4().hex}")
         replay_uuid = input.client_correlation_id or str(uuid.uuid4())
-        # ``_autonomous`` is deliberately left as-is: an autonomous run still
-        # awaiting its terminal keeps its claim on the next result frame.
         self._active = local
         self._pending_content = _normalize_content(input.content)
         self._pending_uuid = replay_uuid
@@ -572,17 +570,20 @@ class ClaudeCodeCliDriver(Driver):
         if not self._active.value:
             # No daemon-started turn is open, yet the CLI is producing
             # assistant output: a background task woke the model after the
-            # daemon finalized its turn. Report it so the daemon can bind a
-            # turn rather than leave the model running unbound.
+            # daemon finalized its turn. Open a real turn for it -- the rest
+            # of this method then projects its tool lifecycle exactly like a
+            # daemon-started turn, which is what held-send admission needs.
+            self._active = TurnRef(f"turn_{uuid.uuid4().hex}")
+            self._active_native_turn_id = str(frame.get("uuid") or "") or (
+                f"autonomous_{uuid.uuid4().hex}"
+            )
+            self._autonomous = True
             await self._emit(
-                HarnessEventType.AUTONOMOUS_STARTED
-                if not self._autonomous
-                else HarnessEventType.SESSION_UPDATED,
+                HarnessEventType.AUTONOMOUS_STARTED,
+                turn_ref=self._active,
                 data={"record_type": "assistant"},
                 native_payload=frame,
             )
-            self._autonomous = True
-            return
         for index, block in enumerate(
             (frame.get("message") or {}).get("content") or ()
         ):
@@ -673,20 +674,6 @@ class ClaudeCodeCliDriver(Driver):
         )
 
     async def _handle_result(self, frame: dict[str, Any], subtype: str) -> None:
-        if self._autonomous:
-            # The CLI runs turns in order, so this terminal belongs to the
-            # autonomous run that started first -- even if the daemon has
-            # since started its own turn. Attributing it to the daemon turn
-            # would report that turn complete before it produced anything.
-            self._autonomous = False
-            await self._emit(
-                HarnessEventType.AUTONOMOUS_COMPLETED,
-                data={"record_type": "result", "outcome": (
-                    "succeeded" if subtype in {"success", ""} else "failed"
-                )},
-                native_payload=frame,
-            )
-            return
         if not self._active.value:
             await self._emit(
                 HarnessEventType.SESSION_UPDATED,
@@ -711,11 +698,14 @@ class ClaudeCodeCliDriver(Driver):
         if outcome == "failed":
             data["error_code"] = _result_error_code(frame, subtype)
         await self._emit(
-            HarnessEventType.TURN_COMPLETED,
+            HarnessEventType.AUTONOMOUS_COMPLETED
+            if self._autonomous
+            else HarnessEventType.TURN_COMPLETED,
             turn_ref=self._active,
             data=data,
             native_payload=frame,
         )
+        self._autonomous = False
         self._clear_pending_replay()
         self._active, self._active_native_turn_id = TurnRef(""), ""
         # A `tool_use` whose `tool_result` never arrives would otherwise keep

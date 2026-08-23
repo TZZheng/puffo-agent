@@ -582,6 +582,10 @@ class RuntimeManager:
 
     async def _consume_event_locked(self, native: HarnessEvent) -> bool:
         self.driver_name = native.driver or self.driver_name
+        if native.type in {
+            HarnessEventType.AUTONOMOUS_STARTED, "turn.autonomous_started",
+        }:
+            self._adopt_driver_turn_locked(native)
         logical_turn = (
             self._turn_refs.get(native.turn_ref)
             if native.turn_ref is not None
@@ -676,13 +680,36 @@ class RuntimeManager:
         if event.type in {
             HarnessEventType.TURN_COMPLETED,
             HarnessEventType.TURN_ABANDONED,
+            HarnessEventType.AUTONOMOUS_COMPLETED,
             "turn.completed",
             "turn.abandoned",
+            "turn.autonomous_completed",
         } and logical_turn is not None:
             await self._publish_terminal_locked(event, logical_turn)
         else:
             await self._publish_event(event)
         return False
+
+    def _adopt_driver_turn_locked(self, native: HarnessEvent) -> None:
+        """Track a provider turn the driver opened on its own.
+
+        Held-send admission and tool-result correlation both key off
+        ``active_turn_ref``/``native_turn_id``; without this the autonomous
+        turn would be visible in the event stream but unusable by them.
+        """
+        if native.turn_ref is None or self.active_turn_ref is not None:
+            return
+        logical = TurnRef(f"turn_{uuid.uuid4().hex}")
+        self.active_turn_ref = logical
+        self._active_driver_turn_ref = native.turn_ref
+        self._turn_refs[native.turn_ref] = logical
+        self.native_turn_id = native.native_turn_id or ""
+        for settled, future in tuple(self._terminal.items()):
+            if future.done():
+                self._terminal.pop(settled, None)
+        self._terminal[logical] = (
+            asyncio.get_running_loop().create_future()
+        )
 
     async def _notify_autonomous(self, event: HarnessEvent) -> None:
         """Hand an unbound provider turn to the daemon. Best-effort: a
