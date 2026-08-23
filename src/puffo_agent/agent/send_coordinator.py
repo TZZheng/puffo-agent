@@ -26,7 +26,6 @@ from ..crypto.http_client import HttpError
 from ..crypto.keystore import decode_secret
 from ..crypto.message import (
     EncryptInput,
-    build_plaintext_message,
     build_supplementation_envelope,
     encrypt_message_with_content_key,
 )
@@ -1114,33 +1113,25 @@ class SendCoordinator:
                 dm_peer=recipient_slug,
             )
             inp = resolved["input"]
-            if resolved["encrypt"]:
-                envelope, content_key = encrypt_message_with_content_key(
-                    inp,
-                    resolved["signing_key"],
-                )
-                raw = await self.http_client.post("/messages", envelope) or {}
-                metadata = self._legacy_dm_metadata(raw)
-                missing = metadata[3]
-                if missing:
-                    from ..mcp.puffo_core_tools import _supplement_missing_devices
+            envelope, content_key = encrypt_message_with_content_key(
+                inp,
+                resolved["signing_key"],
+            )
+            raw = await self.http_client.post("/messages", envelope) or {}
+            metadata = self._legacy_dm_metadata(raw)
+            missing = metadata[3]
+            if missing:
+                from ..mcp.puffo_core_tools import _supplement_missing_devices
 
-                    asyncio.create_task(
-                        _supplement_missing_devices(
-                            self.http_client,
-                            envelope,
-                            content_key,
-                            resolved["recipient_slugs"],
-                            list(missing),
-                        )
+                asyncio.create_task(
+                    _supplement_missing_devices(
+                        self.http_client,
+                        envelope,
+                        content_key,
+                        resolved["recipient_slugs"],
+                        list(missing),
                     )
-            else:
-                envelope = build_plaintext_message(inp, resolved["signing_key"])
-                raw = (
-                    await self.http_client.post("/v2/messages/plaintext", envelope)
-                    or {}
                 )
-                metadata = self._legacy_dm_metadata(raw)
             return SendResult(
                 state="sent",
                 envelope_id=envelope.get("envelope_id"),
@@ -1224,7 +1215,6 @@ class SendCoordinator:
         from ..mcp.puffo_core_tools import (
             _fetch_device_keys,
             _resolve_outgoing_root,
-            _send_encryption_required,
         )
         from ._visibility import resolve_visibility
 
@@ -1244,16 +1234,6 @@ class SendCoordinator:
             space_id=space_id,
             dm_peer=dm_peer,
         )
-        # Channel routes are always E2EE. The daemon-level send-mode decision
-        # only exists to allow the plaintext DM downgrade; consulting it for
-        # channels made turn-unbound sends (background wakeups, where the
-        # turn-scoped bundle flag is already cleared) fail as "plaintext".
-        encrypt = (
-            kind == "channel"
-            or bool(request.attachment_paths)
-            or await _send_encryption_required(coordinator_config(self), root)
-        )
-
         attachments, attachment_note = await self._prepare_attachments(
             request, materialized
         )
@@ -1269,13 +1249,24 @@ class SendCoordinator:
         else:
             content = request.text
             content_type = "text/plain"
-        devices = (
-            await _fetch_device_keys(self.http_client, recipient_slugs)
-            if encrypt
-            else []
-        )
-        if encrypt and not devices:
-            raise RuntimeError("no recipient devices found")
+        if kind == "dm":
+            # Fetch the peer alone: a combined [self, peer] fetch cannot
+            # tell "peer unreachable" from "reachable" once the sender's
+            # own devices make the list non-empty.
+            peer_devices = await _fetch_device_keys(self.http_client, [dm_peer])
+            if not peer_devices:
+                raise RuntimeError(
+                    f"recipient @{dm_peer} has no encryption devices"
+                )
+            self_devices = await _fetch_device_keys(self.http_client, [self.slug])
+            merged: dict[str, Any] = {}
+            for device in (*peer_devices, *self_devices):
+                merged.setdefault(device.device_id, device)
+            devices = list(merged.values())
+        else:
+            devices = await _fetch_device_keys(self.http_client, recipient_slugs)
+            if not devices:
+                raise RuntimeError("no recipient devices found")
         visible, visibility_note = await resolve_visibility(
             request.visibility_level,
             destination,
@@ -1304,7 +1295,6 @@ class SendCoordinator:
         return {
             "input": inp,
             "signing_key": signing_key,
-            "encrypt": encrypt,
             "recipient_slugs": recipient_slugs,
             "root_id": root or "",
             "note": f"{visibility_note}{root_note}{attachment_note}",

@@ -306,12 +306,18 @@ class _ScriptedHttp:
     def __init__(self) -> None:
         self.keyless = False
         self.blocklist_reachable = False
+        self.allowlisted_slugs: list[str] = []
 
     async def get(self, path, *a, **k):
         if path in ("/allowlists", "/blocklists"):
             if not self.blocklist_reachable:
                 raise ConnectionError("simulated Puffo Server incident")
-            return {"entries": [], "blocks": []}
+            return {
+                "entries": [
+                    {"peer_slug": slug} for slug in self.allowlisted_slugs
+                ],
+                "blocks": [],
+            }
         return {}
 
     async def post(self, path, body=None, *a, **k):
@@ -537,6 +543,11 @@ async def test_native_long_message_keeps_segment_source_after_prompt_redaction(
     client._segment_chars = 80
     await client.store.open()
     client.http.blocklist_reachable = True
+    # The server allowlist is authoritative once reachable: a refresh
+    # replaces the local set, so the friend must be allowlisted there
+    # (a bare local note_allowed used to pass only via the gate's since-
+    # removed fail-open prompt path).
+    client.http.allowlisted_slugs = [FRIEND_SLUG]
     client._contacts.note_allowed(FRIEND_SLUG)
 
     original = "0123456789" * 25

@@ -20,7 +20,7 @@ class CoversReconciliationMixin:
     """Cover reconciliation + completion for ``GlobalInboxRuntime``.
 
     No independent lifecycle: the runtime owns ``store``, ``active``,
-    ``covers_renotice_enabled`` and ``send_mode_keys``; this trait only
+    ``covers_renotice_enabled`` and ``identity_aliases``; this trait only
     keeps the finalize-time reconciliation within the module size limit.
     """
 
@@ -47,7 +47,7 @@ class CoversReconciliationMixin:
             for row in rows
             if not row.renotified
             and sender_type(
-                row, current_agent_aliases=self.send_mode_keys
+                row, current_agent_aliases=self.identity_aliases
             ) not in ("agent", "system")
         ]
         if not candidate_ids:

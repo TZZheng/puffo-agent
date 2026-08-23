@@ -12,16 +12,10 @@ async def maybe_gate_foreign_dm(
     *,
     sender_slug: str,
     text: str,
-    trigger_encrypted: bool = False,
 ) -> bool:
     """Prompt the operator for a held foreign DM. True = gated (caller
     skips the ack; the DM waits in /messages/pending). One prompt per
     sender — further DMs ride the same y/n.
-
-    ``trigger_encrypted`` is the inbound DM's own confidentiality. The
-    prompt embeds that decrypted text and is sent with ``root_id=""``,
-    so without it the send-mode policy would answer plaintext and
-    republish an E2EE stranger's message in the clear.
     """
     for entry in client._pending_dm_approvals.values():
         if entry.get("sender_slug") == sender_slug:
@@ -51,24 +45,28 @@ async def maybe_gate_foreign_dm(
             client.operator_slug,
             prompt,
             root_id="",
-            require_encryption=trigger_encrypted,
         )
     except Exception as exc:
-        client._log.warning(
+        # Approval is a control plane: a prompt that cannot reach the
+        # operator must not open the gate. No pending entry is recorded,
+        # so the sender's next DM retries the prompt.
+        client._log.error(
             "auto_accept_dm: failed to send approval prompt for %s: %s; "
-            "delivering DM without approval",
+            "holding the DM gated (fail-closed), prompt retries on their "
+            "next DM",
             sender_slug,
             exc,
         )
-        return False
+        return True
     prompt_env_id = envelope.get("envelope_id", "") if envelope else ""
     if not prompt_env_id:
-        client._log.warning(
+        client._log.error(
             "auto_accept_dm: approval prompt for %s got no envelope_id; "
-            "delivering DM without approval",
+            "holding the DM gated (fail-closed), prompt retries on their "
+            "next DM",
             sender_slug,
         )
-        return False
+        return True
     client._pending_dm_approvals[prompt_env_id] = {
         "sender_slug": sender_slug,
         "sender_display_name": sender_display,
