@@ -25,6 +25,7 @@ from puffo_agent.portal.worker import Worker
     "Invalid API key · Please run /login",
     "invalid_grant",
     "OAuth token revoked",
+    "This organization has been disabled",
     "authentication failed",
     "credentials expired",
     '{"type":"authentication_error"}',

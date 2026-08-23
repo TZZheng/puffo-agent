@@ -84,8 +84,8 @@ the matching stop, upgrade, and restart sequence. Stop the daemon before
 replacing a `uv tool` environment so the old process cannot keep serving stale
 code from the removed environment.
 
-The base install runs the headless foreground daemon. Install the GUI extra
-before using the desktop window, tray, or detached background mode:
+The base install supports both foreground and detached headless daemon modes.
+Install the GUI extra before using the desktop window or tray-backed mode:
 
 ```bash
 uv tool install --force 'puffo-agent[gui]'

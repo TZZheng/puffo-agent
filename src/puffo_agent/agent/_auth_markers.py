@@ -15,6 +15,8 @@ AUTH_ERROR_MARKERS: tuple[str, ...] = (
     "invalid_grant",
     "oauth token revoked",
     "oauth token has expired",
+    "token_invalidated",
+    "this organization has been disabled",
     "authentication failed",
     "failed to authenticate",
     "credentials expired",

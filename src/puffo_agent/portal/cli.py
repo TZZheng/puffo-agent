@@ -613,6 +613,7 @@ def cmd_agent_list(args: argparse.Namespace) -> int:
             "in_progress",
             "auth_failed",
             "api_error_abandoned",
+            "provider_error",
             "refresh_broken",
             "unhandled_error",
             "codex_thread_wedged",

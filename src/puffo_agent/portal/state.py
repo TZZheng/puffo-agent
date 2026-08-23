@@ -915,14 +915,15 @@ class RuntimeState:
     #                           cleared a prior auth_failed
     #   "in_progress"         — turn mid-flight; overrides any sticky
     #                           red so the UI reads alive
-    #   "auth_failed"         — adapter saw 401 / authentication_error
-    #                           (set in worker._handle_suppressed_reply);
+    #   "auth_failed"         — adapter saw 401 / authentication_error;
     #                           cleared by the CredentialRefresher's
     #                           refresh-success callback (PUF-258 wired
     #                           the clear; PUF-221 owns the set lane)
-    #   "api_error_abandoned" — kick-retry exhausted, batch silently
-    #                           abandoned; cleared on next successful turn
-    #                           (PUF-255's on_turn_success lane)
+    #   "api_error_abandoned" — bounded provider retries exhausted and the
+    #                           durable turn was requeued; the next attempt
+    #                           transitions through in_progress and settles it
+    #   "provider_error"      — a categorized non-retryable provider failure;
+    #                           operator-safe detail is stored in ``error``
     #   "refresh_broken"      — daemon saw N consecutive non-success
     #                           refresh outcomes; cleared by next
     #                           REFRESHED. Does not overwrite the two
@@ -938,7 +939,7 @@ class RuntimeState:
     #                           NOT overwrite the stronger downstream
     #                           signals above.
     #   "unknown"             — no probe yet
-    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | refresh_broken | unhandled_error | codex_thread_wedged | unknown
+    health: str = "unknown"  # ok | in_progress | auth_failed | api_error_abandoned | provider_error | refresh_broken | unhandled_error | codex_thread_wedged | unknown
 
     @classmethod
     def load(cls, agent_id: str) -> RuntimeState | None:

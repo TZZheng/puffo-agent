@@ -81,7 +81,7 @@ def test_optimistic_clear_then_re_set_on_next_401():
     runtime = _FakeRuntime(health="auth_failed")
     _call(runtime)
     assert runtime.health == "ok"
-    # Simulate worker's _handle_suppressed_reply re-flipping on next 401.
+    # Simulate the adapter auth path re-flipping on the next 401.
     runtime.health = "auth_failed"
     runtime.error = "fresh-401-after-refresh"
     _call(runtime)

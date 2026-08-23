@@ -11,9 +11,8 @@ from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from .._auth_markers import looks_like_auth_error
 from ..cli_bin import normalize_launch_argv
-from ..provider_failures import provider_failure
+from ..provider_failures import classify_provider_failure
 from .driver import (
     CancelCapability,
     CompactCapability,
@@ -450,6 +449,7 @@ class ClaudeCodeCliDriver(Driver):
                 await self._emit(
                     HarnessEventType.RUNTIME_EXITED,
                     turn_ref=self._active if self._active.value else None,
+                    data=dict(self._active_provider_error or {}),
                 )
 
     async def _log_unexpected_exit(self) -> None:
@@ -580,9 +580,20 @@ class ClaudeCodeCliDriver(Driver):
                 native_payload=frame,
             )
             return
-        for index, block in enumerate(
-            (frame.get("message") or {}).get("content") or ()
-        ):
+        blocks = (frame.get("message") or {}).get("content") or ()
+        has_output = any(
+            isinstance(block, dict)
+            and (
+                block.get("type") == "tool_use"
+                or (block.get("type") == "text" and str(block.get("text") or "").strip())
+            )
+            for block in blocks
+        )
+        if frame.get("parent_tool_use_id") is None and has_output:
+            # A later root assistant frame proves Claude recovered from an
+            # earlier synthetic API-error frame within the same native turn.
+            self._active_provider_error = None
+        for index, block in enumerate(blocks):
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "text":
@@ -832,6 +843,11 @@ def _provider_error(frame: dict[str, Any]) -> dict[str, Any] | None:
     looks like a normal reply. The explicit outer fields are authoritative; raw
     provider text remains in the driver's opaque native diagnostic only.
     """
+    if (
+        frame.get("type") != "assistant"
+        or frame.get("parent_tool_use_id") is not None
+    ):
+        return None
     raw_status = frame.get("apiErrorStatus")
     status = raw_status if type(raw_status) is int else None
     if frame.get("isApiErrorMessage") is not True and not (
@@ -855,29 +871,11 @@ def _provider_error(frame: dict[str, Any]) -> dict[str, Any] | None:
                 fragments.append(str(block.get("text") or ""))
     diagnostic = "\n".join(fragments).lower()
 
-    is_auth = status == 401 or looks_like_auth_error(diagnostic)
-    quota_exhausted = (
-        ("reached your" in diagnostic and "limit" in diagnostic)
-        or ("hit your" in diagnostic and "limit" in diagnostic)
-        or "credit balance is too low" in diagnostic
-        or "billing_error" in diagnostic
-    )
-    if is_auth:
-        error_code = "authentication"
-    elif quota_exhausted:
-        error_code = "quota_exhausted"
-    elif status == 429 or "rate_limit" in diagnostic:
-        error_code = "rate_limit"
-    elif (status is not None and status >= 500) or "overloaded" in diagnostic:
-        error_code = "provider_unavailable"
-    elif status == 403 or "permission_error" in diagnostic:
-        error_code = "permission_denied"
-    else:
-        error_code = "provider_error"
-    failure = provider_failure(error_code)
     return {
-        "error_code": error_code,
-        "retryable": failure.retryable if failure is not None else False,
+        "error_code": classify_provider_failure(
+            status=status,
+            diagnostic=diagnostic,
+        )
     }
 
 

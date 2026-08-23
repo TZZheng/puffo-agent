@@ -192,6 +192,21 @@ def test_fallback_unhandled_error_default_error_when_caller_passes_none(
     assert rs.error  # populated even when caller had no error text
 
 
+def test_categorized_provider_failure_is_not_reported_as_unhandled(
+    tmp_path, monkeypatch,
+):
+    agent_id = _seed_runtime(tmp_path, monkeypatch, health="in_progress")
+    rs = RuntimeState.load(agent_id)
+    assert rs is not None
+
+    Worker._mark_provider_failure_if_in_progress(
+        rs, agent_id, "provider usage limit reached", _LOG,
+    )
+
+    assert rs.health == "provider_error"
+    assert rs.error == "provider usage limit reached"
+
+
 # ── chain integration tests (PR #59 Blocker 1 + Blocker 2) ───────
 
 
@@ -221,11 +236,7 @@ def test_chain_agent_api_error_then_retry_success_resolves_to_ok(
     on_disk = RuntimeState.load(agent_id)
     assert on_disk is not None and on_disk.health == "in_progress"
 
-    # T2: consumer kicks the retry; it succeeds; on_turn_success
-    # fires the same helper pair the worker installed in this PR.
-    Worker._clear_api_error_abandoned_if_recoverable(
-        rs, agent_id, "root_x", _LOG,
-    )
+    # T2: consumer kicks the retry; process success resolves the health state.
     Worker._resolve_health_on_success(rs, agent_id, _LOG)
 
     assert rs.health == "ok"
@@ -349,6 +360,7 @@ def test_cli_surfaced_health_tuple_includes_new_values():
         "unhandled_error",
         "auth_failed",
         "api_error_abandoned",
+        "provider_error",
         "refresh_broken",
     ):
         assert f'"{required}"' in text, (
