@@ -195,6 +195,12 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         # Turn id of an adopted autonomous (daemon-unstarted) provider run.
         self._autonomous_turn_id = ""
         self._autonomous_planned: PlannedTurn | None = None
+        # Adoption stays shut until startup recovery has run. A turn adopted
+        # before that barrier writes no crash-join file, so recover_current_turn
+        # cannot see it and recover_orphaned_turns would retire a run that is
+        # still executing -- while driver, manager and this runtime all still
+        # believe it is active.
+        self._autonomous_ready = False
         self.attempts = SendAttemptState()
         self.health = RuntimeHealth()
         # Per ``(space_id, channel_id)``: sends serialize per target, so two
@@ -419,6 +425,8 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         try:
             await self.recover_current_turn()
             await self.recover_orphaned_turns()
+            # Past the barrier: adopting a provider run is now safe.
+            self._autonomous_ready = True
             if self._defer_requeued_recovery:
                 # Consume the recovery wake without immediately feeding the same
                 # failed durable union through the initial-turn path.
@@ -1799,6 +1807,16 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
 
     async def _on_autonomous_event(self, event: Any) -> None:
         event_type = getattr(event.type, "value", event.type)
+        if not self._autonomous_ready:
+            # Startup recovery owns the durable turn table right now.
+            log_runtime_event(
+                logger,
+                "turn.autonomous_adoption",
+                agent_id=self.agent_id,
+                outcome="deferred",
+                error_category="startup_recovery",
+            )
+            return
         if event_type == "turn.autonomous_started":
             await self.adopt_autonomous_turn(
                 provider_session_id=(

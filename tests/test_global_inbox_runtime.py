@@ -2150,3 +2150,51 @@ async def test_messages_read_during_an_autonomous_run_settle_normally(
     row = await store.get_message_by_envelope("read-during-run")
     assert row.processing_state == expected_row_state
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_adoption_waits_for_startup_recovery(tmp_path):
+    """A turn adopted before startup recovery writes no crash-join file, so
+    recover_orphaned_turns would retire a run that is still executing while
+    driver, manager and runtime all still believe it active. Adoption must
+    therefore stay shut until both recovery passes are done."""
+    store = await make_store(tmp_path)
+    adapter = Adapter()
+    runtime = GlobalInboxRuntime(
+        store=store,
+        adapter=adapter,
+        run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    assert runtime.register_autonomous_adoption() is False  # stub adapter
+    # Registration is not permission: the gate is still shut.
+    await runtime._on_autonomous_event(
+        SimpleNamespace(type="turn.autonomous_started", data={},
+                        native_session_id="p-1", native_turn_id="n-1"),
+    )
+    assert runtime.active.turn_id == ""
+    assert await store.get_active_turn_runs() == ()
+
+    runtime._stopping = True
+    await runtime.run()  # runs both recovery passes, then opens the gate
+    assert runtime._autonomous_ready is True
+
+    await runtime._on_autonomous_event(
+        SimpleNamespace(type="turn.autonomous_started", data={},
+                        native_session_id="p-1", native_turn_id="n-1"),
+    )
+    adopted_id = runtime.active.turn_id
+    assert adopted_id
+    run = await store.get_turn_run(adopted_id)
+    assert run is not None and run.state == "in_turn"
+
+    # The terminal settles it exactly once.
+    await runtime._on_autonomous_event(
+        SimpleNamespace(type="turn.autonomous_completed",
+                        data={"outcome": "succeeded"}),
+    )
+    run = await store.get_turn_run(adopted_id)
+    assert run is not None and run.state == "processed"
+    assert runtime.active.turn_id == ""
+    assert await runtime.finish_autonomous_turn() is False
+    await store.close()
