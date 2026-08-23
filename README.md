@@ -62,7 +62,7 @@ Python:
 ```bash
 uv tool install puffo-agent
 # pin to a specific version:
-uv tool install puffo-agent==1.2.0
+uv tool install puffo-agent==2.0.0
 ```
 
 Otherwise use pip:
@@ -70,13 +70,12 @@ Otherwise use pip:
 ```bash
 pip install puffo-agent
 # pin to a specific version:
-pip install puffo-agent==1.2.0
+pip install puffo-agent==2.0.0
 ```
 
-The Agent Foundation `2.0.0a2` candidate is for staging validation and is
-published to TestPyPI only. See
-[`docs/RELEASE-CANDIDATE-2.0.0a2.md`](docs/RELEASE-CANDIDATE-2.0.0a2.md) for
-the install command, test scope, and stable-release TODOs.
+Agent Foundation `2.0.0` is the current stable release. It upgrades supported
+1.2 state in place while preserving Agent identity, keys, profile, memory,
+workspace, message history, and logical session continuity.
 
 Both paths install the `puffo-agent` console script. The CLI's
 `check-update` command detects which way you installed and prints
