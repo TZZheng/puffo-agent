@@ -30,6 +30,7 @@ from .context_controller import (
     ProviderAdmissionEvent,
     ToolResultAdmission,
 )
+from .errors import AgentAPIError, ProviderFailureError
 from .inbox_scheduler import (
     COALESCE_SECONDS,
     MAX_ESTIMATED_TOKENS,
@@ -81,8 +82,10 @@ from .global_inbox_types import (
     MessageRoute,
     OUTPUT_TOOL_RESERVE_TOKENS,
     PlannedTurn,
+    ProcessOutcomeCallback,
     RuntimeHealth,
     SendAttemptState,
+    TurnStatusLifecycle,
     await_listener_with_runtime,
     conservative_token_estimate,
     format_stored_message,
@@ -122,6 +125,12 @@ TurnRunner = Callable[[PlannedTurn], Awaitable[Any]]
 UnfitPolicy = Callable[..., bool | Awaitable[bool]]
 
 
+def _operator_error_text(exc: Exception) -> str:
+    if isinstance(exc, (AgentAPIError, ProviderFailureError)):
+        return str(exc)
+    return f"{type(exc).__name__}: {exc}"
+
+
 class GlobalInboxRuntime(
     AutonomousTurnLifecycleMixin,
     InboxAdmissionMixin,
@@ -147,12 +156,13 @@ class GlobalInboxRuntime(
         max_api_retries: int = 2,
         retry_sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         held_catchup: Callable[[str], Awaitable[bool]] | None = None,
-        send_mode_keys: Sequence[str] = (),
+        identity_aliases: Sequence[str] = (),
         agent_id: str = "",
         notice_delivery: InboxNoticeDelivery | None = None,
         runtime_event_outbox: Any | None = None,
         reminder_scheduler: ReminderScheduler | None = None,
         status_lifecycle: TurnStatusLifecycle | None = None,
+        process_outcome: ProcessOutcomeCallback | None = None,
         channel_audience_loader: ChannelAudienceLoader | None = None,
         covers_renotice_enabled: bool | None = None,
     ) -> None:
@@ -191,7 +201,7 @@ class GlobalInboxRuntime(
         self.max_context_decisions = max_context_decisions
         self.max_api_retries = max_api_retries
         self.retry_sleep = retry_sleep
-        self.send_mode_keys = tuple(dict.fromkeys(key for key in send_mode_keys if key))
+        self.identity_aliases = tuple(dict.fromkeys(key for key in identity_aliases if key))
         self.agent_id = agent_id
         # Uncovered-message redelivery is observed unconditionally but only
         # acted on behind this flag, so test environments can lead adoption.
@@ -203,19 +213,19 @@ class GlobalInboxRuntime(
                 in {"1", "true", "yes", "on"}
             )
         self.covers_renotice_enabled = bool(covers_renotice_enabled)
-        # ``send_mode_keys`` is the existing runtime identity-alias set used
-        # by the send-mode guard (normally the configured agent id and the
-        # wire slug).  Inbox attribution is derived from the same identities;
-        # no durable or provider state is introduced.
+        # ``identity_aliases`` is the runtime identity-alias set (normally
+        # the configured agent id and the wire slug); inbox attribution is
+        # derived from these identities.
         self.formatter = self._format_for_provider
         capability = getattr(adapter, "inbox_notice_delivery_capability", None)
         self.notice_delivery = notice_delivery or InboxNoticeDelivery(
-            capability() if callable(capability) else NoticeDeliveryCapability.NEXT_TURN
+            capability if callable(capability) else NoticeDeliveryCapability.NEXT_TURN
         )
         self._busy_notice_task: asyncio.Task[None] | None = None
         self._busy_notice_dirty = False
         self._busy_notice_delay_seconds = COALESCE_SECONDS
         self.runtime_event_outbox = runtime_event_outbox
+        self.process_outcome = process_outcome
         self.reminder_scheduler = reminder_scheduler or ReminderScheduler(
             store=store,
             notify=self.notify,
@@ -230,7 +240,7 @@ class GlobalInboxRuntime(
 
     def _current_agent_identity_aliases(self) -> tuple[str, ...]:
         """Return only runtime-owned identities usable for self attribution."""
-        values: list[str] = [self.agent_id, *self.send_mode_keys]
+        values: list[str] = [self.agent_id, *self.identity_aliases]
         for owner in (self.adapter, self.coordinator):
             for name in ("slug", "agent_id", "agent_slug", "self_slug"):
                 value = getattr(owner, name, "")
@@ -1223,8 +1233,6 @@ class GlobalInboxRuntime(
                     await self._run_retry(await self._prepare_retry_attempt(planned))
                 return
             except Exception as exc:
-                from .core import AgentAPIError
-
                 can_retry = (
                     isinstance(exc, AgentAPIError)
                     and not exc.is_auth
@@ -1319,9 +1327,6 @@ class GlobalInboxRuntime(
         return True
 
     def _finalize_process(self, planned: PlannedTurn, terminal: bool) -> None:
-        from . import send_mode
-
-        send_mode.clear_turn_bundle(list(self.send_mode_keys))
         self.adapter.register_admission_callback(None, "")
         was_active = self.active.turn_id == planned.turn_id
         if terminal:
@@ -1396,15 +1401,9 @@ class GlobalInboxRuntime(
                 planned.planning_cycle_key,
             )
             self.health = RuntimeHealth("in_progress", "")
-            from . import send_mode
-
-            send_mode.note_turn_bundle(
-                list(self.send_mode_keys),
-                planned.requires_encryption
-                or any(item.is_encrypted for item in planned.items),
-            )
             terminal = False
             terminal_succeeded = False
+            process_outcome = "failed"
             terminal_error: str | None = None
             try:
                 await self._invoke_turn_with_retries(planned)
@@ -1413,22 +1412,31 @@ class GlobalInboxRuntime(
                         await self._mark_active_processed(planned, process_started)
                     terminal = True
                     terminal_succeeded = True
+                    process_outcome = "succeeded"
                 else:
-                    self._degrade("provider returned without correlated admission")
+                    terminal_error = "provider returned without correlated admission"
+                    self._degrade(terminal_error)
             except asyncio.CancelledError:
                 async with self._turn_state_lock:
                     await self._requeue_active_turn(
                         planned, process_started, "cancelled"
                     )
                 terminal = True
+                process_outcome = "cancelled"
                 terminal_error = "global inbox turn cancelled before completion"
                 raise
             except Exception as exc:
+                if isinstance(exc, AgentAPIError):
+                    process_outcome = (
+                        "auth_failed" if exc.is_auth else "api_error_abandoned"
+                    )
+                elif isinstance(exc, ProviderFailureError):
+                    process_outcome = "provider_failed"
                 async with self._turn_state_lock:
                     terminal = await self._requeue_active_turn(
                         planned, process_started, "provider_error"
                     )
-                terminal_error = f"{type(exc).__name__}: {exc}"
+                terminal_error = _operator_error_text(exc)
                 diagnostic = (
                     "turn failed and was requeued"
                     if terminal
@@ -1456,6 +1464,8 @@ class GlobalInboxRuntime(
                     succeeded=terminal_succeeded,
                     error_text=terminal_error,
                 )
+                if self.process_outcome is not None:
+                    self.process_outcome(process_outcome, terminal_error)
                 self._finalize_process(planned, terminal)
                 await self._replay_deferred_autonomous_start()
             await self._wake_remaining_pending()
@@ -1709,6 +1719,17 @@ class GlobalInboxRuntime(
                 succeeded=succeeded,
                 error_text=None if succeeded else diagnostic,
             )
+        if activated and self.process_outcome is not None:
+            outcome = (
+                state
+                if state in {
+                    "auth_failed",
+                    "api_error_abandoned",
+                    "provider_failed",
+                }
+                else "failed"
+            )
+            self.process_outcome(outcome, diagnostic)
         self._clear_terminal_turn()
         if requeued:
             self.notify()
@@ -1797,10 +1818,10 @@ class GlobalInboxRuntime(
                 await self._run_retry(planned)
                 return None
             except Exception as exc:
-                from .core import AgentAPIError
-
                 if isinstance(exc, AgentAPIError) and exc.is_auth:
                     return "crash resume auth failure", "auth_failed"
+                if isinstance(exc, ProviderFailureError):
+                    return str(exc), "provider_failed"
                 if not isinstance(exc, AgentAPIError):
                     return (
                         f"crash resume unsafe failure: {type(exc).__name__}",
@@ -1836,6 +1857,8 @@ class GlobalInboxRuntime(
             succeeded=True,
             error_text=None,
         )
+        if self.process_outcome is not None:
+            self.process_outcome("succeeded", None)
         self._clear_terminal_turn()
         return True
 
@@ -1867,6 +1890,8 @@ class GlobalInboxRuntime(
             succeeded=False,
             error_text="crash resume cancelled and requeued",
         )
+        if self.process_outcome is not None:
+            self.process_outcome("cancelled", "crash resume cancelled and requeued")
         self._clear_terminal_turn()
         self.notify()
 
@@ -1923,24 +1948,12 @@ class GlobalInboxRuntime(
         await self._release_autonomous_turn(reason="abandoned")
         self._activate_recovery(planned, durable_ids, run.provider_session_id)
         await self._notify_status_active()
-        from . import send_mode
-
-        # A resumed turn establishes the same send-mode facts ``process_once``
-        # does; the module dict is process-local and therefore empty here.
-        send_mode.note_turn_bundle(
-            list(self.send_mode_keys),
-            planned.requires_encryption
-            or any(item.is_encrypted for item in planned.items),
+        return await self._resume_activated_turn(
+            planned=planned,
+            turn_id=turn_id,
+            recovery_started=recovery_started,
+            unwind=unwind,
         )
-        try:
-            return await self._resume_activated_turn(
-                planned=planned,
-                turn_id=turn_id,
-                recovery_started=recovery_started,
-                unwind=unwind,
-            )
-        finally:
-            send_mode.clear_turn_bundle(list(self.send_mode_keys))
 
     async def _resume_activated_turn(
         self,

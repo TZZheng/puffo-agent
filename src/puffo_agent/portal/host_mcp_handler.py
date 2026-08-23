@@ -15,12 +15,10 @@ from typing import Any
 from ..crypto.encoding import base64url_decode
 from ..crypto.http_client import PuffoCoreHttpClient
 from ..crypto.keystore import KeyStore, decode_secret
-from ..agent import send_mode
 from ..agent.send_coordinator import SemanticSendRequest, failed_result
 from ..crypto.message import (
     EncryptInput,
     RecipientDevice,
-    build_plaintext_message,
     encrypt_message,
 )
 from ..crypto.primitives import Ed25519KeyPair
@@ -332,18 +330,22 @@ async def _send_dm_to_operator(
     signing_key = Ed25519KeyPair.from_secret_bytes(
         decode_secret(sess.subkey_secret_key)
     )
-    # Unthreaded DM — only the turn-bundle rule applies (no store here).
-    encrypt = await send_mode.encryption_required(ctx.slug, None, None)
-    devices: list[RecipientDevice] = []
-    if encrypt:
-        devices = await _fetch_device_keys(
-            ctx.http_client,
-            [ctx.slug, ctx.operator_slug],
+    # The operator is fetched alone so their reachability is checked on
+    # its own — the agent's own devices must not mask an operator with
+    # zero encryption devices.
+    operator_devices = await _fetch_device_keys(
+        ctx.http_client,
+        [ctx.operator_slug],
+    )
+    if not operator_devices:
+        raise RuntimeError(
+            f"no recipient devices resolved for @{ctx.operator_slug}"
         )
-        if not devices:
-            raise RuntimeError(
-                f"no recipient devices resolved for @{ctx.operator_slug}"
-            )
+    self_devices = await _fetch_device_keys(ctx.http_client, [ctx.slug])
+    merged: dict[str, RecipientDevice] = {}
+    for device in (*operator_devices, *self_devices):
+        merged.setdefault(device.device_id, device)
+    devices = list(merged.values())
     inp = EncryptInput(
         envelope_kind="dm",
         sender_slug=ctx.slug,
@@ -357,12 +359,8 @@ async def _send_dm_to_operator(
         content=text,
         recipients=devices,
     )
-    if encrypt:
-        envelope = encrypt_message(inp, signing_key)
-        await ctx.http_client.post("/messages", envelope)
-    else:
-        envelope = build_plaintext_message(inp, signing_key)
-        await ctx.http_client.post("/v2/messages/plaintext", envelope)
+    envelope = encrypt_message(inp, signing_key)
+    await ctx.http_client.post("/messages", envelope)
     return str(envelope.get("envelope_id") or "?")
 
 

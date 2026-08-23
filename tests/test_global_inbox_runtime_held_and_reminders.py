@@ -252,7 +252,7 @@ def test_format_stored_message_marks_only_runtime_identity_aliases(tmp_path):
         adapter=SimpleNamespace(slug="wire-agent"),
         run_turn=lambda _planned: None,
         workspace=tmp_path,
-        send_mode_keys=("runtime-agent-id",),
+        identity_aliases=("runtime-agent-id",),
     )
     assert projection_metadata(runtime.formatter(self_echo))["is_self"] is True
     assert projection_metadata(runtime.formatter(stored("alias", "runtime-agent-id")))[
@@ -1747,54 +1747,6 @@ async def _seed_crash_join(store, tmp_path, ids, *, is_encrypted):
         seed._reconstruct_exact_turn(turn_id="durable-turn", rows=rows)
     )
     return seed
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("terminal", ["complete", "failure", "cancel"])
-async def test_crash_resumed_turn_carries_and_clears_encrypted_send_mode(
-    tmp_path, terminal,
-):
-    """A resumed turn derives E2EE facts from its triggering durable rows."""
-    from puffo_agent.agent import send_mode
-    from puffo_agent.agent.core import AgentAPIError
-
-    store = await make_store(tmp_path)
-    await _seed_crash_join(store, tmp_path, ["page-1"], is_encrypted=True)
-    observed = []
-
-    class Runner:
-        async def __call__(self, _planned):
-            raise AssertionError("recovery uses handle_global_inbox_retry")
-
-        async def handle_global_inbox_retry(self, _planned):
-            observed.append(send_mode.turn_bundle_encrypted("agent-key"))
-            if terminal == "failure":
-                raise AgentAPIError("rate limited")
-            if terminal == "cancel":
-                raise asyncio.CancelledError()
-            return None
-
-    recovered = GlobalInboxRuntime(
-        store=store,
-        adapter=Adapter(),
-        run_turn=Runner(),
-        workspace=tmp_path,
-        send_mode_keys=("agent-key",),
-        max_api_retries=0,
-        retry_sleep=lambda _delay: asyncio.sleep(0),
-    )
-    send_mode.clear_turn_bundle(["agent-key"])
-    if terminal == "cancel":
-        with pytest.raises(asyncio.CancelledError):
-            await recovered.recover_current_turn()
-    else:
-        completed = await recovered.recover_current_turn()
-        assert completed is (terminal == "complete")
-
-    # True for the whole resumed turn, and torn down on every terminal path.
-    assert observed and all(observed)
-    assert send_mode.turn_bundle_encrypted("agent-key") is False
-    await store.close()
 
 
 @pytest.mark.asyncio

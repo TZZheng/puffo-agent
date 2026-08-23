@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Sequence
+from typing import Any, Awaitable, Callable, Protocol, Sequence
 
 from .context_controller import AdmissionCandidate
 from .message_projection import canonical_target_parts, format_message_group
@@ -145,6 +145,30 @@ class ActiveExactUnion:
 class RuntimeHealth:
     state: str = "idle"
     diagnostic: str = ""
+
+
+ProcessOutcomeCallback = Callable[[str, str | None], None]
+
+
+class TurnStatusLifecycle(Protocol):
+    """Worker-owned mirror of one durable Global Inbox turn."""
+
+    async def on_notice_admitted(
+        self, *, turn_id: str, message_ids: tuple[str, ...]
+    ) -> None: ...
+
+    async def on_turn_active(
+        self, *, turn_id: str, message_ids: tuple[str, ...]
+    ) -> None: ...
+
+    async def on_turn_terminal(
+        self,
+        *,
+        turn_id: str,
+        message_ids: tuple[str, ...],
+        succeeded: bool,
+        error_text: str | None,
+    ) -> None: ...
 
 
 @dataclass

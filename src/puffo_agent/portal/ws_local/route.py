@@ -330,7 +330,7 @@ def _make_owned_runtime(point: AttachPoint, bridge, holder: dict[str, WsLocalSes
         run_turn=run_turn,
         workspace=workspace,
         held_catchup=client.recover_pending_delivery,
-        send_mode_keys=(point.agent_id, client.slug),
+        identity_aliases=(point.agent_id, client.slug),
         agent_id=point.agent_id,
         channel_audience_loader=lambda space_id, channel_id: read_channel_audience(
             space_id,

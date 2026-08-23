@@ -726,58 +726,6 @@ async def test_local_event_has_no_fabricated_server_seq_and_global_order(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_turn_send_mode_tracks_encrypted_bundle_and_clears(tmp_path):
-    from puffo_agent.agent import send_mode
-
-    store = await make_store(tmp_path)
-    await receipt(store, "encrypted", 1, is_encrypted=True)
-    adapter = Adapter()
-
-    async def run(_planned):
-        assert await send_mode.encryption_required(
-            "agent-send-mode", store, None
-        )
-        await adapter.admit()
-
-    runtime = GlobalInboxRuntime(
-        store=store,
-        adapter=adapter,
-        run_turn=run,
-        workspace=tmp_path,
-        send_mode_keys=("agent-send-mode",),
-    )
-    assert await runtime.process_once()
-    # Finalize clears the bundle; no bound turn fails safe to encrypted.
-    assert await send_mode.encryption_required("agent-send-mode", store, None)
-    await store.close()
-
-
-@pytest.mark.asyncio
-async def test_turn_send_mode_plaintext_bundle_does_not_require_encryption(tmp_path):
-    from puffo_agent.agent import send_mode
-
-    store = await make_store(tmp_path)
-    await receipt(store, "plaintext", 1, is_encrypted=False)
-    adapter = Adapter()
-
-    async def run(_planned):
-        assert not await send_mode.encryption_required(
-            "plaintext-agent", store, None
-        )
-        await adapter.admit()
-
-    runtime = GlobalInboxRuntime(
-        store=store,
-        adapter=adapter,
-        run_turn=run,
-        workspace=tmp_path,
-        send_mode_keys=("plaintext-agent",),
-    )
-    assert await runtime.process_once()
-    await store.close()
-
-
-@pytest.mark.asyncio
 async def test_listener_guard_stops_transport_when_runtime_crashes():
     listener_started = asyncio.Event()
     listener_stopped = asyncio.Event()

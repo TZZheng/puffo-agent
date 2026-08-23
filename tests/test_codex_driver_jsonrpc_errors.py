@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import pytest
 
 from puffo_agent.agent.core import AgentAPIError
+from puffo_agent.agent.errors import ProviderFailureError
 from puffo_agent.agent.harness.codex_driver import (
     CodexAppServerDriver,
     _classify_jsonrpc_error,
@@ -20,6 +22,11 @@ from puffo_agent.agent.harness.driver import PermissionDecision, PermissionRef
     [
         {"code": 401, "message": "access token has expired"},
         {"code": -32000, "message": "token_invalidated"},
+        {
+            "code": -32000,
+            "message": "stream error: unexpected status 401 Unauthorized",
+        },
+        {"code": -32000, "message": "Unauthorized: please run codex login"},
     ],
 )
 def test_jsonrpc_auth_errors_request_operator_reauthentication(error):
@@ -27,7 +34,7 @@ def test_jsonrpc_auth_errors_request_operator_reauthentication(error):
 
     assert isinstance(exc, AgentAPIError)
     assert exc.is_auth is True
-    assert "code=" in str(exc)
+    assert exc.error_code == "authentication"
 
 
 @pytest.mark.parametrize(
@@ -35,6 +42,11 @@ def test_jsonrpc_auth_errors_request_operator_reauthentication(error):
     [
         {"code": 429, "message": "rate limit exceeded"},
         {"code": -32000, "data": {"status": 503}, "message": "unavailable"},
+        {
+            "code": -32603,
+            "message": "stream error: unexpected status 503 Service Unavailable",
+        },
+        {"code": -32603, "message": "unexpected status 500 Internal Server Error"},
     ],
 )
 def test_jsonrpc_retryable_provider_errors_requeue(error):
@@ -42,22 +54,33 @@ def test_jsonrpc_retryable_provider_errors_requeue(error):
 
     assert isinstance(exc, AgentAPIError)
     assert exc.is_auth is False
-    assert "code=" in str(exc)
+    assert exc.error_code in {"rate_limit", "provider_unavailable"}
 
 
-def test_jsonrpc_protocol_error_keeps_safe_diagnostic_without_retry():
-    exc = _classify_jsonrpc_error(
-        {
-            "code": -32602,
-            "message": "invalid params authorization=Bearer sk_secret_token_123456789",
-        }
-    )
+def test_jsonrpc_permission_and_quota_errors_do_not_enter_tight_retry():
+    for error in (
+        {"code": 403, "message": "permission denied"},
+        {"code": -32000, "message": "credit balance is too low"},
+        {"code": -32000, "message": "You have exceeded your quota"},
+    ):
+        exc = _classify_jsonrpc_error(error)
+        assert isinstance(exc, ProviderFailureError)
+        assert exc.error_code in {"permission_denied", "quota_exhausted"}
 
-    assert type(exc) is RuntimeError
-    assert "code=-32602" in str(exc)
-    assert "invalid params" in str(exc)
-    assert "sk_secret_token_123456789" not in str(exc)
-    assert "[REDACTED]" in str(exc)
+
+def test_jsonrpc_protocol_error_keeps_safe_diagnostic_without_retry(caplog):
+    with caplog.at_level(logging.WARNING):
+        exc = _classify_jsonrpc_error(
+            {
+                "code": -32602,
+                "message": "invalid params authorization=Bearer sk_secret_token_123456789",
+            }
+        )
+
+    assert isinstance(exc, ProviderFailureError)
+    assert exc.error_code == "provider_error"
+    assert "sk_secret_token_123456789" not in caplog.text
+    assert "[REDACTED]" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -73,12 +96,13 @@ def test_jsonrpc_protocol_error_keeps_safe_diagnostic_without_retry():
          "plain-bearer-secret"),
     ],
 )
-def test_jsonrpc_diagnostics_redact_structured_credentials(message, secret):
-    exc = _classify_jsonrpc_error({"code": -32602, "message": message})
+def test_jsonrpc_diagnostics_redact_structured_credentials(message, secret, caplog):
+    with caplog.at_level(logging.WARNING):
+        exc = _classify_jsonrpc_error({"code": -32602, "message": message})
 
-    assert type(exc) is RuntimeError
-    assert secret not in str(exc)
-    assert "[REDACTED]" in str(exc)
+    assert isinstance(exc, ProviderFailureError)
+    assert secret not in caplog.text
+    assert "[REDACTED]" in caplog.text
 
 
 @pytest.mark.asyncio

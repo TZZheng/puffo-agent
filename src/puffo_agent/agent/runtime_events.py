@@ -9,6 +9,11 @@ from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from .harness.driver import HarnessEvent, HarnessEventType
+from .provider_failures import (
+    RUNTIME_EVENT_FAILURE_MESSAGES,
+    provider_failure_retryable,
+    runtime_event_failure_code,
+)
 
 
 RUNTIME_EVENT_TYPES = frozenset({
@@ -21,18 +26,8 @@ RUNTIME_EVENT_TYPES = frozenset({
 TOOL_STATES = frozenset({"running", "succeeded", "failed"})
 PERMISSION_STATES = frozenset({"pending", "approved", "denied", "expired"})
 TURN_OUTCOMES = frozenset({"succeeded", "failed", "cancelled", "abandoned"})
-_SAFE_ERROR_CODES = frozenset({
-    "provider_unavailable", "runtime_exited", "protocol_error",
-    "permission_denied", "cancel_failed", "unknown",
-})
-_SAFE_MESSAGES = {
-    "provider_unavailable": "The Agent runtime became unavailable.",
-    "runtime_exited": "The Agent runtime stopped before completing the turn.",
-    "protocol_error": "The Agent runtime returned an invalid response.",
-    "permission_denied": "The requested operation was not permitted.",
-    "cancel_failed": "The Agent runtime could not cancel the turn.",
-    "unknown": "The Agent runtime could not complete the turn.",
-}
+_SAFE_MESSAGES = dict(RUNTIME_EVENT_FAILURE_MESSAGES)
+_SAFE_ERROR_CODES = frozenset(_SAFE_MESSAGES)
 _SAFE_ACTIVITY = "Working"
 _SAFE_TOOL_LABEL = "Tool"
 _SAFE_PERMISSION_TITLE = "Permission required"
@@ -227,7 +222,7 @@ class LifecycleValidator:
 def safe_error(
     code: str, *, retryable: bool = False
 ) -> dict[str, Any]:
-    normalized = code if code in _SAFE_ERROR_CODES else "unknown"
+    normalized = runtime_event_failure_code(code)
     return {
         "code": normalized,
         "message": _SAFE_MESSAGES[normalized],
@@ -297,8 +292,12 @@ class RuntimeEventProjector:
                 "title": _SAFE_PERMISSION_TITLE,
             })
         if kind in {"turn.completed", "turn.abandoned"}:
+            abandoned_error = (
+                kind == "turn.abandoned" and bool(data.get("error_code"))
+            )
             outcome = (
-                "abandoned" if kind == "turn.abandoned"
+                "failed" if abandoned_error
+                else "abandoned" if kind == "turn.abandoned"
                 else str(data.get("outcome") or "succeeded")
             )
             if outcome not in TURN_OUTCOMES:
@@ -313,9 +312,13 @@ class RuntimeEventProjector:
                 if type(context_tokens) is int and context_tokens > 0:
                     payload["current_context"] = context_tokens
             if outcome == "failed":
+                error_code = str(data.get("error_code") or "unknown")
                 payload["error"] = safe_error(
-                    str(data.get("error_code") or "unknown"),
-                    retryable=bool(data.get("retryable")),
+                    error_code,
+                    retryable=provider_failure_retryable(
+                        error_code,
+                        explicitly_retryable=bool(data.get("retryable")),
+                    ),
                 )
             return self._make(event, "turn.finished", payload)
         # Deliberate suppression: native frames, reasoning, provider diagnostics,

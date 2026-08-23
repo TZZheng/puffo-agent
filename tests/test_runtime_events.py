@@ -18,6 +18,7 @@ from puffo_agent.agent.runtime_events import (
     TrustedScope,
     RUNTIME_EVENT_TYPES,
     _SAFE_MESSAGES,
+    safe_error,
 )
 
 
@@ -127,6 +128,49 @@ def test_runtime_event_is_immutable_after_id_assignment():
     with pytest.raises(TypeError):
         value.payload["error"]["message"] = "changed"
     assert value.as_dict()["event_id"] == "evt_fixed"
+
+
+@pytest.mark.parametrize(
+    ("private_code", "public_code", "retryable"),
+    [
+        ("authentication", "permission_denied", False),
+        ("quota_exhausted", "provider_unavailable", False),
+        ("rate_limit", "provider_unavailable", True),
+    ],
+)
+def test_private_provider_failures_use_server_runtime_event_vocabulary(
+    private_code, public_code, retryable
+):
+    assert safe_error(private_code, retryable=retryable) == {
+        "code": public_code,
+        "message": _SAFE_MESSAGES[public_code],
+        "retryable": retryable,
+    }
+
+
+def test_abandoned_provider_failure_projects_as_failed_with_public_error():
+    projector = RuntimeEventProjector(
+        agent_id="agent_1",
+        session_ref="session_1",
+        scope=TrustedScope(),
+    )
+    public = projector.project(HarnessEvent.normalized(
+        type="turn.abandoned",
+        driver="claude-code",
+        session_ref=SessionRef("native"),
+        turn_ref=TurnRef("turn_1"),
+        data={"error_code": "quota_exhausted", "retryable": True},
+    ))
+
+    assert public is not None
+    assert public.payload == {
+        "outcome": "failed",
+        "error": {
+            "code": "provider_unavailable",
+            "message": _SAFE_MESSAGES["provider_unavailable"],
+            "retryable": False,
+        },
+    }
 
 
 def test_assistant_output_is_not_projected_to_remote_events():

@@ -80,10 +80,12 @@ the install command, test scope, and stable-release TODOs.
 
 Both paths install the `puffo-agent` console script. The CLI's
 `check-update` command detects which way you installed and prints
-the matching upgrade command, so you don't have to remember.
+the matching stop, upgrade, and restart sequence. Stop the daemon before
+replacing a `uv tool` environment so the old process cannot keep serving stale
+code from the removed environment.
 
-The base install runs the headless foreground daemon. Install the GUI extra
-before using the desktop window, tray, or detached background mode:
+The base install supports both foreground and detached headless daemon modes.
+Install the GUI extra before using the desktop window or tray-backed mode:
 
 ```bash
 uv tool install --force 'puffo-agent[gui]'
@@ -106,7 +108,7 @@ lazy-creates `~/.puffo-agent/` on first run with sensible defaults (server
 
 | Command | What it does |
 | --- | --- |
-| `puffo-agent start` | Run the daemon (foreground). `--ui` and `--background` require the `[gui]` extra; background mode detaches with a tray icon. |
+| `puffo-agent start` | Run the daemon (foreground). `--detach` runs headless in the background; `--ui` and tray-backed `--background` require the `[gui]` extra. |
 | `puffo-agent status` | Is it alive? which agents are running? |
 | `puffo-agent stop` | Graceful shutdown from any terminal (`--timeout`, default 60s) |
 | `puffo-agent version` | Print the installed `puffo-agent` version |

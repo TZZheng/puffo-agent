@@ -47,8 +47,9 @@ def _add_core_commands(sub, handlers: CommandHandlers) -> None:
     start = sub.add_parser(
         "start",
         help=(
-            "Run the daemon (foreground by default; --background detaches "
-            "with a status-bar icon, --ui opens the desktop window)"
+            "Run the daemon (foreground by default; --detach runs headless "
+            "in the background, --background adds a status-bar icon, "
+            "and --ui opens the desktop window)"
         ),
     )
     start_mode = start.add_mutually_exclusive_group()
@@ -65,6 +66,11 @@ def _add_core_commands(sub, handlers: CommandHandlers) -> None:
             "icon; it survives the terminal closing. Quit from the icon or "
             "run `puffo-agent stop`."
         ),
+    )
+    start_mode.add_argument(
+        "--detach",
+        action="store_true",
+        help="Detach the headless daemon without requiring the desktop GUI extra.",
     )
     # Internal: the detached child that --background spawns to host the
     # tray. Hidden from --help.

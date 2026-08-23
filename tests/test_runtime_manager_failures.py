@@ -5,8 +5,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from puffo_agent.agent.errors import AgentAPIError
+from puffo_agent.agent.errors import AgentAPIError, ProviderFailureError
 from puffo_agent.agent.adapters.base import TurnContext, TurnResult
+from puffo_agent.agent.harness.claude_code_driver import (
+    ClaudeCodeCliDriver,
+    _provider_error,
+)
 from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
@@ -33,6 +37,95 @@ from puffo_agent.agent.runtime_event_outbox import (
     RuntimeEventProjectingSink,
 )
 from puffo_agent.agent.runtime_events import RuntimeEventProjector
+
+
+@pytest.mark.asyncio
+async def test_claude_usage_limit_is_a_terminal_failure_not_assistant_text():
+    """Claude surfaces model quota exhaustion in an assistant-shaped frame."""
+    driver = ClaudeCodeCliDriver()
+    driver._session_ref = SessionRef("native")
+    driver._native_session_id = "native-session"
+    driver._active = TurnRef("turn-1")
+    driver._active_native_turn_id = "native-turn"
+
+    await driver._handle({
+        "type": "assistant",
+        "message": {
+            "model": "<synthetic>",
+            "content": [{
+                "type": "text",
+                "text": (
+                    "You've reached your Fable 5 limit. Switch to another "
+                    "model or wait for your limit to reset."
+                ),
+            }],
+        },
+        "error": "rate_limit",
+        "errorDetails": {"status": 429, "type": "rate_limit_error"},
+        "isApiErrorMessage": True,
+        "apiErrorStatus": 429,
+    })
+
+    assert driver._events.empty()
+    assert driver._active == TurnRef("turn-1")
+    with pytest.raises(RuntimeError, match="already active"):
+        await driver.start_turn(TurnInput("retry"))
+
+    # An empty bookkeeping frame is not evidence that the provider recovered.
+    await driver._handle({
+        "type": "assistant",
+        "parent_tool_use_id": None,
+        "message": {"content": []},
+    })
+    await driver._handle({
+        "type": "result",
+        "subtype": "success",
+        "usage": {"input_tokens": 12, "output_tokens": 0},
+    })
+
+    events = []
+    while not driver._events.empty():
+        events.append(driver._events.get_nowait())
+    event_types = [getattr(event.type, "value", event.type) for event in events]
+    assert "turn.assistant_delta" not in event_types
+    assert event_types == ["turn.completed"]
+    assert events[0].data == {
+        "outcome": "failed",
+        "error_code": "quota_exhausted",
+        "input_tokens": 12,
+        "output_tokens": 0,
+        "context_tokens": 12,
+    }
+    assert driver._active == TurnRef("")
+
+
+def test_claude_403_uses_shared_auth_classification():
+    permission = _provider_error({
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "apiErrorStatus": 403,
+        "errorDetails": {"type": "permission_error"},
+    })
+    explicit_auth = _provider_error({
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "apiErrorStatus": 403,
+        "errorDetails": {"type": "authentication_error"},
+    })
+
+    assert permission == {"error_code": "permission_denied"}
+    assert explicit_auth == {"error_code": "authentication"}
+    assert _provider_error({
+        "type": "result",
+        "isApiErrorMessage": True,
+        "apiErrorStatus": 429,
+    }) is None
+    assert _provider_error({
+        "type": "assistant",
+        "parent_tool_use_id": "tool-child",
+        "isApiErrorMessage": True,
+        "apiErrorStatus": 429,
+    }) is None
 
 
 class _ControllableDriver(Driver):
@@ -253,7 +346,17 @@ async def _complete_active_turn(manager, driver):
 
 
 @pytest.mark.asyncio
-async def test_runtime_exit_abandons_active_turn_and_allows_next_turn():
+@pytest.mark.parametrize(
+    ("error_code", "expected_code", "expected_exception", "is_auth"),
+    [
+        ("authentication", "authentication", AgentAPIError, True),
+        ("quota_exhausted", "quota_exhausted", ProviderFailureError, None),
+        (None, "runtime_exited", AgentAPIError, False),
+    ],
+)
+async def test_runtime_exit_preserves_provider_failure_and_allows_next_turn(
+    error_code, expected_code, expected_exception, is_auth
+):
     driver = _ControllableDriver()
     persisted: list[HarnessEvent] = []
 
@@ -274,13 +377,14 @@ async def test_runtime_exit_abandons_active_turn_and_allows_next_turn():
         type="runtime.exited",
         driver="codex",
         session_ref=SessionRef("native-session-1"),
+        data={"error_code": error_code} if error_code else {},
     ))
 
-    with pytest.raises(AgentAPIError, match="outcome abandoned") as excinfo:
+    with pytest.raises(expected_exception) as excinfo:
         await asyncio.wait_for(first, timeout=1)
-    # The Global Inbox retry path only fires for is_auth=False AgentAPIError.
-    assert excinfo.value.is_auth is False
-    assert excinfo.value.error_code == "runtime_exited"
+    if is_auth is not None:
+        assert excinfo.value.is_auth is is_auth
+    assert excinfo.value.error_code == expected_code
     assert manager.active_turn_ref is None
     assert manager.opened is None
     assert [str(event.type) for event in persisted][-1].endswith(
@@ -381,7 +485,7 @@ async def test_runtime_crash_on_unconfirmed_resume_also_forces_a_fresh_session()
         session_ref=SessionRef(manager.native_session_id),
     ))
 
-    with pytest.raises(AgentAPIError, match="resume_unconfirmed") as excinfo:
+    with pytest.raises(AgentAPIError) as excinfo:
         await asyncio.wait_for(running, timeout=1)
     assert excinfo.value.is_auth is False
     assert excinfo.value.error_code == "resume_unconfirmed"
@@ -496,6 +600,46 @@ async def test_provider_reported_failure_without_retryable_flag_stays_terminal()
     assert manager.active_turn_ref is None
     assert manager.native_session_id == "valid-but-unconfirmed-session"
     assert manager.opened is not None
+    await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "retryable", "is_auth"),
+    [
+        ("authentication", False, True),
+        ("rate_limit", False, False),
+    ],
+)
+async def test_known_provider_failures_share_recovery_semantics(
+    error_code, retryable, is_auth
+):
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="claude-code",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+
+    running = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="claude-code",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        data={
+            "outcome": "failed",
+            "error_code": error_code,
+            "retryable": retryable,
+        },
+    ))
+
+    with pytest.raises(AgentAPIError) as raised:
+        await asyncio.wait_for(running, timeout=1)
+    assert raised.value.error_code == error_code
+    assert raised.value.is_auth is is_auth
     await manager.close()
 
 
@@ -629,8 +773,9 @@ async def test_runtime_exit_waits_for_start_registration_before_abandoning():
     await asyncio.sleep(0)
     driver.release_start.set()
 
-    with pytest.raises(AgentAPIError, match="outcome abandoned"):
+    with pytest.raises(AgentAPIError) as excinfo:
         await asyncio.wait_for(running, timeout=1)
+    assert excinfo.value.error_code == "runtime_exited"
     assert manager.active_turn_ref is None
     assert manager.opened is None
 
@@ -689,8 +834,9 @@ async def test_terminal_persistence_failure_unblocks_turn_and_retires_runtime():
         data={"outcome": "succeeded"},
     ))
 
-    with pytest.raises(AgentAPIError, match="outcome abandoned"):
+    with pytest.raises(AgentAPIError) as excinfo:
         await asyncio.wait_for(running, timeout=1)
+    assert excinfo.value.error_code == "event_persistence_failed"
     assert manager.active_turn_ref is None
     assert manager.opened is None
 
@@ -1023,8 +1169,9 @@ async def test_continuation_failure_persists_terminal_before_next_turn(tmp_path)
         },
     ))
 
-    with pytest.raises(AgentAPIError, match="outcome abandoned"):
+    with pytest.raises(AgentAPIError) as excinfo:
         await asyncio.wait_for(first, timeout=1)
+    assert excinfo.value.error_code == "runtime_event_processing_failed"
     assert manager.active_turn_ref is None
 
     driver.started = asyncio.Event()
