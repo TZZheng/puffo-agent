@@ -6,6 +6,40 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-08-23
+
+> Stable Agent Foundation 2.0 release, promoted from `2.0.0a25` without
+> additional runtime changes after the staged alpha hardening cycle.
+
+### Added
+
+- **Durable multi-target Inbox and turn coordination.** Agents batch pending
+  work across channels, threads, DMs, spaces, and reminders while preserving
+  routing, freshness, processing disposition, and restart recovery.
+- **Driver-based Claude Code and Codex runtimes.** Provider sessions expose a
+  normalized lifecycle, streaming activity, context telemetry, compaction,
+  steering where supported, and explicit provider failure semantics.
+
+### Changed
+
+- **Existing Agent state upgrades in place.** Supported 1.2 installations keep
+  their identity, keys, profile, memory, workspace, message history, and Puffo
+  logical session while the 2.0 runtime adopts the new storage and Driver
+  contracts.
+- **Agent collaboration is model-directed.** Structured Inbox context,
+  reminders, held-draft reconsideration, and semantic messaging tools provide
+  evidence without reducing reply, wait, clarification, or silence decisions
+  to hard-coded social rules.
+
+### Fixed
+
+- **Staged reliability hardening through `2.0.0a25`.** The stable build includes
+  the alpha-cycle fixes for long-message reads, account cutover, degraded
+  provider sessions, autocompaction, background sends, active long turns,
+  message disposition, thread preservation, lifecycle-gated delivery, durable
+  processed receipts, autonomous provider runs, encryption isolation, and
+  provider retry classification.
+
 ## [2.0.0a25] - 2026-08-23
 
 > Staging candidate hardening Claude turn delivery, runtime recovery, and
@@ -4867,7 +4901,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.0a2...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0
 [2.0.0a2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0a2
 [2.0.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0a1
 [1.2.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v1.2.0
