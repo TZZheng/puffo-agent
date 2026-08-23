@@ -67,6 +67,16 @@ class ProcessingReport:
             value["error_text"] = self.error_text
         return value
 
+    def stored_version(self) -> tuple[Any, ...]:
+        """Fields that identify the exact outbox row selected for upload."""
+        return (
+            self.run_id,
+            self.message_id,
+            1 if self.succeeded else 0,
+            self.error_text,
+            self.created_at_ms,
+        )
+
 
 @dataclass(frozen=True)
 class ProcessingReportResult:
@@ -214,58 +224,64 @@ class ProcessingReportStoreMixin:
             ) as cursor:
                 return await cursor.fetchone() is not None
 
-    async def acknowledge_processing_reports(self, run_ids: Sequence[str]) -> int:
-        if not run_ids:
+    async def acknowledge_processing_reports(
+        self, reports: Sequence[ProcessingReport]
+    ) -> int:
+        if not reports:
             return 0
         async with self._inbox_lock:
             db = await self._ensure_db()
-            placeholders = ",".join("?" for _ in run_ids)
-            cursor = await db.execute(
-                f"DELETE FROM processing_report_outbox WHERE run_id IN ({placeholders})",
-                tuple(run_ids),
+            cursor = await db.executemany(
+                """DELETE FROM processing_report_outbox
+                   WHERE run_id = ? AND message_id = ? AND succeeded = ?
+                     AND error_text IS ? AND created_at_ms = ?""",
+                (report.stored_version() for report in reports),
             )
             await db.commit()
             return max(cursor.rowcount, 0)
 
     async def retry_processing_reports(
         self,
-        run_ids: Sequence[str],
+        reports: Sequence[ProcessingReport],
         *,
         now_ms: int,
     ) -> None:
-        if not run_ids:
+        if not reports:
             return
         async with self._inbox_lock:
             db = await self._ensure_db()
-            placeholders = ",".join("?" for _ in run_ids)
-            await db.execute(
-                f"""UPDATE processing_report_outbox
+            await db.executemany(
+                """UPDATE processing_report_outbox
                     SET next_attempt_at_ms = ? + CASE retry_count
                             WHEN 0 THEN ? WHEN 1 THEN ? WHEN 2 THEN ? ELSE ? END,
                         retry_count = retry_count + 1
-                    WHERE run_id IN ({placeholders})""",
+                    WHERE run_id = ? AND message_id = ? AND succeeded = ?
+                      AND error_text IS ? AND created_at_ms = ?""",
                 (
-                    now_ms,
-                    *PROCESSING_REPORT_RETRY_DELAYS_MS,
-                    PROCESSING_REPORT_PARKED_RETRY_MS,
-                    *run_ids,
+                    (
+                        now_ms,
+                        *PROCESSING_REPORT_RETRY_DELAYS_MS,
+                        PROCESSING_REPORT_PARKED_RETRY_MS,
+                        *report.stored_version(),
+                    )
+                    for report in reports
                 ),
             )
             await db.commit()
 
     async def isolate_processing_reports(
-        self, run_ids: Sequence[str], *, now_ms: int
+        self, reports: Sequence[ProcessingReport], *, now_ms: int
     ) -> None:
-        if not run_ids:
+        if not reports:
             return
         async with self._inbox_lock:
             db = await self._ensure_db()
-            placeholders = ",".join("?" for _ in run_ids)
-            await db.execute(
-                f"""UPDATE processing_report_outbox
+            await db.executemany(
+                """UPDATE processing_report_outbox
                     SET isolated = 1, next_attempt_at_ms = ?
-                    WHERE run_id IN ({placeholders})""",
-                (now_ms, *run_ids),
+                    WHERE run_id = ? AND message_id = ? AND succeeded = ?
+                      AND error_text IS ? AND created_at_ms = ?""",
+                ((now_ms, *report.stored_version()) for report in reports),
             )
             await db.commit()
 
@@ -431,7 +447,7 @@ class ProcessingReportDispatcher:
             self._validate_acknowledgement(response, run_ids)
         except ValueError:
             return await self._retry(reports, now_ms=now_ms, error_code="malformed_ack")
-        await self._store.acknowledge_processing_reports(run_ids)
+        await self._store.acknowledge_processing_reports(reports)
         log_runtime_event(
             logger,
             "processing_report.acknowledged",
@@ -453,7 +469,7 @@ class ProcessingReportDispatcher:
         if exc.status in {401, 408, 425, 429} or exc.status >= 500:
             return await self._retry(reports, now_ms=now_ms, error_code=error_code)
         if len(reports) > 1:
-            await self._store.isolate_processing_reports(run_ids, now_ms=now_ms)
+            await self._store.isolate_processing_reports(reports, now_ms=now_ms)
             log_runtime_event(
                 logger,
                 "processing_report.isolated",
@@ -463,7 +479,7 @@ class ProcessingReportDispatcher:
             )
             return ProcessingReportResult("isolating")
         report = reports[0]
-        await self._store.acknowledge_processing_reports((report.run_id,))
+        await self._store.acknowledge_processing_reports((report,))
         log_runtime_event(
             logger,
             "processing_report.discarded",
@@ -481,10 +497,7 @@ class ProcessingReportDispatcher:
         now_ms: int,
         error_code: str,
     ) -> ProcessingReportResult:
-        await self._store.retry_processing_reports(
-            tuple(report.run_id for report in reports),
-            now_ms=now_ms,
-        )
+        await self._store.retry_processing_reports(reports, now_ms=now_ms)
         self._log_retry(reports, error_code)
         return ProcessingReportResult("retry")
 

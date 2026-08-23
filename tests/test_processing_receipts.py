@@ -109,18 +109,22 @@ async def test_retry_schedule_survives_store_reopen(tmp_path):
 
     replacement = _runs(1, prefix="replacement")[0]
     await reopened.enqueue_processing_reports((replacement,))
-    await reopened.retry_processing_reports(
-        (replacement["run_id"],), now_ms=clock.wall()
-    )
+    original = (await reopened.due_processing_reports(
+        now_ms=clock.wall(), force_all=True
+    ))[0]
+    await reopened.retry_processing_reports((original,), now_ms=clock.wall())
     replacement["succeeded"] = False
     replacement["error_text"] = "replacement result"
     await reopened.enqueue_processing_reports((replacement,))
+    # An acknowledgement for the in-flight original must not delete the
+    # corrected result that replaced it under the same deterministic run id.
+    await reopened.acknowledge_processing_reports((original,))
     replaced = await reopened.due_processing_reports(
         now_ms=clock.wall(), force_all=True
     )
     assert replaced[0].succeeded is False
     assert replaced[0].retry_count == 0
-    await reopened.acknowledge_processing_reports((replacement["run_id"],))
+    await reopened.acknowledge_processing_reports((replaced[0],))
 
     await dispatcher.enqueue(_runs(1, prefix="expired"))
     clock.now_ms += PROCESSING_REPORT_RETENTION_MS + 1
@@ -145,9 +149,10 @@ async def test_dispatcher_caps_each_request_at_fifty(tmp_path):
 
     parked = _runs(51, prefix="parked")
     await dispatcher.enqueue(parked)
-    await store.retry_processing_reports(
-        tuple(run["run_id"] for run in parked), now_ms=clock.wall()
+    parked_reports = await store.due_processing_reports(
+        now_ms=clock.wall(), force_all=True
     )
+    await store.retry_processing_reports(parked_reports, now_ms=clock.wall())
     task = asyncio.create_task(dispatcher.run())
     async with asyncio.timeout(2):
         while len(http.calls) < 4:
@@ -160,8 +165,11 @@ async def test_dispatcher_caps_each_request_at_fifty(tmp_path):
     # must therefore accept a later run instead of latching permanently off.
     parked_again = _runs(1, prefix="reattach")
     await dispatcher.enqueue(parked_again)
+    parked_again_reports = await store.due_processing_reports(
+        now_ms=clock.wall(), force_all=True
+    )
     await store.retry_processing_reports(
-        (parked_again[0]["run_id"],), now_ms=clock.wall()
+        parked_again_reports, now_ms=clock.wall()
     )
     task = asyncio.create_task(dispatcher.run())
     async with asyncio.timeout(2):

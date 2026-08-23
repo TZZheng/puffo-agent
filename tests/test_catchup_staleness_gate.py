@@ -62,20 +62,21 @@ def test_now_ms_defaults_to_wall_clock():
 async def test_stale_receipt_is_reported_and_committed_terminal():
     from puffo_agent.agent.inbound_receipts import InboundReceiptHandler
     from puffo_agent.agent.message_store import ReceiptDisposition
+    from puffo_agent.crypto.ws_client import TransportOutcome
 
     client = _client(_48H_MS)
     client._log = logging.getLogger("staleness-test")
-    reported: list[str] = []
+    trace: list[tuple[str, object]] = []
+    commit_outcome = TransportOutcome.ACK
 
     async def _report(message_id):
-        reported.append(message_id)
+        trace.append(("report", message_id))
 
     client._report_stale_processed = _report
-    commits: list[tuple] = []
 
     async def _commit(disposition, reason):
-        commits.append((disposition, reason))
-        return "ack"
+        trace.append(("commit", (disposition, reason)))
+        return commit_outcome
 
     committer = SimpleNamespace(
         payload=SimpleNamespace(
@@ -87,9 +88,16 @@ async def test_stale_receipt_is_reported_and_committed_terminal():
     handler = InboundReceiptHandler.__new__(InboundReceiptHandler)
     handler.client = client
 
-    assert await handler._stale_outcome(committer) == "ack"
-    assert reported == ["msg_old"]
-    assert commits == [(ReceiptDisposition.TERMINAL, "stale catch-up")]
+    assert await handler._stale_outcome(committer) is TransportOutcome.ACK
+    assert trace == [
+        ("commit", (ReceiptDisposition.TERMINAL, "stale catch-up")),
+        ("report", "msg_old"),
+    ]
+
+    trace.clear()
+    commit_outcome = TransportOutcome.HOLD
+    assert await handler._stale_outcome(committer) is TransportOutcome.HOLD
+    assert trace == [("commit", (ReceiptDisposition.TERMINAL, "stale catch-up"))]
 
 
 def _init_client(catchup_stale_hours: float) -> PuffoCoreMessageClient:
