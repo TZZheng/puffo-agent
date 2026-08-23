@@ -56,6 +56,7 @@ from .message_projection import (
 )
 from .reminder_scheduler import ReminderScheduler
 from .shared_content import INBOX_TURN_CUE
+from .provider_failures import operator_failure_text
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ from .global_inbox_held import HeldRecoverySource
 from .global_inbox_send import TrackingSendDelegate
 from .global_inbox_admission import InboxAdmissionMixin
 from .global_inbox_covers import CoversReconciliationMixin
-from .autonomous_turns import AutonomousTurnLifecycleMixin, TurnStatusLifecycle
+from .autonomous_turns import AutonomousTurnLifecycleMixin
 from .global_inbox_types import (
     opt_str,
     ActiveBoundaryAdapter,
@@ -123,12 +124,6 @@ __all__ = [
 
 TurnRunner = Callable[[PlannedTurn], Awaitable[Any]]
 UnfitPolicy = Callable[..., bool | Awaitable[bool]]
-
-
-def _operator_error_text(exc: Exception) -> str:
-    if isinstance(exc, (AgentAPIError, ProviderFailureError)):
-        return str(exc)
-    return f"{type(exc).__name__}: {exc}"
 
 
 class GlobalInboxRuntime(
@@ -1366,6 +1361,41 @@ class GlobalInboxRuntime(
         ):
             self.notify()
 
+    async def _handle_process_failure(
+        self, planned: PlannedTurn, process_started: float, exc: Exception
+    ) -> tuple[bool, str, str]:
+        process_outcome = "failed"
+        if isinstance(exc, AgentAPIError):
+            process_outcome = "auth_failed" if exc.is_auth else "api_error_abandoned"
+        elif isinstance(exc, ProviderFailureError):
+            process_outcome = "provider_failed"
+        async with self._turn_state_lock:
+            terminal = await self._requeue_active_turn(
+                planned, process_started, "provider_error"
+            )
+        terminal_error = operator_failure_text(exc)
+        self._degrade(
+            "turn failed and was requeued"
+            if terminal
+            else "turn failed outside the active durable turn"
+        )
+        log_runtime_event(
+            logger,
+            "turn.failed",
+            level=logging.ERROR,
+            agent_id=self.agent_id,
+            turn_id=planned.turn_id,
+            provider_session_id=self.active.provider_session_id,
+            provider_turn_id=self.active.provider_turn_id,
+            notice_generation=planned.notice_generation,
+            target_count=len(planned.targets),
+            error_category="provider_error",
+            error_type=type(exc).__name__,
+            error_code=getattr(exc, "error_code", None),
+            outcome="requeued" if terminal else "degraded",
+        )
+        return terminal, process_outcome, terminal_error
+
     async def process_once(self) -> bool:
         if not self._try_degraded_recovery():
             return False
@@ -1426,37 +1456,10 @@ class GlobalInboxRuntime(
                 terminal_error = "global inbox turn cancelled before completion"
                 raise
             except Exception as exc:
-                if isinstance(exc, AgentAPIError):
-                    process_outcome = (
-                        "auth_failed" if exc.is_auth else "api_error_abandoned"
+                terminal, process_outcome, terminal_error = (
+                    await self._handle_process_failure(
+                        planned, process_started, exc
                     )
-                elif isinstance(exc, ProviderFailureError):
-                    process_outcome = "provider_failed"
-                async with self._turn_state_lock:
-                    terminal = await self._requeue_active_turn(
-                        planned, process_started, "provider_error"
-                    )
-                terminal_error = _operator_error_text(exc)
-                diagnostic = (
-                    "turn failed and was requeued"
-                    if terminal
-                    else "turn failed outside the active durable turn"
-                )
-                self._degrade(diagnostic)
-                log_runtime_event(
-                    logger,
-                    "turn.failed",
-                    level=logging.ERROR,
-                    agent_id=self.agent_id,
-                    turn_id=planned.turn_id,
-                    provider_session_id=self.active.provider_session_id,
-                    provider_turn_id=self.active.provider_turn_id,
-                    notice_generation=planned.notice_generation,
-                    target_count=len(planned.targets),
-                    error_category="provider_error",
-                    error_type=type(exc).__name__,
-                    error_code=getattr(exc, "error_code", None),
-                    outcome="requeued" if terminal else "degraded",
                 )
             finally:
                 await self._notify_status_terminal(

@@ -11,33 +11,12 @@ import asyncio
 import logging
 import time
 import uuid
-from typing import Any, Protocol
+from typing import Any
 
 from ._logging import log_runtime_event
 from .global_inbox_types import PlannedTurn, RuntimeHealth
 
 logger = logging.getLogger(__name__)
-
-
-class TurnStatusLifecycle(Protocol):
-    """Worker-owned mirror of the active Global Inbox turn."""
-
-    async def on_notice_admitted(
-        self, *, turn_id: str, message_ids: tuple[str, ...]
-    ) -> None: ...
-
-    async def on_turn_active(
-        self, *, turn_id: str, message_ids: tuple[str, ...]
-    ) -> None: ...
-
-    async def on_turn_terminal(
-        self,
-        *,
-        turn_id: str,
-        message_ids: tuple[str, ...],
-        succeeded: bool,
-        error_text: str | None,
-    ) -> None: ...
 
 
 class AutonomousTurnLifecycleMixin:
