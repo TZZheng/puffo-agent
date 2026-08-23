@@ -48,15 +48,6 @@ def _history_text(content: Any) -> str:
     return content if isinstance(content, str) else ""
 
 
-async def _send_encryption_required(cfg, resolved_root):
-    """Daemon-level send-mode decision. Data-client shims without the
-    method (older harnesses) fail safe to E2EE."""
-    getter = getattr(cfg.data_client, "get_send_encryption", None)
-    if getter is None:
-        return True
-    return await getter(cfg.slug, resolved_root or None)
-
-
 async def _resolve_channel_space(cfg: Any, channel_id: str) -> str:
     """Resolve ``channel_id`` → ``space_id`` from the local cache.
 

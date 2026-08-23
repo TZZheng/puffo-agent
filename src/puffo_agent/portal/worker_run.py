@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import time
 import uuid
@@ -21,6 +20,7 @@ from .workspace_layout import (
     AVAILABLE_SHARED_WORKSPACE_STATES,
     prepare_workspace_shared_access,
 )
+from ..agent.processing_receipts import processing_run_id
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -199,8 +199,7 @@ class GlobalInboxStatusLifecycle:
 
     @staticmethod
     def _run_id(turn_id: str, message_id: str) -> str:
-        identity = f"{turn_id}\0{message_id}".encode("utf-8")
-        return f"run_{hashlib.sha256(identity).hexdigest()[:32]}"
+        return processing_run_id(turn_id, message_id)
 
 
 class StandardWorkerRun:
@@ -714,7 +713,7 @@ class StandardWorkerRun:
             run_turn=self._build_global_turn_handler(context),
             workspace=paths.workspace_path,
             held_catchup=client.recover_pending_delivery,
-            send_mode_keys=(paths.agent_id, client.slug),
+            identity_aliases=(paths.agent_id, client.slug),
             agent_id=paths.agent_id,
             runtime_event_outbox=context.runtime_event_outbox,
             status_lifecycle=status_lifecycle,

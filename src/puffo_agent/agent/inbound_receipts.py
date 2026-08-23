@@ -444,11 +444,13 @@ class InboundReceiptHandler:
             self.client._catchup_stale_ms,
             root_id or payload.envelope_id,
         )
-        self.client._report_stale_processed(payload.envelope_id)
-        return await committer.commit(
+        outcome = await committer.commit(
             ReceiptDisposition.TERMINAL,
             "stale catch-up",
         )
+        if outcome is TransportOutcome.ACK:
+            await self.client._report_stale_processed(payload.envelope_id)
+        return outcome
 
     @staticmethod
     def _raw_text(payload: MessagePayload) -> str:
@@ -489,7 +491,6 @@ class InboundReceiptHandler:
                 self.client,
                 committer.payload,
                 raw_text,
-                bool(committer.stored_payload.get("is_encrypted")),
             ),
         )
 

@@ -49,12 +49,6 @@ class _FakeDataClient:
         self.messages: dict[str, object] = {}
         self.exc: Exception | None = None
         self.calls: list[str] = []
-        # Existing tool tests exercise the E2EE branch; plaintext-branch
-        # tests flip this to False.
-        self.send_encryption = True
-
-    async def get_send_encryption(self, slug, thread_root_id):
-        return self.send_encryption
 
     def add(
         self,
@@ -912,7 +906,7 @@ async def test_send_message_dm_rejects_channel_root():
     """DM sends scope-check too: a channel message as root rejects."""
     cfg, http, ms = _setup()
     _seed_recipient(http, "alice-0001")
-    http.responses["/certs/sync?slugs=agent-0001,alice-0001"] = (
+    http.responses["/certs/sync?slugs=alice-0001"] = (
         http.responses["/certs/sync?slugs=alice-0001"]
     )
     await ms.store({
