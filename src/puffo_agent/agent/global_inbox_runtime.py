@@ -1401,6 +1401,10 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 self.health = RuntimeHealth()
                 return False
             self.attempts.reset()
+            # An adopted autonomous turn must be closed exactly once before a
+            # daemon turn takes the session, or its durable row stays in_turn
+            # and its identity leaks into the turn starting here.
+            await self._release_autonomous_turn(reason="superseded")
             async with self._turn_state_lock:
                 await self._start_local_turn(planned)
             self.adapter.register_admission_callback(
@@ -1855,6 +1859,12 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
             )
             return True
 
+    async def _release_autonomous_turn(self, *, reason: str) -> bool:
+        """Finalize an adopted turn before something else claims the session."""
+        if not self._autonomous_turn_id:
+            return False
+        return await self.finish_autonomous_turn(outcome=reason)
+
     async def finish_autonomous_turn(self, *, outcome: str = "succeeded") -> bool:
         """Close the turn opened by :meth:`adopt_autonomous_turn`."""
         async with self._turn_state_lock:
@@ -2041,6 +2051,9 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 **unwind,
                 diagnostic="crash join identity, route, or target mismatch",
             )
+        # Same rule as the normal start path: a resumed crash join takes the
+        # session, so any adopted turn is closed exactly once first.
+        await self._release_autonomous_turn(reason="superseded")
         self._activate_recovery(planned, durable_ids, run.provider_session_id)
         await self._notify_status_active()
         from . import send_mode

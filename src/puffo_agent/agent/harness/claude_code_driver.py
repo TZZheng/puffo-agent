@@ -199,9 +199,8 @@ class ClaudeCodeCliDriver(Driver):
             raise RuntimeError("one turn is already active")
         local = TurnRef(f"turn_{uuid.uuid4().hex}")
         replay_uuid = input.client_correlation_id or str(uuid.uuid4())
-        # A daemon-started turn supersedes any autonomous run in flight; its
-        # frames take the bound path, so the unbound pair must not stay armed.
-        self._autonomous = False
+        # ``_autonomous`` is deliberately left as-is: an autonomous run still
+        # awaiting its terminal keeps its claim on the next result frame.
         self._active = local
         self._pending_content = _normalize_content(input.content)
         self._pending_uuid = replay_uuid
@@ -674,19 +673,24 @@ class ClaudeCodeCliDriver(Driver):
         )
 
     async def _handle_result(self, frame: dict[str, Any], subtype: str) -> None:
-        if not self._active.value:
-            # Terminal frame of an autonomous (daemon-unbound) turn; pairs
-            # with the AUTONOMOUS_STARTED emitted for its first assistant
-            # frame so the daemon can close the turn it bound.
-            reported = self._autonomous
+        if self._autonomous:
+            # The CLI runs turns in order, so this terminal belongs to the
+            # autonomous run that started first -- even if the daemon has
+            # since started its own turn. Attributing it to the daemon turn
+            # would report that turn complete before it produced anything.
             self._autonomous = False
             await self._emit(
-                HarnessEventType.AUTONOMOUS_COMPLETED
-                if reported
-                else HarnessEventType.SESSION_UPDATED,
+                HarnessEventType.AUTONOMOUS_COMPLETED,
                 data={"record_type": "result", "outcome": (
                     "succeeded" if subtype in {"success", ""} else "failed"
                 )},
+                native_payload=frame,
+            )
+            return
+        if not self._active.value:
+            await self._emit(
+                HarnessEventType.SESSION_UPDATED,
+                data={"record_type": "result"},
                 native_payload=frame,
             )
             return

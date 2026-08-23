@@ -2057,6 +2057,33 @@ async def test_adoption_never_displaces_a_daemon_started_turn(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_daemon_turn_finalizes_an_adopted_turn_before_starting(tmp_path):
+    """A daemon turn taking the session must close the adopted turn exactly
+    once: leaving it in_turn strands the durable row and its identity."""
+    store = await make_store(tmp_path)
+    adapter = Adapter()
+    await receipt(store, "inbound", 1)
+
+    async def run(_planned):
+        await adapter.admit()
+
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=run, workspace=tmp_path,
+    )
+    assert await runtime.adopt_autonomous_turn(provider_session_id="p-1")
+    adopted_id = runtime.active.turn_id
+
+    assert await runtime.process_once()
+
+    adopted = await store.get_turn_run(adopted_id)
+    assert adopted is not None and adopted.state == "processed"
+    assert runtime._autonomous_turn_id == ""
+    # The autonomous terminal arriving late is a no-op, not a second finalize.
+    assert await runtime.finish_autonomous_turn() is False
+    await store.close()
+
+
+@pytest.mark.asyncio
 async def test_finish_autonomous_turn_ignores_a_superseded_adoption(tmp_path):
     """If a daemon turn took over, the autonomous terminal frame must not
     clear the daemon's active state."""
