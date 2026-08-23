@@ -23,6 +23,7 @@ from ..context_controller import (
     normalize_context_snapshot,
 )
 from ..errors import AgentAPIError
+from ..provider_failures import provider_failure, provider_failure_message
 from .driver import (
     CompactRequest,
     ContextStatus,
@@ -76,25 +77,6 @@ class RuntimeStateError(RuntimeError):
     def __init__(self, message: str, *, error_code: str | None = None) -> None:
         super().__init__(message)
         self.error_code = error_code
-
-
-def _provider_failure_message(outcome: str, error_code: str) -> str:
-    """Return operator-safe text for a provider terminal failure."""
-    if error_code == "quota_exhausted":
-        return (
-            "The selected provider model has reached its usage limit; "
-            "switch models or wait for the limit to reset."
-        )
-    if error_code == "authentication":
-        return "Provider authentication failed; sign in again and retry."
-    if error_code == "rate_limit":
-        return "The provider rate-limited this turn; retry later."
-    if error_code == "provider_unavailable":
-        return "The provider is temporarily unavailable; retry later."
-    return (
-        f"provider turn ended with outcome {outcome} "
-        f"(error_code={error_code})"
-    )
 
 
 def _native_resume_is_unavailable(exc: Exception) -> bool:
@@ -1011,11 +993,16 @@ class RuntimeManagerAdapter(Adapter):
                 outcome = str(event.data.get("outcome") or "succeeded")
                 if event_type == "turn.abandoned" or outcome != "succeeded":
                     error_code = str(event.data.get("error_code") or outcome)
-                    message = _provider_failure_message(outcome, error_code)
-                    if event.data.get("retryable") or event.data.get("is_auth"):
+                    failure = provider_failure(error_code)
+                    message = provider_failure_message(error_code, outcome=outcome)
+                    is_auth = failure.is_auth if failure is not None else False
+                    retryable = bool(event.data.get("retryable")) or (
+                        failure.retryable if failure is not None else False
+                    )
+                    if retryable or is_auth:
                         raise AgentAPIError(
                             message,
-                            is_auth=event.data.get("is_auth") is True,
+                            is_auth=is_auth,
                             error_code=error_code,
                         )
                     raise RuntimeStateError(message, error_code=error_code)

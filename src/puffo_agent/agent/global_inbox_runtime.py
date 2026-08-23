@@ -146,6 +146,7 @@ class TurnStatusLifecycle(Protocol):
         message_ids: tuple[str, ...],
         succeeded: bool,
         error_text: str | None,
+        cancelled: bool = False,
     ) -> None:
         """Settle the exact active union in one terminal status batch."""
 
@@ -985,6 +986,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
         terminal: bool,
         succeeded: bool,
         error_text: str | None,
+        cancelled: bool = False,
     ) -> None:
         """Settle the exact active union before ``_finalize_process`` clears it.
 
@@ -999,6 +1001,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                 message_ids=tuple(self.active.message_ids),
                 succeeded=succeeded,
                 error_text=error_text,
+                cancelled=cancelled,
             )
         except Exception:
             logger.warning(
@@ -1415,6 +1418,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
             )
             terminal = False
             terminal_succeeded = False
+            terminal_cancelled = False
             terminal_error: str | None = None
             try:
                 await self._invoke_turn_with_retries(planned)
@@ -1431,6 +1435,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                         planned, process_started, "cancelled"
                     )
                 terminal = True
+                terminal_cancelled = True
                 terminal_error = "global inbox turn cancelled before completion"
                 raise
             except Exception as exc:
@@ -1465,6 +1470,7 @@ class GlobalInboxRuntime(InboxAdmissionMixin, CoversReconciliationMixin):
                     terminal=terminal,
                     succeeded=terminal_succeeded,
                     error_text=terminal_error,
+                    cancelled=terminal_cancelled,
                 )
                 self._finalize_process(planned, terminal)
             await self._wake_remaining_pending()

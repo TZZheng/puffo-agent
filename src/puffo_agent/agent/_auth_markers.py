@@ -13,6 +13,8 @@ AUTH_ERROR_MARKERS: tuple[str, ...] = (
     "run `claude login`",
     "invalid api key",
     "invalid_grant",
+    "oauth token revoked",
+    "oauth token has expired",
     "authentication failed",
     "failed to authenticate",
     "credentials expired",

@@ -306,6 +306,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         from .background import spawn_background
 
         return spawn_background()
+    if getattr(args, "detach", False):
+        from .background import spawn_headless_background
+
+        return spawn_headless_background()
     if getattr(args, "ui", False):
         try:
             from .ui.launcher import launch
@@ -413,13 +417,12 @@ def cmd_check_update(args: argparse.Namespace) -> int:
     print(f"latest:    {remote}")
     if is_outdated(local, remote):
         print()
-        print("an update is available. to upgrade:")
+        print("an update is available. to upgrade without leaving an old daemon:")
+        print("  puffo-agent stop")
         print(f"  {upgrade_command_for_install_mode()}")
+        print("  puffo-agent start --detach")
         if is_source_install():
             print("  (or re-run pip install against your local clone)")
-        print()
-        print("note: if the daemon is currently running, stop it first —")
-        print("on windows the puffo-agent.exe file is locked while in use.")
         return 0
     print()
     print("you're up to date.")

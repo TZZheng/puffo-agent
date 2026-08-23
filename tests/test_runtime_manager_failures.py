@@ -7,7 +7,10 @@ import pytest
 
 from puffo_agent.agent.errors import AgentAPIError
 from puffo_agent.agent.adapters.base import TurnContext, TurnResult
-from puffo_agent.agent.harness.claude_code_driver import ClaudeCodeCliDriver
+from puffo_agent.agent.harness.claude_code_driver import (
+    ClaudeCodeCliDriver,
+    _provider_error,
+)
 from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
@@ -63,6 +66,17 @@ async def test_claude_usage_limit_is_a_terminal_failure_not_assistant_text():
         "apiErrorStatus": 429,
     })
 
+    assert driver._events.empty()
+    assert driver._active == TurnRef("turn-1")
+    with pytest.raises(RuntimeError, match="already active"):
+        await driver.start_turn(TurnInput("retry"))
+
+    await driver._handle({
+        "type": "result",
+        "subtype": "success",
+        "usage": {"input_tokens": 12, "output_tokens": 0},
+    })
+
     events = []
     while not driver._events.empty():
         events.append(driver._events.get_nowait())
@@ -73,8 +87,29 @@ async def test_claude_usage_limit_is_a_terminal_failure_not_assistant_text():
         "outcome": "failed",
         "error_code": "quota_exhausted",
         "retryable": False,
-        "is_auth": False,
+        "input_tokens": 12,
+        "output_tokens": 0,
+        "context_tokens": 12,
     }
+    assert driver._active == TurnRef("")
+
+
+def test_claude_403_uses_shared_auth_classification():
+    permission = _provider_error({
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "apiErrorStatus": 403,
+        "errorDetails": {"type": "permission_error"},
+    })
+    explicit_auth = _provider_error({
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "apiErrorStatus": 403,
+        "errorDetails": {"type": "authentication_error"},
+    })
+
+    assert permission == {"error_code": "permission_denied", "retryable": False}
+    assert explicit_auth == {"error_code": "authentication", "retryable": False}
 
 
 class _ControllableDriver(Driver):
@@ -538,6 +573,46 @@ async def test_provider_reported_failure_without_retryable_flag_stays_terminal()
     assert manager.active_turn_ref is None
     assert manager.native_session_id == "valid-but-unconfirmed-session"
     assert manager.opened is not None
+    await manager.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_code", "retryable", "is_auth"),
+    [
+        ("authentication", False, True),
+        ("rate_limit", False, False),
+    ],
+)
+async def test_known_provider_failures_share_recovery_semantics(
+    error_code, retryable, is_auth
+):
+    driver = _ControllableDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="claude-code",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+
+    running = asyncio.create_task(adapter.run_turn(_context()))
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await driver.queue.put(HarnessEvent(
+        type="turn.completed",
+        driver="claude-code",
+        session_ref=SessionRef(manager.native_session_id),
+        turn_ref=driver.turn,
+        data={
+            "outcome": "failed",
+            "error_code": error_code,
+            "retryable": retryable,
+        },
+    ))
+
+    with pytest.raises(AgentAPIError) as raised:
+        await asyncio.wait_for(running, timeout=1)
+    assert raised.value.error_code == error_code
+    assert raised.value.is_auth is is_auth
     await manager.close()
 
 

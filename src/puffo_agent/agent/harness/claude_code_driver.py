@@ -11,7 +11,9 @@ from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from .._auth_markers import looks_like_auth_error
 from ..cli_bin import normalize_launch_argv
+from ..provider_failures import provider_failure
 from .driver import (
     CancelCapability,
     CompactCapability,
@@ -96,6 +98,7 @@ class ClaudeCodeCliDriver(Driver):
         self._init_commands: tuple[str, ...] = ()
         self._active = TurnRef("")
         self._active_native_turn_id = ""
+        self._active_provider_error: dict[str, Any] | None = None
         self._closed = False
         self._compact_advertised = False
         self._output_block_counter = 0
@@ -197,6 +200,7 @@ class ClaudeCodeCliDriver(Driver):
         local = TurnRef(f"turn_{uuid.uuid4().hex}")
         replay_uuid = input.client_correlation_id or str(uuid.uuid4())
         self._active = local
+        self._active_provider_error = None
         self._pending_content = _normalize_content(input.content)
         self._pending_uuid = replay_uuid
         self._active_native_turn_id = replay_uuid
@@ -220,6 +224,7 @@ class ClaudeCodeCliDriver(Driver):
         except BaseException:
             self._active = TurnRef("")
             self._active_native_turn_id = ""
+            self._active_provider_error = None
             self._clear_pending_replay()
             raise
         return TurnStarted(
@@ -360,6 +365,7 @@ class ClaudeCodeCliDriver(Driver):
         self._fail_pending_futures("Claude Code CLI closed")
         self._active = TurnRef("")
         self._active_native_turn_id = ""
+        self._active_provider_error = None
         self._pending_content = ""
         self._pending_uuid = ""
         self._tool_calls.clear()
@@ -375,6 +381,7 @@ class ClaudeCodeCliDriver(Driver):
         self._pending_uuid = ""
         self._active = TurnRef("")
         self._active_native_turn_id = ""
+        self._active_provider_error = None
         self._tool_calls.clear()
         self._compact_advertised = False
         self._resumed = False
@@ -684,7 +691,12 @@ class ClaudeCodeCliDriver(Driver):
             "output_tokens": int(usage.get("output_tokens") or 0),
             "context_tokens": context_tokens,
         }
-        if outcome == "failed":
+        if self._active_provider_error is not None:
+            data.update({
+                "outcome": "failed",
+                **self._active_provider_error,
+            })
+        elif outcome == "failed":
             data["error_code"] = _result_error_code(frame, subtype)
         await self._finish_active_turn(frame, data)
 
@@ -693,7 +705,7 @@ class ClaudeCodeCliDriver(Driver):
         frame: dict[str, Any],
         provider_error: dict[str, Any],
     ) -> None:
-        """Terminate an active turn from Claude's synthetic API-error frame."""
+        """Remember Claude's synthetic failure until its real result boundary."""
         if not self._active.value:
             await self._emit(
                 HarnessEventType.SESSION_UPDATED,
@@ -704,10 +716,7 @@ class ClaudeCodeCliDriver(Driver):
                 native_payload=frame,
             )
             return
-        await self._finish_active_turn(
-            frame,
-            {"outcome": "failed", **provider_error},
-        )
+        self._active_provider_error = provider_error
 
     async def _finish_active_turn(
         self,
@@ -722,6 +731,7 @@ class ClaudeCodeCliDriver(Driver):
         )
         self._clear_pending_replay()
         self._active, self._active_native_turn_id = TurnRef(""), ""
+        self._active_provider_error = None
         # A `tool_use` whose `tool_result` never arrives would otherwise keep
         # its name and arguments alive until close, so a later turn reusing the
         # id would report the stale call.
@@ -829,7 +839,15 @@ def _provider_error(frame: dict[str, Any]) -> dict[str, Any] | None:
     ):
         return None
 
-    fragments = [str(frame.get("error") or ""), str(frame.get("errorDetails") or "")]
+    fragments = [
+        str(frame.get("error") or ""),
+        json.dumps(
+            frame.get("errorDetails") or {},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+    ]
     message = frame.get("message")
     if isinstance(message, dict):
         for block in message.get("content") or ():
@@ -837,12 +855,7 @@ def _provider_error(frame: dict[str, Any]) -> dict[str, Any] | None:
                 fragments.append(str(block.get("text") or ""))
     diagnostic = "\n".join(fragments).lower()
 
-    is_auth = (
-        status in {401, 403}
-        or "authentication_error" in diagnostic
-        or "oauth token" in diagnostic
-        or "invalid api key" in diagnostic
-    )
+    is_auth = status == 401 or looks_like_auth_error(diagnostic)
     quota_exhausted = (
         ("reached your" in diagnostic and "limit" in diagnostic)
         or ("hit your" in diagnostic and "limit" in diagnostic)
@@ -850,33 +863,21 @@ def _provider_error(frame: dict[str, Any]) -> dict[str, Any] | None:
         or "billing_error" in diagnostic
     )
     if is_auth:
-        return {
-            "error_code": "authentication",
-            "retryable": False,
-            "is_auth": True,
-        }
-    if quota_exhausted:
-        return {
-            "error_code": "quota_exhausted",
-            "retryable": False,
-            "is_auth": False,
-        }
-    if status == 429 or "rate_limit" in diagnostic:
-        return {
-            "error_code": "rate_limit",
-            "retryable": True,
-            "is_auth": False,
-        }
-    if (status is not None and status >= 500) or "overloaded" in diagnostic:
-        return {
-            "error_code": "provider_unavailable",
-            "retryable": True,
-            "is_auth": False,
-        }
+        error_code = "authentication"
+    elif quota_exhausted:
+        error_code = "quota_exhausted"
+    elif status == 429 or "rate_limit" in diagnostic:
+        error_code = "rate_limit"
+    elif (status is not None and status >= 500) or "overloaded" in diagnostic:
+        error_code = "provider_unavailable"
+    elif status == 403 or "permission_error" in diagnostic:
+        error_code = "permission_denied"
+    else:
+        error_code = "provider_error"
+    failure = provider_failure(error_code)
     return {
-        "error_code": "provider_error",
-        "retryable": False,
-        "is_auth": False,
+        "error_code": error_code,
+        "retryable": failure.retryable if failure is not None else False,
     }
 
 

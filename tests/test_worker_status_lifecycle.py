@@ -156,8 +156,10 @@ async def test_global_inbox_turn_owns_one_status_lifecycle(tmp_path, monkeypatch
     )
     store = await make_store(tmp_path)
     http = FakeHttp()
+    terminal_failures = []
     lifecycle = GlobalInboxStatusLifecycle(
-        StatusReporter(http, heartbeat_interval_s=999)
+        StatusReporter(http, heartbeat_interval_s=999),
+        on_terminal_failure=terminal_failures.append,
     )
     if case.get("synthetic"):
         await store.store_local_event(
@@ -204,6 +206,7 @@ async def test_global_inbox_turn_owns_one_status_lifecycle(tmp_path, monkeypatch
         await receipt(store, "m3", 3)
         assert await runtime.process_once() is True
     _assert_status_wire(case, http, lifecycle)
+    assert bool(terminal_failures) is (case["outcome"] == "failure")
     await store.close()
 
 

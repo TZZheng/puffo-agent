@@ -159,6 +159,7 @@ class GlobalInboxStatusLifecycle:
         message_ids: tuple[str, ...],
         succeeded: bool,
         error_text: str | None,
+        cancelled: bool = False,
     ) -> None:
         if (self._notice_began or self._began) and self._turn_id != turn_id:
             raise RuntimeError("status lifecycle terminal turn does not match")
@@ -172,7 +173,11 @@ class GlobalInboxStatusLifecycle:
                     error_text=error_text,
                 )
         finally:
-            if not succeeded and self._on_terminal_failure is not None:
+            if (
+                not succeeded
+                and not cancelled
+                and self._on_terminal_failure is not None
+            ):
                 try:
                     self._on_terminal_failure(error_text)
                 except Exception:  # noqa: BLE001 - telemetry must still settle
@@ -667,17 +672,32 @@ class StandardWorkerRun:
     async def _execute_global_retry(self, context: WorkerRunContext, planned) -> None:
         worker = self.worker
         worker._turn_active = True
+        worker_module.Worker._flip_health_in_progress(
+            worker.runtime, context.paths.agent_id, logger
+        )
         try:
-            try:
-                reply = await context.puffo.handle_global_inbox_retry(planned)
-            finally:
-                worker._turn_active = False
+            reply = await context.puffo.handle_global_inbox_retry(planned)
+        except asyncio.CancelledError:
+            worker_module.Worker._resolve_health_on_success(
+                worker.runtime, context.paths.agent_id, logger
+            )
+            raise
         except worker_module.AgentAPIError as exc:
             if exc.is_auth:
                 worker._enter_auth_failed(context.paths.agent_id)
             raise
+        except Exception as exc:
+            worker_module.Worker._fallback_unhandled_error_if_stuck_in_progress(
+                worker.runtime,
+                context.paths.agent_id,
+                f"{type(exc).__name__}: {exc}",
+                logger,
+            )
+            raise
         else:
             worker._resolve_health_after_success(context.paths.agent_id)
+        finally:
+            worker._turn_active = False
         if reply:
             logger.warning(
                 "agent %s: suppressed global retry plain output; outbound "
@@ -691,9 +711,22 @@ class StandardWorkerRun:
         async def run_global_turn(planned):
             try:
                 reply = await self._execute_global_turn(context, planned)
+            except asyncio.CancelledError:
+                worker_module.Worker._resolve_health_on_success(
+                    worker.runtime, context.paths.agent_id, logger
+                )
+                raise
             except worker_module.AgentAPIError as exc:
                 if exc.is_auth:
                     worker._enter_auth_failed(context.paths.agent_id)
+                raise
+            except Exception as exc:
+                worker_module.Worker._fallback_unhandled_error_if_stuck_in_progress(
+                    worker.runtime,
+                    context.paths.agent_id,
+                    f"{type(exc).__name__}: {exc}",
+                    logger,
+                )
                 raise
             else:
                 worker._resolve_health_after_success(context.paths.agent_id)
