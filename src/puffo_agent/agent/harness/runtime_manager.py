@@ -78,6 +78,25 @@ class RuntimeStateError(RuntimeError):
         self.error_code = error_code
 
 
+def _provider_failure_message(outcome: str, error_code: str) -> str:
+    """Return operator-safe text for a provider terminal failure."""
+    if error_code == "quota_exhausted":
+        return (
+            "The selected provider model has reached its usage limit; "
+            "switch models or wait for the limit to reset."
+        )
+    if error_code == "authentication":
+        return "Provider authentication failed; sign in again and retry."
+    if error_code == "rate_limit":
+        return "The provider rate-limited this turn; retry later."
+    if error_code == "provider_unavailable":
+        return "The provider is temporarily unavailable; retry later."
+    return (
+        f"provider turn ended with outcome {outcome} "
+        f"(error_code={error_code})"
+    )
+
+
 def _native_resume_is_unavailable(exc: Exception) -> bool:
     """Whether the provider explicitly rejected the saved native session."""
     text = str(exc).lower()
@@ -992,12 +1011,13 @@ class RuntimeManagerAdapter(Adapter):
                 outcome = str(event.data.get("outcome") or "succeeded")
                 if event_type == "turn.abandoned" or outcome != "succeeded":
                     error_code = str(event.data.get("error_code") or outcome)
-                    message = (
-                        f"provider turn ended with outcome {outcome} "
-                        f"(error_code={error_code})"
-                    )
-                    if event.data.get("retryable"):
-                        raise AgentAPIError(message, error_code=error_code)
+                    message = _provider_failure_message(outcome, error_code)
+                    if event.data.get("retryable") or event.data.get("is_auth"):
+                        raise AgentAPIError(
+                            message,
+                            is_auth=event.data.get("is_auth") is True,
+                            error_code=error_code,
+                        )
                     raise RuntimeStateError(message, error_code=error_code)
                 metadata.update({
                     key: value for key, value in event.data.items()

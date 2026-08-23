@@ -476,6 +476,10 @@ class ClaudeCodeCliDriver(Driver):
         if self._is_exact_replay(frame):
             await self._complete_replay(frame)
             return
+        provider_error = _provider_error(frame)
+        if provider_error is not None:
+            await self._handle_provider_error(frame, provider_error)
+            return
         if type_ == "assistant":
             await self._handle_assistant(frame)
             return
@@ -682,6 +686,34 @@ class ClaudeCodeCliDriver(Driver):
         }
         if outcome == "failed":
             data["error_code"] = _result_error_code(frame, subtype)
+        await self._finish_active_turn(frame, data)
+
+    async def _handle_provider_error(
+        self,
+        frame: dict[str, Any],
+        provider_error: dict[str, Any],
+    ) -> None:
+        """Terminate an active turn from Claude's synthetic API-error frame."""
+        if not self._active.value:
+            await self._emit(
+                HarnessEventType.SESSION_UPDATED,
+                data={
+                    "record_type": "provider_error",
+                    "error_code": provider_error["error_code"],
+                },
+                native_payload=frame,
+            )
+            return
+        await self._finish_active_turn(
+            frame,
+            {"outcome": "failed", **provider_error},
+        )
+
+    async def _finish_active_turn(
+        self,
+        frame: dict[str, Any],
+        data: dict[str, Any],
+    ) -> None:
         await self._emit(
             HarnessEventType.TURN_COMPLETED,
             turn_ref=self._active,
@@ -781,6 +813,71 @@ def _result_error_code(frame: dict[str, Any], subtype: str) -> str:
         return "invalid_resume"
     normalized = subtype.strip().lower()
     return normalized or "execution_error"
+
+
+def _provider_error(frame: dict[str, Any]) -> dict[str, Any] | None:
+    """Normalize Claude's model-visible synthetic API errors.
+
+    Claude emits quota and API failures as ``type=assistant`` frames whose text
+    looks like a normal reply. The explicit outer fields are authoritative; raw
+    provider text remains in the driver's opaque native diagnostic only.
+    """
+    raw_status = frame.get("apiErrorStatus")
+    status = raw_status if type(raw_status) is int else None
+    if frame.get("isApiErrorMessage") is not True and not (
+        status is not None and status >= 400
+    ):
+        return None
+
+    fragments = [str(frame.get("error") or ""), str(frame.get("errorDetails") or "")]
+    message = frame.get("message")
+    if isinstance(message, dict):
+        for block in message.get("content") or ():
+            if isinstance(block, dict) and block.get("type") == "text":
+                fragments.append(str(block.get("text") or ""))
+    diagnostic = "\n".join(fragments).lower()
+
+    is_auth = (
+        status in {401, 403}
+        or "authentication_error" in diagnostic
+        or "oauth token" in diagnostic
+        or "invalid api key" in diagnostic
+    )
+    quota_exhausted = (
+        ("reached your" in diagnostic and "limit" in diagnostic)
+        or ("hit your" in diagnostic and "limit" in diagnostic)
+        or "credit balance is too low" in diagnostic
+        or "billing_error" in diagnostic
+    )
+    if is_auth:
+        return {
+            "error_code": "authentication",
+            "retryable": False,
+            "is_auth": True,
+        }
+    if quota_exhausted:
+        return {
+            "error_code": "quota_exhausted",
+            "retryable": False,
+            "is_auth": False,
+        }
+    if status == 429 or "rate_limit" in diagnostic:
+        return {
+            "error_code": "rate_limit",
+            "retryable": True,
+            "is_auth": False,
+        }
+    if (status is not None and status >= 500) or "overloaded" in diagnostic:
+        return {
+            "error_code": "provider_unavailable",
+            "retryable": True,
+            "is_auth": False,
+        }
+    return {
+        "error_code": "provider_error",
+        "retryable": False,
+        "is_auth": False,
+    }
 
 
 ClaudeDriver = ClaudeCodeCliDriver

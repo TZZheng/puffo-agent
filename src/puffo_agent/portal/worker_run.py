@@ -9,7 +9,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 from . import worker as worker_module
 from .runtime_matrix import (
@@ -115,8 +115,14 @@ class GlobalInboxStatusLifecycle:
     the next turn cannot inherit runs.
     """
 
-    def __init__(self, reporter) -> None:
+    def __init__(
+        self,
+        reporter,
+        *,
+        on_terminal_failure: Callable[[str | None], None] | None = None,
+    ) -> None:
         self._reporter = reporter
+        self._on_terminal_failure = on_terminal_failure
         self._notice_began = False
         self._began = False
         self._turn_id: str | None = None
@@ -166,6 +172,13 @@ class GlobalInboxStatusLifecycle:
                     error_text=error_text,
                 )
         finally:
+            if not succeeded and self._on_terminal_failure is not None:
+                try:
+                    self._on_terminal_failure(error_text)
+                except Exception:  # noqa: BLE001 - telemetry must still settle
+                    logger.warning(
+                        "terminal failure status update failed", exc_info=True
+                    )
             self.reset()
 
     def _claim_turn(self, turn_id: str) -> None:
@@ -807,9 +820,21 @@ class StandardWorkerRun:
         worker = self.worker
         uploader = self._build_runtime_event_uploader(context)
         reporter = self._build_reporter(context.client)
+
+        def record_terminal_failure(error_text: str | None) -> None:
+            worker_module.Worker._fallback_unhandled_error_if_stuck_in_progress(
+                worker.runtime,
+                context.paths.agent_id,
+                error_text,
+                logger,
+            )
+
         global_runtime = self._build_global_runtime(
             context,
-            status_lifecycle=GlobalInboxStatusLifecycle(reporter),
+            status_lifecycle=GlobalInboxStatusLifecycle(
+                reporter,
+                on_terminal_failure=record_terminal_failure,
+            ),
         )
         reminder_sync = await self._prepare_reminder_sync(context, global_runtime)
         global_task = asyncio.ensure_future(global_runtime.run())

@@ -7,6 +7,7 @@ import pytest
 
 from puffo_agent.agent.errors import AgentAPIError
 from puffo_agent.agent.adapters.base import TurnContext, TurnResult
+from puffo_agent.agent.harness.claude_code_driver import ClaudeCodeCliDriver
 from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
@@ -33,6 +34,47 @@ from puffo_agent.agent.runtime_event_outbox import (
     RuntimeEventProjectingSink,
 )
 from puffo_agent.agent.runtime_events import RuntimeEventProjector
+
+
+@pytest.mark.asyncio
+async def test_claude_usage_limit_is_a_terminal_failure_not_assistant_text():
+    """Claude surfaces model quota exhaustion in an assistant-shaped frame."""
+    driver = ClaudeCodeCliDriver()
+    driver._session_ref = SessionRef("native")
+    driver._native_session_id = "native-session"
+    driver._active = TurnRef("turn-1")
+    driver._active_native_turn_id = "native-turn"
+
+    await driver._handle({
+        "type": "assistant",
+        "message": {
+            "model": "<synthetic>",
+            "content": [{
+                "type": "text",
+                "text": (
+                    "You've reached your Fable 5 limit. Switch to another "
+                    "model or wait for your limit to reset."
+                ),
+            }],
+        },
+        "error": "rate_limit",
+        "errorDetails": {"status": 429, "type": "rate_limit_error"},
+        "isApiErrorMessage": True,
+        "apiErrorStatus": 429,
+    })
+
+    events = []
+    while not driver._events.empty():
+        events.append(driver._events.get_nowait())
+    event_types = [getattr(event.type, "value", event.type) for event in events]
+    assert "turn.assistant_delta" not in event_types
+    assert event_types == ["turn.completed"]
+    assert events[0].data == {
+        "outcome": "failed",
+        "error_code": "quota_exhausted",
+        "retryable": False,
+        "is_auth": False,
+    }
 
 
 class _ControllableDriver(Driver):
