@@ -95,7 +95,10 @@ def is_provider_failure_code(error_code: str) -> bool:
 def provider_failure_retryable(
     error_code: str, *, explicitly_retryable: bool = False
 ) -> bool:
-    return explicitly_retryable or provider_failure(error_code).retryable
+    failure = PROVIDER_FAILURES.get(error_code)
+    if failure is not None:
+        return failure.retryable
+    return explicitly_retryable
 
 
 def provider_failure_message(error_code: str, *, outcome: str | None = None) -> str:

@@ -159,7 +159,7 @@ def test_abandoned_provider_failure_projects_as_failed_with_public_error():
         driver="claude-code",
         session_ref=SessionRef("native"),
         turn_ref=TurnRef("turn_1"),
-        data={"error_code": "quota_exhausted"},
+        data={"error_code": "quota_exhausted", "retryable": True},
     ))
 
     assert public is not None
