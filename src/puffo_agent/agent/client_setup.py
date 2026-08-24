@@ -99,6 +99,7 @@ def _cache_state() -> dict[str, Any]:
         "_warm_task": None,
         "_space_name_cache": {},
         "_channel_name_cache": {},
+        "_channel_encrypted": {},
         "_space_members": {},
     }
 
