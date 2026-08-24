@@ -12,6 +12,7 @@ from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any
 
+from ..._proc import no_window_kwargs
 from ..errors import AgentAPIError, ProviderFailureError
 from ..provider_failures import (
     classify_provider_failure,
@@ -315,6 +316,7 @@ class CodexAppServerDriver(Driver):
                 # One provider frame can carry a large tool result; the default
                 # 64 KiB stream limit would terminate the reader mid-session.
                 limit=16 * 1024 * 1024,
+                **no_window_kwargs(),
             )
         else:
             self._proc = self.process_factory(spec)

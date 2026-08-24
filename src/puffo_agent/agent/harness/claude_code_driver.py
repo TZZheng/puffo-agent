@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from ..._proc import no_window_kwargs
 from ..cli_bin import normalize_launch_argv
 from ..provider_failures import classify_provider_failure
 from .driver import (
@@ -198,6 +199,7 @@ class ClaudeCodeCliDriver(Driver):
                 cwd=spec.workspace_dir or None,
                 env=env,
                 limit=16 * 1024 * 1024,
+                **no_window_kwargs(),
             )
         else:
             try:
