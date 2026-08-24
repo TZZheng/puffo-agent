@@ -58,6 +58,7 @@ from .state import (
     home_dir,
     is_daemon_alive,
     is_daemon_ready,
+    is_daemon_startup_stalled,
     is_pid_alive,
     read_daemon_pid,
     refresh_model_flag_path,
@@ -1353,6 +1354,11 @@ async def _existing_daemon_start_result() -> int | None:
         print(msg)
         return 0
     if startup is DaemonStartupState.STARTING:
+        if is_daemon_startup_stalled(pid):
+            msg = f"puffo-agent daemon is alive but stalled during startup (pid={pid})"
+            logger.error(msg)
+            print(msg)
+            return 1
         msg = f"puffo-agent daemon already starting (pid={pid})"
         logger.info(msg)
         print(msg)

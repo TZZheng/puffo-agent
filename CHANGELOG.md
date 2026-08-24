@@ -6,6 +6,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Background startup now distinguishes slow, stalled, stopped, and exited
+  daemons without terminating a live process after a fixed observation window.
+- Detached startup reports success when a concurrently launched child exits
+  because another daemon won startup, and avoids redundant daemon imports in
+  the parent CLI process.
+
 ## [2.0.0] - 2026-08-23
 
 > Stable Agent Foundation 2.0 release, promoted from `2.0.0a25` without

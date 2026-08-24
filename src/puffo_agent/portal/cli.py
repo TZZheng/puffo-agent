@@ -41,6 +41,7 @@ from .state import (
     home_dir,
     is_daemon_alive,
     is_daemon_ready,
+    is_daemon_startup_stalled,
     is_pid_alive,
     is_valid_agent_id,
     read_daemon_pid,
@@ -50,6 +51,7 @@ from .state import (
     refresh_runtime_flag_path,
     refresh_session_flag_path,
     shared_fs_dir,
+    stop_requested_for,
     write_refresh_token_request,
     write_stop_request,
 )
@@ -57,13 +59,6 @@ from .workspace_layout import (
     AVAILABLE_SHARED_WORKSPACE_STATES,
     prepare_workspace_shared_access,
 )
-
-
-async def run_daemon() -> int:
-    """Load the daemon only in the process that runs it."""
-    from .daemon import run_daemon as _run_daemon
-
-    return await _run_daemon()
 
 
 DEFAULT_PROFILE = """# Agent Profile
@@ -329,6 +324,8 @@ def cmd_start(args: argparse.Namespace) -> int:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    from .daemon import run_daemon
+
     return asyncio.run(run_daemon())
 
 
@@ -440,10 +437,17 @@ def cmd_status(args: argparse.Namespace) -> int:
     pid = read_daemon_pid()
     alive = is_daemon_alive()
     ready = alive and pid is not None and is_daemon_ready(pid)
-    if ready:
+    if alive and pid is not None and stop_requested_for(pid):
+        print(f"daemon: stopping (pid={pid})")
+    elif ready:
         print(f"daemon: running (pid={pid})")
     elif alive and pid is not None:
-        print(f"daemon: starting (pid={pid})")
+        state = (
+            "stalled during startup"
+            if is_daemon_startup_stalled(pid)
+            else "starting"
+        )
+        print(f"daemon: {state} (pid={pid})")
     elif pid is not None:
         print(f"daemon: not running (stale pid file at {daemon_pid_path()}; pid={pid})")
     else:

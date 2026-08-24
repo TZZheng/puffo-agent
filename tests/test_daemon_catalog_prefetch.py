@@ -77,6 +77,24 @@ async def test_daemon_ready_precedes_worker_preparation_and_reconcile(
     ]
 
 
+@pytest.mark.asyncio
+async def test_worker_preparation_failure_does_not_stop_ready_daemon(
+    monkeypatch, caplog,
+):
+    def fail_preparation():
+        raise RuntimeError("preparation failed")
+
+    monkeypatch.setattr(
+        daemon_mod,
+        "_respawn_codex_on_mcp_change_at_startup",
+        fail_preparation,
+    )
+
+    await daemon_mod._prepare_workers_at_startup()
+
+    assert "worker preparation failed; continuing" in caplog.text
+
+
 def test_capabilities_fetch_claude_catalog_after_late_login(monkeypatch):
     from puffo_agent.agent import cli_bin, model_catalog
     from puffo_agent.portal.control.client import build_capabilities

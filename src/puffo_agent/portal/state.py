@@ -41,6 +41,9 @@ logger = logging.getLogger(__name__)
 
 
 DAEMON_STARTUP_OBSERVATION_SECONDS = 10.0
+# Slow startup remains non-fatal; this only marks an old unready process
+# as diagnosably stalled when a later command inspects it.
+DAEMON_STARTUP_STALLED_SECONDS = 300.0
 
 
 class DaemonStartupState(Enum):
@@ -1089,6 +1092,21 @@ def write_daemon_pid(pid: int) -> None:
     path = daemon_pid_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(pid), encoding="utf-8")
+
+
+def is_daemon_startup_stalled(
+    pid: int,
+    *,
+    threshold: float = DAEMON_STARTUP_STALLED_SECONDS,
+) -> bool:
+    """Whether the current daemon has stayed alive but unready too long."""
+    if read_daemon_pid() != pid:
+        return False
+    try:
+        started_at = daemon_pid_path().stat().st_mtime
+    except OSError:
+        return False
+    return time.time() - started_at >= threshold
 
 
 def read_daemon_ready_pid() -> int | None:
