@@ -23,6 +23,60 @@ def test_daemon_run_calls_model_catalog_prefetch_at_startup():
     assert "model_catalog" in source and "prefetch" in source
 
 
+@pytest.mark.asyncio
+async def test_daemon_ready_precedes_worker_preparation_and_reconcile(
+    monkeypatch,
+):
+    """A slow MCP scan must not hide a usable control plane, while workers
+    must not reconcile until the scan has prepared their sessions."""
+    events = []
+
+    async def start_runtime(_self, _runtime):
+        events.append("control-plane")
+
+    async def prepare_workers():
+        events.append("worker-preparation")
+
+    async def reconcile(_self, _pid, _interval, _external_stop):
+        events.append("reconcile")
+
+    async def shutdown(_self, _runtime, _pid):
+        events.append("shutdown")
+
+    daemon = daemon_mod.Daemon.__new__(daemon_mod.Daemon)
+    daemon.daemon_cfg = DaemonConfig()
+    daemon._stop = asyncio.Event()
+    monkeypatch.setattr(daemon_mod.Daemon, "_start_runtime", start_runtime)
+    monkeypatch.setattr(daemon_mod.Daemon, "_run_reconcile_loop", reconcile)
+    monkeypatch.setattr(daemon_mod.Daemon, "_shutdown_runtime", shutdown)
+    monkeypatch.setattr(
+        daemon_mod.Daemon,
+        "_stop_was_requested",
+        lambda *_args: False,
+    )
+    monkeypatch.setattr(
+        daemon_mod,
+        "_prepare_workers_at_startup",
+        prepare_workers,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        daemon_mod,
+        "write_daemon_ready",
+        lambda _pid: events.append("ready"),
+    )
+
+    await daemon.run()
+
+    assert events == [
+        "control-plane",
+        "ready",
+        "worker-preparation",
+        "reconcile",
+        "shutdown",
+    ]
+
+
 def test_capabilities_fetch_claude_catalog_after_late_login(monkeypatch):
     from puffo_agent.agent import cli_bin, model_catalog
     from puffo_agent.portal.control.client import build_capabilities

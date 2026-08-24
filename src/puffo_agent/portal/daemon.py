@@ -138,6 +138,7 @@ class Daemon:
         self,
         external_stop_requested: threading.Event | None = None,
     ) -> None:
+        startup_started = time.perf_counter()
         logger.info("puffo-agent portal starting; home=%s", home_dir())
         interval = max(0.5, self.daemon_cfg.reconcile_interval_seconds)
         pid = os.getpid()
@@ -149,6 +150,11 @@ class Daemon:
                 self._stop.set()
             else:
                 write_daemon_ready(pid)
+                logger.info(
+                    "startup: control plane ready; elapsed_ms=%d",
+                    int((time.perf_counter() - startup_started) * 1000),
+                )
+                await _prepare_workers_at_startup()
             await self._run_reconcile_loop(
                 pid,
                 interval,
@@ -198,7 +204,6 @@ class Daemon:
         runtime.runtime_tasks.append(
             asyncio.ensure_future(runtime.control_manager.run())
         )
-        _respawn_codex_on_mcp_change_at_startup()
 
     def _stop_was_requested(
         self,
@@ -850,13 +855,26 @@ def _mcp_fingerprint_path() -> Path:
     return home_dir() / "mcp_tool_fingerprint"
 
 
+async def _prepare_workers_at_startup() -> None:
+    """Finish worker prerequisites without blocking control-plane readiness."""
+    started = time.perf_counter()
+    try:
+        await asyncio.to_thread(_respawn_codex_on_mcp_change_at_startup)
+    except Exception:  # noqa: BLE001 - preparation is best-effort
+        logger.exception("startup: worker preparation failed; continuing")
+    logger.info(
+        "startup: worker preparation complete; elapsed_ms=%d",
+        int((time.perf_counter() - started) * 1000),
+    )
+
+
 def _respawn_codex_on_mcp_change_at_startup() -> None:
     """Rotate Codex sessions when their cached MCP surface changed."""
     import json
 
-    from ..mcp.puffo_core_server import mcp_tool_fingerprint
-
     try:
+        from ..mcp.puffo_core_server import mcp_tool_fingerprint
+
         current = mcp_tool_fingerprint()
     except Exception as exc:  # noqa: BLE001 - startup remains best-effort
         logger.warning("startup: mcp fingerprint failed: %s", exc)

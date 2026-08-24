@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 from .cli_parser import build_parser as build_cli_parser
-from .daemon import run_daemon
 from .state import (
     AgentConfig,
     DaemonConfig,
@@ -58,6 +57,14 @@ from .workspace_layout import (
     AVAILABLE_SHARED_WORKSPACE_STATES,
     prepare_workspace_shared_access,
 )
+
+
+async def run_daemon() -> int:
+    """Load the daemon only in the process that runs it."""
+    from .daemon import run_daemon as _run_daemon
+
+    return await _run_daemon()
+
 
 DEFAULT_PROFILE = """# Agent Profile
 
