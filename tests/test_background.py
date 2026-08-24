@@ -14,6 +14,7 @@ import sys
 
 
 from puffo_agent.portal import background as bg
+from puffo_agent.portal.state import DaemonStartupState
 
 
 def test_detached_runner_commands_use_dash_m():
@@ -49,8 +50,8 @@ def test_spawn_background_short_circuits_when_already_running(monkeypatch, capsy
     waited = []
     monkeypatch.setattr(
         bg,
-        "_wait_for_pid_ready",
-        lambda pid: waited.append(pid) or True,
+        "_observe_pid_startup",
+        lambda pid: waited.append(pid) or DaemonStartupState.READY,
     )
 
     def _no_spawn(*a, **k):
@@ -62,17 +63,21 @@ def test_spawn_background_short_circuits_when_already_running(monkeypatch, capsy
     assert "already running (pid=4321)" in capsys.readouterr().out
 
 
-def test_spawn_background_existing_daemon_must_be_ready(monkeypatch, capsys):
+def test_spawn_background_accepts_existing_daemon_still_starting(monkeypatch, capsys):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: True)
     monkeypatch.setattr(bg, "read_daemon_pid", lambda: 4321)
-    monkeypatch.setattr(bg, "_wait_for_pid_ready", lambda _pid: False)
+    monkeypatch.setattr(
+        bg,
+        "_observe_pid_startup",
+        lambda _pid: DaemonStartupState.STARTING,
+    )
 
     def _no_spawn(*_args, **_kwargs):
         raise AssertionError("must not spawn over an existing daemon process")
 
     monkeypatch.setattr(bg.subprocess, "Popen", _no_spawn)
-    assert bg.spawn_background() == 1
-    assert "failed to become ready" in capsys.readouterr().err
+    assert bg.spawn_background() == 0
+    assert "already starting (pid=4321)" in capsys.readouterr().out
 
 
 def test_spawn_background_preflights_gui_before_detach(monkeypatch, capsys):
@@ -91,7 +96,11 @@ def test_spawn_background_detaches_child(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
     monkeypatch.setattr(bg, "find_spec", lambda _name: object())
     monkeypatch.setattr(bg, "background_log_path", lambda: tmp_path / "background.log")
-    monkeypatch.setattr(bg, "_wait_for_background_ready", lambda _proc: True)
+    monkeypatch.setattr(
+        bg,
+        "_observe_background_startup",
+        lambda _proc: DaemonStartupState.READY,
+    )
 
     captured = {}
 
@@ -117,13 +126,19 @@ def test_spawn_background_detaches_child(monkeypatch, tmp_path, capsys):
     assert captured["cmd"] == bg.headless_runner_command()
 
 
-def test_spawn_background_reports_readiness_failure(monkeypatch, tmp_path, capsys):
+def test_spawn_background_keeps_a_live_child_after_observation_timeout(
+    monkeypatch, tmp_path, capsys
+):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
     monkeypatch.setattr(bg, "find_spec", lambda _name: object())
     monkeypatch.setattr(bg, "background_log_path", lambda: tmp_path / "background.log")
-    monkeypatch.setattr(bg, "_wait_for_background_ready", lambda _proc: False)
+    monkeypatch.setattr(
+        bg,
+        "_observe_background_startup",
+        lambda _proc: DaemonStartupState.STARTING,
+    )
 
-    class _FailedProc:
+    class _SlowProc:
         pid = 9999
         terminated = False
 
@@ -136,12 +151,60 @@ def test_spawn_background_reports_readiness_failure(monkeypatch, tmp_path, capsy
         def wait(self, timeout):
             return 1
 
-    proc = _FailedProc()
+    proc = _SlowProc()
     monkeypatch.setattr(bg.subprocess, "Popen", lambda *_a, **_kw: proc)
 
+    assert bg.spawn_background() == 0
+    assert proc.terminated is False
+    assert "still initializing" in capsys.readouterr().out
+
+
+def test_observation_timeout_classifies_live_child_as_starting(monkeypatch):
+    monkeypatch.setattr(bg, "is_daemon_ready", lambda _pid: False)
+
+    class _LiveProc:
+        pid = 9999
+
+        def poll(self):
+            return None
+
+    assert (
+        bg._observe_background_startup(_LiveProc(), timeout=0)
+        is DaemonStartupState.STARTING
+    )
+
+
+def test_spawn_background_reports_child_exit_before_ready(
+    monkeypatch, tmp_path, capsys
+):
+    monkeypatch.setattr(bg, "is_daemon_alive", lambda: False)
+    monkeypatch.setattr(bg, "find_spec", lambda _name: object())
+    monkeypatch.setattr(bg, "background_log_path", lambda: tmp_path / "background.log")
+    monkeypatch.setattr(
+        bg,
+        "_observe_background_startup",
+        lambda _proc: DaemonStartupState.EXITED,
+    )
+
+    class _ExitedProc:
+        pid = 9999
+
+    monkeypatch.setattr(bg.subprocess, "Popen", lambda *_a, **_kw: _ExitedProc())
+
     assert bg.spawn_background() == 1
-    assert proc.terminated is True
-    assert "startup failed" in capsys.readouterr().err
+    assert "exited before becoming ready" in capsys.readouterr().err
+
+
+def test_cmd_status_reports_live_unready_daemon_as_starting(monkeypatch, capsys):
+    from puffo_agent.portal import cli
+
+    monkeypatch.setattr(cli, "read_daemon_pid", lambda: 4321)
+    monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
+    monkeypatch.setattr(cli, "is_daemon_ready", lambda _pid: False)
+    monkeypatch.setattr(cli, "discover_agents", lambda: [])
+
+    assert cli.cmd_status(argparse.Namespace()) == 0
+    assert "daemon: starting (pid=4321)" in capsys.readouterr().out
 
 
 # ── cmd_start routing ─────────────────────────────────────────────────────────

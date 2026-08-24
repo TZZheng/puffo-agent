@@ -27,6 +27,7 @@ import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,17 @@ from ..limits import DEFAULT_CATCHUP_STALE_HOURS
 
 
 logger = logging.getLogger(__name__)
+
+
+DAEMON_STARTUP_OBSERVATION_SECONDS = 10.0
+
+
+class DaemonStartupState(Enum):
+    """What a bounded startup observation can prove about a daemon."""
+
+    READY = "ready"
+    STARTING = "starting"
+    EXITED = "exited"
 
 
 # Where daemon.yml, agents/, etc. live.

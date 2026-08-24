@@ -57,8 +57,8 @@ def test_run_daemon_short_circuit_does_not_prefetch(monkeypatch):
     ), patch(
         "puffo_agent.portal.daemon.read_daemon_pid", return_value=4242,
     ), patch(
-        "puffo_agent.portal.daemon._wait_for_existing_daemon_ready",
-        return_value=True,
+        "puffo_agent.portal.daemon._observe_existing_daemon_startup",
+        return_value=state_mod.DaemonStartupState.READY,
     ):
         rc = asyncio.run(daemon_mod.run_daemon())
     assert rc == 0
