@@ -323,6 +323,56 @@ async def test_native_resume_keeps_session_on_transient_error():
     assert manager.native_session_id == "native-old"
 
 
+@pytest.mark.asyncio
+async def test_native_resume_falls_back_on_invalid_resume_error_code():
+    # Even when the driver launders the message text, the error_code channel
+    # must still route into the fresh-session fallback.
+    driver = _ResumeBoundaryDriver(
+        AgentAPIError(
+            "The provider could not complete the turn.",
+            is_auth=False,
+            error_code="invalid_resume",
+        )
+    )
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+
+    opened = await manager.open()
+
+    assert driver.resume_values == [SessionRef("native-old"), None]
+    assert opened.session_ref == SessionRef("logical-session")
+    assert manager.native_session_id == "native-session-1"
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_start_preserves_the_native_session():
+    driver = _FailingStartDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+    )
+
+    with pytest.raises(RuntimeError, match="provider refused the turn"):
+        await asyncio.wait_for(
+            RuntimeManagerAdapter(manager).run_turn(_context()), timeout=1
+        )
+
+    # Runtime retired, session kept: the next open resumes the same thread.
+    assert manager.opened is None
+    assert manager.native_session_id == "native-session-1"
+
+    await manager.open()
+    assert driver.open_calls == 2
+    assert manager.native_session_id == "native-session-1"
+    await manager.close()
+
+
 def _context():
     return SimpleNamespace(
         messages=[{"role": "user", "content": "current notice"}],
@@ -890,7 +940,8 @@ async def test_unaccepted_receipt_releases_the_event_subscriber():
     assert result.metadata == {"accepted": False}
     assert ambiguous.close_calls == 1
     assert ambiguous_manager.opened is None
-    assert ambiguous_manager.native_session_id == ""
+    # Failed start retires the runtime but keeps the session for resume.
+    assert ambiguous_manager.native_session_id == "native-session-1"
     await ambiguous_manager.close()
 
 
@@ -913,7 +964,7 @@ async def test_silent_turn_start_is_bounded_by_the_task_timeout():
     assert manager._terminal == {}
     assert driver.close_calls == 1
     assert manager.opened is None
-    assert manager.native_session_id == ""
+    assert manager.native_session_id == "native-session-1"
     driver.release_start.set()
     await manager.close()
 

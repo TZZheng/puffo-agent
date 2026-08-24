@@ -86,6 +86,8 @@ class RuntimeStateError(RuntimeError):
 
 def _native_resume_is_unavailable(exc: Exception) -> bool:
     """Whether the provider explicitly rejected the saved native session."""
+    if getattr(exc, "error_code", None) == "invalid_resume":
+        return True
     text = str(exc).lower()
     identifies_session = any(
         marker in text
@@ -303,14 +305,12 @@ class RuntimeManager:
         if not retire:
             return
         try:
-            await self._retire_runtime_locked(preserve_session=False)
+            # Keep session: driver close prevents turn overlap; a dead
+            # session fails the next resume -> invalid_resume fallback.
+            await self._retire_runtime_locked(preserve_session=True)
         except Exception:
-            # Preserve the start failure as the caller-visible error while
-            # still making the next command open a fresh native session.
             logger.exception("failed to retire runtime after turn start failure")
             self.opened = None
-            self._clear_native_session()
-            self.session_ref = SessionRef(f"session_{uuid.uuid4().hex}")
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput) -> Any:
         async with self._command_lock:
