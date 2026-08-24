@@ -943,6 +943,12 @@ class PuffoCoreMessageClient:
             self._channel_name_cache[channel_id] = name.strip()
         policy = update.get("is_encrypted")
         if isinstance(policy, bool):
+            if self._channel_encrypted.get(channel_id) != policy:
+                logger.info(
+                    "channel %s policy -> %s",
+                    channel_id,
+                    "encrypted" if policy else "plaintext",
+                )
             self._channel_encrypted[channel_id] = policy
             cache_name = (
                 self._channel_name_cache.get(channel_id)
