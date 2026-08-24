@@ -42,6 +42,7 @@ from .state import (
     is_daemon_alive,
     is_daemon_ready,
     is_daemon_startup_stalled,
+    is_daemon_stop_stalled,
     is_pid_alive,
     is_valid_agent_id,
     read_daemon_pid,
@@ -438,7 +439,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     alive = is_daemon_alive()
     ready = alive and pid is not None and is_daemon_ready(pid)
     if alive and pid is not None and stop_requested_for(pid):
-        print(f"daemon: stopping (pid={pid})")
+        state = "stop stalled" if is_daemon_stop_stalled(pid) else "stopping"
+        print(f"daemon: {state} (pid={pid})")
     elif ready:
         print(f"daemon: running (pid={pid})")
     elif alive and pid is not None:

@@ -81,7 +81,7 @@ def test_spawn_background_accepts_existing_daemon_still_starting(monkeypatch, ca
     assert "already starting (pid=4321)" in capsys.readouterr().out
 
 
-def test_spawn_background_reports_existing_daemon_stalled(monkeypatch, capsys):
+def test_headless_background_reports_existing_daemon_stalled(monkeypatch, capsys):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: True)
     monkeypatch.setattr(bg, "read_daemon_pid", lambda: 4321)
     monkeypatch.setattr(
@@ -227,6 +227,7 @@ def test_spawn_background_accepts_redundant_child_exit(
 ):
     monkeypatch.setattr(bg, "is_daemon_alive", lambda: True)
     monkeypatch.setattr(bg, "read_daemon_pid", lambda: 4321)
+    monkeypatch.setattr(bg, "is_pid_alive", lambda _pid: True)
     monkeypatch.setattr(bg, "background_log_path", lambda: tmp_path / "background.log")
     monkeypatch.setattr(
         bg,
@@ -268,10 +269,16 @@ def test_cmd_status_reports_stop_request(monkeypatch, capsys):
     monkeypatch.setattr(cli, "is_daemon_alive", lambda: True)
     monkeypatch.setattr(cli, "is_daemon_ready", lambda _pid: False)
     monkeypatch.setattr(cli, "stop_requested_for", lambda _pid: True)
+    stalled = False
+    monkeypatch.setattr(cli, "is_daemon_stop_stalled", lambda _pid: stalled)
     monkeypatch.setattr(cli, "discover_agents", lambda: [])
 
     assert cli.cmd_status(argparse.Namespace()) == 0
     assert "daemon: stopping (pid=4321)" in capsys.readouterr().out
+
+    stalled = True
+    assert cli.cmd_status(argparse.Namespace()) == 0
+    assert "daemon: stop stalled (pid=4321)" in capsys.readouterr().out
 
 
 # ── cmd_start routing ─────────────────────────────────────────────────────────

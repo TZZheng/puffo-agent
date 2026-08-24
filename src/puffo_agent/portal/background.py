@@ -98,18 +98,18 @@ def _existing_daemon_result() -> int | None:
     if pid is None:
         print("puffo-agent daemon has no readable pid.", file=sys.stderr)
         return 1
+    if is_daemon_startup_stalled(pid):
+        print(
+            f"puffo-agent daemon is alive but stalled during startup (pid={pid}).",
+            file=sys.stderr,
+        )
+        print(f"  logs: {background_log_path()}", file=sys.stderr)
+        return 1
     startup = _observe_pid_startup(pid)
     if startup is DaemonStartupState.READY:
         print(f"puffo-agent daemon already running (pid={pid}).")
         return 0
     if startup is DaemonStartupState.STARTING:
-        if is_daemon_startup_stalled(pid):
-            print(
-                f"puffo-agent daemon is alive but stalled during startup (pid={pid}).",
-                file=sys.stderr,
-            )
-            print(f"  logs: {background_log_path()}", file=sys.stderr)
-            return 1
         print(f"puffo-agent daemon already starting (pid={pid}).")
         print(f"  logs: {background_log_path()}")
         return 0
@@ -132,9 +132,16 @@ def _spawn_detached(command: list[str], *, tray: bool) -> int:
 
     startup = _observe_background_startup(proc)
     if startup is DaemonStartupState.EXITED:
-        if proc.poll() == 0 and is_daemon_alive():
-            pid = read_daemon_pid()
-            print(f"puffo-agent daemon already running or starting (pid={pid}).")
+        winner_pid = read_daemon_pid()
+        if (
+            proc.poll() == 0
+            and winner_pid is not None
+            and is_pid_alive(winner_pid)
+        ):
+            print(
+                "puffo-agent daemon already running or starting "
+                f"(pid={winner_pid})."
+            )
             print(f"  logs: {log_path}")
             return 0
         print(

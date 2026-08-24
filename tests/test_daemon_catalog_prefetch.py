@@ -78,7 +78,7 @@ async def test_daemon_ready_precedes_worker_preparation_and_reconcile(
 
 
 @pytest.mark.asyncio
-async def test_worker_preparation_failure_does_not_stop_ready_daemon(
+async def test_worker_preparation_failure_is_best_effort(
     monkeypatch, caplog,
 ):
     def fail_preparation():
