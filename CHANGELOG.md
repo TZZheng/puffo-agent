@@ -6,6 +6,14 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Codex resume recovery.** A resume against a thread with no rollout on disk
+  ("no rollout found") is classified as `invalid_resume` and falls back to a
+  fresh session instead of dying in a blind retry loop, and failed turn starts
+  keep the persisted native session id so restarts resume the same thread
+  instead of creating a new one. (#290)
+
 ## [2.0.0] - 2026-08-23
 
 > Stable Agent Foundation 2.0 release, promoted from `2.0.0a25` without

@@ -168,8 +168,7 @@ def _classify_jsonrpc_error(error: Any) -> Exception:
     detail = f"Codex JSON-RPC error code={code}: {message}"
     context = _jsonrpc_error_context(error)
     if _is_invalid_resume_error(message):
-        # Missing rollout: keep native detail so the fresh-session
-        # fallback (_native_resume_is_unavailable) can match it.
+        # Missing rollout: keep detail for the fresh-session fallback.
         logger.warning(
             "codex provider request failed (invalid_resume): %s", detail
         )

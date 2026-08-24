@@ -325,8 +325,7 @@ async def test_native_resume_keeps_session_on_transient_error():
 
 @pytest.mark.asyncio
 async def test_native_resume_falls_back_on_invalid_resume_error_code():
-    # Even when the driver launders the message text, the error_code channel
-    # must still route into the fresh-session fallback.
+    # laundered text: error_code alone must trigger the fallback
     driver = _ResumeBoundaryDriver(
         AgentAPIError(
             "The provider could not complete the turn.",
@@ -363,7 +362,7 @@ async def test_failed_turn_start_preserves_the_native_session():
             RuntimeManagerAdapter(manager).run_turn(_context()), timeout=1
         )
 
-    # Runtime retired, session kept: the next open resumes the same thread.
+    # retired but session kept; next open resumes the same thread
     assert manager.opened is None
     assert manager.native_session_id == "native-session-1"
 
@@ -940,7 +939,7 @@ async def test_unaccepted_receipt_releases_the_event_subscriber():
     assert result.metadata == {"accepted": False}
     assert ambiguous.close_calls == 1
     assert ambiguous_manager.opened is None
-    # Failed start retires the runtime but keeps the session for resume.
+    # failed start keeps the session
     assert ambiguous_manager.native_session_id == "native-session-1"
     await ambiguous_manager.close()
 

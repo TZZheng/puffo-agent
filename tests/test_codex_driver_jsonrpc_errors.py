@@ -71,7 +71,7 @@ def test_jsonrpc_missing_rollout_is_classified_as_invalid_resume(message):
     assert isinstance(exc, AgentAPIError)
     assert exc.is_auth is False
     assert exc.error_code == "invalid_resume"
-    # Native detail survives so text-marker matching also recognizes it.
+    # detail preserved for text-marker matching
     assert message in str(exc)
 
 

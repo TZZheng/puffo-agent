@@ -305,8 +305,7 @@ class RuntimeManager:
         if not retire:
             return
         try:
-            # Keep session: driver close prevents turn overlap; a dead
-            # session fails the next resume -> invalid_resume fallback.
+            # Keep session: close prevents overlap; dead -> invalid_resume.
             await self._retire_runtime_locked(preserve_session=True)
         except Exception:
             logger.exception("failed to retire runtime after turn start failure")
