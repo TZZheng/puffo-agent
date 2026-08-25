@@ -67,6 +67,7 @@ from ..runtime_event_outbox import (
 )
 from ..runtime_events import RuntimeEventProjector, TrustedScope
 from . import UnsupportedDriver, build_driver
+from .child_env import build_child_environment
 from .driver import (
     Driver,
     HarnessEvent,
@@ -470,21 +471,24 @@ class LocalRuntimePreparer:
         remove_legacy_permission_hook(self.claude_dir)
         runtime = self.agent_cfg.runtime
         llm_env = anthropic_base_url_env(runtime.llm_base_url)
-        environment = dict(os.environ)
-        environment.pop("ANTHROPIC_API_KEY", None)
-        environment.update(self.agent_cfg.env_overrides)
-        environment.pop("ANTHROPIC_API_KEY", None)
         if llm_env and runtime.api_key:
             llm_env["ANTHROPIC_API_KEY"] = runtime.api_key
         else:
             configured_key = claude_cli_api_key(self.daemon_cfg)
             if configured_key:
                 llm_env["ANTHROPIC_API_KEY"] = configured_key
-        environment.update({
-            "HOME": str(self.agent_home),
-            "USERPROFILE": str(self.agent_home),
-            **llm_env,
-        })
+        # Same guarantee the old pop-before-and-after-overrides dance gave,
+        # now from an allowlist: ambient provider keys never reach the child,
+        # an override cannot reintroduce one, and only llm_env injects the
+        # controlled key.
+        environment = build_child_environment(
+            overrides=self.agent_cfg.env_overrides,
+            controlled={
+                "HOME": str(self.agent_home),
+                "USERPROFILE": str(self.agent_home),
+                **llm_env,
+            },
+        )
         if is_macos():
             environment["CLAUDE_CONFIG_DIR"] = str(
                 agent_claude_user_dir(self.agent_id)
@@ -528,13 +532,12 @@ class LocalRuntimePreparer:
             })
         write_codex_mcp_config(codex_home / "config.toml", **config_kwargs)
 
-        environment = {
-            **os.environ,
-            **self.agent_cfg.env_overrides,
-            "CODEX_HOME": str(codex_home),
-        }
+        # Controlled injection only: an ambient OPENAI_API_KEY must not reach
+        # the child. Native OAuth uses the CODEX_HOME auth view instead, and
+        # the gateway branch supplies its own key explicitly.
+        controlled: dict[str, str] = {"CODEX_HOME": str(codex_home)}
         if gateway:
-            environment["OPENAI_API_KEY"] = self.agent_cfg.runtime.api_key
+            controlled["OPENAI_API_KEY"] = self.agent_cfg.runtime.api_key
         else:
             auth_mode = sync_host_codex_auth_view(host_home, codex_home)
             if auth_mode == "no-host-file":
@@ -555,6 +558,11 @@ class LocalRuntimePreparer:
                 "PUFFO_CODEX_BIN=/absolute/path/to/codex."
             )
         self._ensure_codex_self_invoke(executable)
+        environment = build_child_environment(
+            overrides=self.agent_cfg.env_overrides,
+            controlled=controlled,
+            extra_allowed=("CODEX_HOME",),
+        )
         environment["PATH"] = self._prepend_executable_path(
             environment.get("PATH", ""),
             executable,
