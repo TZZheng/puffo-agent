@@ -37,6 +37,8 @@ from .driver import (
     SessionRef,
     SteerCapability,
     TurnInput,
+    observed_returncode,
+    runtime_exited_data,
     TurnRef,
     TurnStarted,
     UnsupportedCapability,
@@ -601,7 +603,10 @@ class ClaudeCodeCliDriver(Driver):
                 await self._emit(
                     HarnessEventType.RUNTIME_EXITED,
                     turn_ref=self._active if self._active.value else None,
-                    data=dict(self._active_provider_error or {}),
+                    data=runtime_exited_data(
+                        observed_returncode(self._proc),
+                        self._active_provider_error,
+                    ),
                 )
 
     async def _log_unexpected_exit(self) -> None:

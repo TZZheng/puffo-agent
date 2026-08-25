@@ -293,6 +293,35 @@ class HarnessEventType(str, Enum):
     COMPACTION_COMPLETED = "compaction.completed"
 
 
+def observed_returncode(proc: Any) -> int | None:
+    """The child's exit status, if the process object carries one yet."""
+    code = getattr(proc, "returncode", None)
+    return code if isinstance(code, int) else None
+
+
+def runtime_exited_data(
+    returncode: int | None,
+    provider_data: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the payload for ``RUNTIME_EXITED``, one shape for every driver.
+
+    ``returncode`` is always present and may be ``None``.  ``None`` says the
+    exit status was not observable when the child's stream ended -- not that
+    the child exited cleanly.  Omitting the key instead would destroy that
+    distinction: a consumer reading ``data.get("returncode")`` could not tell
+    "no status yet" from "this driver never reports one", and that is exactly
+    the drift this function exists to end.
+
+    ``provider_data`` carries provider-specific fields such as ``error_code``.
+    They stay flat siblings because ``RuntimeManager`` reads
+    ``data["error_code"]`` directly, and they are merged first so a provider
+    payload can never shadow the uniform field.
+    """
+    data: dict[str, Any] = dict(provider_data or {})
+    data["returncode"] = returncode
+    return data
+
+
 class _NativeDiagnostic:
     """Opaque wrapper that deliberately rejects serialization."""
 

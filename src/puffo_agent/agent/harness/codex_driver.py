@@ -41,6 +41,8 @@ from .driver import (
     RuntimeRef,
     RuntimeSpec,
     SessionRef,
+    observed_returncode,
+    runtime_exited_data,
     SteerCapability,
     TurnInput,
     TurnRef,
@@ -619,7 +621,10 @@ class CodexAppServerDriver(Driver):
         finally:
             self._fail_pending_requests("Codex app-server exited")
             if not self._closed:
-                await self._emit(HarnessEventType.RUNTIME_EXITED)
+                await self._emit(
+                    HarnessEventType.RUNTIME_EXITED,
+                    data=runtime_exited_data(observed_returncode(self._proc)),
+                )
 
     async def _dispatch_frame(self, frame: dict[str, Any]) -> None:
         if "id" in frame and ("result" in frame or "error" in frame):

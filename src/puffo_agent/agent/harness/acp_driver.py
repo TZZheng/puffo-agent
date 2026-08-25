@@ -56,6 +56,7 @@ from .driver import (
     SessionRef,
     SteerCapability,
     TurnInput,
+    runtime_exited_data,
     TurnRef,
     TurnStarted,
     UnsupportedCapability,
@@ -471,7 +472,7 @@ class AcpDriver(Driver):
             await self._emit(
                 HarnessEventType.RUNTIME_EXITED,
                 turn=self._active if self._active.value else None,
-                data={"returncode": returncode},
+                data=runtime_exited_data(returncode),
             )
 
     async def _observe_stream(self, event: StreamEvent) -> None:
