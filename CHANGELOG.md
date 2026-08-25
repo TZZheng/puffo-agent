@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-08-24
+
 ### Changed
 
 - **Channel sends follow the channel's format policy.** The channel's
@@ -29,6 +31,11 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 - Detached startup reports success when a concurrently launched child exits
   because another daemon won startup, and avoids redundant daemon imports in
   the parent CLI process.
+- The daemon publishes control-plane readiness before worker preparation, so
+  background startup returns promptly while preserving bounded stalled-start
+  and stalled-stop diagnostics.
+- Windows background Agents now launch Claude Code, Codex, and memory Git
+  subprocesses without opening visible console windows.
 
 ## [2.0.0] - 2026-08-23
 
@@ -4925,7 +4932,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.1...HEAD
+[2.0.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.1
 [2.0.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0
 [2.0.0a2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0a2
 [2.0.0a1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0a1
