@@ -29,7 +29,7 @@ class UnsupportedDriver:
 
 
 def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
-    """Construct only the two ratified Driver implementations.
+    """Construct only Driver implementations admitted for production use.
 
     Process placement is supplied separately through ``process_factory``.
     """
