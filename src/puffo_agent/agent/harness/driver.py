@@ -71,6 +71,34 @@ class CompactCapability(str, Enum):
     SESSION_COMMAND = "session_command"
 
 
+class RuntimeLifecycle(str, Enum):
+    """How the harness process exists across turns.
+
+    Read by the layers above the Driver to decide warm/reload/restart and
+    whether a session can be held open between turns. The Driver still
+    absorbs the mechanics: a ``PER_TURN_CHILD`` driver may accept ``open()``
+    as a logical session and spawn only on ``start_turn()``.
+    """
+
+    PERSISTENT_CHILD = "persistent_child"
+    PER_TURN_CHILD = "per_turn_child"
+    IN_PROCESS = "in_process"
+
+
+class BusyDelivery(str, Enum):
+    """What the driver accepts while one of its turns is already running.
+
+    Declared, not inferred: the caller must not probe by sending and seeing
+    what happens. ``REJECT`` means the driver takes nothing mid-turn and the
+    caller owns the pending input.
+    """
+
+    STEER = "steer"
+    COALESCE = "coalesce"
+    QUEUE = "queue"
+    REJECT = "reject"
+
+
 class PermissionDecision(str, Enum):
     APPROVE = "approved"
     DENY = "denied"
@@ -85,6 +113,11 @@ class DriverCapabilities:
     context_status: ContextStatusCapability | str
     compact: CompactCapability | str
     permission_bridge: bool
+    # Defaults describe the two drivers that shipped before this field existed;
+    # a new driver must declare both explicitly (see
+    # ``test_shipped_drivers_declare_lifecycle_and_busy_delivery``).
+    lifecycle: RuntimeLifecycle | str = RuntimeLifecycle.PERSISTENT_CHILD
+    busy_delivery: BusyDelivery | str = BusyDelivery.REJECT
 
 
 @dataclass(frozen=True, slots=True)

@@ -16,6 +16,8 @@ from ..._proc import no_window_kwargs
 from ..cli_bin import normalize_launch_argv
 from ..provider_failures import classify_provider_failure
 from .driver import (
+    BusyDelivery,
+    RuntimeLifecycle,
     CancelCapability,
     CompactCapability,
     CompactReceipt,
@@ -83,6 +85,14 @@ def claude_capabilities(
             else CompactCapability.NONE
         ),
         permission_bridge=False,
+        lifecycle=RuntimeLifecycle.PERSISTENT_CHILD,
+        # Mirrors ``steer`` above: without msg_lifecycle_v1 there is no
+        # mid-turn delivery path at all, so the caller keeps the input.
+        busy_delivery=(
+            BusyDelivery.STEER
+            if message_lifecycle_v1
+            else BusyDelivery.REJECT
+        ),
     )
 
 

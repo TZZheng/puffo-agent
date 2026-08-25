@@ -1997,3 +1997,134 @@ async def test_local_sink_projects_only_bounded_safe_legacy_status(
         assert sentinel not in serialized
     await adapter.aclose()
     outbox.close()
+
+
+# --- T1: lifecycle / busy_delivery capability declarations -----------------
+#
+# These two fields carry defaults so that adding them did not break existing
+# positional construction. That convenience is exactly the risk: a new driver
+# (pi / opencode / acp) can inherit "persistent_child + reject" by saying
+# nothing and look declared. These tests are the tripwire.
+
+from puffo_agent.agent.harness.claude_code_driver import claude_capabilities
+from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
+from puffo_agent.agent.harness.driver import (
+    BusyDelivery,
+    RuntimeLifecycle,
+    SteerCapability,
+)
+
+
+def _shipped_capabilities():
+    return {
+        "codex": CODEX_CAPABILITIES,
+        "claude-code": claude_capabilities(),
+        "claude-code+msg_lifecycle_v1": claude_capabilities(
+            message_lifecycle_v1=True
+        ),
+    }
+
+
+def test_shipped_drivers_declare_lifecycle_and_busy_delivery():
+    """Every shipped driver names a valid member of both new enums."""
+    for name, caps in _shipped_capabilities().items():
+        assert RuntimeLifecycle(caps.lifecycle), name
+        assert BusyDelivery(caps.busy_delivery), name
+
+
+def test_shipped_driver_lifecycles_are_the_expected_values():
+    """Locks intent, so a change to either value has to be deliberate."""
+    assert CODEX_CAPABILITIES.lifecycle == RuntimeLifecycle.PERSISTENT_CHILD
+    assert CODEX_CAPABILITIES.busy_delivery == BusyDelivery.STEER
+
+    assert claude_capabilities().lifecycle == RuntimeLifecycle.PERSISTENT_CHILD
+    assert claude_capabilities().busy_delivery == BusyDelivery.REJECT
+
+    gated = claude_capabilities(message_lifecycle_v1=True)
+    assert gated.lifecycle == RuntimeLifecycle.PERSISTENT_CHILD
+    assert gated.busy_delivery == BusyDelivery.STEER
+
+
+def test_busy_delivery_agrees_with_steer_capability():
+    """Cross-field coherence, for the drivers shipping today only.
+
+    ``steer`` says whether mid-turn input has a native path; ``busy_delivery``
+    says what the driver does with it. Advertising steer while declaring it
+    accepts nothing mid-turn (or the reverse) is incoherent, and the caller
+    would route input on a promise the driver does not keep.
+
+    Deliberately scoped to ``_shipped_capabilities()``: this is a current
+    admission invariant, NOT a law about the enums. A future driver may
+    legitimately report ``steer=none`` with ``busy_delivery=queue`` or
+    ``coalesce`` -- OpenCode is expected to report ``reject + steer none`` and
+    let the scheduler do the queueing. Do not generalise this assertion to all
+    DriverCapabilities; that would block exactly those upper-layer policies.
+    """
+    for name, caps in _shipped_capabilities().items():
+        steerable = SteerCapability(caps.steer) != SteerCapability.NONE
+        declares_steer = BusyDelivery(caps.busy_delivery) == BusyDelivery.STEER
+        assert steerable == declares_steer, (
+            f"{name}: steer={caps.steer} but busy_delivery={caps.busy_delivery}"
+        )
+
+
+def test_reject_busy_delivery_forces_next_turn_regardless_of_steer():
+    """The consumer must gate on busy_delivery before reading steer.
+
+    A driver can advertise a steer granularity while having no mid-turn
+    delivery path at all (per-turn child harnesses are the coming case:
+    no stdin, so nothing lands until the next process). If the consumer
+    reads steer first, such a driver is told "direct" and the caller hands
+    it input that is silently never delivered.
+    """
+    from puffo_agent.agent.harness.driver import (
+        CancelCapability,
+        CompactCapability,
+        ContextStatusCapability,
+        DriverCapabilities,
+    )
+
+    incoherent = DriverCapabilities(
+        session_resume=False,
+        inflight_turn_recovery=False,
+        steer=SteerCapability.CURRENT_TURN,
+        cancel=CancelCapability.NONE,
+        context_status=ContextStatusCapability.NONE,
+        compact=CompactCapability.NONE,
+        permission_bridge=False,
+        lifecycle=RuntimeLifecycle.PER_TURN_CHILD,
+        busy_delivery=BusyDelivery.REJECT,
+    )
+
+    class _Manager:
+        driver = object()
+
+        def current_capabilities(self):
+            return incoherent
+
+    from puffo_agent.agent.harness.runtime_manager import RuntimeManagerAdapter
+
+    adapter = RuntimeManagerAdapter.__new__(RuntimeManagerAdapter)
+    adapter.manager = _Manager()
+    assert adapter.inbox_notice_delivery_capability() == "next_turn"
+
+
+def test_shipped_drivers_delivery_capability_is_unchanged_by_the_new_gate():
+    """T1 promises no behaviour change; this pins that for both drivers."""
+    from puffo_agent.agent.harness.runtime_manager import RuntimeManagerAdapter
+
+    expected = {
+        "codex": "direct",
+        "claude-code": "next_turn",
+        "claude-code+msg_lifecycle_v1": "gated",
+    }
+    for name, caps in _shipped_capabilities().items():
+        class _Manager:
+            driver = object()
+
+            def current_capabilities(self, _c=caps):
+                return _c
+
+        adapter = RuntimeManagerAdapter.__new__(RuntimeManagerAdapter)
+        adapter.manager = _Manager()
+        assert adapter.inbox_notice_delivery_capability() == expected[name], name

@@ -20,6 +20,8 @@ from ..provider_failures import (
     provider_failure_message,
 )
 from .driver import (
+    BusyDelivery,
+    RuntimeLifecycle,
     CancelCapability,
     CancelReceipt,
     CompactCapability,
@@ -56,6 +58,8 @@ CODEX_CAPABILITIES = DriverCapabilities(
     context_status=ContextStatusCapability.PUSH,
     compact=CompactCapability.TYPED,
     permission_bridge=True,
+    lifecycle=RuntimeLifecycle.PERSISTENT_CHILD,
+    busy_delivery=BusyDelivery.STEER,
 )
 
 logger = logging.getLogger(__name__)
