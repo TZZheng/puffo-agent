@@ -18,6 +18,7 @@ from ..provider_failures import (
     provider_failure,
     provider_failure_message,
 )
+from .redaction import safe_provider_message
 from .driver import (
     BusyDelivery,
     RuntimeLifecycle,
@@ -75,16 +76,6 @@ _PERMISSION_REQUEST_METHODS = frozenset({
 })
 
 
-_SENSITIVE_ERROR_FIELD = re.compile(
-    r"(?i)(?P<prefix>[\"']?(?:api[_-]?key|access[_-]?token|"
-    r"refresh[_-]?token|authorization)[\"']?\s*[:=]\s*)"
-    r"(?P<value>(?:bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s,}\]]+))"
-)
-_BEARER_VALUE = re.compile(r"(?i)\bbearer\s+(?:\"[^\"]*\"|'[^']*'|[^\s,}\]]+)")
-_TOKENISH = re.compile(
-    r"(?i)\b(?:sk[_-][a-z0-9_-]{12,}|eyJ[a-zA-Z0-9_-]{12,}"
-    r"\.[a-zA-Z0-9_-]+(?:\.[a-zA-Z0-9_-]+)?)"
-)
 _TOOL_ITEM_TYPES = frozenset(
     {"mcpToolCall", "dynamicToolCall", "functionCall", "toolCall"}
 )
@@ -101,16 +92,7 @@ def _tool_label(item: dict[str, Any]) -> str:
 
 
 def _safe_jsonrpc_error_message(message: Any) -> str:
-    """Keep a bounded diagnostic while never copying credential-shaped text."""
-    if not isinstance(message, str):
-        return "(missing or invalid provider message)"
-    compact = " ".join(message.split())
-    redacted = _SENSITIVE_ERROR_FIELD.sub(
-        lambda match: f"{match.group('prefix')}[REDACTED]", compact
-    )
-    redacted = _BEARER_VALUE.sub("Bearer [REDACTED]", redacted)
-    redacted = _TOKENISH.sub("[REDACTED]", redacted)
-    return redacted[:300] or "(empty provider message)"
+    return safe_provider_message(message)
 
 
 def _safe_jsonrpc_error_code(code: Any) -> str:
