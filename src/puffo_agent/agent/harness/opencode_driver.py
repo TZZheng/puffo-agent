@@ -9,7 +9,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from ..._proc import no_window_kwargs
+from ..._proc import STREAM_READER_LIMIT_BYTES, no_window_kwargs
 from ..cli_bin import normalize_launch_argv
 from .driver import (
     BusyDelivery,
@@ -174,7 +174,7 @@ class OpenCodeDriver(Driver):
             stderr=asyncio.subprocess.PIPE,
             cwd=spec.workspace_dir or None,
             env=env,
-            limit=16 * 1024 * 1024,
+            limit=STREAM_READER_LIMIT_BYTES,
             **no_window_kwargs(),
         )
 

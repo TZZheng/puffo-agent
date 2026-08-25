@@ -27,6 +27,8 @@ FRAMED_STREAM_MODULES = (
     "src/puffo_agent/agent/harness/codex_driver.py",
     "src/puffo_agent/agent/harness/claude_code_driver.py",
     "src/puffo_agent/agent/harness/docker_runtime.py",
+    "src/puffo_agent/agent/harness/opencode_driver.py",
+    "src/puffo_agent/agent/harness/acp_driver.py",
     "src/puffo_agent/agent/adapters/cli_session.py",
 )
 
