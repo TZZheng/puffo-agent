@@ -1370,7 +1370,25 @@ class RuntimeManagerAdapter(Adapter):
         return value or None
 
     def inbox_notice_delivery_capability(self) -> str:
+        """Whether an inbox notice can reach a turn that is already running.
+
+        Two separate facts decide this, and conflating them is how a caller
+        ends up routing input on a promise the driver does not keep:
+
+        ``busy_delivery`` -- does the driver accept anything at all mid-turn.
+        ``steer``         -- if so, how immediately it lands.
+
+        A driver with no mid-turn path (``REJECT``) is ``next_turn`` no matter
+        what ``steer`` says. For both drivers shipping today the two agree, so
+        this returns exactly what it returned before.
+        """
         capabilities = self.manager.current_capabilities()
+        if capabilities is not None:
+            busy = getattr(
+                capabilities.busy_delivery, "value", capabilities.busy_delivery
+            )
+            if busy == "reject":
+                return "next_turn"
         steer = (
             capabilities.steer
             if capabilities is not None
