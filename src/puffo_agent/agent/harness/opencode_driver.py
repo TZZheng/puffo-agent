@@ -157,10 +157,8 @@ class OpenCodeDriver(Driver):
             native_session_id=self._native_session_id,
         )
         if self.process_factory is not None:
-            try:
-                proc = self.process_factory(command, spec)
-            except TypeError:
-                proc = self.process_factory(command)
+            # One call with the declared signature; see AcpDriver._spawn.
+            proc = self.process_factory(command, spec)
             return await proc if asyncio.iscoroutine(proc) else proc
         executable, *arguments = command
         env = dict(spec.environment)

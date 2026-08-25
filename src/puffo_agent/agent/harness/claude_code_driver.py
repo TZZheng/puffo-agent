@@ -210,10 +210,8 @@ class ClaudeCodeCliDriver(Driver):
                 **no_window_kwargs(),
             )
         else:
-            try:
-                self._proc = self.process_factory(args, spec)
-            except TypeError:
-                self._proc = self.process_factory(args)
+            # One call with the declared signature; see AcpDriver._spawn.
+            self._proc = self.process_factory(args, spec)
             if asyncio.iscoroutine(self._proc):
                 self._proc = await self._proc
         self._init = asyncio.get_running_loop().create_future()

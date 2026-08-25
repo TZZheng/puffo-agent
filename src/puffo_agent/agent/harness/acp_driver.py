@@ -276,10 +276,11 @@ class AcpDriver(Driver):
     async def _spawn(self, spec: RuntimeSpec) -> Any:
         command = (*normalize_launch_argv(spec.executable), *spec.launch_args)
         if self.process_factory is not None:
-            try:
-                proc = self.process_factory(command, spec)
-            except TypeError:
-                proc = self.process_factory(command)
+            # One call with the declared signature. Retrying on TypeError
+            # cannot tell "wrong arity" from "the factory raised TypeError
+            # internally", and the retry would spawn a second child after the
+            # first already exists.
+            proc = self.process_factory(command, spec)
             return await proc if asyncio.iscoroutine(proc) else proc
         env = dict(spec.environment)
         return await asyncio.create_subprocess_exec(
