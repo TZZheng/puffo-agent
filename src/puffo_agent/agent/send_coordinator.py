@@ -26,10 +26,12 @@ from ..crypto.http_client import HttpError
 from ..crypto.keystore import decode_secret
 from ..crypto.message import (
     EncryptInput,
+    build_plaintext_message,
     build_supplementation_envelope,
     encrypt_message_with_content_key,
 )
 from ..crypto.primitives import Ed25519KeyPair
+from .channel_format import is_channel_format_mismatch
 from .held_context import build_held_context_output
 from .message_projection import CONTEXT_VERSION
 from .send_models import SemanticSendRequest, SendResult
@@ -186,6 +188,7 @@ class SendCoordinator:
         active_turn_source: ActiveTurnBoundarySource | Any | None = None,
         held_recovery_source: HeldRecoverySource | Any | None = None,
         provider_session_id: str | None = None,
+        channel_policy_source: Any | None = None,
     ) -> None:
         self.slug = slug
         self.keystore = keystore
@@ -197,6 +200,9 @@ class SendCoordinator:
         self.active_turn_source = active_turn_source
         self.held_recovery_source = held_recovery_source
         self.provider_session_id = provider_session_id
+        # ensure_channel_policy/refresh_channel_policy provider (the message
+        # client). None -> always encrypt (keyless never routes through here).
+        self.channel_policy_source = channel_policy_source
         self._channel_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._held_lock = asyncio.Lock()
         self._held_evidence: dict[tuple[str, str, str, str], _HeldEvidence] = {}
@@ -871,6 +877,7 @@ class SendCoordinator:
         )
         if isinstance(boundary, dict):
             return boundary
+        encrypt = await self._channel_encrypt_policy(channel_id, space_id)
         try:
             resolved = await self._resolve_route_and_content(
                 request,
@@ -878,27 +885,60 @@ class SendCoordinator:
                 channel_id=channel_id,
                 dm_peer=None,
                 materialized=boundary.materialized,
+                encrypt=encrypt,
             )
         except Exception as exc:
             return failed_result(str(exc), kind="validation")
 
-        envelope, content_key = encrypt_message_with_content_key(
-            resolved["input"],
-            resolved["signing_key"],
-        )
         freshness = {
             "context_baseline_seq": boundary.baseline,
             "seen_seq": boundary.seen_seq,
             "mode": "send_anyway" if request.send_anyway else "require_current",
         }
-        body = {"envelope": envelope, "freshness": freshness}
         visible_draft_basis = await self._visible_draft_basis(
             space_id,
             channel_id,
             str(resolved.get("root_id") or request.root_id or ""),
         )
-        response = await self._post_channel_exact(body)
-        result = self._validate_channel_response(response, envelope, freshness)
+        for attempt in (0, 1):
+            if encrypt:
+                envelope, content_key = encrypt_message_with_content_key(
+                    resolved["input"],
+                    resolved["signing_key"],
+                )
+            else:
+                envelope = build_plaintext_message(
+                    resolved["input"], resolved["signing_key"]
+                )
+                content_key = b""
+            body = {"envelope": envelope, "freshness": freshness}
+            response = await self._post_channel_exact(body)
+            result = self._validate_channel_response(response, envelope, freshness)
+            if (
+                attempt == 0
+                and result.state == "failed"
+                and result.error_kind == "channel_format_mismatch"
+            ):
+                refreshed = await self._refresh_channel_encrypt_policy(
+                    channel_id, encrypt
+                )
+                if refreshed == encrypt:
+                    break
+                encrypt = refreshed
+                try:
+                    resolved = await self._resolve_route_and_content(
+                        request,
+                        space_id=space_id,
+                        channel_id=channel_id,
+                        dm_peer=None,
+                        materialized=boundary.materialized,
+                        encrypt=encrypt,
+                        prepared=resolved["prepared_attachments"],
+                    )
+                except Exception as exc:
+                    return failed_result(str(exc), kind="validation")
+                continue
+            break
         return await self._finish_channel_send(
             request,
             space_id,
@@ -1048,6 +1088,28 @@ class SendCoordinator:
             f"context-independent draft, or leave it unsent.{resolved['note']}"
         )
 
+    async def _channel_encrypt_policy(self, channel_id: str, space_id: str) -> bool:
+        source = self.channel_policy_source
+        if source is None:
+            return True
+        try:
+            return bool(await source.ensure_channel_policy(channel_id, space_id))
+        except Exception:
+            logger.exception("channel policy lookup failed; defaulting to encrypted")
+            return True
+
+    async def _refresh_channel_encrypt_policy(
+        self, channel_id: str, current: bool
+    ) -> bool:
+        source = self.channel_policy_source
+        if source is None:
+            return current
+        try:
+            return bool(await source.refresh_channel_policy(channel_id))
+        except Exception:
+            logger.exception("channel policy refresh failed")
+            return current
+
     async def _post_channel_exact(self, body: dict[str, Any]) -> Any:
         # The same object is deliberately reused after an uncertain outcome; the
         # signed client serializes it deterministically with json.dumps.
@@ -1055,6 +1117,13 @@ class SendCoordinator:
             try:
                 return await self.http_client.post(CHANNEL_SEND_PATH, body)
             except HttpError as exc:
+                if is_channel_format_mismatch(exc):
+                    return SendResult(
+                        state="failed",
+                        error=http_error_detail(exc.body),
+                        error_kind="channel_format_mismatch",
+                        status=exc.status,
+                    )
                 kind = (
                     "deployment"
                     if exc.status in (404, 405)
@@ -1203,52 +1272,27 @@ class SendCoordinator:
             raise RuntimeError(f"channel {channel_id} has no resolvable members")
         return recipient_slugs
 
-    async def _resolve_route_and_content(
-        self,
-        request: SemanticSendRequest,
-        *,
-        space_id: str | None,
-        channel_id: str | None,
-        dm_peer: str | None,
-        materialized: Sequence[tuple[str, bytes]] | None = None,
-    ) -> dict[str, Any]:
-        from ..mcp.puffo_core_tools import (
-            _fetch_device_keys,
-            _resolve_outgoing_root,
-        )
-        from ._visibility import resolve_visibility
-
-        destination = request.destination.strip()
+    async def _resolve_send_recipients(
+        self, *, space_id: str | None, channel_id: str | None,
+        dm_peer: str | None, encrypt: bool
+    ) -> tuple[list[str], str]:
         if channel_id is not None:
-            recipient_slugs = await self._channel_recipient_slugs(space_id, channel_id)
-            kind = "channel"
-        else:
-            recipient_slugs = [self.slug, dm_peer]
-            kind = "dm"
+            # Members feed device wraps + supplementation: encrypted only.
+            if not encrypt:
+                return [], "channel"
+            slugs = await self._channel_recipient_slugs(space_id, channel_id)
+            return slugs, "channel"
+        return [self.slug, dm_peer], "dm"
 
-        root, root_note = await _resolve_outgoing_root(
-            request.root_id,
-            self.data_client,
-            self_slug=self.slug,
-            channel_id=channel_id,
-            space_id=space_id,
-            dm_peer=dm_peer,
-        )
-        attachments, attachment_note = await self._prepare_attachments(
-            request, materialized
-        )
-        content: Any
-        content_type: str
-        visible_text = request.caption if request.attachment_paths else request.text
-        if request.attachment_paths:
-            content = {
-                "text": request.caption,
-                "attachments": [m.to_dict() for m in attachments],
-            }
-            content_type = ATTACHMENT_CONTENT_TYPE
-        else:
-            content = request.text
-            content_type = "text/plain"
+    async def _resolve_send_devices(
+        self,
+        kind: str,
+        dm_peer: str | None,
+        recipient_slugs: list[str],
+        encrypt: bool,
+    ) -> list[Any]:
+        from ..mcp.puffo_core_tools import _fetch_device_keys
+
         if kind == "dm":
             # Fetch the peer alone: a combined [self, peer] fetch cannot
             # tell "peer unreachable" from "reachable" once the sender's
@@ -1262,11 +1306,66 @@ class SendCoordinator:
             merged: dict[str, Any] = {}
             for device in (*peer_devices, *self_devices):
                 merged.setdefault(device.device_id, device)
-            devices = list(merged.values())
-        else:
+            return list(merged.values())
+        if encrypt:
             devices = await _fetch_device_keys(self.http_client, recipient_slugs)
             if not devices:
                 raise RuntimeError("no recipient devices found")
+            return devices
+        # Plaintext channel send: no per-device key wrap.
+        return []
+
+    async def _resolve_route_and_content(
+        self,
+        request: SemanticSendRequest,
+        *,
+        space_id: str | None,
+        channel_id: str | None,
+        dm_peer: str | None,
+        materialized: Sequence[tuple[str, bytes]] | None = None,
+        encrypt: bool = True,
+        prepared: tuple[list[AttachmentMeta], str] | None = None,
+    ) -> dict[str, Any]:
+        from ..mcp.puffo_core_tools import _resolve_outgoing_root
+        from ._visibility import resolve_visibility
+
+        destination = request.destination.strip()
+        recipient_slugs, kind = await self._resolve_send_recipients(
+            space_id=space_id,
+            channel_id=channel_id,
+            dm_peer=dm_peer,
+            encrypt=encrypt,
+        )
+
+        root, root_note = await _resolve_outgoing_root(
+            request.root_id,
+            self.data_client,
+            self_slug=self.slug,
+            channel_id=channel_id,
+            space_id=space_id,
+            dm_peer=dm_peer,
+        )
+        # Format retry reuses the already-uploaded blobs.
+        attachments, attachment_note = (
+            prepared
+            if prepared is not None
+            else await self._prepare_attachments(request, materialized)
+        )
+        content: Any
+        content_type: str
+        visible_text = request.caption if request.attachment_paths else request.text
+        if request.attachment_paths:
+            content = {
+                "text": request.caption,
+                "attachments": [m.to_dict() for m in attachments],
+            }
+            content_type = ATTACHMENT_CONTENT_TYPE
+        else:
+            content = request.text
+            content_type = "text/plain"
+        devices = await self._resolve_send_devices(
+            kind, dm_peer, recipient_slugs, encrypt
+        )
         visible, visibility_note = await resolve_visibility(
             request.visibility_level,
             destination,
@@ -1298,6 +1397,7 @@ class SendCoordinator:
             "recipient_slugs": recipient_slugs,
             "root_id": root or "",
             "note": f"{visibility_note}{root_note}{attachment_note}",
+            "prepared_attachments": (attachments, attachment_note),
         }
 
     async def _prepare_attachments(
