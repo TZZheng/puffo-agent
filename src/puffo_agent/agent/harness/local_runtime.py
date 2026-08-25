@@ -66,14 +66,8 @@ from ..runtime_event_outbox import (
     RuntimeEventProjectingSink,
 )
 from ..runtime_events import RuntimeEventProjector, TrustedScope
-from . import UnsupportedDriver, build_driver
+from . import SUPPORTED_LOCAL_DRIVERS, UnsupportedDriver, build_driver
 from .child_env import build_child_environment
-from .pi_bridge import (
-    build_bridge_environment,
-    install_pi_tool_bridge,
-    mint_bridge_nonce,
-    ready_file_path,
-)
 from .driver import (
     Driver,
     HarnessEvent,
@@ -86,12 +80,6 @@ from .runtime_manager import RuntimeManager, RuntimeManagerAdapter
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_LOCAL_DRIVERS = frozenset({
-    "acp",
-    "claude-code",
-    "codex",
-    "opencode",
-})
 VALID_PERMISSION_MODES = frozenset({"bypassPermissions"})
 VALID_SANDBOX_MODES = frozenset({
     "read-only",
@@ -277,11 +265,12 @@ class LocalRuntimePreparer:
         ).strip()
         self.provider = provider
         if self.harness_name not in SUPPORTED_LOCAL_DRIVERS:
+            supported = ", ".join(
+                f"{name!r}" for name in sorted(SUPPORTED_LOCAL_DRIVERS)
+            )
             raise RuntimeError(
                 f"agent {self.agent_id!r}: runtime.kind='cli-local' supports "
-                "only harness='acp', 'claude-code', 'codex', or "
-                "'opencode' in the "
-                "Driver runtime"
+                f"only harness in ({supported}) in the Driver runtime"
             )
         self.workspace_dir = agent_cfg.resolve_workspace_dir()
         self.claude_dir = agent_cfg.resolve_claude_dir()
@@ -358,6 +347,32 @@ class LocalRuntimePreparer:
         return runtime.model or getattr(provider_cfg, "model", "") or ""
 
     def _prepare_generic_spec(self, system_prompt: str) -> RuntimeSpec:
+        executable, launch_args = self._resolve_generic_command()
+        controlled, opencode_config = self._prepare_executable_configuration(
+            executable, system_prompt
+        )
+        mcp_servers = self._project_protocol_mcp(opencode_config)
+        if opencode_config:
+            controlled["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+                opencode_config
+            )
+        return RuntimeSpec(
+            workspace_dir=str(self.workspace_dir),
+            model=self.model,
+            system_prompt=system_prompt,
+            executable=executable,
+            launch_args=tuple(launch_args),
+            environment=build_child_environment(
+                overrides=self.agent_cfg.env_overrides,
+                controlled=controlled,
+            ),
+            mcp_servers=mcp_servers,
+            permission_mode=self.permission_mode,
+            sandbox=self.sandbox,
+            task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
+        )
+
+    def _resolve_generic_command(self) -> tuple[str, list[str]]:
         command = tuple(self.agent_cfg.runtime.harness_command)
         if command:
             executable, *launch_args = command
@@ -369,55 +384,51 @@ class LocalRuntimePreparer:
                     "opencode binary not found. Install OpenCode or set "
                     "PUFFO_OPENCODE_BIN=/absolute/path/to/opencode."
                 )
-        elif self.harness_name == "pi":
-            executable = "pi"
-            launch_args = []
         else:
             raise RuntimeError(
                 f"agent {self.agent_id!r}: harness='acp' requires "
                 "runtime.harness_command, for example "
                 "['opencode', 'acp']"
             )
+        return executable, launch_args
+
+    def _prepare_executable_configuration(
+        self, executable: str, system_prompt: str
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        """Project configuration selected by executable family.
+
+        ACP-over-OpenCode intentionally receives OpenCode's instructions file;
+        this axis is independent of which Driver protocol owns the process.
+        """
         controlled: dict[str, str] = {}
-        mcp_servers: tuple[McpServerSpec, ...] = ()
-        is_opencode = Path(executable).name.lower() in {
+        uses_opencode_executable = Path(executable).name.lower() in {
             "opencode",
             "opencode.exe",
         }
         opencode_config: dict[str, Any] = {}
-        if is_opencode:
+        if uses_opencode_executable:
             instruction_path = (
                 agent_dir(self.agent_id) / "opencode-instructions.md"
             )
             instruction_path.parent.mkdir(parents=True, exist_ok=True)
             instruction_path.write_text(system_prompt, encoding="utf-8")
             opencode_config["instructions"] = [str(instruction_path)]
-        is_pi = self.harness_name == "pi"
+        return controlled, opencode_config
+
+    def _project_protocol_mcp(
+        self, opencode_config: dict[str, Any]
+    ) -> tuple[McpServerSpec, ...]:
+        """Project Puffo tools according to the selected Driver protocol.
+
+        Native OpenCode receives its inline MCP configuration. ACP-over-
+        OpenCode carries the same server through ``RuntimeSpec.mcp_servers``
+        and must not receive the native inline projection.
+        """
+        mcp_servers: tuple[McpServerSpec, ...] = ()
         if self._puffo_core_env:
             puffo_command = default_python_executable()
             puffo_args = ("-m", "puffo_agent.mcp.puffo_core_server")
-            if is_pi:
-                # Pi cannot consume an McpServerSpec: it has no MCP client.
-                # The bridge extension is installed into the per-agent Pi home
-                # and told where the server lives; mcp_servers stays empty so
-                # the driver's admission check does not see a projection Pi
-                # would silently drop.
-                #
-                # Scope: the bridge carries the Puffo core server only. Catalog
-                # MCP servers remain genuinely unprojectable for Pi, which is
-                # why its assets profile still reports McpProjection.UNSUPPORTED
-                # -- that describes catalog assets, not this harness-level path.
-                controlled.update(
-                    self._prepare_pi_bridge(
-                        McpServerSpec(
-                            name="puffo",
-                            command=puffo_command,
-                            args=puffo_args,
-                            environment=self._puffo_core_env,
-                        )
-                    )
-                )
-            mcp_servers = () if is_pi else (
+            mcp_servers = (
                 McpServerSpec(
                     name="puffo",
                     command=puffo_command,
@@ -439,44 +450,7 @@ class LocalRuntimePreparer:
                 "puffo_core is incomplete",
                 self.agent_id,
             )
-        if opencode_config:
-            controlled["OPENCODE_CONFIG_CONTENT"] = json.dumps(
-                opencode_config
-            )
-        return RuntimeSpec(
-            workspace_dir=str(self.workspace_dir),
-            model=self.model,
-            system_prompt=system_prompt,
-            executable=executable,
-            launch_args=tuple(launch_args),
-            environment=build_child_environment(
-                overrides=self.agent_cfg.env_overrides,
-                controlled=controlled,
-            ),
-            mcp_servers=mcp_servers,
-            permission_mode=self.permission_mode,
-            sandbox=self.sandbox,
-            task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
-        )
-
-    def _prepare_pi_bridge(self, mcp: McpServerSpec) -> dict[str, str]:
-        """Install the bridge into this agent's Pi home and address it.
-
-        The nonce is minted per spec build; the Driver clears the ready file
-        before each spawn, so a restart cannot inherit the previous run's
-        attestation.
-        """
-        pi_home = agent_dir(self.agent_id) / ".pi" / "agent"
-        install_pi_tool_bridge(pi_home)
-        controlled = {"PI_CODING_AGENT_DIR": str(pi_home)}
-        controlled.update(
-            build_bridge_environment(
-                mcp=mcp,
-                ready_file=ready_file_path(pi_home),
-                nonce=mint_bridge_nonce(),
-            )
-        )
-        return controlled
+        return mcp_servers
 
     def _build_puffo_core_env(self) -> dict[str, str] | None:
         pc = self.agent_cfg.puffo_core

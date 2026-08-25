@@ -48,6 +48,7 @@ from puffo_agent.agent.harness.pi_protocol import (
 )
 
 from .fixtures.pi_rpc_0_84_3 import (
+    COMMANDS,
     DECLARED_CAPABILITIES,
     EVENTS,
     EXTENSION_UI_REQUESTS,
@@ -243,6 +244,11 @@ def test_capabilities_match_the_pinned_protocol_surface():
     assert PI_CAPABILITIES.permission_bridge is DECLARED_CAPABILITIES[
         "permission_bridge"
     ]
+    assert "steer" in COMMANDS
+    assert "abort" in COMMANDS
+    assert "get_session_stats" in COMMANDS
+    assert "compact" in COMMANDS
+    assert "switch_session" in COMMANDS
 
 
 def test_launch_command_never_disables_session_persistence():
@@ -721,13 +727,11 @@ async def test_compact_requires_an_idle_session():
 # -- tool-bridge admission ---------------------------------------------------
 
 
-def test_pi_is_not_selectable_without_a_bridge():
-    """Selection stays closed while Pi has no shipped Puffo tool bridge.
+def test_pi_is_not_selectable_until_production_admission_is_opened():
+    """The Driver and bridge exist, but live admission is a separate change.
 
-    PiDriver is complete and exercised above, but a Pi agent cannot call
-    ``send_message`` yet. Wiring "pi" into ``build_driver`` would admit a
-    runtime that looks healthy and cannot answer anyone, so that edit must be
-    deliberate enough to change this test.
+    Wiring "pi" into ``build_driver`` must be accompanied by live lifecycle
+    and Puffo tool-call integration tests, not happen as incidental cleanup.
     """
     assert isinstance(build_driver("pi"), UnsupportedDriver)
 

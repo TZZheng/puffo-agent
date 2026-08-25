@@ -51,6 +51,24 @@ EXTENSION_UI_FIRE_AND_FORGET_METHODS = frozenset({
 # Terminal event for a Puffo turn. Exactly one, deliberately.
 TERMINAL_EVENT = "agent_settled"
 
+# Enumerable production dispatch surface. The normalizer admits only these
+# event names, and every admitted name must reach an explicit branch below.
+# Tests compare these keys with the independently pinned upstream fixture.
+PI_EVENT_DISPATCH_KEYS = frozenset({
+    "agent_start", "agent_end", "agent_settled",
+    "turn_start", "turn_end",
+    "message_start", "message_update", "message_end",
+    "tool_execution_start", "tool_execution_update", "tool_execution_end",
+    "bash_execution_update",
+    "queue_update",
+    "compaction_start", "compaction_end",
+    "auto_retry_start", "auto_retry_end",
+    "summarization_retry_scheduled",
+    "summarization_retry_attempt_start",
+    "summarization_retry_finished",
+    "extension_error",
+})
+
 
 def build_pi_launch_command(spec: RuntimeSpec) -> tuple[str, ...]:
     """Build the persistent ``pi --mode rpc`` child command.
@@ -100,6 +118,20 @@ def normalize_pi_event(
                 {"record_type": record_type, **data},
             ),
         )
+
+    def unknown_event() -> tuple[HarnessEvent, ...]:
+        return (
+            event(
+                HarnessEventType.RUNTIME_WARNING,
+                {
+                    "code": "unknown_pi_event",
+                    "record_type": type_ or "unknown",
+                },
+            ),
+        )
+
+    if type_ not in PI_EVENT_DISPATCH_KEYS:
+        return unknown_event()
 
     # --- agent run lifecycle -------------------------------------------------
     if type_ == "agent_start":
@@ -259,12 +291,10 @@ def normalize_pi_event(
             ),
         )
 
-    # An undocumented frame is a protocol change we have not read. Report it.
-    return (
-        event(
-            HarnessEventType.RUNTIME_WARNING,
-            {"code": "unknown_pi_event", "record_type": type_ or "unknown"},
-        ),
+    # A dispatch key without a branch is a production programming error. It is
+    # deliberately distinct from an upstream protocol event we do not know.
+    raise AssertionError(
+        f"Pi event {type_!r} is admitted but has no normalization branch"
     )
 
 

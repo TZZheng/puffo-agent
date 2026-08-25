@@ -1,6 +1,7 @@
 """Protocol Drivers used by host-local and Docker Puffo runtimes."""
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 from .driver import (
@@ -22,6 +23,15 @@ from .pi_driver import (
     verify_pi_tool_bridge,
 )
 
+_DRIVER_FACTORIES: dict[str, Callable[..., Driver]] = {
+    "acp": AcpDriver,
+    "claude-code": ClaudeCodeCliDriver,
+    "codex": CodexAppServerDriver,
+    "opencode": OpenCodeDriver,
+}
+SUPPORTED_LOCAL_DRIVERS = frozenset(_DRIVER_FACTORIES)
+
+
 @dataclass(frozen=True)
 class UnsupportedDriver:
     harness: str
@@ -33,17 +43,14 @@ def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
 
     Process placement is supplied separately through ``process_factory``.
     """
-    if name == "codex":
-        return CodexAppServerDriver(**kwargs)
-    if name == "opencode":
-        return OpenCodeDriver(**kwargs)
-    if name == "acp":
-        return AcpDriver(**kwargs)
-    # "pi" is deliberately absent: PiDriver is complete and tested offline, but
-    # Pi has no Puffo tool bridge yet, so selecting it would admit a runtime
-    # that cannot send a message. See test_pi_is_not_selectable_without_a_bridge.
-    if not name or name == "claude-code":
-        return ClaudeCodeCliDriver(**kwargs)
+    normalized_name = name or "claude-code"
+    factory = _DRIVER_FACTORIES.get(normalized_name)
+    if factory is not None:
+        return factory(**kwargs)
+    # "pi" is deliberately absent. Its Driver and Puffo tool bridge are
+    # implemented, but production admission was explicitly left out of this
+    # integration batch. Enabling it requires live lifecycle/tool-call tests,
+    # not an incidental factory edit.
     return UnsupportedDriver(name)
 
 
@@ -55,6 +62,7 @@ __all__ = [
     "PermissionRef",
     "UnsupportedCapability",
     "UnsupportedDriver",
+    "SUPPORTED_LOCAL_DRIVERS",
     "CodexAppServerDriver",
     "CodexDriver",
     "ClaudeCodeCliDriver",
