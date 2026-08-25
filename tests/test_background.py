@@ -36,10 +36,13 @@ def test_detach_kwargs_posix(monkeypatch):
 
 
 def test_detach_kwargs_windows(monkeypatch):
+    """Closing a Windows terminal must not terminate its background daemon."""
     monkeypatch.setattr(bg.os, "name", "nt")
     kwargs = bg.detach_kwargs(log_handle="LOG")
     assert kwargs["creationflags"] == (
-        bg._DETACHED_PROCESS | bg._CREATE_NEW_PROCESS_GROUP
+        bg._DETACHED_PROCESS
+        | bg._CREATE_NEW_PROCESS_GROUP
+        | bg._CREATE_BREAKAWAY_FROM_JOB
     )
     assert "start_new_session" not in kwargs
 

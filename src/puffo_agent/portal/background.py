@@ -30,6 +30,7 @@ from .state import (
 # POSIX, where ``subprocess`` doesn't define them).
 _DETACHED_PROCESS = 0x00000008
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 _GUI_EXTRA_HINT = (
     "puffo-agent start --background requires the desktop [gui] extra "
     "(PySide6). install it with: pip install 'puffo-agent[gui]' or "
@@ -57,7 +58,16 @@ def detach_kwargs(log_handle) -> dict:
         "stderr": log_handle,
     }
     if os.name == "nt":
-        kwargs["creationflags"] = _DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP
+        # DETACHED_PROCESS severs the console connection, but Windows children
+        # still inherit their parent's Job object by default.  Terminal hosts
+        # and managed launchers may configure that job to terminate its whole
+        # process tree when the window closes.  Break away as well so
+        # ``--background`` has the same lifetime contract as POSIX setsid().
+        kwargs["creationflags"] = (
+            _DETACHED_PROCESS
+            | _CREATE_NEW_PROCESS_GROUP
+            | _CREATE_BREAKAWAY_FROM_JOB
+        )
     else:
         kwargs["start_new_session"] = True
     return kwargs
