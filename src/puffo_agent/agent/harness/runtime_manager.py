@@ -639,6 +639,25 @@ class RuntimeManager:
                     "session.resumed",
                 }:
                     self.driver_name = native.driver or self.driver_name
+                    # A per-turn child can learn its durable provider session
+                    # only from the first accepted output frame.  Persist that
+                    # identity before projecting the session boundary.
+                    capabilities = self.current_capabilities()
+                    lifecycle = (
+                        getattr(
+                            capabilities.lifecycle,
+                            "value",
+                            capabilities.lifecycle,
+                        )
+                        if capabilities is not None
+                        else ""
+                    )
+                    if (
+                        event_type in {"session.opened", "session.resumed"}
+                        and lifecycle == "per_turn_child"
+                        and native.native_session_id
+                    ):
+                        self.native_session_id = native.native_session_id
                     await self._publish_event(replace(
                         native,
                         session_ref=self.session_ref,
