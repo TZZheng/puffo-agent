@@ -8,7 +8,11 @@ from puffo_agent.agent.harness.driver import (
     CompactCapability,
     ContextStatusCapability,
     DriverCapabilities,
+    ProtocolDiagnostics,
+    RuntimeOpened,
+    RuntimeRef,
     RuntimeLifecycle,
+    SessionRef,
     SteerCapability,
 )
 from puffo_agent.agent.harness.runtime_manager import RuntimeManagerAdapter
@@ -38,6 +42,21 @@ def test_shipped_driver_lifecycles_are_the_expected_values():
     gated = claude_capabilities(message_lifecycle_v1=True)
     assert gated.lifecycle == RuntimeLifecycle.PERSISTENT_CHILD
     assert gated.busy_delivery == BusyDelivery.STEER
+
+
+def test_runtime_opened_diagnostics_include_admission_contract():
+    opened = RuntimeOpened(
+        RuntimeRef("runtime"),
+        SessionRef("session"),
+        "native-session",
+        False,
+        CODEX_CAPABILITIES,
+        ProtocolDiagnostics(native_capabilities=("thread/resume",)),
+    )
+
+    assert opened.diagnostics.native_capabilities == ("thread/resume",)
+    assert opened.diagnostics.runtime_lifecycle == "persistent_child"
+    assert opened.diagnostics.busy_delivery == "steer"
 
 
 def test_busy_delivery_agrees_with_steer_for_current_shipped_drivers_only():

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -125,6 +125,8 @@ class ProtocolDiagnostics:
     executable_version: str = ""
     schema_source: str = "pinned"
     native_capabilities: tuple[str, ...] = ()
+    runtime_lifecycle: str = ""
+    busy_delivery: str = ""
     warnings: tuple[str, ...] = ()
 
 
@@ -165,6 +167,35 @@ class RuntimeOpened:
     resumed: bool
     capabilities: DriverCapabilities
     diagnostics: ProtocolDiagnostics
+
+    def __post_init__(self) -> None:
+        """Project admission semantics into the diagnostic snapshot.
+
+        Drivers declare these truths once in ``DriverCapabilities``. Keeping
+        the copy here centralized prevents a diagnostic string from drifting
+        away from the control-flow value the Runtime Manager actually reads.
+        """
+        if not isinstance(self.diagnostics, ProtocolDiagnostics):
+            return
+        lifecycle = getattr(
+            self.capabilities.lifecycle,
+            "value",
+            self.capabilities.lifecycle,
+        )
+        busy_delivery = getattr(
+            self.capabilities.busy_delivery,
+            "value",
+            self.capabilities.busy_delivery,
+        )
+        object.__setattr__(
+            self,
+            "diagnostics",
+            replace(
+                self.diagnostics,
+                runtime_lifecycle=str(lifecycle),
+                busy_delivery=str(busy_delivery),
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
