@@ -60,7 +60,7 @@ from ..adapters.base import (
     is_silent,
 )
 from ..adapters.desired_install import run_spawn_install
-from ..cli_bin import resolve_claude_bin, resolve_codex_bin
+from ..cli_bin import resolve_claude_bin, resolve_codex_bin, resolve_opencode_bin
 from ..runtime_event_outbox import (
     RuntimeEventOutbox,
     RuntimeEventProjectingSink,
@@ -78,7 +78,12 @@ from .runtime_manager import RuntimeManager, RuntimeManagerAdapter
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_LOCAL_DRIVERS = frozenset({"codex", "claude-code"})
+SUPPORTED_LOCAL_DRIVERS = frozenset({
+    "acp",
+    "claude-code",
+    "codex",
+    "opencode",
+})
 VALID_PERMISSION_MODES = frozenset({"bypassPermissions"})
 VALID_SANDBOX_MODES = frozenset({
     "read-only",
@@ -262,10 +267,12 @@ class LocalRuntimePreparer:
             provider,
             agent_cfg.runtime.harness,
         ).strip()
+        self.provider = provider
         if self.harness_name not in SUPPORTED_LOCAL_DRIVERS:
             raise RuntimeError(
                 f"agent {self.agent_id!r}: runtime.kind='cli-local' supports "
-                "only harness='codex' or harness='claude-code' in the "
+                "only harness='acp', 'claude-code', 'codex', or "
+                "'opencode' in the "
                 "Driver runtime"
             )
         self.workspace_dir = agent_cfg.resolve_workspace_dir()
@@ -329,13 +336,48 @@ class LocalRuntimePreparer:
         await self._install_desired_once()
         if self.harness_name == "codex":
             return self._prepare_codex_spec(system_prompt)
-        return self._prepare_claude_spec(system_prompt)
+        if self.harness_name == "claude-code":
+            return self._prepare_claude_spec(system_prompt)
+        return self._prepare_generic_spec(system_prompt)
 
     def _resolve_model(self) -> str:
         runtime = self.agent_cfg.runtime
         if self.harness_name == "codex":
             return runtime.model or self.daemon_cfg.openai.model or ""
-        return runtime.model or self.daemon_cfg.anthropic.model or ""
+        if self.harness_name == "claude-code":
+            return runtime.model or self.daemon_cfg.anthropic.model or ""
+        provider_cfg = getattr(self.daemon_cfg, self.provider, None)
+        return runtime.model or getattr(provider_cfg, "model", "") or ""
+
+    def _prepare_generic_spec(self, system_prompt: str) -> RuntimeSpec:
+        command = tuple(self.agent_cfg.runtime.harness_command)
+        if command:
+            executable, *launch_args = command
+        elif self.harness_name == "opencode":
+            executable = resolve_opencode_bin() or ""
+            launch_args = []
+            if not executable:
+                raise RuntimeError(
+                    "opencode binary not found. Install OpenCode or set "
+                    "PUFFO_OPENCODE_BIN=/absolute/path/to/opencode."
+                )
+        else:
+            raise RuntimeError(
+                f"agent {self.agent_id!r}: harness='acp' requires "
+                "runtime.harness_command, for example "
+                "['opencode', 'acp']"
+            )
+        return RuntimeSpec(
+            workspace_dir=str(self.workspace_dir),
+            model=self.model,
+            system_prompt=system_prompt,
+            executable=executable,
+            launch_args=tuple(launch_args),
+            environment=dict(self.agent_cfg.env_overrides),
+            permission_mode=self.permission_mode,
+            sandbox=self.sandbox,
+            task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
+        )
 
     def _build_puffo_core_env(self) -> dict[str, str] | None:
         pc = self.agent_cfg.puffo_core

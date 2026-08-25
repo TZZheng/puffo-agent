@@ -56,12 +56,16 @@ HARNESS_CLAUDE_CODE = "claude-code"
 HARNESS_HERMES      = "hermes"
 HARNESS_GEMINI_CLI  = "gemini-cli"
 HARNESS_CODEX       = "codex"
+HARNESS_OPENCODE    = "opencode"
+HARNESS_ACP         = "acp"
 
 VALID_HARNESSES: frozenset[str] = frozenset({
     HARNESS_CLAUDE_CODE,
     HARNESS_HERMES,
     HARNESS_GEMINI_CLI,
     HARNESS_CODEX,
+    HARNESS_OPENCODE,
+    HARNESS_ACP,
 })
 
 
@@ -77,6 +81,8 @@ HARNESS_PROVIDERS: dict[str, frozenset[str]] = {
     HARNESS_HERMES:      frozenset({PROVIDER_ANTHROPIC, PROVIDER_OPENAI}),
     HARNESS_GEMINI_CLI:  frozenset({PROVIDER_GOOGLE}),
     HARNESS_CODEX:       frozenset({PROVIDER_OPENAI}),
+    HARNESS_OPENCODE:    VALID_PROVIDERS,
+    HARNESS_ACP:         VALID_PROVIDERS,
 }
 
 
@@ -194,10 +200,13 @@ def validate_triple(
     if runtime == RUNTIME_CLI_LOCAL and harness not in {
         HARNESS_CLAUDE_CODE,
         HARNESS_CODEX,
+        HARNESS_OPENCODE,
+        HARNESS_ACP,
     }:
         return ValidationResult(False, (
             f"runtime {RUNTIME_CLI_LOCAL!r} supports only "
-            f"{HARNESS_CLAUDE_CODE!r} and {HARNESS_CODEX!r}; "
+            f"{HARNESS_CLAUDE_CODE!r}, {HARNESS_CODEX!r}, "
+            f"{HARNESS_OPENCODE!r}, and {HARNESS_ACP!r}; "
             f"harness {harness!r} is not implemented by the Driver runtime"
         ))
 

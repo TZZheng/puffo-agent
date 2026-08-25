@@ -12,6 +12,8 @@ from puffo_agent.portal.runtime_matrix import (
     HARNESS_CODEX,
     HARNESS_GEMINI_CLI,
     HARNESS_HERMES,
+    HARNESS_ACP,
+    HARNESS_OPENCODE,
     HARNESS_PROVIDERS,
     PROVIDER_ANTHROPIC,
     PROVIDER_GOOGLE,
@@ -71,6 +73,8 @@ def test_supported_runtime_surface_is_explicit():
     (RUNTIME_CLI_LOCAL, PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE),
     (RUNTIME_CLI_LOCAL, PROVIDER_OPENAI, HARNESS_CODEX),
     (RUNTIME_CLI_LOCAL, PROVIDER_OPENAI, ""),
+    (RUNTIME_CLI_LOCAL, PROVIDER_GOOGLE, HARNESS_ACP),
+    (RUNTIME_CLI_LOCAL, PROVIDER_ANTHROPIC, HARNESS_OPENCODE),
     (RUNTIME_CLI_DOCKER, PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE),
     (RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, HARNESS_CODEX),
     (RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, ""),
@@ -94,6 +98,7 @@ def test_validate_triple_accepts_supported_combinations(
     # explicitly, and via the provider-resolved default harness.
     (RUNTIME_CLI_DOCKER, PROVIDER_ANTHROPIC, HARNESS_HERMES, "design-only"),
     (RUNTIME_CLI_DOCKER, PROVIDER_GOOGLE, HARNESS_GEMINI_CLI, "design-only"),
+    (RUNTIME_CLI_DOCKER, PROVIDER_OPENAI, HARNESS_ACP, "design-only"),
     (RUNTIME_CLI_SANDBOX, PROVIDER_ANTHROPIC, HARNESS_CLAUDE_CODE, "reserved"),
 ])
 def test_validate_triple_rejects_unsupported_combinations(

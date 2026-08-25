@@ -79,6 +79,15 @@ def resolve_hermes_bin() -> str | None:
     return _resolve("hermes", "PUFFO_HERMES_BIN", _hermes_bundle_paths())
 
 
+def resolve_opencode_bin() -> str | None:
+    """Return the absolute path of the ``opencode`` binary, or ``None``.
+
+    ``PUFFO_OPENCODE_BIN`` is an expert deployment override for daemons whose
+    inherited PATH predates the OpenCode installation.
+    """
+    return _resolve("opencode", "PUFFO_OPENCODE_BIN", [])
+
+
 def _resolve(name: str, env_var: str, bundle_paths: list[Path]) -> str | None:
     # 1. Explicit operator override — always wins, read live.
     env_override = os.environ.get(env_var)

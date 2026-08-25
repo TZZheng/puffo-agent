@@ -177,6 +177,51 @@ async def test_durable_session_resumes_across_prompt_refresh(
     assert refreshed.native_session_id == "native-old"
 
 
+@pytest.mark.asyncio
+async def test_generic_acp_command_projects_to_runtime_spec(puffo_home):
+    config = AgentConfig(
+        id="generic-acp",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="google",
+            harness="acp",
+            harness_command=["/opt/bin/gemini", "--experimental-acp"],
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(system_prompt="managed prompt")
+
+    assert prepared.harness_name == "acp"
+    assert prepared.spec.executable == "/opt/bin/gemini"
+    assert prepared.spec.launch_args == ("--experimental-acp",)
+
+
+@pytest.mark.asyncio
+async def test_opencode_uses_shared_binary_resolver(puffo_home, monkeypatch):
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(
+        local_runtime, "resolve_opencode_bin", lambda: "/opt/bin/opencode"
+    )
+    config = AgentConfig(
+        id="opencode-agent",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="anthropic",
+            harness="opencode",
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(system_prompt="managed prompt")
+
+    assert prepared.harness_name == "opencode"
+    assert prepared.spec.executable == "/opt/bin/opencode"
+
+
 class _ResumeFallbackDriver(Driver):
     def __init__(self):
         self.open_calls: list[str | None] = []

@@ -30,3 +30,27 @@ def test_create_cli_docker_anthropic_uses_claude(tmp_path, monkeypatch):
     cfg = AgentConfig.load("docker-claude")
     assert cfg.runtime.provider == "anthropic"
     assert cfg.runtime.harness == "claude-code"
+
+
+def test_create_generic_acp_persists_literal_command_argv(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+
+    rc = main([
+        "agent", "create", "--id", "acp-agent",
+        "--provider", "google", "--harness", "acp",
+        "--harness-command", "opencode", "acp",
+    ])
+
+    assert rc == 0
+    cfg = AgentConfig.load("acp-agent")
+    assert cfg.runtime.harness == "acp"
+    assert cfg.runtime.harness_command == ["opencode", "acp"]
+
+
+def test_create_generic_acp_requires_command(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+
+    rc = main(["agent", "create", "--id", "bad-acp", "--harness", "acp"])
+
+    assert rc == 2
+    assert "requires --harness-command" in capsys.readouterr().err
