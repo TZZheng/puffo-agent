@@ -323,6 +323,55 @@ async def test_native_resume_keeps_session_on_transient_error():
     assert manager.native_session_id == "native-old"
 
 
+@pytest.mark.asyncio
+async def test_native_resume_falls_back_on_invalid_resume_error_code():
+    # laundered text: error_code alone must trigger the fallback
+    driver = _ResumeBoundaryDriver(
+        AgentAPIError(
+            "The provider could not complete the turn.",
+            is_auth=False,
+            error_code="invalid_resume",
+        )
+    )
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+
+    opened = await manager.open()
+
+    assert driver.resume_values == [SessionRef("native-old"), None]
+    assert opened.session_ref == SessionRef("logical-session")
+    assert manager.native_session_id == "native-session-1"
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_turn_start_preserves_the_native_session():
+    driver = _FailingStartDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+    )
+
+    with pytest.raises(RuntimeError, match="provider refused the turn"):
+        await asyncio.wait_for(
+            RuntimeManagerAdapter(manager).run_turn(_context()), timeout=1
+        )
+
+    # retired but session kept; next open resumes the same thread
+    assert manager.opened is None
+    assert manager.native_session_id == "native-session-1"
+
+    await manager.open()
+    assert driver.open_calls == 2
+    assert manager.native_session_id == "native-session-1"
+    await manager.close()
+
+
 def _context():
     return SimpleNamespace(
         messages=[{"role": "user", "content": "current notice"}],
@@ -644,8 +693,15 @@ async def test_known_provider_failures_share_recovery_semantics(
 
 
 @pytest.mark.asyncio
-async def test_retry_payload_depends_on_whether_native_session_survived():
-    manager = SimpleNamespace(native_session_id="preserved-session")
+async def test_retry_payload_depends_on_input_admission():
+    async def open_():
+        return None
+
+    manager = SimpleNamespace(
+        native_session_id="preserved-session",
+        input_admitted=True,
+        open=open_,
+    )
     adapter = RuntimeManagerAdapter(manager)
     received: list[str] = []
 
@@ -657,10 +713,248 @@ async def test_retry_payload_depends_on_whether_native_session_survived():
     context = TurnContext(system_prompt="system", messages=[])
 
     await adapter.run_retry_turn("continue", "full durable input", context)
+    # survived but not admitted -> durable replay
+    manager.input_admitted = False
+    await adapter.run_retry_turn("continue", "full durable input", context)
+    # no session -> durable replay
     manager.native_session_id = ""
+    manager.input_admitted = True
     await adapter.run_retry_turn("continue", "full durable input", context)
 
-    assert received == ["continue", "full durable input"]
+    assert received == [
+        "continue",
+        "full durable input",
+        "full durable input",
+    ]
+
+
+class _FailFirstStartDriver(_ControllableDriver):
+    def __init__(self) -> None:
+        super().__init__()
+        self.inputs: list[str] = []
+
+    async def start_turn(self, input):
+        if self.start_calls == 0:
+            self.start_calls += 1
+            raise RuntimeError("provider refused the turn")
+        self.inputs.append(input.content)
+        return await super().start_turn(input)
+
+
+@pytest.mark.asyncio
+async def test_failed_start_retry_replays_the_durable_payload():
+    driver = _FailFirstStartDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+    )
+    adapter = RuntimeManagerAdapter(manager)
+
+    with pytest.raises(RuntimeError, match="provider refused the turn"):
+        await asyncio.wait_for(adapter.run_turn(_context()), timeout=1)
+    # session survives, admission cleared
+    assert manager.native_session_id == "native-session-1"
+    assert manager.input_admitted is False
+
+    retry_ctx = TurnContext(
+        system_prompt="system",
+        messages=[{"role": "user", "content": "current notice"}],
+    )
+    running = asyncio.create_task(
+        adapter.run_retry_turn("continue processing", "full durable input", retry_ctx)
+    )
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await _complete_active_turn(manager, driver)
+    await asyncio.wait_for(running, timeout=1)
+
+    assert driver.inputs == ["full durable input"]
+    assert manager.input_admitted is True
+    await manager.close()
+
+
+class _ResumeBoundaryTurnDriver(_ResumeBoundaryDriver):
+    def __init__(self, resume_error: Exception) -> None:
+        super().__init__(resume_error)
+        self.inputs: list[str] = []
+
+    async def start_turn(self, input):
+        self.inputs.append(input.content)
+        return await super().start_turn(input)
+
+
+@pytest.mark.asyncio
+async def test_retry_kick_is_reconsidered_after_a_fresh_session_fallback():
+    # dead session: fresh fallback happens before the payload choice
+    driver = _ResumeBoundaryTurnDriver(
+        AgentAPIError(
+            "The provider could not complete the turn.",
+            is_auth=False,
+            error_code="invalid_resume",
+        )
+    )
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+        driver_name="codex",
+    )
+    manager._input_admitted = True
+    adapter = RuntimeManagerAdapter(manager)
+
+    retry_ctx = TurnContext(
+        system_prompt="system",
+        messages=[{"role": "user", "content": "current notice"}],
+    )
+    running = asyncio.create_task(
+        adapter.run_retry_turn("continue processing", "full durable input", retry_ctx)
+    )
+    await asyncio.wait_for(driver.started.wait(), timeout=1)
+    await _complete_active_turn(manager, driver)
+    await asyncio.wait_for(running, timeout=1)
+
+    assert driver.resume_values == [SessionRef("native-old"), None]
+    assert driver.inputs == ["full durable input"]
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_unclassified_resume_failures_fall_back_after_a_bounded_streak():
+    # unknown wording must not wedge forever
+    driver = _ResumeBoundaryDriver(RuntimeError("Codex rollout missing"))
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="rollout missing"):
+            await manager.open()
+        assert manager.native_session_id == "native-old"
+
+    opened = await manager.open()
+    assert opened.session_ref == SessionRef("logical-session")
+    assert manager.native_session_id == "native-session-1"
+    assert driver.resume_values == [
+        SessionRef("native-old"),
+        SessionRef("native-old"),
+        SessionRef("native-old"),
+        None,
+    ]
+    await manager.close()
+
+
+class _ResumeErrorSequenceDriver(_ControllableDriver):
+    def __init__(self, errors: list[Exception]) -> None:
+        super().__init__()
+        self.errors = list(errors)
+        self.resume_values: list[SessionRef | None] = []
+
+    async def open(self, spec, resume=None):
+        self.resume_values.append(resume)
+        if resume is not None and self.errors:
+            raise self.errors.pop(0)
+        return await super().open(spec, resume)
+
+
+@pytest.mark.asyncio
+async def test_untagged_agent_api_errors_never_lose_the_session():
+    # untagged AgentAPIError: recoverable, never feeds the streak
+    driver = _ResumeBoundaryDriver(AgentAPIError("temporary transport failure"))
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+
+    for _ in range(5):
+        with pytest.raises(AgentAPIError, match="temporary transport failure"):
+            await manager.open()
+    assert manager.native_session_id == "native-old"
+    assert all(v == SessionRef("native-old") for v in driver.resume_values)
+
+
+@pytest.mark.asyncio
+async def test_transient_resume_failures_reset_the_unclassified_streak():
+    # transient resets the streak: fallback on the 6th attempt, not the 4th
+    driver = _ResumeErrorSequenceDriver([
+        RuntimeError("weird wording one"),
+        RuntimeError("weird wording two"),
+        AgentAPIError("rate limited", error_code="rate_limit"),
+        RuntimeError("weird wording three"),
+        RuntimeError("weird wording four"),
+        RuntimeError("weird wording five"),
+    ])
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+
+    for match in (
+        "wording one", "wording two", "rate limited",
+        "wording three", "wording four",
+    ):
+        with pytest.raises(Exception, match=match):
+            await manager.open()
+        assert manager.native_session_id == "native-old"
+
+    opened = await manager.open()
+    assert opened.session_ref == SessionRef("logical-session")
+    assert manager.native_session_id == "native-session-1"
+    assert driver.resume_values[-1] is None
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_categorized_provider_errors_hit_the_bounded_fallback():
+    # provider_error (codex-laundered unknown wording) hits the fallback
+    driver = _ResumeBoundaryDriver(
+        ProviderFailureError(
+            "The provider could not complete the turn.",
+            error_code="provider_error",
+        )
+    )
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+
+    for _ in range(2):
+        with pytest.raises(ProviderFailureError):
+            await manager.open()
+        assert manager.native_session_id == "native-old"
+
+    opened = await manager.open()
+    assert opened.session_ref == SessionRef("logical-session")
+    assert manager.native_session_id == "native-session-1"
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_classified_transient_resume_failures_never_lose_the_session():
+    driver = _ResumeBoundaryDriver(
+        AgentAPIError("rate limited", is_auth=False, error_code="rate_limit")
+    )
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+
+    for _ in range(5):
+        with pytest.raises(AgentAPIError, match="rate limited"):
+            await manager.open()
+    assert manager.native_session_id == "native-old"
+    assert all(v == SessionRef("native-old") for v in driver.resume_values)
 
 
 @pytest.mark.asyncio
@@ -890,7 +1184,8 @@ async def test_unaccepted_receipt_releases_the_event_subscriber():
     assert result.metadata == {"accepted": False}
     assert ambiguous.close_calls == 1
     assert ambiguous_manager.opened is None
-    assert ambiguous_manager.native_session_id == ""
+    # failed start keeps the session
+    assert ambiguous_manager.native_session_id == "native-session-1"
     await ambiguous_manager.close()
 
 
@@ -913,7 +1208,7 @@ async def test_silent_turn_start_is_bounded_by_the_task_timeout():
     assert manager._terminal == {}
     assert driver.close_calls == 1
     assert manager.opened is None
-    assert manager.native_session_id == ""
+    assert manager.native_session_id == "native-session-1"
     driver.release_start.set()
     await manager.close()
 

@@ -57,6 +57,24 @@ def test_jsonrpc_retryable_provider_errors_requeue(error):
     assert exc.error_code in {"rate_limit", "provider_unavailable"}
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "no rollout found for thread id 01a0356d-c424-7d00-0000-000000000000",
+        "Rollout not found for thread abc",
+        "thread not found: 01a0356d",
+    ],
+)
+def test_jsonrpc_missing_rollout_is_classified_as_invalid_resume(message):
+    exc = _classify_jsonrpc_error({"code": -32600, "message": message})
+
+    assert isinstance(exc, AgentAPIError)
+    assert exc.is_auth is False
+    assert exc.error_code == "invalid_resume"
+    # detail preserved for text-marker matching
+    assert message in str(exc)
+
+
 def test_jsonrpc_permission_and_quota_errors_do_not_enter_tight_retry():
     for error in (
         {"code": 403, "message": "permission denied"},

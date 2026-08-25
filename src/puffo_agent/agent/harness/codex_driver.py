@@ -149,6 +149,18 @@ def _jsonrpc_error_status(error: Any) -> int | None:
     return None
 
 
+_INVALID_RESUME_MARKERS = (
+    "no rollout found",
+    "rollout not found",
+    "thread not found",
+)
+
+
+def _is_invalid_resume_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(marker in lowered for marker in _INVALID_RESUME_MARKERS)
+
+
 def _classify_jsonrpc_error(error: Any) -> Exception:
     """Translate a Codex JSON-RPC error into Global Inbox recovery semantics."""
     error_obj = error if isinstance(error, dict) else {}
@@ -156,6 +168,12 @@ def _classify_jsonrpc_error(error: Any) -> Exception:
     message = _safe_jsonrpc_error_message(error_obj.get("message", error))
     detail = f"Codex JSON-RPC error code={code}: {message}"
     context = _jsonrpc_error_context(error)
+    if _is_invalid_resume_error(message):
+        # Missing rollout: keep detail for the fresh-session fallback.
+        logger.warning(
+            "codex provider request failed (invalid_resume): %s", detail
+        )
+        return AgentAPIError(detail, error_code="invalid_resume")
     error_code = classify_provider_failure(
         status=_jsonrpc_error_status(error),
         diagnostic=context,

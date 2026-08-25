@@ -17,6 +17,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Codex resume recovery.** A resume against a thread with no rollout on disk
+  ("no rollout found") is classified as `invalid_resume` and falls back to a
+  fresh session instead of dying in a blind retry loop; unclassified resume
+  failures fall back after a bounded streak while recoverable provider
+  failures never lose the session; failed turn starts keep the persisted
+  native session id, and retries replay the durable payload unless the
+  input provably reached the transcript. (#290)
 - Background startup now distinguishes slow, stalled, stopped, and exited
   daemons without terminating a live process after a fixed observation window.
 - Detached startup reports success when a concurrently launched child exits
