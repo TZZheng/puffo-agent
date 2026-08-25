@@ -750,8 +750,9 @@ async def test_compact_requires_an_idle_session():
 def test_pi_is_not_selectable_until_production_admission_is_opened():
     """The Driver and bridge exist, but live admission is a separate change.
 
-    Wiring "pi" into ``build_driver`` must be accompanied by live lifecycle
-    and Puffo tool-call integration tests, not happen as incidental cleanup.
+    Wiring "pi" into ``build_driver`` must restore/adapt the local preparer
+    assembly from 980b4d4 and add live lifecycle and Puffo tool-call
+    integration tests, not happen as incidental cleanup.
     """
     assert isinstance(build_driver("pi"), UnsupportedDriver)
 
