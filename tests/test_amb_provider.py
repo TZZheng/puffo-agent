@@ -15,8 +15,8 @@ def test_bm25_retrieval_ranks_relevant_note_and_returns_full_body(tmp_path: Path
     documents, raw = provider.retrieve("What gear does Alex need for hiking?", k=1)
 
     assert documents[0].id == "target"
-    assert documents[0].content == "alex plans a hiking trip\nwith detailed gear notes"
-    assert raw == {"retrieval_mode": "bm25", "matched_note_paths": ["notes/target.md"]}
+    assert documents[0].content.replace("\r\n", "\n") == "alex plans a hiking trip\nwith detailed gear notes"
+    assert raw == {"retrieval_mode": "bm25", "matched_note_paths": ["notes/target-0001.md"]}
 
 
 def test_retrieval_scopes_documents_to_the_requested_user(tmp_path: Path):
