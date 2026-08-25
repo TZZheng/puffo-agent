@@ -848,6 +848,101 @@ async def test_unclassified_resume_failures_fall_back_after_a_bounded_streak():
     await manager.close()
 
 
+class _ResumeErrorSequenceDriver(_ControllableDriver):
+    def __init__(self, errors: list[Exception]) -> None:
+        super().__init__()
+        self.errors = list(errors)
+        self.resume_values: list[SessionRef | None] = []
+
+    async def open(self, spec, resume=None):
+        self.resume_values.append(resume)
+        if resume is not None and self.errors:
+            raise self.errors.pop(0)
+        return await super().open(spec, resume)
+
+
+@pytest.mark.asyncio
+async def test_untagged_agent_api_errors_never_lose_the_session():
+    # AgentAPIError without an error_code is recoverable by contract and
+    # must stay outside the destructive fallback counter, however often
+    # it repeats.
+    driver = _ResumeBoundaryDriver(AgentAPIError("temporary transport failure"))
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+
+    for _ in range(5):
+        with pytest.raises(AgentAPIError, match="temporary transport failure"):
+            await manager.open()
+    assert manager.native_session_id == "native-old"
+    assert all(v == SessionRef("native-old") for v in driver.resume_values)
+
+
+@pytest.mark.asyncio
+async def test_transient_resume_failures_reset_the_unclassified_streak():
+    # 2 unclassified, then a transient, then 3 unclassified: the transient
+    # breaks the streak, so fallback happens on the 6th attempt, not the 4th.
+    driver = _ResumeErrorSequenceDriver([
+        RuntimeError("weird wording one"),
+        RuntimeError("weird wording two"),
+        AgentAPIError("rate limited", error_code="rate_limit"),
+        RuntimeError("weird wording three"),
+        RuntimeError("weird wording four"),
+        RuntimeError("weird wording five"),
+    ])
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+
+    for match in (
+        "wording one", "wording two", "rate limited",
+        "wording three", "wording four",
+    ):
+        with pytest.raises(Exception, match=match):
+            await manager.open()
+        assert manager.native_session_id == "native-old"
+
+    opened = await manager.open()
+    assert opened.session_ref == SessionRef("logical-session")
+    assert manager.native_session_id == "native-session-1"
+    assert driver.resume_values[-1] is None
+    await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_categorized_provider_errors_hit_the_bounded_fallback():
+    # The codex driver launders unknown wordings into ProviderFailureError
+    # (provider_error); that class must still reach the bounded fallback.
+    driver = _ResumeBoundaryDriver(
+        ProviderFailureError(
+            "The provider could not complete the turn.",
+            error_code="provider_error",
+        )
+    )
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        session_ref=SessionRef("logical-session"),
+        native_session_id="native-old",
+    )
+
+    for _ in range(2):
+        with pytest.raises(ProviderFailureError):
+            await manager.open()
+        assert manager.native_session_id == "native-old"
+
+    opened = await manager.open()
+    assert opened.session_ref == SessionRef("logical-session")
+    assert manager.native_session_id == "native-session-1"
+    await manager.close()
+
+
 @pytest.mark.asyncio
 async def test_classified_transient_resume_failures_never_lose_the_session():
     driver = _ResumeBoundaryDriver(

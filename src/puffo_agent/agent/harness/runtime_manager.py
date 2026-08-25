@@ -93,12 +93,18 @@ _TRANSIENT_RESUME_ERROR_CODES = frozenset({
     "quota_exhausted",
 })
 
-# Unclassified resume failures tolerated before assuming the session is gone.
+# Consecutive unclassified resume failures tolerated before assuming the
+# session is gone.
 _RESUME_FAILURE_FALLBACK_AFTER = 3
 
 
 def _resume_error_is_transient(exc: Exception) -> bool:
     if getattr(exc, "is_auth", False):
+        return True
+    # AgentAPIError is recoverable-with-backoff by contract (invalid_resume
+    # is intercepted earlier); only categorized non-retryable failures
+    # (ProviderFailureError) and raw exceptions count toward the streak.
+    if isinstance(exc, AgentAPIError):
         return True
     return getattr(exc, "error_code", None) in _TRANSIENT_RESUME_ERROR_CODES
 
@@ -249,6 +255,8 @@ class RuntimeManager:
                 raise
             if not _native_resume_is_unavailable(exc):
                 if _resume_error_is_transient(exc):
+                    # Consecutive semantics: transients break the streak.
+                    self._resume_failure_streak = 0
                     raise
                 self._resume_failure_streak += 1
                 if self._resume_failure_streak < _RESUME_FAILURE_FALLBACK_AFTER:
