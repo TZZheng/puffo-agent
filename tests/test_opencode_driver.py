@@ -258,3 +258,119 @@ async def test_manager_adopts_session_learned_by_per_turn_child():
     )
     assert terminal.type is HarnessEventType.TURN_COMPLETED
     await manager.close()
+
+
+# -- diagnosability: a failure must say why (PUF harness acceptance) --------
+
+
+@pytest.mark.asyncio
+async def test_bare_model_name_fails_fast_with_the_fix_in_hand():
+    """OpenCode requires '<provider>/<model>'; its own error for a bare name
+    is an opaque UnknownError that a recovery loop retries forever. The
+    format rule is deterministic, so the driver refuses it at open()."""
+    from puffo_agent.agent.errors import ProviderFailureError
+
+    driver = OpenCodeDriver(lambda command, _spec: _TurnProcess())
+
+    with pytest.raises(ProviderFailureError) as excinfo:
+        await driver.open(RuntimeSpec("/workspace", model="deepseek-chat"))
+
+    assert "deepseek-chat" in str(excinfo.value)
+    assert "provider" in str(excinfo.value)
+    assert excinfo.value.error_code == "provider_error"
+
+
+@pytest.mark.asyncio
+async def test_qualified_model_name_is_accepted():
+    driver = OpenCodeDriver(lambda command, _spec: _TurnProcess())
+
+    opened = await driver.open(
+        RuntimeSpec("/workspace", model="deepseek/deepseek-chat")
+    )
+
+    assert opened is not None
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_error_frame_detail_reaches_the_failed_turn():
+    """The error frame's message is the only thing that distinguishes a wrong
+    model from a provider outage; dropping it made both look identical."""
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda command, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+    stream = driver.events()
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    proc.feed({
+        "type": "step_start",
+        "sessionID": "ses_1",
+        "part": {"messageID": "msg_1"},
+    })
+    await asyncio.wait_for(started, timeout=1)
+    proc.feed({
+        "type": "error",
+        "sessionID": "ses_1",
+        "error": {
+            "name": "UnknownError",
+            "data": {"message": "Unexpected server error. ref err_3bf8"},
+        },
+    })
+    proc.exit(1)
+    proc.eof()
+
+    events = await asyncio.wait_for(
+        _collect_through(stream, HarnessEventType.TURN_COMPLETED), timeout=1
+    )
+
+    failed_frame = next(
+        e for e in events if e.type is HarnessEventType.RUNTIME_FAILED
+    )
+    assert "Unexpected server error" in failed_frame.data.get("diagnostic", "")
+    terminal = events[-1]
+    assert terminal.data["outcome"] == "failed"
+    assert "Unexpected server error" in terminal.data.get("diagnostic", "")
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_acceptance_exit_carries_the_stderr_tail():
+    """A child that dies before its first JSON frame explains itself only on
+    stderr ("Error: Session not found"). That text must reach the exception
+    the caller sees, or the operator gets a bare returncode forever."""
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda command, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    await asyncio.sleep(0)
+    proc.stderr.feed_data(b"Error: Session not found\n")
+    proc.exit(1)
+    proc.eof()
+
+    with pytest.raises(RuntimeError, match="Session not found"):
+        await asyncio.wait_for(started, timeout=1)
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_credential_shaped_stderr_is_redacted_before_surfacing():
+    """Surfacing stderr must not become a credential leak: the child may
+    echo the very key whose rejection killed it."""
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda command, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    await asyncio.sleep(0)
+    proc.stderr.feed_data(
+        b"rejected api_key=sk_live_abcdef1234567890 for provider\n"
+    )
+    proc.exit(1)
+    proc.eof()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await asyncio.wait_for(started, timeout=1)
+
+    assert "sk_live_abcdef1234567890" not in str(excinfo.value)
+    assert "[REDACTED]" in str(excinfo.value)
+    await driver.close()
