@@ -21,6 +21,7 @@ from .state import (
     background_log_path,
     is_daemon_alive,
     is_daemon_ready,
+    is_daemon_startup_stalled,
     is_pid_alive,
     read_daemon_pid,
 )
@@ -97,6 +98,13 @@ def _existing_daemon_result() -> int | None:
     if pid is None:
         print("puffo-agent daemon has no readable pid.", file=sys.stderr)
         return 1
+    if is_daemon_startup_stalled(pid):
+        print(
+            f"puffo-agent daemon is alive but stalled during startup (pid={pid}).",
+            file=sys.stderr,
+        )
+        print(f"  logs: {background_log_path()}", file=sys.stderr)
+        return 1
     startup = _observe_pid_startup(pid)
     if startup is DaemonStartupState.READY:
         print(f"puffo-agent daemon already running (pid={pid}).")
@@ -124,6 +132,18 @@ def _spawn_detached(command: list[str], *, tray: bool) -> int:
 
     startup = _observe_background_startup(proc)
     if startup is DaemonStartupState.EXITED:
+        winner_pid = read_daemon_pid()
+        if (
+            proc.poll() == 0
+            and winner_pid is not None
+            and is_pid_alive(winner_pid)
+        ):
+            print(
+                "puffo-agent daemon already running or starting "
+                f"(pid={winner_pid})."
+            )
+            print(f"  logs: {log_path}")
+            return 0
         print(
             "puffo-agent background process exited before becoming ready; "
             "inspect the log for details.",
