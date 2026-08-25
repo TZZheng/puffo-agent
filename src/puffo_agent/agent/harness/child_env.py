@@ -15,13 +15,16 @@ variable nobody has named yet.
 Layering: this constructs what a child *may* see. Which controlled credential
 a runtime then injects stays with that runtime.
 
-INCOMPLETE as of this commit. The result only holds if the caller uses it as
-the child's *complete* environment. Every Driver currently does
+This only holds if the caller uses the result as the child's *complete*
+environment. It briefly did not: the Drivers merged it into ambient with
 ``env = os.environ.copy(); env.update(spec.environment)``, and ``update``
 only overwrites keys the spec contains -- an allowlist sanitises by removal,
-so the stripped key is absent and the ambient value survives. See
-``tests/test_child_env_spawn_boundary.py`` (xfail) for the executable proof.
-Do not cite this module as a credential boundary until that test is green.
+so the stripped key was absent, nothing overwrote the ambient value, and it
+reached the child. Absence carries no instruction to delete.
+
+Every Driver now does ``env = dict(spec.environment)``. If a future driver
+merges instead of replaces, this module stops being a boundary; the AST
+tripwire in ``tests/test_child_env_allowlist.py`` guards that.
 """
 
 from __future__ import annotations
