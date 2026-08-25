@@ -84,6 +84,25 @@ class RuntimeStateError(RuntimeError):
         self.error_code = error_code
 
 
+# Environmental failures: retrying the same native session is correct and
+# these must never trigger session loss, however often they repeat.
+_TRANSIENT_RESUME_ERROR_CODES = frozenset({
+    "authentication",
+    "rate_limit",
+    "provider_unavailable",
+    "quota_exhausted",
+})
+
+# Unclassified resume failures tolerated before assuming the session is gone.
+_RESUME_FAILURE_FALLBACK_AFTER = 3
+
+
+def _resume_error_is_transient(exc: Exception) -> bool:
+    if getattr(exc, "is_auth", False):
+        return True
+    return getattr(exc, "error_code", None) in _TRANSIENT_RESUME_ERROR_CODES
+
+
 def _native_resume_is_unavailable(exc: Exception) -> bool:
     """Whether the provider explicitly rejected the saved native session."""
     if getattr(exc, "error_code", None) == "invalid_resume":
@@ -195,6 +214,11 @@ class RuntimeManager:
         # See _consume_event_locked.
         self._resume_unconfirmed = False
         self._confirmed_native_session_id = ""
+        # True only when the last started turn's input provably reached the
+        # native transcript (accepted start receipt). Retry payload choice
+        # keys off this, never off session-id presence alone.
+        self._input_admitted = False
+        self._resume_failure_streak = 0
 
     async def open(self, *, resume: bool = True) -> RuntimeOpened:
         async with self._command_lock:
@@ -217,11 +241,18 @@ class RuntimeManager:
                 await self.driver.close()
             except Exception:
                 logger.exception("failed to close runtime after open failure")
-            # Network, auth, rate-limit, and process failures retry the same
-            # native session. Only explicit absence/incompatibility permits a
-            # transparent fresh native session.
-            if native_resume is None or not _native_resume_is_unavailable(exc):
+            # Classified transient failures retry the same native session.
+            # Explicit absence/incompatibility falls back fresh at once;
+            # unclassified failures fall back after a bounded streak so an
+            # unknown provider wording cannot wedge the agent forever.
+            if native_resume is None:
                 raise
+            if not _native_resume_is_unavailable(exc):
+                if _resume_error_is_transient(exc):
+                    raise
+                self._resume_failure_streak += 1
+                if self._resume_failure_streak < _RESUME_FAILURE_FALLBACK_AFTER:
+                    raise
             logger.warning(
                 "%s could not resume native session; starting a fresh session",
                 self.driver_name,
@@ -239,6 +270,7 @@ class RuntimeManager:
                     )
                 raise
         self.native_session_id = opened.native_session_id
+        self._resume_failure_streak = 0
         # Preserve the durable Puffo logical reference independently of the
         # native provider session ID.
         self.opened = replace(opened, session_ref=self.session_ref)
@@ -291,11 +323,16 @@ class RuntimeManager:
             self._active_driver_turn_ref = receipt.turn_ref
             self._turn_refs[receipt.turn_ref] = logical
             self.native_turn_id = receipt.native_turn_id
+            self._input_admitted = True
             return replace(receipt, turn_ref=logical)
 
     async def _discard_failed_start_locked(
         self, logical: TurnRef, *, retire: bool
     ) -> None:
+        # The input may or may not have crossed the process boundary:
+        # unknown must read as not-admitted so a retry replays the durable
+        # payload instead of kicking a thread that never got the task.
+        self._input_admitted = False
         self.active_turn_ref = None
         self._active_driver_turn_ref = None
         self.native_turn_id = ""
@@ -979,8 +1016,15 @@ class RuntimeManager:
     def _clear_native_session(self) -> None:
         cleared = self.native_session_id
         self.native_session_id = ""
+        self._input_admitted = False
+        self._resume_failure_streak = 0
         if self._confirmed_native_session_id == cleared:
             self._confirmed_native_session_id = ""
+
+    @property
+    def input_admitted(self) -> bool:
+        """Whether the last started turn's input reached the transcript."""
+        return self._input_admitted
 
     def current_capabilities(self) -> DriverCapabilities | None:
         dynamic = self.driver.current_capabilities()
@@ -1262,12 +1306,15 @@ class RuntimeManagerAdapter(Adapter):
         fallback_user_message: str,
         ctx: TurnContext,
     ) -> TurnResult:
-        # A preserved native session already contains the original input and
-        # only needs a cheap continuation. A retired session needs the exact
-        # durable fallback because its replacement has no prior transcript.
+        # Open first: a dead session may fall back fresh here, clearing
+        # input admission before the payload choice below.
+        await self.manager.open()
+        # Kick only a session whose input provably reached the transcript;
+        # anything else replays the exact durable payload (duplication is
+        # recoverable, silent input loss is not).
         content = (
             kick_text
-            if self.manager.native_session_id
+            if self.manager.native_session_id and self.manager.input_admitted
             else fallback_user_message
         )
         return await self.run_turn(replace(
