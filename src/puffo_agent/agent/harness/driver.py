@@ -131,6 +131,16 @@ class ProtocolDiagnostics:
 
 
 @dataclass(frozen=True, slots=True)
+class McpServerSpec:
+    """Provider-neutral stdio MCP server passed at session creation."""
+
+    name: str
+    command: str
+    args: tuple[str, ...] = ()
+    environment: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeSpec:
     workspace_dir: str
     model: str = ""
@@ -138,6 +148,7 @@ class RuntimeSpec:
     executable: str = ""
     launch_args: tuple[str, ...] = ()
     environment: Mapping[str, str] = field(default_factory=dict)
+    mcp_servers: tuple[McpServerSpec, ...] = ()
     permission_mode: str = "bypassPermissions"
     sandbox: str = "danger-full-access"
     task_timeout_seconds: float = 1800.0

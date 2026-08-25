@@ -18,6 +18,8 @@ from acp.schema import (
     DeniedOutcome,
     FileSystemCapabilities,
     Implementation,
+    EnvVariable,
+    McpServerStdio,
     PermissionOption,
     ReadTextFileResponse,
     ReleaseTerminalResponse,
@@ -42,6 +44,7 @@ from .driver import (
     DriverCapabilities,
     HarnessEvent,
     HarnessEventType,
+    McpServerSpec,
     PermissionDecision,
     PermissionReceipt,
     PermissionRef,
@@ -213,20 +216,21 @@ class AcpDriver(Driver):
         native_caps = initialized.agent_capabilities
         can_load = bool(native_caps and native_caps.load_session)
         self._capabilities = acp_capabilities(session_resume=can_load)
+        mcp_servers = [self._acp_mcp_server(server) for server in spec.mcp_servers]
         if resume is not None:
             if not can_load:
                 raise RuntimeError("ACP agent does not support session/load")
             await self._conn.load_session(
                 cwd=spec.workspace_dir,
                 session_id=str(resume),
-                mcp_servers=[],
+                mcp_servers=mcp_servers,
             )
             native_session_id = str(resume)
             resumed = True
         else:
             session = await self._conn.new_session(
                 cwd=spec.workspace_dir,
-                mcp_servers=[],
+                mcp_servers=mcp_servers,
             )
             native_session_id = session.session_id
             resumed = False
@@ -240,6 +244,7 @@ class AcpDriver(Driver):
             if resumed
             else HarnessEventType.SESSION_OPENED
         )
+
         capability_names = ["cancel", "permission_bridge"]
         if can_load:
             capability_names.append("session/load")
@@ -254,6 +259,18 @@ class AcpDriver(Driver):
                 schema_source="agent-client-protocol==0.10.1/protocol-v1",
                 native_capabilities=tuple(capability_names),
             ),
+        )
+
+    @staticmethod
+    def _acp_mcp_server(server: McpServerSpec) -> McpServerStdio:
+        return McpServerStdio(
+            name=server.name,
+            command=server.command,
+            args=list(server.args),
+            env=[
+                EnvVariable(name=name, value=value)
+                for name, value in sorted(server.environment.items())
+            ],
         )
 
     async def _spawn(self, spec: RuntimeSpec) -> Any:

@@ -23,6 +23,7 @@ from puffo_agent.agent.harness import build_driver
 from puffo_agent.agent.harness.acp_driver import AcpDriver
 from puffo_agent.agent.harness.driver import (
     HarnessEventType,
+    McpServerSpec,
     PermissionDecision,
     PermissionRef,
     RuntimeLifecycle,
@@ -155,6 +156,37 @@ async def test_acp_open_negotiates_v1_and_loads_or_creates_session():
     assert result.resumed is True
     assert resumed_harness.conn.calls[-1][0] == "load_session"
     await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_acp_projects_stdio_mcp_servers_at_session_creation():
+    harness = _Harness()
+    driver = AcpDriver(
+        harness.process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    await driver.open(RuntimeSpec(
+        "/workspace",
+        executable="agent",
+        mcp_servers=(McpServerSpec(
+            name="puffo",
+            command="/opt/python",
+            args=("-m", "puffo_agent.mcp.puffo_core_server"),
+            environment={"PUFFO_CORE_SLUG": "bot-0001"},
+        ),),
+    ))
+
+    call, kwargs = harness.conn.calls[-1]
+    assert call == "new_session"
+    assert len(kwargs["mcp_servers"]) == 1
+    server = kwargs["mcp_servers"][0]
+    assert server.name == "puffo"
+    assert server.command == "/opt/python"
+    assert server.args == ["-m", "puffo_agent.mcp.puffo_core_server"]
+    assert [(item.name, item.value) for item in server.env] == [
+        ("PUFFO_CORE_SLUG", "bot-0001"),
+    ]
+    await driver.close()
 
 
 @pytest.mark.asyncio

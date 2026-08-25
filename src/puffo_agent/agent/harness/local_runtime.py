@@ -72,6 +72,7 @@ from .driver import (
     Driver,
     HarnessEvent,
     HarnessEventType,
+    McpServerSpec,
     RuntimeSpec,
     SessionRef,
 )
@@ -368,6 +369,49 @@ class LocalRuntimePreparer:
                 "runtime.harness_command, for example "
                 "['opencode', 'acp']"
             )
+        controlled: dict[str, str] = {}
+        mcp_servers: tuple[McpServerSpec, ...] = ()
+        is_opencode = Path(executable).name.lower() in {
+            "opencode",
+            "opencode.exe",
+        }
+        opencode_config: dict[str, Any] = {}
+        if is_opencode:
+            instruction_path = (
+                agent_dir(self.agent_id) / "opencode-instructions.md"
+            )
+            instruction_path.parent.mkdir(parents=True, exist_ok=True)
+            instruction_path.write_text(system_prompt, encoding="utf-8")
+            opencode_config["instructions"] = [str(instruction_path)]
+        if self._puffo_core_env:
+            puffo_command = default_python_executable()
+            puffo_args = ("-m", "puffo_agent.mcp.puffo_core_server")
+            mcp_servers = (
+                McpServerSpec(
+                    name="puffo",
+                    command=puffo_command,
+                    args=puffo_args,
+                    environment=self._puffo_core_env,
+                ),
+            )
+            if self.harness_name == "opencode":
+                opencode_config["mcp"] = {
+                    "puffo": {
+                        "type": "local",
+                        "command": [puffo_command, *puffo_args],
+                        "environment": self._puffo_core_env,
+                    }
+                }
+        else:
+            logger.warning(
+                "agent %s: Puffo MCP tools are unavailable because "
+                "puffo_core is incomplete",
+                self.agent_id,
+            )
+        if opencode_config:
+            controlled["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+                opencode_config
+            )
         return RuntimeSpec(
             workspace_dir=str(self.workspace_dir),
             model=self.model,
@@ -376,7 +420,9 @@ class LocalRuntimePreparer:
             launch_args=tuple(launch_args),
             environment=build_child_environment(
                 overrides=self.agent_cfg.env_overrides,
+                controlled=controlled,
             ),
+            mcp_servers=mcp_servers,
             permission_mode=self.permission_mode,
             sandbox=self.sandbox,
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,

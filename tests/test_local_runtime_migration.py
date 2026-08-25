@@ -29,6 +29,7 @@ from puffo_agent.agent.harness.runtime_manager import (
 from puffo_agent.portal.state import (
     AgentConfig,
     DaemonConfig,
+    PuffoCoreConfig,
     RuntimeConfig,
     agent_codex_user_dir,
     agent_home_dir,
@@ -220,6 +221,62 @@ async def test_opencode_uses_shared_binary_resolver(puffo_home, monkeypatch):
 
     assert prepared.harness_name == "opencode"
     assert prepared.spec.executable == "/opt/bin/opencode"
+    inline = json.loads(prepared.spec.environment["OPENCODE_CONFIG_CONTENT"])
+    instruction_path = Path(inline["instructions"][0])
+    assert instruction_path.read_text(encoding="utf-8") == "managed prompt"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "command"),
+    [
+        ("opencode", []),
+        ("acp", ["/opt/bin/opencode", "acp"]),
+    ],
+)
+async def test_generic_runtime_projects_puffo_tools(
+    puffo_home, monkeypatch, harness, command,
+):
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(
+        local_runtime, "resolve_opencode_bin", lambda: "/opt/bin/opencode"
+    )
+    config = AgentConfig(
+        id=f"{harness}-tools",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="anthropic",
+            harness=harness,
+            harness_command=command,
+        ),
+        puffo_core=PuffoCoreConfig(
+            server_url="http://localhost:3000",
+            slug="bot-0001",
+            device_id="dev_1",
+            space_id="sp_test",
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(system_prompt="managed prompt")
+
+    assert len(prepared.spec.mcp_servers) == 1
+    server = prepared.spec.mcp_servers[0]
+    assert server.name == "puffo"
+    assert server.args == ("-m", "puffo_agent.mcp.puffo_core_server")
+    assert server.environment["PUFFO_CORE_SLUG"] == "bot-0001"
+    inline = json.loads(prepared.spec.environment["OPENCODE_CONFIG_CONTENT"])
+    instruction_path = Path(inline["instructions"][0])
+    assert instruction_path.read_text(encoding="utf-8") == "managed prompt"
+    if harness == "opencode":
+        assert inline["mcp"]["puffo"]["command"] == [
+            server.command,
+            *server.args,
+        ]
+    else:
+        assert "mcp" not in inline
 
 
 class _ResumeFallbackDriver(Driver):
