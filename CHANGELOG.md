@@ -6,13 +6,29 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Channel sends follow the channel's format policy.** The channel's
+  `is_encrypted` field alone decides sealed vs signed-plaintext for channel
+  sends; DMs stay encrypted and the agent cannot choose the format. The
+  policy is cached (disk + memory), kept live by `channel_update` frames,
+  and a `CHANNEL_FORMAT_MISMATCH` rejection refreshes the policy once and
+  resends in the channel's current format. (#212)
+
 ### Fixed
 
 - **Codex resume recovery.** A resume against a thread with no rollout on disk
   ("no rollout found") is classified as `invalid_resume` and falls back to a
-  fresh session instead of dying in a blind retry loop, and failed turn starts
-  keep the persisted native session id so restarts resume the same thread
-  instead of creating a new one. (#290)
+  fresh session instead of dying in a blind retry loop; unclassified resume
+  failures fall back after a bounded streak while recoverable provider
+  failures never lose the session; failed turn starts keep the persisted
+  native session id, and retries replay the durable payload unless the
+  input provably reached the transcript. (#290)
+- Background startup now distinguishes slow, stalled, stopped, and exited
+  daemons without terminating a live process after a fixed observation window.
+- Detached startup reports success when a concurrently launched child exits
+  because another daemon won startup, and avoids redundant daemon imports in
+  the parent CLI process.
 
 ## [2.0.0] - 2026-08-23
 

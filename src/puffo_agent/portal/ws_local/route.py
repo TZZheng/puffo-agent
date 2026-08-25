@@ -349,6 +349,7 @@ def _make_owned_runtime(point: AttachPoint, bridge, holder: dict[str, WsLocalSes
         baseline_source=BaselineAdapter(client.store),
         active_turn_source=ActiveBoundaryAdapter(client.store, runtime.active),
         held_recovery_source=runtime.held_recovery_source,
+        channel_policy_source=client,
     )
     runtime.coordinator = coordinator
     runtime.send_delegate = TrackingSendDelegate(coordinator, runtime.attempts, runtime)

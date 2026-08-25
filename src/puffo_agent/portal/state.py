@@ -27,6 +27,7 @@ import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,21 @@ from ..limits import DEFAULT_CATCHUP_STALE_HOURS
 
 
 logger = logging.getLogger(__name__)
+
+
+DAEMON_STARTUP_OBSERVATION_SECONDS = 10.0
+# Slow startup remains non-fatal; this only marks an old unready process
+# as diagnosably stalled when a later command inspects it.
+DAEMON_STARTUP_STALLED_SECONDS = 300.0
+DAEMON_STOP_STALLED_SECONDS = 60.0
+
+
+class DaemonStartupState(Enum):
+    """What a bounded startup observation can prove about a daemon."""
+
+    READY = "ready"
+    STARTING = "starting"
+    EXITED = "exited"
 
 
 # Where daemon.yml, agents/, etc. live.
@@ -1079,6 +1095,21 @@ def write_daemon_pid(pid: int) -> None:
     path.write_text(str(pid), encoding="utf-8")
 
 
+def is_daemon_startup_stalled(
+    pid: int,
+    *,
+    threshold: float = DAEMON_STARTUP_STALLED_SECONDS,
+) -> bool:
+    """Whether the current daemon has stayed alive but unready too long."""
+    if read_daemon_pid() != pid or is_daemon_ready(pid):
+        return False
+    try:
+        started_at = daemon_pid_path().stat().st_mtime
+    except OSError:
+        return False
+    return time.time() - started_at >= threshold
+
+
 def read_daemon_ready_pid() -> int | None:
     path = daemon_ready_path()
     if not path.exists():
@@ -1189,6 +1220,21 @@ def stop_requested_for(pid: int) -> bool:
     request, which targets whichever daemon is running."""
     kind, target_pid = _classify_stop_request()
     return (kind == "pid" and target_pid == pid) or kind == "legacy"
+
+
+def is_daemon_stop_stalled(
+    pid: int,
+    *,
+    threshold: float = DAEMON_STOP_STALLED_SECONDS,
+) -> bool:
+    """Whether an owned stop request has waited too long for process exit."""
+    if not stop_requested_for(pid):
+        return False
+    try:
+        requested_at = stop_request_path().stat().st_mtime
+    except OSError:
+        return False
+    return time.time() - requested_at >= threshold
 
 
 def write_stop_request(pid: int | None = None) -> None:

@@ -38,6 +38,8 @@ from .host_mcp_handler import HostMcpContext
 from .rpc_service import set_rpc_resolver, start_rpc_service, stop_rpc_service
 from .runtime_matrix import RUNTIME_CLI_DOCKER, RUNTIME_CLI_LOCAL
 from .state import (
+    DAEMON_STARTUP_OBSERVATION_SECONDS,
+    DaemonStartupState,
     AgentConfig,
     DaemonConfig,
     agent_dir,
@@ -56,6 +58,7 @@ from .state import (
     home_dir,
     is_daemon_alive,
     is_daemon_ready,
+    is_daemon_startup_stalled,
     is_pid_alive,
     read_daemon_pid,
     refresh_model_flag_path,
@@ -67,6 +70,7 @@ from .state import (
     shared_fs_dir,
     stop_request_path,
     stop_requested_for,
+    write_stop_request,
     write_daemon_pid,
     write_daemon_ready,
 )
@@ -136,6 +140,7 @@ class Daemon:
         self,
         external_stop_requested: threading.Event | None = None,
     ) -> None:
+        startup_started = time.perf_counter()
         logger.info("puffo-agent portal starting; home=%s", home_dir())
         interval = max(0.5, self.daemon_cfg.reconcile_interval_seconds)
         pid = os.getpid()
@@ -147,6 +152,11 @@ class Daemon:
                 self._stop.set()
             else:
                 write_daemon_ready(pid)
+                logger.info(
+                    "startup: control plane ready; elapsed_ms=%d",
+                    int((time.perf_counter() - startup_started) * 1000),
+                )
+                await _prepare_workers_at_startup()
             await self._run_reconcile_loop(
                 pid,
                 interval,
@@ -196,7 +206,6 @@ class Daemon:
         runtime.runtime_tasks.append(
             asyncio.ensure_future(runtime.control_manager.run())
         )
-        _respawn_codex_on_mcp_change_at_startup()
 
     def _stop_was_requested(
         self,
@@ -282,6 +291,13 @@ class Daemon:
 
     def request_stop(self) -> None:
         self._stop.set()
+        pid = os.getpid()
+        if read_daemon_pid() != pid:
+            return
+        try:
+            write_stop_request(pid)
+        except Exception:  # noqa: BLE001 - the in-process event still stops us
+            logger.exception("failed to persist signal stop request")
 
     def _load_agent_cfg_cached(self, agent_id: str) -> AgentConfig:
         """Reuses a cached parse when (mtime_ns, size) is unchanged.
@@ -848,13 +864,26 @@ def _mcp_fingerprint_path() -> Path:
     return home_dir() / "mcp_tool_fingerprint"
 
 
+async def _prepare_workers_at_startup() -> None:
+    """Finish worker prerequisites without blocking control-plane readiness."""
+    started = time.perf_counter()
+    try:
+        await asyncio.to_thread(_respawn_codex_on_mcp_change_at_startup)
+    except Exception:  # noqa: BLE001 - preparation is best-effort
+        logger.exception("startup: worker preparation failed; continuing")
+    logger.info(
+        "startup: worker preparation complete; elapsed_ms=%d",
+        int((time.perf_counter() - started) * 1000),
+    )
+
+
 def _respawn_codex_on_mcp_change_at_startup() -> None:
     """Rotate Codex sessions when their cached MCP surface changed."""
     import json
 
-    from ..mcp.puffo_core_server import mcp_tool_fingerprint
-
     try:
+        from ..mcp.puffo_core_server import mcp_tool_fingerprint
+
         current = mcp_tool_fingerprint()
     except Exception as exc:  # noqa: BLE001 - startup remains best-effort
         logger.warning("startup: mcp fingerprint failed: %s", exc)
@@ -1301,38 +1330,62 @@ def _install_posix_stop_handlers(loop, handle_signal) -> bool:
     return installed
 
 
-async def _wait_for_existing_daemon_ready(pid: int, timeout: float = 10.0) -> bool:
+async def _observe_existing_daemon_startup(
+    pid: int,
+    timeout: float = DAEMON_STARTUP_OBSERVATION_SECONDS,
+) -> DaemonStartupState:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
-    while loop.time() < deadline:
+    while True:
         if is_daemon_ready(pid):
-            return True
+            return DaemonStartupState.READY
         if not is_pid_alive(pid):
-            return False
-        await asyncio.sleep(0.1)
-    return is_daemon_ready(pid)
+            return DaemonStartupState.EXITED
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return DaemonStartupState.STARTING
+        await asyncio.sleep(min(0.1, remaining))
+
+
+async def _existing_daemon_start_result() -> int | None:
+    if not is_daemon_alive():
+        return None
+    pid = read_daemon_pid()
+    if pid is not None and is_daemon_startup_stalled(pid):
+        msg = f"puffo-agent daemon is alive but stalled during startup (pid={pid})"
+        logger.error(msg)
+        print(msg)
+        return 1
+    startup = (
+        await _observe_existing_daemon_startup(pid)
+        if pid is not None
+        else DaemonStartupState.EXITED
+    )
+    if startup is DaemonStartupState.READY:
+        msg = f"puffo-agent daemon already running (pid={pid})"
+        logger.info(msg)
+        print(msg)
+        return 0
+    if startup is DaemonStartupState.STARTING:
+        msg = f"puffo-agent daemon already starting (pid={pid})"
+        logger.info(msg)
+        print(msg)
+        return 0
+    msg = f"puffo-agent daemon exited before becoming ready (pid={pid})"
+    logger.error(msg)
+    print(msg)
+    return 1
 
 
 async def run_daemon(
     external_stop_requested: threading.Event | None = None,
 ) -> int:
-    # Single-daemon enforcement. ``start`` against an already-running
-    # daemon exits 0 (the user wanted a running daemon; one exists) —
-    # exit 1 read as an error in upgrade flows. Enforcement is unchanged:
-    # we never spawn a second daemon. A different running version isn't
-    # discriminated here; ``stop && start`` is the version-swap path.
-    if is_daemon_alive():
-        pid = read_daemon_pid()
-        if pid is not None and await _wait_for_existing_daemon_ready(pid):
-            # print + log: background / tray runners may not surface INFO.
-            msg = f"puffo-agent daemon already running (pid={pid})"
-            logger.info(msg)
-            print(msg)
-            return 0
-        msg = f"puffo-agent daemon failed to become ready (pid={pid})"
-        logger.error(msg)
-        print(msg)
-        return 1
+    # Single-daemon enforcement. ``start`` against an already-running or
+    # recently-started daemon exits 0; a live process that stayed unready
+    # beyond the stall threshold returns 1 with diagnostics. We never spawn
+    # a second daemon. ``stop && start`` remains the version-swap path.
+    if (existing := await _existing_daemon_start_result()) is not None:
+        return existing
 
     home_dir().mkdir(parents=True, exist_ok=True)
     agents_dir().mkdir(parents=True, exist_ok=True)
