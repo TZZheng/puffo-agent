@@ -183,6 +183,42 @@ async def test_format_mismatch_refreshes_and_resends_in_the_other_format():
 
 
 @pytest.mark.asyncio
+async def test_format_mismatch_retry_uploads_attachments_once(tmp_path):
+    policy = _Policy(False, refreshed=True)
+    coordinator, http = await _policy_fixture(policy)
+    coordinator.workspace = str(tmp_path)
+    (tmp_path / "a.txt").write_bytes(b"hello file")
+
+    original_post = http.post
+    state = {"failed": False}
+
+    async def post(path, body=None):
+        if path == CHANNEL_SEND_PATH and not state["failed"]:
+            state["failed"] = True
+            http.calls.append(("POST", path, body))
+            raise HttpError(400, MISMATCH_BODY)
+        return await original_post(path, body)
+
+    http.post = post
+    result = await coordinator.send(
+        SemanticSendRequest(
+            destination="ch_a",
+            caption="see file",
+            attachment_paths=("a.txt",),
+        )
+    )
+    assert result["state"] == "sent"
+    uploads = [
+        c for c in http.calls if c[0] == "POST_BYTES" and c[1] == "/blobs/upload"
+    ]
+    assert len(uploads) == 1
+    # Both attempts reference the same uploaded blob.
+    first, second = _channel_posts(http)
+    assert first[2]["envelope"]["type"] == "plaintext_message_envelope"
+    assert second[2]["envelope"]["type"] == "message_envelope"
+
+
+@pytest.mark.asyncio
 async def test_format_mismatch_with_unchanged_policy_fails_once():
     policy = _Policy(False, refreshed=False)
     coordinator, http = await _policy_fixture(policy)

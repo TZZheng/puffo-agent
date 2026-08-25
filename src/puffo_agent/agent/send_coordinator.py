@@ -933,6 +933,7 @@ class SendCoordinator:
                         dm_peer=None,
                         materialized=boundary.materialized,
                         encrypt=encrypt,
+                        prepared=resolved["prepared_attachments"],
                     )
                 except Exception as exc:
                     return failed_result(str(exc), kind="validation")
@@ -1271,58 +1272,27 @@ class SendCoordinator:
             raise RuntimeError(f"channel {channel_id} has no resolvable members")
         return recipient_slugs
 
-    async def _resolve_route_and_content(
-        self,
-        request: SemanticSendRequest,
-        *,
-        space_id: str | None,
-        channel_id: str | None,
-        dm_peer: str | None,
-        materialized: Sequence[tuple[str, bytes]] | None = None,
-        encrypt: bool = True,
-    ) -> dict[str, Any]:
-        from ..mcp.puffo_core_tools import (
-            _fetch_device_keys,
-            _resolve_outgoing_root,
-        )
-        from ._visibility import resolve_visibility
-
-        destination = request.destination.strip()
+    async def _resolve_send_recipients(
+        self, *, space_id: str | None, channel_id: str | None,
+        dm_peer: str | None, encrypt: bool
+    ) -> tuple[list[str], str]:
         if channel_id is not None:
             # Members feed device wraps + supplementation: encrypted only.
-            recipient_slugs = (
-                await self._channel_recipient_slugs(space_id, channel_id)
-                if encrypt
-                else []
-            )
-            kind = "channel"
-        else:
-            recipient_slugs = [self.slug, dm_peer]
-            kind = "dm"
+            if not encrypt:
+                return [], "channel"
+            slugs = await self._channel_recipient_slugs(space_id, channel_id)
+            return slugs, "channel"
+        return [self.slug, dm_peer], "dm"
 
-        root, root_note = await _resolve_outgoing_root(
-            request.root_id,
-            self.data_client,
-            self_slug=self.slug,
-            channel_id=channel_id,
-            space_id=space_id,
-            dm_peer=dm_peer,
-        )
-        attachments, attachment_note = await self._prepare_attachments(
-            request, materialized
-        )
-        content: Any
-        content_type: str
-        visible_text = request.caption if request.attachment_paths else request.text
-        if request.attachment_paths:
-            content = {
-                "text": request.caption,
-                "attachments": [m.to_dict() for m in attachments],
-            }
-            content_type = ATTACHMENT_CONTENT_TYPE
-        else:
-            content = request.text
-            content_type = "text/plain"
+    async def _resolve_send_devices(
+        self,
+        kind: str,
+        dm_peer: str | None,
+        recipient_slugs: list[str],
+        encrypt: bool,
+    ) -> list[Any]:
+        from ..mcp.puffo_core_tools import _fetch_device_keys
+
         if kind == "dm":
             # Fetch the peer alone: a combined [self, peer] fetch cannot
             # tell "peer unreachable" from "reachable" once the sender's
@@ -1336,14 +1306,66 @@ class SendCoordinator:
             merged: dict[str, Any] = {}
             for device in (*peer_devices, *self_devices):
                 merged.setdefault(device.device_id, device)
-            devices = list(merged.values())
-        elif encrypt:
+            return list(merged.values())
+        if encrypt:
             devices = await _fetch_device_keys(self.http_client, recipient_slugs)
             if not devices:
                 raise RuntimeError("no recipient devices found")
+            return devices
+        # Plaintext channel send: no per-device key wrap.
+        return []
+
+    async def _resolve_route_and_content(
+        self,
+        request: SemanticSendRequest,
+        *,
+        space_id: str | None,
+        channel_id: str | None,
+        dm_peer: str | None,
+        materialized: Sequence[tuple[str, bytes]] | None = None,
+        encrypt: bool = True,
+        prepared: tuple[list[AttachmentMeta], str] | None = None,
+    ) -> dict[str, Any]:
+        from ..mcp.puffo_core_tools import _resolve_outgoing_root
+        from ._visibility import resolve_visibility
+
+        destination = request.destination.strip()
+        recipient_slugs, kind = await self._resolve_send_recipients(
+            space_id=space_id,
+            channel_id=channel_id,
+            dm_peer=dm_peer,
+            encrypt=encrypt,
+        )
+
+        root, root_note = await _resolve_outgoing_root(
+            request.root_id,
+            self.data_client,
+            self_slug=self.slug,
+            channel_id=channel_id,
+            space_id=space_id,
+            dm_peer=dm_peer,
+        )
+        # Format retry reuses the already-uploaded blobs.
+        attachments, attachment_note = (
+            prepared
+            if prepared is not None
+            else await self._prepare_attachments(request, materialized)
+        )
+        content: Any
+        content_type: str
+        visible_text = request.caption if request.attachment_paths else request.text
+        if request.attachment_paths:
+            content = {
+                "text": request.caption,
+                "attachments": [m.to_dict() for m in attachments],
+            }
+            content_type = ATTACHMENT_CONTENT_TYPE
         else:
-            # Plaintext channel send: no per-device key wrap.
-            devices = []
+            content = request.text
+            content_type = "text/plain"
+        devices = await self._resolve_send_devices(
+            kind, dm_peer, recipient_slugs, encrypt
+        )
         visible, visibility_note = await resolve_visibility(
             request.visibility_level,
             destination,
@@ -1375,6 +1397,7 @@ class SendCoordinator:
             "recipient_slugs": recipient_slugs,
             "root_id": root or "",
             "note": f"{visibility_note}{root_note}{attachment_note}",
+            "prepared_attachments": (attachments, attachment_note),
         }
 
     async def _prepare_attachments(
