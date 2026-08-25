@@ -432,8 +432,11 @@ def cmd_check_update(args: argparse.Namespace) -> int:
 def cmd_status(args: argparse.Namespace) -> int:
     pid = read_daemon_pid()
     alive = is_daemon_alive()
-    if alive and pid is not None:
+    ready = alive and pid is not None and is_daemon_ready(pid)
+    if ready:
         print(f"daemon: running (pid={pid})")
+    elif alive and pid is not None:
+        print(f"daemon: starting (pid={pid})")
     elif pid is not None:
         print(f"daemon: not running (stale pid file at {daemon_pid_path()}; pid={pid})")
     else:

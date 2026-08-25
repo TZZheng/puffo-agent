@@ -38,6 +38,8 @@ from .host_mcp_handler import HostMcpContext
 from .rpc_service import set_rpc_resolver, start_rpc_service, stop_rpc_service
 from .runtime_matrix import RUNTIME_CLI_DOCKER, RUNTIME_CLI_LOCAL
 from .state import (
+    DAEMON_STARTUP_OBSERVATION_SECONDS,
+    DaemonStartupState,
     AgentConfig,
     DaemonConfig,
     agent_dir,
@@ -1301,16 +1303,46 @@ def _install_posix_stop_handlers(loop, handle_signal) -> bool:
     return installed
 
 
-async def _wait_for_existing_daemon_ready(pid: int, timeout: float = 10.0) -> bool:
+async def _observe_existing_daemon_startup(
+    pid: int,
+    timeout: float = DAEMON_STARTUP_OBSERVATION_SECONDS,
+) -> DaemonStartupState:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
-    while loop.time() < deadline:
+    while True:
         if is_daemon_ready(pid):
-            return True
+            return DaemonStartupState.READY
         if not is_pid_alive(pid):
-            return False
-        await asyncio.sleep(0.1)
-    return is_daemon_ready(pid)
+            return DaemonStartupState.EXITED
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return DaemonStartupState.STARTING
+        await asyncio.sleep(min(0.1, remaining))
+
+
+async def _existing_daemon_start_result() -> int | None:
+    if not is_daemon_alive():
+        return None
+    pid = read_daemon_pid()
+    startup = (
+        await _observe_existing_daemon_startup(pid)
+        if pid is not None
+        else DaemonStartupState.EXITED
+    )
+    if startup is DaemonStartupState.READY:
+        msg = f"puffo-agent daemon already running (pid={pid})"
+        logger.info(msg)
+        print(msg)
+        return 0
+    if startup is DaemonStartupState.STARTING:
+        msg = f"puffo-agent daemon already starting (pid={pid})"
+        logger.info(msg)
+        print(msg)
+        return 0
+    msg = f"puffo-agent daemon exited before becoming ready (pid={pid})"
+    logger.error(msg)
+    print(msg)
+    return 1
 
 
 async def run_daemon(
@@ -1321,18 +1353,8 @@ async def run_daemon(
     # exit 1 read as an error in upgrade flows. Enforcement is unchanged:
     # we never spawn a second daemon. A different running version isn't
     # discriminated here; ``stop && start`` is the version-swap path.
-    if is_daemon_alive():
-        pid = read_daemon_pid()
-        if pid is not None and await _wait_for_existing_daemon_ready(pid):
-            # print + log: background / tray runners may not surface INFO.
-            msg = f"puffo-agent daemon already running (pid={pid})"
-            logger.info(msg)
-            print(msg)
-            return 0
-        msg = f"puffo-agent daemon failed to become ready (pid={pid})"
-        logger.error(msg)
-        print(msg)
-        return 1
+    if (existing := await _existing_daemon_start_result()) is not None:
+        return existing
 
     home_dir().mkdir(parents=True, exist_ok=True)
     agents_dir().mkdir(parents=True, exist_ok=True)
