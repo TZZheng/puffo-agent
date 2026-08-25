@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import pytest
 
@@ -28,6 +29,10 @@ from puffo_agent.agent.harness.driver import (
     UnsupportedCapability,
 )
 from puffo_agent.agent.harness import UnsupportedDriver, build_driver
+from puffo_agent.agent.harness.pi_bridge import (
+    BRIDGE_NONCE_ENV,
+    BRIDGE_READY_FILE_ENV,
+)
 from puffo_agent.agent.harness.pi_driver import (
     PI_AGENT_DIR_ENV,
     PI_CAPABILITIES,
@@ -53,17 +58,21 @@ SESSION_FILE = "/sessions/abc123.jsonl"
 # Set per test by the autouse fixture below; every spec points at a Pi config
 # directory that contains an installed Puffo tool bridge.
 _AGENT_DIR = ""
+_READY_FILE = ""
+_NONCE = "test-nonce"
 
 
 @pytest.fixture(autouse=True)
 def _installed_tool_bridge(tmp_path):
-    global _AGENT_DIR
+    global _AGENT_DIR, _READY_FILE
     extensions = tmp_path / "extensions"
     extensions.mkdir()
     (extensions / "puffo-tools.ts").write_text("// puffo tool bridge")
     _AGENT_DIR = str(tmp_path)
+    _READY_FILE = str(tmp_path / "puffo-bridge-ready.json")
     yield
     _AGENT_DIR = ""
+    _READY_FILE = ""
 
 
 class FakeStdin:
@@ -157,13 +166,34 @@ def _spec(**overrides) -> RuntimeSpec:
     return RuntimeSpec(
         workspace_dir="/tmp/ws",
         executable="pi",
-        environment={PI_AGENT_DIR_ENV: _AGENT_DIR},
+        environment={
+            PI_AGENT_DIR_ENV: _AGENT_DIR,
+            BRIDGE_READY_FILE_ENV: _READY_FILE,
+            BRIDGE_NONCE_ENV: _NONCE,
+        },
         **overrides,
     )
 
 
+def _attesting_factory(proc: FakePiProcess, *, tools: int = 3):
+    """Stand in for Pi loading the extension, which writes the attestation."""
+
+    def factory(spec):
+        ready = spec.environment.get(BRIDGE_READY_FILE_ENV)
+        if ready and tools:
+            Path(ready).write_text(
+                json.dumps({"nonce": spec.environment[BRIDGE_NONCE_ENV],
+                            "tools": tools})
+            )
+        return proc
+
+    return factory
+
+
 async def _open(proc: FakePiProcess, resume: SessionRef | None = None):
-    driver = PiDriver(process_factory=lambda spec: proc)
+    driver = PiDriver(
+        process_factory=_attesting_factory(proc), bridge_ready_timeout=1.0
+    )
     task = asyncio.create_task(driver.open(_spec(), resume))
     if resume is not None:
         await proc.answer_next()
@@ -382,7 +412,7 @@ async def test_open_reports_the_session_file_as_the_resume_handle():
 async def test_open_without_session_persistence_fails_loudly():
     """A driver declaring session_resume must not quietly resume nothing."""
     proc = FakePiProcess(stats={"sessionId": "abc123"})
-    driver = PiDriver(process_factory=lambda spec: proc)
+    driver = PiDriver(process_factory=_attesting_factory(proc))
     task = asyncio.create_task(driver.open(_spec()))
     await proc.answer_next()
     with pytest.raises(RuntimeError, match="no-session"):
@@ -398,7 +428,7 @@ async def test_extension_vetoed_resume_is_a_failure_not_a_success():
     reporting the requested one as restored.
     """
     proc = FakePiProcess(switch_cancelled=True)
-    driver = PiDriver(process_factory=lambda spec: proc)
+    driver = PiDriver(process_factory=_attesting_factory(proc))
     task = asyncio.create_task(driver.open(_spec(), SessionRef(SESSION_FILE)))
     await proc.answer_next()
     with pytest.raises(Exception) as excinfo:

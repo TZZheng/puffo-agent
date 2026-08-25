@@ -68,6 +68,12 @@ from ..runtime_event_outbox import (
 from ..runtime_events import RuntimeEventProjector, TrustedScope
 from . import UnsupportedDriver, build_driver
 from .child_env import build_child_environment
+from .pi_bridge import (
+    build_bridge_environment,
+    install_pi_tool_bridge,
+    mint_bridge_nonce,
+    ready_file_path,
+)
 from .driver import (
     Driver,
     HarnessEvent,
@@ -363,6 +369,9 @@ class LocalRuntimePreparer:
                     "opencode binary not found. Install OpenCode or set "
                     "PUFFO_OPENCODE_BIN=/absolute/path/to/opencode."
                 )
+        elif self.harness_name == "pi":
+            executable = "pi"
+            launch_args = []
         else:
             raise RuntimeError(
                 f"agent {self.agent_id!r}: harness='acp' requires "
@@ -383,10 +392,32 @@ class LocalRuntimePreparer:
             instruction_path.parent.mkdir(parents=True, exist_ok=True)
             instruction_path.write_text(system_prompt, encoding="utf-8")
             opencode_config["instructions"] = [str(instruction_path)]
+        is_pi = self.harness_name == "pi"
         if self._puffo_core_env:
             puffo_command = default_python_executable()
             puffo_args = ("-m", "puffo_agent.mcp.puffo_core_server")
-            mcp_servers = (
+            if is_pi:
+                # Pi cannot consume an McpServerSpec: it has no MCP client.
+                # The bridge extension is installed into the per-agent Pi home
+                # and told where the server lives; mcp_servers stays empty so
+                # the driver's admission check does not see a projection Pi
+                # would silently drop.
+                #
+                # Scope: the bridge carries the Puffo core server only. Catalog
+                # MCP servers remain genuinely unprojectable for Pi, which is
+                # why its assets profile still reports McpProjection.UNSUPPORTED
+                # -- that describes catalog assets, not this harness-level path.
+                controlled.update(
+                    self._prepare_pi_bridge(
+                        McpServerSpec(
+                            name="puffo",
+                            command=puffo_command,
+                            args=puffo_args,
+                            environment=self._puffo_core_env,
+                        )
+                    )
+                )
+            mcp_servers = () if is_pi else (
                 McpServerSpec(
                     name="puffo",
                     command=puffo_command,
@@ -427,6 +458,25 @@ class LocalRuntimePreparer:
             sandbox=self.sandbox,
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,
         )
+
+    def _prepare_pi_bridge(self, mcp: McpServerSpec) -> dict[str, str]:
+        """Install the bridge into this agent's Pi home and address it.
+
+        The nonce is minted per spec build; the Driver clears the ready file
+        before each spawn, so a restart cannot inherit the previous run's
+        attestation.
+        """
+        pi_home = agent_dir(self.agent_id) / ".pi" / "agent"
+        install_pi_tool_bridge(pi_home)
+        controlled = {"PI_CODING_AGENT_DIR": str(pi_home)}
+        controlled.update(
+            build_bridge_environment(
+                mcp=mcp,
+                ready_file=ready_file_path(pi_home),
+                nonce=mint_bridge_nonce(),
+            )
+        )
+        return controlled
 
     def _build_puffo_core_env(self) -> dict[str, str] | None:
         pc = self.agent_cfg.puffo_core

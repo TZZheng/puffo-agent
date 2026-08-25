@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import uuid
+from pathlib import Path
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -58,6 +59,12 @@ from .driver import (
     TurnRef,
     TurnStarted,
     UnsupportedCapability,
+)
+from .pi_bridge import (
+    BRIDGE_NONCE_ENV,
+    BRIDGE_READY_FILE_ENV,
+    await_bridge_ready,
+    clear_ready_file,
 )
 from .subprocess_io import drain_subprocess_stream
 from .pi_protocol import (
@@ -150,10 +157,12 @@ class PiDriver(Driver):
         *,
         executable_version: str = "",
         request_timeout_seconds: float = 60.0,
+        bridge_ready_timeout: float = 20.0,
     ):
         self.process_factory = process_factory
         self.executable_version = executable_version
         self.request_timeout_seconds = request_timeout_seconds
+        self.bridge_ready_timeout = bridge_ready_timeout
         self._proc: Any = None
         self._reader: asyncio.Task | None = None
         self._stderr_reader: asyncio.Task | None = None
@@ -186,6 +195,13 @@ class PiDriver(Driver):
         if self._closed:
             self._prepare_reopen()
         verify_pi_tool_bridge(spec)
+        ready_file = spec.environment.get(BRIDGE_READY_FILE_ENV)
+        nonce = spec.environment.get(BRIDGE_NONCE_ENV)
+        if ready_file:
+            # Before the child, not after: the nonce lives in the spec and
+            # survives a restart, so last run's file would otherwise attest a
+            # bridge this process never loaded.
+            clear_ready_file(Path(ready_file))
         await self._start_process(spec)
         self._reader = asyncio.create_task(self._read_loop())
         self._stderr_reader = asyncio.create_task(
@@ -207,6 +223,7 @@ class PiDriver(Driver):
         self._native_session_id = native
         self._session_ref = SessionRef(native)
         self._context = _context_from_stats(stats)
+        await self._require_loaded_bridge(ready_file, nonce)
         await self._emit(
             HarnessEventType.SESSION_RESUMED
             if resumed
@@ -233,6 +250,33 @@ class PiDriver(Driver):
                 warnings=("pi_has_no_mcp",),
             ),
         )
+
+    async def _require_loaded_bridge(
+        self, ready_file: str | None, nonce: str | None
+    ) -> None:
+        """Refuse a session whose bridge did not actually load.
+
+        ``verify_pi_tool_bridge`` proves an installer ran. It cannot see an
+        extension that threw on load, was disabled, or belongs to a previous
+        run -- all of which leave the file in place and the agent unable to
+        send a message. Only this spawn's nonce settles that.
+        """
+        if not ready_file or not nonce:
+            await self.close()
+            raise PiToolBridgeUnavailableError(
+                f"{BRIDGE_READY_FILE_ENV}/{BRIDGE_NONCE_ENV} are unset; "
+                "bridge readiness cannot be attested for this spawn"
+            )
+        tools = await await_bridge_ready(
+            Path(ready_file), nonce, timeout_seconds=self.bridge_ready_timeout
+        )
+        if tools is None:
+            await self.close()
+            raise PiToolBridgeUnavailableError(
+                "the Puffo tool bridge did not attest readiness for this "
+                "spawn; the extension is installed but did not load"
+            )
+        logger.info("pi bridge attested %d Puffo tool(s)", tools)
 
     async def _start_process(self, spec: RuntimeSpec) -> None:
         if self.process_factory is None:
