@@ -48,6 +48,15 @@ from .driver import (
     TurnRef,
     TurnStarted,
 )
+from .jsonl_rpc import (
+    RpcFrameTooLarge,
+    RpcRequestTimeout,
+    await_rpc_response,
+    decode_json_object,
+    fail_pending_requests,
+    read_json_line,
+    write_json_line,
+)
 from .subprocess_io import drain_subprocess_stream
 
 CODEX_CAPABILITIES = DriverCapabilities(
@@ -500,7 +509,7 @@ class CodexAppServerDriver(Driver):
             await asyncio.gather(self._stderr_reader, return_exceptions=True)
         self._reader = None
         self._stderr_reader = None
-        self._fail_pending_requests("Codex app-server closed")
+        fail_pending_requests(self._pending, "Codex app-server closed")
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         self._permission_requests.clear()
@@ -523,26 +532,19 @@ class CodexAppServerDriver(Driver):
         self._reset_usage()
         self._context = ContextStatus(stale=True)
 
-    def _fail_pending_requests(self, message: str) -> None:
-        for future in self._pending.values():
-            if not future.done():
-                future.set_exception(RuntimeError(message))
-        self._pending.clear()
-
     async def _request(self, method: str, params: dict[str, Any]) -> Any:
         self._request_id += 1
         request_id = self._request_id
-        future = asyncio.get_running_loop().create_future()
-        self._pending[request_id] = future
         try:
-            # Inside the try: a write that raises must not leak the registered
-            # entry, which `_fail_pending_requests` would later resolve with an
-            # exception no coroutine is left to retrieve.
-            await self._write(
-                {"id": request_id, "method": method, "params": params}
+            return await await_rpc_response(
+                self._pending,
+                request_id,
+                send=self._write(
+                    {"id": request_id, "method": method, "params": params}
+                ),
+                timeout_seconds=self.request_timeout_seconds,
             )
-            return await asyncio.wait_for(future, self.request_timeout_seconds)
-        except asyncio.TimeoutError:
+        except RpcRequestTimeout:
             # Provider silence must surface as a bounded, retryable failure so
             # Global Inbox recovery re-enqueues instead of waiting forever.
             logger.warning(
@@ -557,24 +559,16 @@ class CodexAppServerDriver(Driver):
                 is_auth=False,
                 error_code="provider_unavailable",
             ) from None
-        finally:
-            self._pending.pop(request_id, None)
 
     async def _write(self, frame: dict[str, Any]) -> None:
-        encoded = (
-            json.dumps(frame, separators=(",", ":"), ensure_ascii=False).encode()
-            + b"\n"
-        )
-        async with self._write_lock:
-            self._proc.stdin.write(encoded)
-            await self._proc.stdin.drain()
+        await write_json_line(self._proc.stdin, self._write_lock, frame)
 
     async def _read_loop(self) -> None:
         try:
             while True:
                 try:
-                    line = await self._proc.stdout.readline()
-                except ValueError:
+                    line = await read_json_line(self._proc.stdout)
+                except RpcFrameTooLarge:
                     # A frame beyond the stream limit leaves stdout partially
                     # consumed; the session cannot be resynchronized, so fall
                     # through to the bounded failure path below.
@@ -585,14 +579,14 @@ class CodexAppServerDriver(Driver):
                 if not line:
                     break
                 try:
-                    frame = json.loads(line)
+                    frame = decode_json_object(line)
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     await self._emit(
                         HarnessEventType.RUNTIME_WARNING,
                         data={"code": "protocol_parse"},
                     )
                     continue
-                if not isinstance(frame, dict):
+                except TypeError:
                     await self._emit(
                         HarnessEventType.RUNTIME_WARNING,
                         data={"code": "protocol_frame"},
@@ -611,7 +605,7 @@ class CodexAppServerDriver(Driver):
                         data={"code": "frame_dispatch_failed"},
                     )
         finally:
-            self._fail_pending_requests("Codex app-server exited")
+            fail_pending_requests(self._pending, "Codex app-server exited")
             if not self._closed:
                 await self._emit(
                     HarnessEventType.RUNTIME_EXITED,
