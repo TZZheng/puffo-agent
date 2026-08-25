@@ -44,8 +44,8 @@ async def await_rpc_response(
     future = asyncio.get_running_loop().create_future()
     pending[request_id] = future
     try:
+        await send
         try:
-            await send
             return await asyncio.wait_for(future, timeout_seconds)
         except asyncio.TimeoutError:
             raise RpcRequestTimeout from None

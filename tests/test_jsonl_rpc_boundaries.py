@@ -43,6 +43,11 @@ class _RecordingStdin:
         return None
 
 
+class _TimeoutOnDrainStdin(_RecordingStdin):
+    async def drain(self) -> None:
+        raise TimeoutError("write stalled")
+
+
 class _Proc:
     def __init__(self, stdin) -> None:
         self.stdin = stdin
@@ -112,6 +117,20 @@ async def test_write_failure_is_not_reported_as_provider_unavailable(name, drive
     assert not isinstance(excinfo.value, AgentAPIError), (
         f"{name} converted a local write failure into a provider verdict"
     )
+
+
+@pytest.mark.parametrize("name,driver", _drivers())
+@pytest.mark.asyncio
+async def test_write_timeout_is_not_reported_as_response_timeout(name, driver):
+    driver._proc = _Proc(_TimeoutOnDrainStdin())
+
+    with pytest.raises(TimeoutError, match="write stalled") as excinfo:
+        await driver._request("anything", {})
+
+    assert not isinstance(excinfo.value, AgentAPIError), (
+        f"{name} converted a local write timeout into a provider verdict"
+    )
+    assert driver._pending == {}, f"{name} leaked a pending entry"
 
 
 @pytest.mark.parametrize("name,driver", _drivers())
