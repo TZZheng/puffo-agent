@@ -14,7 +14,6 @@ raised exception are asserted, so neither half can regress silently.
 
 from __future__ import annotations
 
-import asyncio
 
 import pytest
 

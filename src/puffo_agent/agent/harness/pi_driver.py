@@ -55,6 +55,8 @@ from .driver import (
     RuntimeSpec,
     SessionRef,
     SteerCapability,
+    observed_returncode,
+    runtime_exited_data,
     TurnInput,
     TurnRef,
     TurnStarted,
@@ -528,7 +530,7 @@ class PiDriver(Driver):
                 # here too would give the manager a second, spurious exit.
                 await self._emit(
                     HarnessEventType.RUNTIME_EXITED,
-                    data={"returncode": _returncode(proc)},
+                    data=runtime_exited_data(observed_returncode(proc)),
                 )
 
     async def _dispatch_frame(self, frame: dict[str, Any]) -> None:
@@ -713,6 +715,3 @@ def _optional_int(value: Any) -> int | None:
     return max(0, int(value))
 
 
-def _returncode(proc: Any) -> int | None:
-    code = getattr(proc, "returncode", None)
-    return code if isinstance(code, int) else None
