@@ -60,7 +60,12 @@ from ..adapters.base import (
     is_silent,
 )
 from ..adapters.desired_install import run_spawn_install
-from ..cli_bin import resolve_claude_bin, resolve_codex_bin, resolve_opencode_bin
+from ..cli_bin import (
+    resolve_claude_bin,
+    resolve_codex_bin,
+    resolve_opencode_bin,
+    resolve_pi_bin,
+)
 from ..runtime_event_outbox import (
     RuntimeEventOutbox,
     RuntimeEventProjectingSink,
@@ -247,6 +252,26 @@ class PreparedLocalRuntime:
         )
 
 
+def select_native_session(
+    *,
+    harness_name: str,
+    persisted_native_session_id: str,
+    persisted_native_session_harness: str,
+    legacy_native_session_id: str,
+) -> tuple[str, str]:
+    """Resume only native sessions created by the active harness."""
+    if (
+        persisted_native_session_id
+        and persisted_native_session_harness == harness_name
+    ):
+        return persisted_native_session_id, "runtime_event_outbox"
+    if legacy_native_session_id:
+        return legacy_native_session_id, "legacy_session_file"
+    if persisted_native_session_id:
+        return "", "harness_changed"
+    return "", "fresh"
+
+
 class LocalRuntimePreparer:
     """Build refreshable RuntimeSpecs for one local Driver runtime."""
 
@@ -293,19 +318,19 @@ class LocalRuntimePreparer:
         *,
         system_prompt: str,
         persisted_native_session_id: str = "",
+        persisted_native_session_harness: str = "",
     ) -> PreparedLocalRuntime:
         spec = await self.refresh_spec(system_prompt)
         legacy_path = self._legacy_session_path()
         legacy_id = self._load_legacy_session_id(legacy_path)
-        if persisted_native_session_id:
-            native_session_id = persisted_native_session_id
-            source = "runtime_event_outbox"
-        elif legacy_id:
-            native_session_id = legacy_id
-            source = "legacy_session_file"
-        else:
-            native_session_id = ""
-            source = "fresh"
+        native_session_id, source = select_native_session(
+            harness_name=self.harness_name,
+            persisted_native_session_id=persisted_native_session_id,
+            persisted_native_session_harness=(
+                persisted_native_session_harness
+            ),
+            legacy_native_session_id=legacy_id,
+        )
         return PreparedLocalRuntime(
             harness_name=self.harness_name,
             spec=spec,
@@ -376,13 +401,20 @@ class LocalRuntimePreparer:
         command = tuple(self.agent_cfg.runtime.harness_command)
         if command:
             executable, *launch_args = command
-        elif self.harness_name == "opencode":
-            executable = resolve_opencode_bin() or ""
+        elif self.harness_name in {"opencode", "pi"}:
+            resolver = (
+                resolve_opencode_bin
+                if self.harness_name == "opencode"
+                else resolve_pi_bin
+            )
+            executable = resolver() or ""
             launch_args = []
             if not executable:
                 raise RuntimeError(
-                    "opencode binary not found. Install OpenCode or set "
-                    "PUFFO_OPENCODE_BIN=/absolute/path/to/opencode."
+                    f"{self.harness_name} binary not found. Install "
+                    f"{self.harness_name} or set "
+                    f"PUFFO_{self.harness_name.upper()}_BIN=/absolute/path/"
+                    f"to/{self.harness_name}."
                 )
         else:
             raise RuntimeError(
@@ -928,6 +960,7 @@ def build_local_runtime_adapter(
                 active_turn,
                 session_ref=logical_session,
                 native_session_id=manager.native_session_id,
+                native_session_harness=prepared.harness_name,
             )
         except Exception as exc:
             logger.warning(

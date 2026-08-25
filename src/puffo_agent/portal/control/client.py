@@ -479,6 +479,8 @@ def build_capabilities() -> dict:
         codex_has_credentials,
         resolve_claude_bin,
         resolve_codex_bin,
+        resolve_opencode_bin,
+        resolve_pi_bin,
     )
     from ...agent.model_catalog import KNOWN_HARNESSES, provider_models
 
@@ -492,6 +494,9 @@ def build_capabilities() -> dict:
     cli_tools = {
         "claude-code": cli_tool_status(resolve_claude_bin, claude_has_credentials),
         "codex": cli_tool_status(resolve_codex_bin, codex_has_credentials),
+        "pi": cli_tool_status(resolve_pi_bin, lambda: True),
+        "opencode": cli_tool_status(resolve_opencode_bin, lambda: True),
+        "acp": cli_tool_status(resolve_opencode_bin, lambda: True),
     }
     claude_ready = cli_tools["claude-code"] == "ready"
     providers = [

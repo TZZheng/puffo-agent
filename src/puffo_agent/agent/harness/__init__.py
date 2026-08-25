@@ -28,6 +28,7 @@ _DRIVER_FACTORIES: dict[str, Callable[..., Driver]] = {
     "claude-code": ClaudeCodeCliDriver,
     "codex": CodexAppServerDriver,
     "opencode": OpenCodeDriver,
+    "pi": PiDriver,
 }
 SUPPORTED_LOCAL_DRIVERS = frozenset(_DRIVER_FACTORIES)
 
@@ -47,11 +48,6 @@ def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
     factory = _DRIVER_FACTORIES.get(normalized_name)
     if factory is not None:
         return factory(**kwargs)
-    # "pi" is deliberately absent. Its Driver and Puffo tool bridge are
-    # implemented, but production admission was explicitly left out of this
-    # integration batch. Enabling it requires restoring/adapting the local
-    # preparer assembly from 980b4d4 plus live lifecycle/tool-call tests, not
-    # an incidental factory edit.
     return UnsupportedDriver(name)
 
 

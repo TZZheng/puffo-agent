@@ -168,14 +168,47 @@ async def test_durable_session_resumes_across_prompt_refresh(
     resumed = await preparer.prepare(
         system_prompt="stable prompt",
         persisted_native_session_id="native-old",
+        persisted_native_session_harness="claude-code",
     )
     refreshed = await preparer.prepare(
         system_prompt="changed identity prompt",
         persisted_native_session_id="native-old",
+        persisted_native_session_harness="claude-code",
     )
 
     assert resumed.native_session_id == "native-old"
     assert refreshed.native_session_id == "native-old"
+
+
+@pytest.mark.asyncio
+async def test_durable_session_is_not_reused_after_harness_change(
+    puffo_home, monkeypatch,
+):
+    """A Claude session ID must never be passed to OpenCode on restart."""
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(
+        local_runtime, "resolve_opencode_bin", lambda: "/opt/bin/opencode"
+    )
+    config = AgentConfig(
+        id="swapped-to-opencode",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="openai",
+            harness="opencode",
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(
+        system_prompt="managed prompt",
+        persisted_native_session_id="claude-session-old",
+        persisted_native_session_harness="claude-code",
+    )
+
+    assert prepared.native_session_id == ""
+    assert prepared.migration_source == "harness_changed"
 
 
 @pytest.mark.asyncio
@@ -224,6 +257,30 @@ async def test_opencode_uses_shared_binary_resolver(puffo_home, monkeypatch):
     inline = json.loads(prepared.spec.environment["OPENCODE_CONFIG_CONTENT"])
     instruction_path = Path(inline["instructions"][0])
     assert instruction_path.read_text(encoding="utf-8") == "managed prompt"
+
+
+@pytest.mark.asyncio
+async def test_pi_uses_shared_binary_resolver(puffo_home, monkeypatch):
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(
+        local_runtime, "resolve_pi_bin", lambda: "/opt/bin/pi"
+    )
+    config = AgentConfig(
+        id="pi-agent",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="openai",
+            harness="pi",
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(system_prompt="managed prompt")
+
+    assert prepared.harness_name == "pi"
+    assert prepared.spec.executable == "/opt/bin/pi"
 
 
 @pytest.mark.asyncio

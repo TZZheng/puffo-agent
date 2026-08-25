@@ -88,6 +88,11 @@ def resolve_opencode_bin() -> str | None:
     return _resolve("opencode", "PUFFO_OPENCODE_BIN", [])
 
 
+def resolve_pi_bin() -> str | None:
+    """Return the absolute path of the Pi coding-agent binary, or ``None``."""
+    return _resolve("pi", "PUFFO_PI_BIN", [])
+
+
 def _resolve(name: str, env_var: str, bundle_paths: list[Path]) -> str | None:
     # 1. Explicit operator override — always wins, read live.
     env_override = os.environ.get(env_var)

@@ -345,6 +345,9 @@ class StandardWorkerRun:
         prepared = await preparer.prepare(
             system_prompt=paths.system_prompt,
             persisted_native_session_id=persisted.get("native_session_id", ""),
+            persisted_native_session_harness=persisted.get(
+                "native_session_harness", ""
+            ),
         )
         try:
             return await self._bind_driver_runtime(
@@ -379,6 +382,7 @@ class StandardWorkerRun:
             active_turn_ref,
             session_ref=session_ref,
             native_session_id=prepared.native_session_id,
+            native_session_harness=prepared.harness_name,
         )
         driver = None
         cleanup = None
@@ -494,6 +498,9 @@ class StandardWorkerRun:
                 persisted.get("active_turn_ref") or None,
                 session_ref=context.runtime_session_ref,
                 native_session_id=worker._adapter.get_provider_session_id() or "",
+                native_session_harness=(
+                    context.prepared_local_runtime.harness_name
+                ),
             )
             context.prepared_local_runtime.finalize_legacy_session_migration()
         if warm_ok:
