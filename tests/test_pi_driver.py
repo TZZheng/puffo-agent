@@ -598,6 +598,26 @@ async def test_carriage_return_terminated_frame_is_accepted():
 
 
 @pytest.mark.asyncio
+async def test_blank_records_are_framing_not_malformed_frames():
+    """A blank JSONL record is separator noise, not a protocol violation.
+
+    ``iter_jsonl_frames`` in the conformance helper already skipped these, but
+    that helper is not the production reader: ``_read_loop`` handed ``b""`` to
+    ``json.loads`` and reported ``protocol_parse``, telling the manager the
+    peer was speaking badly when it had said nothing at all. The following
+    real frame must still arrive.
+    """
+    proc = FakePiProcess()
+    driver, _ = await _open(proc)
+    proc.push_raw(b"\n")
+    proc.push_raw(b"\r\n")
+    proc.push({"type": "agent_settled"})
+    events = await _drain_events(driver, 1)
+    assert [e.type for e in events] == [HarnessEventType.AUTONOMOUS_COMPLETED]
+    await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_malformed_frame_does_not_kill_the_reader():
     proc = FakePiProcess()
     driver, _ = await _open(proc)

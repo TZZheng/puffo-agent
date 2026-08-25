@@ -489,8 +489,14 @@ class PiDriver(Driver):
                 if not line:
                     break
                 # LF-only framing; strip an optional CR as docs/rpc.md allows.
+                record = line.rstrip(b"\r\n")
+                if not record:
+                    # A blank record is framing, not a frame. Reporting it as
+                    # protocol_parse would tell the manager the peer is
+                    # speaking badly when it has said nothing at all.
+                    continue
                 try:
-                    frame = json.loads(line.rstrip(b"\r\n"))
+                    frame = json.loads(record)
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     await self._emit(
                         HarnessEventType.RUNTIME_WARNING,
