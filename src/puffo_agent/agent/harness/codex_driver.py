@@ -11,7 +11,7 @@ from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from ..._proc import STREAM_READER_LIMIT_BYTES, no_window_kwargs
+from ..._proc import spawn_framed_child
 from ..errors import AgentAPIError, ProviderFailureError
 from ..provider_failures import (
     classify_provider_failure,
@@ -322,18 +322,10 @@ class CodexAppServerDriver(Driver):
     async def _start_process(self, spec: RuntimeSpec) -> None:
         if self.process_factory is None:
             executable = spec.executable or "codex"
-            env = dict(spec.environment)
-            self._proc = await asyncio.create_subprocess_exec(
-                executable,
-                *spec.launch_args,
-                "app-server",
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            self._proc = await spawn_framed_child(
+                [executable, *spec.launch_args, "app-server"],
+                env=spec.environment,
                 cwd=spec.workspace_dir or None,
-                env=env,
-                limit=STREAM_READER_LIMIT_BYTES,
-                **no_window_kwargs(),
             )
         else:
             self._proc = self.process_factory(spec)

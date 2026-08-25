@@ -29,7 +29,7 @@ from pathlib import Path
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from ..._proc import STREAM_READER_LIMIT_BYTES, no_window_kwargs
+from ..._proc import spawn_framed_child
 from ..errors import AgentAPIError
 from ..provider_failures import provider_failure_message
 from .driver import (
@@ -282,19 +282,10 @@ class PiDriver(Driver):
 
     async def _start_process(self, spec: RuntimeSpec) -> None:
         if self.process_factory is None:
-            command = build_pi_launch_command(spec)
-            self._proc = await asyncio.create_subprocess_exec(
-                *command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            self._proc = await spawn_framed_child(
+                build_pi_launch_command(spec),
+                env=spec.environment,
                 cwd=spec.workspace_dir or None,
-                # The whole child environment, never merged into the ambient
-                # one: build_child_environment sanitizes by omission, and an
-                # omitted key carries no instruction to delete.
-                env=dict(spec.environment),
-                limit=STREAM_READER_LIMIT_BYTES,
-                **no_window_kwargs(),
             )
         else:
             self._proc = self.process_factory(spec)

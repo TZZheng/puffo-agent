@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from ..._proc import STREAM_READER_LIMIT_BYTES, no_window_kwargs
+from ..._proc import spawn_framed_child
 from ..cli_bin import normalize_launch_argv
 from ..provider_failures import classify_provider_failure
 from .driver import (
@@ -200,16 +200,10 @@ class ClaudeCodeCliDriver(Driver):
             # establish the durable session without inventing a probe turn.
             args.extend(["--session-id", native])
         if self.process_factory is None:
-            env = dict(spec.environment)
-            self._proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            self._proc = await spawn_framed_child(
+                args,
+                env=spec.environment,
                 cwd=spec.workspace_dir or None,
-                env=env,
-                limit=STREAM_READER_LIMIT_BYTES,
-                **no_window_kwargs(),
             )
         else:
             # One call with the declared signature; see AcpDriver._spawn.

@@ -14,7 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..._proc import STREAM_READER_LIMIT_BYTES, no_window_kwargs
+from ..._proc import spawn_framed_child
 from ...mcp.config import (
     INFERENCE_LEVELS,
     puffo_core_mcp_env,
@@ -726,15 +726,9 @@ class DockerRuntimePreparer:
         command: list[str],
         child_env: dict[str, str],
     ) -> asyncio.subprocess.Process:
-        return await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=child_env,
-            limit=STREAM_READER_LIMIT_BYTES,
-            **no_window_kwargs(),
-        )
+        # No cwd: `docker exec -w` already placed the child in the
+        # workspace, and this side of the pipe is the host.
+        return await spawn_framed_child(command, env=child_env)
 
     async def _exec_codex_process(
         self, spec: RuntimeSpec

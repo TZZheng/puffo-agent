@@ -14,10 +14,10 @@ from unittest.mock import patch
 
 import pytest
 
+from puffo_agent._proc import STREAM_READER_LIMIT_BYTES
 from puffo_agent.agent.adapters.cli_session import (
     MAX_USER_MESSAGE_BYTES,
     REQUEST_TOO_LARGE_FRIENDLY,
-    STREAM_READER_LIMIT_BYTES,
     AuditLog,
     ClaudeSession,
     _looks_like_poisoned_session,
