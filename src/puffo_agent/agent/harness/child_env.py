@@ -14,6 +14,14 @@ variable nobody has named yet.
 
 Layering: this constructs what a child *may* see. Which controlled credential
 a runtime then injects stays with that runtime.
+
+INCOMPLETE as of this commit. The result only holds if the caller uses it as
+the child's *complete* environment. Every Driver currently does
+``env = os.environ.copy(); env.update(spec.environment)``, and ``update``
+only overwrites keys the spec contains -- an allowlist sanitises by removal,
+so the stripped key is absent and the ambient value survives. See
+``tests/test_child_env_spawn_boundary.py`` (xfail) for the executable proof.
+Do not cite this module as a credential boundary until that test is green.
 """
 
 from __future__ import annotations
