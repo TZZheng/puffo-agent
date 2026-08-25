@@ -28,7 +28,7 @@ from puffo_agent.agent.harness.driver import (
     TurnRef,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness import UnsupportedDriver, build_driver
+from puffo_agent.agent.harness import build_driver
 from puffo_agent.agent.harness.pi_bridge import (
     BRIDGE_NONCE_ENV,
     BRIDGE_READY_FILE_ENV,
@@ -747,14 +747,8 @@ async def test_compact_requires_an_idle_session():
 # -- tool-bridge admission ---------------------------------------------------
 
 
-def test_pi_is_not_selectable_until_production_admission_is_opened():
-    """The Driver and bridge exist, but live admission is a separate change.
-
-    Wiring "pi" into ``build_driver`` must restore/adapt the local preparer
-    assembly from 980b4d4 and add live lifecycle and Puffo tool-call
-    integration tests, not happen as incidental cleanup.
-    """
-    assert isinstance(build_driver("pi"), UnsupportedDriver)
+def test_pi_is_selectable_after_production_admission_is_opened():
+    assert isinstance(build_driver("pi"), PiDriver)
 
 
 def test_admission_refuses_when_the_bridge_is_missing(tmp_path):
