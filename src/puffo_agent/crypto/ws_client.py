@@ -82,6 +82,7 @@ class PuffoCoreWsClient:
         self.on_event: EventHandler | None = None
         self.on_cert_update: CertHandler | None = None
         self.on_space_membership_changed: SpaceMembershipHandler | None = None
+        self.on_channel_update: Callable[[dict], Coroutine[Any, Any, None]] | None = None
         # Fires after every (re)connect handshake, before catch-up.
         self.on_connect: Callable[[], Coroutine[Any, Any, None]] | None = None
         self._catchup_lock = asyncio.Lock()
@@ -323,6 +324,13 @@ class PuffoCoreWsClient:
                     await self.on_space_membership_changed(space_id)
                 except Exception:
                     logger.exception("on_space_membership_changed callback failed")
+
+        elif msg_type == "channel_update":
+            if self.on_channel_update:
+                try:
+                    await self.on_channel_update(msg)
+                except Exception:
+                    logger.exception("on_channel_update callback failed")
 
     async def _listen_loop(self) -> None:
         async for raw in self._ws:

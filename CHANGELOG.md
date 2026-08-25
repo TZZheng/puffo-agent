@@ -6,6 +6,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Channel sends follow the channel's format policy.** The channel's
+  `is_encrypted` field alone decides sealed vs signed-plaintext for channel
+  sends; DMs stay encrypted and the agent cannot choose the format. The
+  policy is cached (disk + memory), kept live by `channel_update` frames,
+  and a `CHANNEL_FORMAT_MISMATCH` rejection refreshes the policy once and
+  resends in the channel's current format. (#212)
+
 ## [2.0.0] - 2026-08-23
 
 > Stable Agent Foundation 2.0 release, promoted from `2.0.0a25` without
