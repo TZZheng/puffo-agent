@@ -374,7 +374,9 @@ class LocalRuntimePreparer:
             system_prompt=system_prompt,
             executable=executable,
             launch_args=tuple(launch_args),
-            environment=dict(self.agent_cfg.env_overrides),
+            environment=build_child_environment(
+                overrides=self.agent_cfg.env_overrides,
+            ),
             permission_mode=self.permission_mode,
             sandbox=self.sandbox,
             task_timeout_seconds=self.agent_cfg.runtime.task_timeout_seconds,

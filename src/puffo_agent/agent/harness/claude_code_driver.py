@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import uuid
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
@@ -199,8 +198,7 @@ class ClaudeCodeCliDriver(Driver):
             # establish the durable session without inventing a probe turn.
             args.extend(["--session-id", native])
         if self.process_factory is None:
-            env = os.environ.copy()
-            env.update(spec.environment)
+            env = dict(spec.environment)
             self._proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdin=asyncio.subprocess.PIPE,

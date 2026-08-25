@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import re
 import uuid
 from collections.abc import AsyncIterator, Callable
@@ -321,11 +320,7 @@ class CodexAppServerDriver(Driver):
     async def _start_process(self, spec: RuntimeSpec) -> None:
         if self.process_factory is None:
             executable = spec.executable or "codex"
-            # Merge, matching ClaudeCodeCliDriver.open: `RuntimeSpec.environment`
-            # is a Mapping that invites a delta, and replacing the child's whole
-            # environment would strip PATH/HOME from `codex app-server`.
-            env = os.environ.copy()
-            env.update(spec.environment)
+            env = dict(spec.environment)
             self._proc = await asyncio.create_subprocess_exec(
                 executable,
                 *spec.launch_args,

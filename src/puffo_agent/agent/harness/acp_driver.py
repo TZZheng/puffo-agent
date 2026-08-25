@@ -28,7 +28,6 @@ from acp.schema import (
     UsageUpdate,
     WaitForTerminalExitResponse,
 )
-from acp.transports import default_environment
 
 from ..._proc import STREAM_READER_LIMIT_BYTES, no_window_kwargs
 from ..cli_bin import normalize_launch_argv
@@ -265,10 +264,7 @@ class AcpDriver(Driver):
             except TypeError:
                 proc = self.process_factory(command)
             return await proc if asyncio.iscoroutine(proc) else proc
-        # The official SDK's transport allowlist supplies only process basics;
-        # provider credentials enter through the explicit RuntimeSpec delta.
-        env = default_environment()
-        env.update(spec.environment)
+        env = dict(spec.environment)
         return await asyncio.create_subprocess_exec(
             *command,
             stdin=asyncio.subprocess.PIPE,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -164,8 +163,7 @@ class OpenCodeDriver(Driver):
                 proc = self.process_factory(command)
             return await proc if asyncio.iscoroutine(proc) else proc
         executable, *arguments = command
-        env = os.environ.copy()
-        env.update(spec.environment)
+        env = dict(spec.environment)
         return await asyncio.create_subprocess_exec(
             *normalize_launch_argv(executable),
             *arguments,

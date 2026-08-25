@@ -89,13 +89,21 @@ def test_extra_allowed_admits_a_runtime_specific_name():
     assert env["CODEX_HOME"] == "/agents/a/.codex"
 
 
-def test_spec_builders_do_not_touch_os_environ_directly():
-    """Tripwire: a new runtime spec must go through the builder.
+@pytest.mark.parametrize("relpath", (
+    "src/puffo_agent/agent/harness/local_runtime.py",
+    "src/puffo_agent/agent/harness/claude_code_driver.py",
+    "src/puffo_agent/agent/harness/codex_driver.py",
+    "src/puffo_agent/agent/harness/opencode_driver.py",
+    "src/puffo_agent/agent/harness/acp_driver.py",
+))
+def test_harness_child_environment_boundary_never_rereads_ambient(relpath):
+    """Spec construction and real spawn must share one allowlist boundary.
 
-    Both drift cases started as a local ``dict(os.environ)``. This fails the
-    moment one reappears in the module that builds RuntimeSpec environments.
+    Sanitizing a RuntimeSpec is ineffective if a Driver merges ``os.environ``
+    back at spawn. SDK-owned default allowlists are also forbidden here: their
+    contents can drift independently of Puffo's credential contract.
     """
-    path = _REPO_ROOT / "src/puffo_agent/agent/harness/local_runtime.py"
+    path = _REPO_ROOT / relpath
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
     offenders = []
@@ -105,9 +113,15 @@ def test_spec_builders_do_not_touch_os_environ_directly():
             value = node.value
             if isinstance(value, ast.Name) and value.id == "os":
                 offenders.append(node.lineno)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "default_environment"
+        ):
+            offenders.append(node.lineno)
 
     assert not offenders, (
-        f"local_runtime.py reads os.environ directly at line(s) {offenders}; "
+        f"{relpath} rebuilds ambient child env at line(s) {offenders}; "
         "build the child environment with child_env.build_child_environment "
-        "so ambient provider credentials cannot reach the harness."
+        "once, then pass RuntimeSpec.environment through unchanged."
     )
