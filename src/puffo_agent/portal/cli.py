@@ -500,14 +500,15 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     provider = args.provider or ""
     from .runtime_matrix import resolve_effective_harness, validate_triple
 
-    harness = args.harness or resolve_effective_harness(
+    harness = getattr(args, "harness", None) or resolve_effective_harness(
         runtime_kind, provider, ""
     )
     validation = validate_triple(runtime_kind, provider, harness)
     if not validation.ok:
         print(f"error: {validation.error}", file=sys.stderr)
         return 2
-    if runtime_kind == "cli-local" and harness == "acp" and not args.harness_command:
+    harness_command = list(getattr(args, "harness_command", None) or [])
+    if runtime_kind == "cli-local" and harness == "acp" and not harness_command:
         print(
             "error: --harness acp requires --harness-command EXECUTABLE [ARG ...]",
             file=sys.stderr,
@@ -550,7 +551,7 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
             api_key=args.api_key or "",
             model=args.model or "",
             harness=harness,
-            harness_command=list(args.harness_command or []),
+            harness_command=harness_command,
         ),
         profile="profile.md",
         memory_dir="memory",
