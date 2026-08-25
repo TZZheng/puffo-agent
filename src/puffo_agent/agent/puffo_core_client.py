@@ -279,6 +279,7 @@ class PuffoCoreMessageClient:
         self._ws.on_message = receipt_handler.handle
         self._ws.on_event = self._handle_event
         self._ws.on_space_membership_changed = self._handle_space_membership_changed
+        self._ws.on_channel_update = self._handle_channel_update
         # Re-warms caches on every (re)connect, first connect included.
         self._ws.on_connect = self._on_ws_connect
         await self.store.open()
@@ -558,6 +559,7 @@ class PuffoCoreMessageClient:
             space_members=self._space_members,
             store=self.store,
             log=self._log,
+            channel_policies=self._channel_encrypted,
         )
 
     async def _evict_channel_caches(self, channel_id: str) -> None:
@@ -567,6 +569,7 @@ class PuffoCoreMessageClient:
             channel_names=self._channel_name_cache,
             store=self.store,
             log=self._log,
+            channel_policies=self._channel_encrypted,
         )
 
     async def _dm_operator_membership_change(self, text: str) -> None:
@@ -891,7 +894,73 @@ class PuffoCoreMessageClient:
             store=self.store,
             channel_spaces=self._channel_space,
             channel_names=self._channel_name_cache,
+            channel_policies=self._channel_encrypted,
         )
+
+    def channel_policy(self, channel_id: str) -> bool:
+        """is_encrypted for a channel; unknown fails safe to encrypted."""
+        if not channel_id:
+            return True
+        cached = self._channel_encrypted.get(channel_id)
+        if isinstance(cached, bool):
+            return cached
+        persisted = (disk_cache.load_channel(channel_id) or {}).get("is_encrypted")
+        return persisted is not False
+
+    async def ensure_channel_policy(self, channel_id: str, space_id: str = "") -> bool:
+        if channel_id in self._channel_encrypted:
+            return self._channel_encrypted[channel_id]
+        persisted = (disk_cache.load_channel(channel_id) or {}).get("is_encrypted")
+        if isinstance(persisted, bool):
+            self._channel_encrypted[channel_id] = persisted
+            return persisted
+        space = space_id or self._channel_space.get(channel_id) or ""
+        if space:
+            await self._warm_channels_for_space(space)
+        return self.channel_policy(channel_id)
+
+    async def refresh_channel_policy(self, channel_id: str) -> bool:
+        """Server re-read, bypassing caches (post-CHANNEL_FORMAT_MISMATCH)."""
+        space_id = self._channel_space.get(channel_id) or ""
+        if not space_id:
+            try:
+                space_id = await self.store.lookup_channel_space(channel_id) or ""
+            except Exception:
+                space_id = ""
+        if space_id:
+            await self._warm_channels_for_space(space_id)
+        return self.channel_policy(channel_id)
+
+    async def _handle_channel_update(self, update: dict) -> None:
+        channel_id = update.get("channel_id")
+        if not isinstance(channel_id, str) or not channel_id:
+            return
+        space_id = update.get("space_id")
+        if isinstance(space_id, str) and space_id:
+            self._channel_space[channel_id] = space_id
+        name = update.get("name")
+        if isinstance(name, str) and name.strip():
+            self._channel_name_cache[channel_id] = name.strip()
+        policy = update.get("is_encrypted")
+        if isinstance(policy, bool):
+            if self._channel_encrypted.get(channel_id) != policy:
+                logger.info(
+                    "channel %s policy -> %s",
+                    channel_id,
+                    "encrypted" if policy else "plaintext",
+                )
+            self._channel_encrypted[channel_id] = policy
+            cache_name = (
+                self._channel_name_cache.get(channel_id)
+                or (disk_cache.load_channel(channel_id) or {}).get("name")
+                or channel_id
+            )
+            disk_cache.persist_channel(
+                channel_id,
+                cache_name,
+                self._channel_space.get(channel_id) or "",
+                policy,
+            )
 
     async def _bulk_fetch_profiles(self, slugs: list[str]) -> None:
         await bulk_fetch_profiles(

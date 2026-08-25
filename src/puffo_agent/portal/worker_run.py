@@ -740,6 +740,7 @@ class StandardWorkerRun:
                 client.store, global_runtime.active
             ),
             held_recovery_source=global_runtime.held_recovery_source,
+            channel_policy_source=client,
         )
         global_runtime.coordinator = coordinator
         global_runtime.send_delegate = TrackingSendDelegate(

@@ -173,6 +173,7 @@ async def warm_channels_for_space(
     store: Any,
     channel_spaces: dict[str, str],
     channel_names: dict[str, str],
+    channel_policies: dict[str, bool] | None = None,
 ) -> None:
     try:
         response = await http.get(f"/spaces/{space_id}/channels")
@@ -184,9 +185,13 @@ async def warm_channels_for_space(
         if not channel_id:
             continue
         channel_spaces.setdefault(channel_id, space_id)
+        # Missing/legacy policy fails safe to encrypted.
+        is_encrypted = channel.get("is_encrypted") is not False
+        if channel_policies is not None:
+            channel_policies[channel_id] = is_encrypted
         if name:
             channel_names.setdefault(channel_id, name)
-            disk_cache.persist_channel(channel_id, name, space_id)
+            disk_cache.persist_channel(channel_id, name, space_id, is_encrypted)
         try:
             await store.mark_channel_space(channel_id, space_id)
         except Exception:
