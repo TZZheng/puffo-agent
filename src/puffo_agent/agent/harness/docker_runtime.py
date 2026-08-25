@@ -14,7 +14,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from ..._proc import no_window_kwargs
+from ..._proc import STREAM_READER_LIMIT_BYTES, no_window_kwargs
 from ...mcp.config import (
     INFERENCE_LEVELS,
     puffo_core_mcp_env,
@@ -732,9 +732,7 @@ class DockerRuntimePreparer:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=child_env,
-            # One provider frame can carry a large tool result; the default
-            # 64 KiB stream limit would terminate the reader mid-session.
-            limit=16 * 1024 * 1024,
+            limit=STREAM_READER_LIMIT_BYTES,
             **no_window_kwargs(),
         )
 

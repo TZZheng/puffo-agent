@@ -286,7 +286,10 @@ INIT_TIMEOUT_SECONDS = 10.0
 # which would raise ``LimitOverrunError`` from ``readline()`` and wedge
 # the turn. 16 MiB bounds memory per agent while comfortably covering
 # every event size seen in practice.
-STREAM_READER_LIMIT_BYTES = 16 * 1024 * 1024
+# Re-exported: several tests import this name from here. Single
+# definition lives in ``_proc`` so harness Drivers and this adapter
+# cannot drift apart.
+from ..._proc import STREAM_READER_LIMIT_BYTES  # noqa: E402
 CONTEXT_USAGE_TIMEOUT_SECONDS = 3.0
 
 # Read loop has no turn-correlation — collects until ``result`` — so any
