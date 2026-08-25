@@ -1289,7 +1289,12 @@ class SendCoordinator:
 
         destination = request.destination.strip()
         if channel_id is not None:
-            recipient_slugs = await self._channel_recipient_slugs(space_id, channel_id)
+            # Members feed device wraps + supplementation: encrypted only.
+            recipient_slugs = (
+                await self._channel_recipient_slugs(space_id, channel_id)
+                if encrypt
+                else []
+            )
             kind = "channel"
         else:
             recipient_slugs = [self.slug, dm_peer]

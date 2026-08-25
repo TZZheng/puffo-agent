@@ -130,8 +130,30 @@ async def test_plaintext_channel_sends_a_plaintext_envelope():
     envelope = post[2]["envelope"]
     assert envelope["type"] == "plaintext_message_envelope"
     assert "signed_payload" in envelope
-    # No device fetch on the plaintext path.
+    # No device or member fetch on the plaintext path.
     assert not any("/certs/sync" in c[1] for c in http.calls if c[0] == "GET")
+    assert not any("/members" in c[1] for c in http.calls if c[0] == "GET")
+
+
+@pytest.mark.asyncio
+async def test_plaintext_channel_send_survives_an_empty_member_list():
+    coordinator, http = await _policy_fixture(_Policy(False))
+    http.responses["/spaces/sp_1/channels/ch_a/members"] = {"members": []}
+    result = await coordinator.send(
+        SemanticSendRequest(destination="ch_a", text="hello")
+    )
+    assert result["state"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_encrypted_channel_send_still_requires_members():
+    coordinator, http = await _policy_fixture(_Policy(True))
+    http.responses["/spaces/sp_1/channels/ch_a/members"] = {"members": []}
+    result = await coordinator.send(
+        SemanticSendRequest(destination="ch_a", text="hello")
+    )
+    assert result["state"] == "failed"
+    assert "no resolvable members" in result["error"]
 
 
 @pytest.mark.asyncio
