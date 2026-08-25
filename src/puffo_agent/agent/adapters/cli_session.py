@@ -289,7 +289,6 @@ INIT_TIMEOUT_SECONDS = 10.0
 # Re-exported: several tests import this name from here. Single
 # definition lives in ``_proc`` so harness Drivers and this adapter
 # cannot drift apart.
-from ..._proc import STREAM_READER_LIMIT_BYTES  # noqa: E402
 CONTEXT_USAGE_TIMEOUT_SECONDS = 3.0
 
 # Read loop has no turn-correlation — collects until ``result`` — so any
@@ -869,17 +868,10 @@ class ClaudeSession:
             self.agent_id,
             bool(self._session_id),
         )
-        from ..._proc import no_window_kwargs
+        from ..._proc import spawn_framed_child
 
-        self._proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self.cwd,
-            env=self.env,
-            limit=STREAM_READER_LIMIT_BYTES,
-            **no_window_kwargs(),
+        self._proc = await spawn_framed_child(
+            cmd, env=self.env, cwd=self.cwd
         )
         if self.audit is not None:
             self.audit.write(

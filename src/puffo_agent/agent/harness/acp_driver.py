@@ -31,7 +31,7 @@ from acp.schema import (
     WaitForTerminalExitResponse,
 )
 
-from ..._proc import STREAM_READER_LIMIT_BYTES, no_window_kwargs
+from ..._proc import spawn_framed_child
 from ..cli_bin import normalize_launch_argv
 from .driver import (
     BusyDelivery,
@@ -283,16 +283,10 @@ class AcpDriver(Driver):
             # first already exists.
             proc = self.process_factory(command, spec)
             return await proc if asyncio.iscoroutine(proc) else proc
-        env = dict(spec.environment)
-        return await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        return await spawn_framed_child(
+            command,
+            env=spec.environment,
             cwd=spec.workspace_dir or None,
-            env=env,
-            limit=STREAM_READER_LIMIT_BYTES,
-            **no_window_kwargs(),
         )
 
     async def start_turn(self, input: TurnInput):

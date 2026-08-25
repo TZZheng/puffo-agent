@@ -8,7 +8,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from ..._proc import STREAM_READER_LIMIT_BYTES, no_window_kwargs
+from ..._proc import spawn_framed_child
 from ..cli_bin import normalize_launch_argv
 from .driver import (
     BusyDelivery,
@@ -161,17 +161,12 @@ class OpenCodeDriver(Driver):
             proc = self.process_factory(command, spec)
             return await proc if asyncio.iscoroutine(proc) else proc
         executable, *arguments = command
-        env = dict(spec.environment)
-        return await asyncio.create_subprocess_exec(
-            *normalize_launch_argv(executable),
-            *arguments,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        return await spawn_framed_child(
+            [*normalize_launch_argv(executable), *arguments],
+            env=spec.environment,
             cwd=spec.workspace_dir or None,
-            env=env,
-            limit=STREAM_READER_LIMIT_BYTES,
-            **no_window_kwargs(),
+            # A one-shot `opencode run`; nothing is ever written to it.
+            stdin=asyncio.subprocess.DEVNULL,
         )
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput):

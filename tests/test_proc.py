@@ -11,7 +11,6 @@ import pytest
 
 from puffo_agent import _proc
 from puffo_agent.agent import memory_git
-from puffo_agent.agent.harness import claude_code_driver, codex_driver
 from puffo_agent.agent.harness.claude_code_driver import ClaudeCodeCliDriver
 from puffo_agent.agent.harness.codex_driver import CodexAppServerDriver
 from puffo_agent.agent.harness.driver import RuntimeSpec
@@ -49,16 +48,21 @@ def test_no_window_kwargs_off_windows(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["claude", "codex"])
 async def test_cli_drivers_request_windowless_child_processes(monkeypatch, provider):
-    """A detached Windows daemon must not create one console per Driver."""
+    """A detached Windows daemon must not create one console per Driver.
+
+    Patched at ``_proc`` rather than per driver module: both drivers now
+    reach the flag through ``spawn_framed_child``, and a test that patched
+    the old per-module import would keep passing against a driver that
+    stopped asking for it.
+    """
     captured = {}
 
     async def fake_exec(*_args, **kwargs):
         captured.update(kwargs)
         return _finished_process()
 
-    module = claude_code_driver if provider == "claude" else codex_driver
     monkeypatch.setattr(
-        module,
+        _proc,
         "no_window_kwargs",
         lambda: {"creationflags": _CREATE_NO_WINDOW},
     )
