@@ -124,6 +124,20 @@ def test_clear_ready_file_tolerates_an_absent_file(tmp_path):
     clear_ready_file(ready_file_path(tmp_path))  # must not raise
 
 
+def test_clear_ready_file_fails_closed_when_stale_attestation_cannot_be_removed(
+    tmp_path, monkeypatch
+):
+    path = ready_file_path(tmp_path)
+    path.write_text(json.dumps({"nonce": "same-spec", "tools": 3}))
+
+    def denied(_self):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(Path, "unlink", denied)
+    with pytest.raises(PermissionError, match="denied"):
+        clear_ready_file(path)
+
+
 @pytest.mark.asyncio
 async def test_await_bridge_ready_is_bounded(tmp_path):
     assert (
@@ -314,9 +328,7 @@ def test_tool_result_survives_unicode_separators(tmp_path):
     """U+2028/U+2029/U+0085 are legal in a JSON string and must not split it."""
     payload, _ready, _proc = _run_bridge(tmp_path, mode="separators", scenario="call")
     assert payload["ok"] is True
-    assert payload["result"]["content"][0]["text"] == (
-        "before middle afterend"
-    )
+    assert payload["result"]["content"][0]["text"] == ("before middle afterend")
 
 
 @requires_node
@@ -329,9 +341,7 @@ def test_tool_result_survives_unicode_separators(tmp_path):
         ("bad_schema", "puffo_bridge_tool_surface_invalid"),
     ],
 )
-def test_unusable_tool_surface_fails_closed_and_attests_nothing(
-    tmp_path, mode, code
-):
+def test_unusable_tool_surface_fails_closed_and_attests_nothing(tmp_path, mode, code):
     """Never partially registered, and never attested as ready."""
     payload, ready, _proc = _run_bridge(tmp_path, mode=mode)
     assert payload["ok"] is False
@@ -344,6 +354,14 @@ def test_unusable_tool_surface_fails_closed_and_attests_nothing(
 @requires_node
 def test_server_exit_before_listing_is_reported_as_unavailable(tmp_path):
     payload, ready, _proc = _run_bridge(tmp_path, mode="exit_before_list")
+    assert payload["ok"] is False
+    assert payload["code"] == "puffo_bridge_unavailable"
+    assert not ready.exists()
+
+
+@requires_node
+def test_half_frame_then_server_exit_is_reported_as_unavailable(tmp_path):
+    payload, ready, _proc = _run_bridge(tmp_path, mode="half_frame_before_list")
     assert payload["ok"] is False
     assert payload["code"] == "puffo_bridge_unavailable"
     assert not ready.exists()
@@ -380,6 +398,19 @@ _CONFIG_MARKER = "CONFIG-MUST-NOT-LEAK"
         (f"not json {_CONFIG_MARKER}", "puffo_bridge_config_invalid"),
         (f'["{_CONFIG_MARKER}"]', "puffo_bridge_config_invalid"),
         (f'{{"args":["{_CONFIG_MARKER}"]}}', "puffo_bridge_config_invalid"),
+        (
+            f'{{"command":"python","args":"{_CONFIG_MARKER}","environment":{{}}}}',
+            "puffo_bridge_config_invalid",
+        ),
+        (
+            f'{{"command":"python","args":[],"environment":["{_CONFIG_MARKER}"]}}',
+            "puffo_bridge_config_invalid",
+        ),
+        (
+            f'{{"command":"python","args":[],"environment":'
+            f'{{"TOKEN":7,"MARKER":"{_CONFIG_MARKER}"}}}}',
+            "puffo_bridge_config_invalid",
+        ),
     ],
 )
 def test_bad_configuration_fails_closed_without_echoing_it(tmp_path, value, code):
@@ -418,6 +449,15 @@ def test_missing_configuration_fails_closed(tmp_path):
     payload = json.loads(_last_line(result.stdout))
     assert payload["ok"] is False
     assert payload["code"] == "puffo_bridge_config_missing"
+
+
+@requires_node
+@pytest.mark.parametrize("missing", [BRIDGE_READY_FILE_ENV, BRIDGE_NONCE_ENV])
+def test_missing_attestation_configuration_fails_closed(tmp_path, missing):
+    payload, ready, _proc = _run_bridge(tmp_path, env={missing: ""})
+    assert payload["ok"] is False
+    assert payload["code"] == "puffo_bridge_config_missing"
+    assert not ready.exists()
 
 
 def test_bridge_source_is_declared_as_package_data():

@@ -102,8 +102,6 @@ def clear_ready_file(path: Path) -> None:
         Path(path).unlink()
     except FileNotFoundError:
         return
-    except OSError:
-        return
 
 
 def read_ready_attestation(path: Path, nonce: str) -> int | None:

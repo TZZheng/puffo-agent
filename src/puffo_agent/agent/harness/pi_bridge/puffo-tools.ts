@@ -104,13 +104,26 @@ export function readBridgeConfig(
   if (typeof config.command !== "string" || config.command.length === 0) {
     throw new PuffoBridgeError(BridgeErrorCode.CONFIG_INVALID);
   }
+  if (
+    !Array.isArray(config.args) ||
+    config.args.some((value) => typeof value !== "string")
+  ) {
+    throw new PuffoBridgeError(BridgeErrorCode.CONFIG_INVALID);
+  }
+  if (
+    typeof config.environment !== "object" ||
+    config.environment === null ||
+    Array.isArray(config.environment) ||
+    Object.values(config.environment).some(
+      (value) => typeof value !== "string",
+    )
+  ) {
+    throw new PuffoBridgeError(BridgeErrorCode.CONFIG_INVALID);
+  }
   return {
     command: config.command,
-    args: Array.isArray(config.args) ? config.args.map(String) : [],
-    environment:
-      typeof config.environment === "object" && config.environment !== null
-        ? (config.environment as Record<string, string>)
-        : {},
+    args: config.args,
+    environment: config.environment as Record<string, string>,
   };
 }
 
@@ -155,20 +168,30 @@ export class McpStdioClient {
   }
 
   async start(): Promise<void> {
-    const proc = spawn(this.config.command, this.config.args, {
-      // The whole child environment, not merged into this process's own: the
-      // harness already decided what the Puffo server may see.
-      env: this.config.environment,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
+    let proc: ChildProcessWithoutNullStreams;
+    try {
+      proc = spawn(this.config.command, this.config.args, {
+        // The whole child environment, not merged into this process's own: the
+        // harness already decided what the Puffo server may see.
+        env: this.config.environment,
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch {
+      throw new PuffoBridgeError(BridgeErrorCode.UNAVAILABLE);
+    }
     this.proc = proc;
     proc.stdout.setEncoding("utf8");
     proc.stdout.on("data", (chunk: string) => this.consume(chunk));
     // stderr is drained to keep the pipe from filling, and deliberately
     // discarded: it can carry provider text and configuration values.
     proc.stderr.resume();
-    proc.on("exit", () => this.failAll(BridgeErrorCode.UNAVAILABLE));
-    proc.on("error", () => this.failAll(BridgeErrorCode.UNAVAILABLE));
+    const unavailable = () => {
+      this.failAll(BridgeErrorCode.UNAVAILABLE);
+      this.proc = null;
+      this.initialized = false;
+    };
+    proc.on("exit", unavailable);
+    proc.on("error", unavailable);
 
     try {
       await this.request("initialize", {
@@ -396,12 +419,16 @@ export async function startBridge(
   try {
     const tools = await client.listTools();
     registered = registerPuffoTools(pi, client, tools);
+    if (!attestReady(env, registered)) {
+      throw new PuffoBridgeError(BridgeErrorCode.CONFIG_MISSING);
+    }
   } catch (error) {
     // No surviving server behind a failed registration.
     client.stop();
-    throw error;
+    // Pi may surface an extension-load rejection. Preserve only our stable
+    // vocabulary so filesystem paths and runtime exception text cannot leak.
+    throw new PuffoBridgeError(errorCode(error));
   }
-  attestReady(env, registered);
   return { client, registered };
 }
 

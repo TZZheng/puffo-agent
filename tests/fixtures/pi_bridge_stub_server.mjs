@@ -50,6 +50,11 @@ function handle(frame) {
   }
   if (method === "notifications/initialized") return;
   if (method === "tools/list") {
+    if (MODE === "half_frame_before_list") {
+      process.stdout.write('{"jsonrpc":"2.0","id":');
+      process.exit(4);
+      return;
+    }
     if (MODE === "exit_before_list") {
       process.exit(3);
       return;
