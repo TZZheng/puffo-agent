@@ -6,6 +6,16 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.2] - 2026-08-25
+
+### Fixed
+
+- **Windows background daemons survive terminal closure.** Detached children
+  break away from the launcher's Job object instead of being terminated with
+  the PowerShell or Terminal window. Managed Windows machines whose App Control
+  policy blocks the pip/uv-generated `puffo-agent.exe` shim can use the new
+  equivalent `python -m puffo_agent` entry point. (#292)
+
 ## [2.0.1] - 2026-08-24
 
 ### Changed
@@ -4932,7 +4942,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.1...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.2...HEAD
+[2.0.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.2
 [2.0.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.1
 [2.0.0]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0
 [2.0.0a2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.0a2
