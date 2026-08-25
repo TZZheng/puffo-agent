@@ -279,7 +279,7 @@ def _run_bridge(tmp_path, *, mode="ok", scenario="start", nonce="n1", env=None):
         cwd=str(work),
     )
     assert result.stdout.strip(), f"no harness output; stderr={result.stderr[-800:]}"
-    return json.loads(_last_line(result.stdout)), ready
+    return json.loads(_last_line(result.stdout)), ready, result
 
 
 def _last_line(stdout: str) -> str:
@@ -294,7 +294,7 @@ def _last_line(stdout: str) -> str:
 
 @requires_node
 def test_bridge_registers_every_tool_the_server_advertises(tmp_path):
-    payload, ready = _run_bridge(tmp_path)
+    payload, ready, _proc = _run_bridge(tmp_path)
     assert payload["ok"] is True
     assert payload["registered"] == ["send_message", "read_inbox"]
     attested = json.loads(ready.read_text())
@@ -303,7 +303,7 @@ def test_bridge_registers_every_tool_the_server_advertises(tmp_path):
 
 @requires_node
 def test_bridge_calls_a_tool_end_to_end(tmp_path):
-    payload, _ = _run_bridge(tmp_path, scenario="call")
+    payload, _ready, _proc = _run_bridge(tmp_path, scenario="call")
     assert payload["ok"] is True
     assert payload["result"]["isError"] is False
     assert payload["result"]["content"][0]["text"] == "sent"
@@ -312,7 +312,7 @@ def test_bridge_calls_a_tool_end_to_end(tmp_path):
 @requires_node
 def test_tool_result_survives_unicode_separators(tmp_path):
     """U+2028/U+2029/U+0085 are legal in a JSON string and must not split it."""
-    payload, _ = _run_bridge(tmp_path, mode="separators", scenario="call")
+    payload, _ready, _proc = _run_bridge(tmp_path, mode="separators", scenario="call")
     assert payload["ok"] is True
     assert payload["result"]["content"][0]["text"] == (
         "before middle afterend"
@@ -333,7 +333,7 @@ def test_unusable_tool_surface_fails_closed_and_attests_nothing(
     tmp_path, mode, code
 ):
     """Never partially registered, and never attested as ready."""
-    payload, ready = _run_bridge(tmp_path, mode=mode)
+    payload, ready, _proc = _run_bridge(tmp_path, mode=mode)
     assert payload["ok"] is False
     assert payload["code"] == code
     assert payload["known"] is True
@@ -343,7 +343,7 @@ def test_unusable_tool_surface_fails_closed_and_attests_nothing(
 
 @requires_node
 def test_server_exit_before_listing_is_reported_as_unavailable(tmp_path):
-    payload, ready = _run_bridge(tmp_path, mode="exit_before_list")
+    payload, ready, _proc = _run_bridge(tmp_path, mode="exit_before_list")
     assert payload["ok"] is False
     assert payload["code"] == "puffo_bridge_unavailable"
     assert not ready.exists()
@@ -351,7 +351,7 @@ def test_server_exit_before_listing_is_reported_as_unavailable(tmp_path):
 
 @requires_node
 def test_a_silent_server_times_out_rather_than_hanging(tmp_path):
-    payload, ready = _run_bridge(
+    payload, ready, _proc = _run_bridge(
         tmp_path, mode="no_handshake", env={"PUFFO_BRIDGE_TIMEOUT_MS": "500"}
     )
     assert payload["ok"] is False
@@ -362,7 +362,7 @@ def test_a_silent_server_times_out_rather_than_hanging(tmp_path):
 @requires_node
 def test_a_failed_tool_call_reports_a_code_not_provider_text(tmp_path):
     """The stub's error message must not reach the model or the result."""
-    payload, _ = _run_bridge(tmp_path, mode="tool_error", scenario="call")
+    payload, _ready, _proc = _run_bridge(tmp_path, mode="tool_error", scenario="call")
     assert payload["ok"] is True  # registration succeeded; the call failed
     assert payload["result"]["isError"] is True
     rendered = json.dumps(payload["result"])
@@ -370,20 +370,31 @@ def test_a_failed_tool_call_reports_a_code_not_provider_text(tmp_path):
     assert payload["result"]["content"][0]["text"] == "puffo_tool_error"
 
 
+_CONFIG_MARKER = "CONFIG-MUST-NOT-LEAK"
+
+
 @requires_node
 @pytest.mark.parametrize(
     "value,code",
     [
-        ("not json", "puffo_bridge_config_invalid"),
-        ("[]", "puffo_bridge_config_invalid"),
-        ('{"args":[]}', "puffo_bridge_config_invalid"),
+        (f"not json {_CONFIG_MARKER}", "puffo_bridge_config_invalid"),
+        (f'["{_CONFIG_MARKER}"]', "puffo_bridge_config_invalid"),
+        (f'{{"args":["{_CONFIG_MARKER}"]}}', "puffo_bridge_config_invalid"),
     ],
 )
 def test_bad_configuration_fails_closed_without_echoing_it(tmp_path, value, code):
-    payload, ready = _run_bridge(tmp_path, env={BRIDGE_CONFIG_ENV: value})
+    """The rejection must not quote the value it rejected.
+
+    The configuration blob carries the Puffo MCP server's environment, so an
+    error that echoes it to explain itself is a disclosure. Every case here
+    plants a marker inside the value and asserts it reaches neither stream.
+    """
+    payload, ready, proc = _run_bridge(tmp_path, env={BRIDGE_CONFIG_ENV: value})
     assert payload["ok"] is False
     assert payload["code"] == code
     assert not ready.exists()
+    assert _CONFIG_MARKER not in proc.stdout
+    assert _CONFIG_MARKER not in proc.stderr
 
 
 @requires_node
