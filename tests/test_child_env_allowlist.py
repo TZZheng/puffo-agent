@@ -95,6 +95,7 @@ def test_extra_allowed_admits_a_runtime_specific_name():
     "src/puffo_agent/agent/harness/codex_driver.py",
     "src/puffo_agent/agent/harness/opencode_driver.py",
     "src/puffo_agent/agent/harness/acp_driver.py",
+    "src/puffo_agent/agent/harness/pi_driver.py",
 ))
 def test_harness_child_environment_boundary_never_rereads_ambient(relpath):
     """Spec construction and real spawn must share one allowlist boundary.

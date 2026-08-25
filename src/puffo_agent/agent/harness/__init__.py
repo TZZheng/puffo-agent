@@ -15,6 +15,12 @@ from .codex_driver import CodexAppServerDriver, CodexDriver
 from .claude_code_driver import ClaudeCodeCliDriver, ClaudeDriver
 from .opencode_driver import OpenCodeCliDriver, OpenCodeDriver
 from .acp_driver import AcpDriver, GenericAcpDriver
+from .pi_driver import (
+    PI_CAPABILITIES,
+    PiDriver,
+    PiToolBridgeUnavailableError,
+    verify_pi_tool_bridge,
+)
 
 @dataclass(frozen=True)
 class UnsupportedDriver:
@@ -33,6 +39,9 @@ def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
         return OpenCodeDriver(**kwargs)
     if name == "acp":
         return AcpDriver(**kwargs)
+    # "pi" is deliberately absent: PiDriver is complete and tested offline, but
+    # Pi has no Puffo tool bridge yet, so selecting it would admit a runtime
+    # that cannot send a message. See test_pi_is_not_selectable_without_a_bridge.
     if not name or name == "claude-code":
         return ClaudeCodeCliDriver(**kwargs)
     return UnsupportedDriver(name)
@@ -54,5 +63,9 @@ __all__ = [
     "OpenCodeDriver",
     "AcpDriver",
     "GenericAcpDriver",
+    "PiDriver",
+    "PI_CAPABILITIES",
+    "PiToolBridgeUnavailableError",
+    "verify_pi_tool_bridge",
     "build_driver",
 ]
