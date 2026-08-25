@@ -713,10 +713,10 @@ async def test_retry_payload_depends_on_input_admission():
     context = TurnContext(system_prompt="system", messages=[])
 
     await adapter.run_retry_turn("continue", "full durable input", context)
-    # Session survived but the input never reached it: durable replay.
+    # survived but not admitted -> durable replay
     manager.input_admitted = False
     await adapter.run_retry_turn("continue", "full durable input", context)
-    # No session at all: durable replay regardless of admission.
+    # no session -> durable replay
     manager.native_session_id = ""
     manager.input_admitted = True
     await adapter.run_retry_turn("continue", "full durable input", context)
@@ -753,7 +753,7 @@ async def test_failed_start_retry_replays_the_durable_payload():
 
     with pytest.raises(RuntimeError, match="provider refused the turn"):
         await asyncio.wait_for(adapter.run_turn(_context()), timeout=1)
-    # Session survives the failed start, but admission is cleared.
+    # session survives, admission cleared
     assert manager.native_session_id == "native-session-1"
     assert manager.input_admitted is False
 
@@ -785,8 +785,7 @@ class _ResumeBoundaryTurnDriver(_ResumeBoundaryDriver):
 
 @pytest.mark.asyncio
 async def test_retry_kick_is_reconsidered_after_a_fresh_session_fallback():
-    # The saved session died; open() inside run_retry_turn falls back fresh
-    # BEFORE the payload choice, so the kick is replaced by the durable input.
+    # dead session: fresh fallback happens before the payload choice
     driver = _ResumeBoundaryTurnDriver(
         AgentAPIError(
             "The provider could not complete the turn.",
@@ -822,7 +821,7 @@ async def test_retry_kick_is_reconsidered_after_a_fresh_session_fallback():
 
 @pytest.mark.asyncio
 async def test_unclassified_resume_failures_fall_back_after_a_bounded_streak():
-    # Unknown wording (matches no marker) must not wedge the agent forever.
+    # unknown wording must not wedge forever
     driver = _ResumeBoundaryDriver(RuntimeError("Codex rollout missing"))
     manager = RuntimeManager(
         driver,
@@ -863,9 +862,7 @@ class _ResumeErrorSequenceDriver(_ControllableDriver):
 
 @pytest.mark.asyncio
 async def test_untagged_agent_api_errors_never_lose_the_session():
-    # AgentAPIError without an error_code is recoverable by contract and
-    # must stay outside the destructive fallback counter, however often
-    # it repeats.
+    # untagged AgentAPIError: recoverable, never feeds the streak
     driver = _ResumeBoundaryDriver(AgentAPIError("temporary transport failure"))
     manager = RuntimeManager(
         driver,
@@ -883,8 +880,7 @@ async def test_untagged_agent_api_errors_never_lose_the_session():
 
 @pytest.mark.asyncio
 async def test_transient_resume_failures_reset_the_unclassified_streak():
-    # 2 unclassified, then a transient, then 3 unclassified: the transient
-    # breaks the streak, so fallback happens on the 6th attempt, not the 4th.
+    # transient resets the streak: fallback on the 6th attempt, not the 4th
     driver = _ResumeErrorSequenceDriver([
         RuntimeError("weird wording one"),
         RuntimeError("weird wording two"),
@@ -917,8 +913,7 @@ async def test_transient_resume_failures_reset_the_unclassified_streak():
 
 @pytest.mark.asyncio
 async def test_categorized_provider_errors_hit_the_bounded_fallback():
-    # The codex driver launders unknown wordings into ProviderFailureError
-    # (provider_error); that class must still reach the bounded fallback.
+    # provider_error (codex-laundered unknown wording) hits the fallback
     driver = _ResumeBoundaryDriver(
         ProviderFailureError(
             "The provider could not complete the turn.",

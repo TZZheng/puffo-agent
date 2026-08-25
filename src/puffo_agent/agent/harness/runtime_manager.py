@@ -84,8 +84,7 @@ class RuntimeStateError(RuntimeError):
         self.error_code = error_code
 
 
-# Environmental failures: retrying the same native session is correct and
-# these must never trigger session loss, however often they repeat.
+# Environmental failures: never session loss.
 _TRANSIENT_RESUME_ERROR_CODES = frozenset({
     "authentication",
     "rate_limit",
@@ -93,17 +92,14 @@ _TRANSIENT_RESUME_ERROR_CODES = frozenset({
     "quota_exhausted",
 })
 
-# Consecutive unclassified resume failures tolerated before assuming the
-# session is gone.
+# Consecutive unclassified failures tolerated before fallback.
 _RESUME_FAILURE_FALLBACK_AFTER = 3
 
 
 def _resume_error_is_transient(exc: Exception) -> bool:
     if getattr(exc, "is_auth", False):
         return True
-    # AgentAPIError is recoverable-with-backoff by contract (invalid_resume
-    # is intercepted earlier); only categorized non-retryable failures
-    # (ProviderFailureError) and raw exceptions count toward the streak.
+    # AgentAPIError: recoverable by contract (invalid_resume intercepted earlier).
     if isinstance(exc, AgentAPIError):
         return True
     return getattr(exc, "error_code", None) in _TRANSIENT_RESUME_ERROR_CODES
@@ -220,9 +216,7 @@ class RuntimeManager:
         # See _consume_event_locked.
         self._resume_unconfirmed = False
         self._confirmed_native_session_id = ""
-        # True only when the last started turn's input provably reached the
-        # native transcript (accepted start receipt). Retry payload choice
-        # keys off this, never off session-id presence alone.
+        # input reached the transcript (accepted start receipt only)
         self._input_admitted = False
         self._resume_failure_streak = 0
 
@@ -247,15 +241,13 @@ class RuntimeManager:
                 await self.driver.close()
             except Exception:
                 logger.exception("failed to close runtime after open failure")
-            # Classified transient failures retry the same native session.
-            # Explicit absence/incompatibility falls back fresh at once;
-            # unclassified failures fall back after a bounded streak so an
-            # unknown provider wording cannot wedge the agent forever.
+            # transient -> retry same session; invalid -> fresh at once;
+            # unclassified -> fresh after a bounded streak (no forever-wedge)
             if native_resume is None:
                 raise
             if not _native_resume_is_unavailable(exc):
                 if _resume_error_is_transient(exc):
-                    # Consecutive semantics: transients break the streak.
+                    # transients break the streak
                     self._resume_failure_streak = 0
                     raise
                 self._resume_failure_streak += 1
@@ -337,9 +329,7 @@ class RuntimeManager:
     async def _discard_failed_start_locked(
         self, logical: TurnRef, *, retire: bool
     ) -> None:
-        # The input may or may not have crossed the process boundary:
-        # unknown must read as not-admitted so a retry replays the durable
-        # payload instead of kicking a thread that never got the task.
+        # admission unknown -> retry must replay the durable payload
         self._input_admitted = False
         self.active_turn_ref = None
         self._active_driver_turn_ref = None
@@ -1314,12 +1304,9 @@ class RuntimeManagerAdapter(Adapter):
         fallback_user_message: str,
         ctx: TurnContext,
     ) -> TurnResult:
-        # Open first: a dead session may fall back fresh here, clearing
-        # input admission before the payload choice below.
+        # open() first: a fresh fallback clears admission before the choice
         await self.manager.open()
-        # Kick only a session whose input provably reached the transcript;
-        # anything else replays the exact durable payload (duplication is
-        # recoverable, silent input loss is not).
+        # kick only admitted input; otherwise durable replay
         content = (
             kick_text
             if self.manager.native_session_id and self.manager.input_admitted
