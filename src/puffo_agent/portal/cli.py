@@ -1119,16 +1119,9 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if not result.ok:
         print(f"error: {result.error}", file=sys.stderr)
         return 2
-    if (
-        cfg.runtime.kind == "cli-local"
-        and cfg.runtime.harness == "acp"
-        and not cfg.runtime.harness_command
-    ):
-        print(
-            "error: harness='acp' requires --harness-command "
-            "EXECUTABLE [ARG ...]",
-            file=sys.stderr,
-        )
+    command_error = _harness_command_error(cfg.runtime)
+    if command_error:
+        print(f"error: {command_error}", file=sys.stderr)
         return 2
 
     cfg.save()
@@ -1143,6 +1136,19 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if is_daemon_alive():
         print("daemon will restart the worker on the next reconcile tick.")
     return 0
+
+
+def _harness_command_error(runtime: RuntimeConfig) -> str:
+    if (
+        runtime.kind == "cli-local"
+        and runtime.harness == "acp"
+        and not runtime.harness_command
+    ):
+        return (
+            "harness='acp' requires --harness-command "
+            "EXECUTABLE [ARG ...]"
+        )
+    return ""
 
 
 def cmd_agent_archive(args: argparse.Namespace) -> int:
