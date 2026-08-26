@@ -201,6 +201,15 @@ def test_opencode_resolver_uses_its_typed_override(tmp_path, monkeypatch):
     assert cli_bin.resolve_opencode_bin() == str(fake)
 
 
+def test_pi_resolver_uses_its_typed_override(tmp_path, monkeypatch):
+    """A service PATH miss must not discard the operator's Pi location."""
+    fake = _make_exe(tmp_path, "fake_pi")
+    monkeypatch.setenv("PUFFO_PI_BIN", str(fake))
+    monkeypatch.setattr("shutil.which", lambda name, path=None: None)
+
+    assert cli_bin.resolve_pi_bin() == str(fake)
+
+
 def test_real_path_used_when_process_path_misses(monkeypatch):
     """When the process PATH misses, resolution retries against the
     reconstructed real PATH."""

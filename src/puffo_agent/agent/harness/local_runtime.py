@@ -60,7 +60,12 @@ from ..adapters.base import (
     is_silent,
 )
 from ..adapters.desired_install import run_spawn_install
-from ..cli_bin import resolve_claude_bin, resolve_codex_bin, resolve_opencode_bin
+from ..cli_bin import (
+    resolve_claude_bin,
+    resolve_codex_bin,
+    resolve_opencode_bin,
+    resolve_pi_bin,
+)
 from ..runtime_event_outbox import (
     RuntimeEventOutbox,
     RuntimeEventProjectingSink,
@@ -91,6 +96,7 @@ SUPPORTED_LOCAL_DRIVERS = frozenset({
     "claude-code",
     "codex",
     "opencode",
+    "pi",
 })
 VALID_PERMISSION_MODES = frozenset({"bypassPermissions"})
 VALID_SANDBOX_MODES = frozenset({
@@ -277,11 +283,10 @@ class LocalRuntimePreparer:
         ).strip()
         self.provider = provider
         if self.harness_name not in SUPPORTED_LOCAL_DRIVERS:
+            supported = ", ".join(sorted(SUPPORTED_LOCAL_DRIVERS))
             raise RuntimeError(
                 f"agent {self.agent_id!r}: runtime.kind='cli-local' supports "
-                "only harness='acp', 'claude-code', 'codex', or "
-                "'opencode' in the "
-                "Driver runtime"
+                f"only these Driver harnesses: {supported}"
             )
         self.workspace_dir = agent_cfg.resolve_workspace_dir()
         self.claude_dir = agent_cfg.resolve_claude_dir()
@@ -357,27 +362,38 @@ class LocalRuntimePreparer:
         provider_cfg = getattr(self.daemon_cfg, self.provider, None)
         return runtime.model or getattr(provider_cfg, "model", "") or ""
 
-    def _prepare_generic_spec(self, system_prompt: str) -> RuntimeSpec:
+    def _generic_launch_command(self) -> tuple[str, list[str]]:
         command = tuple(self.agent_cfg.runtime.harness_command)
+        # Older web clients persisted the bare argv ["pi"]. Normalize that at
+        # this compatibility boundary so both old configs and new commandless
+        # presets use the daemon's broad PATH / PUFFO_PI_BIN resolver.
+        if self.harness_name == "pi" and (not command or command == ("pi",)):
+            executable = resolve_pi_bin() or ""
+            if not executable:
+                raise RuntimeError(
+                    "pi binary not found. Install Pi or set "
+                    "PUFFO_PI_BIN=/absolute/path/to/pi."
+                )
+            return executable, []
         if command:
             executable, *launch_args = command
-        elif self.harness_name == "opencode":
+            return executable, launch_args
+        if self.harness_name == "opencode":
             executable = resolve_opencode_bin() or ""
-            launch_args = []
             if not executable:
                 raise RuntimeError(
                     "opencode binary not found. Install OpenCode or set "
                     "PUFFO_OPENCODE_BIN=/absolute/path/to/opencode."
                 )
-        elif self.harness_name == "pi":
-            executable = "pi"
-            launch_args = []
-        else:
-            raise RuntimeError(
-                f"agent {self.agent_id!r}: harness='acp' requires "
-                "runtime.harness_command, for example "
-                "['opencode', 'acp']"
-            )
+            return executable, []
+        raise RuntimeError(
+            f"agent {self.agent_id!r}: harness='acp' requires "
+            "runtime.harness_command, for example "
+            "['opencode', 'acp']"
+        )
+
+    def _prepare_generic_spec(self, system_prompt: str) -> RuntimeSpec:
+        executable, launch_args = self._generic_launch_command()
         controlled: dict[str, str] = {}
         mcp_servers: tuple[McpServerSpec, ...] = ()
         is_opencode = Path(executable).name.lower() in {

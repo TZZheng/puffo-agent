@@ -28,7 +28,7 @@ from puffo_agent.agent.harness.driver import (
     TurnRef,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness import UnsupportedDriver, build_driver
+from puffo_agent.agent.harness import build_driver
 from puffo_agent.agent.harness.pi_bridge import (
     BRIDGE_NONCE_ENV,
     BRIDGE_READY_FILE_ENV,
@@ -741,15 +741,9 @@ async def test_compact_requires_an_idle_session():
 # -- tool-bridge admission ---------------------------------------------------
 
 
-def test_pi_is_not_selectable_without_a_bridge():
-    """Selection stays closed while Pi has no shipped Puffo tool bridge.
-
-    PiDriver is complete and exercised above, but a Pi agent cannot call
-    ``send_message`` yet. Wiring "pi" into ``build_driver`` would admit a
-    runtime that looks healthy and cannot answer anyone, so that edit must be
-    deliberate enough to change this test.
-    """
-    assert isinstance(build_driver("pi"), UnsupportedDriver)
+def test_pi_is_selectable_now_that_admission_verifies_the_bridge():
+    """The factory must reach the driver whose open gate rejects mute Pi."""
+    assert isinstance(build_driver("pi"), PiDriver)
 
 
 def test_admission_refuses_when_the_bridge_is_missing(tmp_path):

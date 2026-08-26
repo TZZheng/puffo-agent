@@ -39,9 +39,10 @@ def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
         return OpenCodeDriver(**kwargs)
     if name == "acp":
         return AcpDriver(**kwargs)
-    # "pi" is deliberately absent: PiDriver is complete and tested offline, but
-    # Pi has no Puffo tool bridge yet, so selecting it would admit a runtime
-    # that cannot send a message. See test_pi_is_not_selectable_without_a_bridge.
+    if name == "pi":
+        # Admission remains fail-closed in PiDriver.open(): every spawned Pi
+        # process must load and attest the shipped Puffo tool bridge.
+        return PiDriver(**kwargs)
     if not name or name == "claude-code":
         return ClaudeCodeCliDriver(**kwargs)
     return UnsupportedDriver(name)

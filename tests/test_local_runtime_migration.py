@@ -279,6 +279,41 @@ async def test_generic_runtime_projects_puffo_tools(
         assert "mcp" not in inline
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [[], ["pi"]])
+async def test_pi_runtime_uses_daemon_binary_resolver(
+    puffo_home, monkeypatch, command,
+):
+    """Web defaults and legacy bare argv must survive a service's narrow PATH."""
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(local_runtime, "resolve_pi_bin", lambda: "/opt/bin/pi")
+    config = AgentConfig(
+        id="pi-resolver",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="openai",
+            harness="pi",
+            harness_command=command,
+        ),
+        puffo_core=PuffoCoreConfig(
+            server_url="http://localhost:3000",
+            slug="bot-0001",
+            device_id="dev_1",
+            space_id="sp_test",
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(system_prompt="managed prompt")
+
+    assert prepared.harness_name == "pi"
+    assert prepared.spec.executable == "/opt/bin/pi"
+    assert prepared.spec.launch_args == ()
+    assert prepared.spec.mcp_servers == ()
+
+
 class _ResumeFallbackDriver(Driver):
     def __init__(self):
         self.open_calls: list[str | None] = []
