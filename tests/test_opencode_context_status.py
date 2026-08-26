@@ -79,33 +79,26 @@ def test_capability_declares_push_not_none():
 
 
 @pytest.mark.asyncio
-async def test_window_lookup_waits_until_first_turn_is_accepted(monkeypatch):
-    """Do not race two OpenCode schema initializers in a fresh user home."""
+async def test_window_lookup_finishes_before_first_turn_can_start(monkeypatch):
+    """Open cannot expose a driver while its metadata process is active."""
     proc = _TurnProcess()
     driver = OpenCodeDriver(lambda command, spec: proc)
     lookup_started = asyncio.Event()
+    lookup_release = asyncio.Event()
 
     async def fake_lookup(spec):
         lookup_started.set()
+        await lookup_release.wait()
 
     monkeypatch.setattr(driver, "_resolve_context_window", fake_lookup)
-    await driver.open(RuntimeSpec("/workspace", model="opencode/hy3-free"))
-    assert driver._window_task is None
-
-    started = asyncio.create_task(driver.start_turn(TurnInput("hi")))
-    await asyncio.sleep(0)
-    assert not lookup_started.is_set()
-
-    proc.feed({
-        "type": "step_start",
-        "sessionID": "ses_fresh_home",
-        "part": {"messageID": "msg_1"},
-    })
-    await asyncio.wait_for(started, timeout=1)
+    opening = asyncio.create_task(
+        driver.open(RuntimeSpec("/workspace", model="opencode/hy3-free"))
+    )
     await asyncio.wait_for(lookup_started.wait(), timeout=1)
-
-    proc.exit()
-    proc.eof()
+    await asyncio.sleep(0)
+    assert not opening.done()
+    lookup_release.set()
+    await asyncio.wait_for(opening, timeout=1)
     await driver.close()
 
 
@@ -114,7 +107,6 @@ async def test_step_finish_total_becomes_context_status_and_augments_event():
     proc = _TurnProcess()
     driver = OpenCodeDriver(lambda command, spec: proc)
     await driver.open(RuntimeSpec("/workspace"))
-    assert driver._window_task is None  # no model -> no registry lookup
 
     before = await driver.context_status()
     assert before.stale and before.used_tokens is None

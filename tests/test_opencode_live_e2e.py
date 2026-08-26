@@ -18,6 +18,7 @@ import pytest
 
 from puffo_agent.agent.adapters.desired_install import install_desired
 from puffo_agent.agent.harness.driver import (
+    CompactRequest,
     HarnessEventType,
     RuntimeSpec,
     TurnInput,
@@ -174,5 +175,38 @@ async def test_real_opencode_driver_loads_skill_and_reports_context(tmp_path: Pa
         assert context.used_tokens and context.used_tokens > 0
         assert context.context_window and context.context_window > 0
         assert not context.stale
+
+        native_session_id = driver._native_session_id
+        receipt = await driver.compact(CompactRequest())
+        assert receipt.accepted and receipt.operation_ref
+        compact_events = []
+        async for event in driver.events():
+            compact_events.append(event)
+            if event.type in {
+                HarnessEventType.COMPACTION_COMPLETED,
+                HarnessEventType.COMPACTION_FAILED,
+            }:
+                break
+        assert compact_events[-1].type is HarnessEventType.COMPACTION_COMPLETED
+        assert compact_events[-1].data["operation_ref"] == receipt.operation_ref
+        assert driver._serve_proc is None
+
+        await driver.start_turn(
+            TurnInput(
+                "After compaction, return only the exact sentinel you were "
+                "required to emit earlier."
+            )
+        )
+        continued = []
+        async for event in driver.events():
+            continued.append(event)
+            if event.type is HarnessEventType.TURN_COMPLETED:
+                break
+        assert driver._native_session_id == native_session_id
+        assert "SENTINEL-OPENCODE-SKILL" in "".join(
+            str(event.data.get("delta") or "")
+            for event in continued
+            if event.type is HarnessEventType.ASSISTANT_DELTA
+        )
     finally:
         await driver.close()

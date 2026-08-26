@@ -221,7 +221,6 @@ class OpenCodeDriver(Driver):
         self._provider_failed = False
         self._context = ContextStatus(stale=True)
         self._context_window: int | None = None
-        self._window_task: asyncio.Task[None] | None = None
         self._compact_task: asyncio.Task[None] | None = None
         self._compact_ref = ""
         self._serve_proc: Any = None
@@ -419,28 +418,6 @@ class OpenCodeDriver(Driver):
             out.decode("utf-8", "replace"), model_id
         )
 
-    def _start_context_window_lookup(self) -> None:
-        """Start model metadata lookup only after OpenCode accepted a turn.
-
-        A fresh OpenCode home initializes its SQLite schema on first command.
-        Starting ``models --verbose`` in ``open()`` raced that migration with
-        the first ``run`` child and could make a new user's first turn fail.
-        The first JSON frame proves the run child finished initialization, so
-        launching the best-effort lookup from that boundary is safe and still
-        normally finishes before the turn's final usage frame.
-        """
-        spec = self._spec
-        if (
-            spec is not None
-            and spec.model
-            and self._window_task is None
-            and not self._closed
-        ):
-            self._window_task = spawn(
-                self._resolve_context_window(spec),
-                name="opencode.context_window",
-            )
-
     def _absorb_context_update(self, event: HarnessEvent) -> HarnessEvent:
         total = event.data.get("total_tokens")
         if not isinstance(total, int) or total <= 0:
@@ -569,7 +546,11 @@ class OpenCodeDriver(Driver):
                             "modelID": model_id,
                             "auto": False,
                         },
-                        auth=aiohttp.BasicAuth("opencode", password),
+                        headers={
+                            "Authorization": aiohttp.encode_basic_auth(
+                                "opencode", password
+                            )
+                        },
                     )
                     body = await response.text()
                     _require_summarize_ack(response.status, body)
@@ -624,14 +605,6 @@ class OpenCodeDriver(Driver):
                 timeout=CLEANUP_TIMEOUT_SECONDS,
             )
             self._stderr_reader = None
-        if self._window_task is not None:
-            self._window_task.cancel()
-            await collect_cleanup_errors(
-                asyncio.gather(self._window_task, return_exceptions=True),
-                errors,
-                timeout=CLEANUP_TIMEOUT_SECONDS,
-            )
-            self._window_task = None
         self._proc = None
         self._active = TurnRef("")
         self._active_native_turn_id = ""
@@ -772,7 +745,6 @@ class OpenCodeDriver(Driver):
                     )
                     self._session_announced = True
                 self._accepted.set_result((native_session_id, native_turn_id))
-                self._start_context_window_lookup()
             for event in normalize_opencode_frame(
                 frame,
                 session_ref=self._session_ref,
