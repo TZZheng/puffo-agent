@@ -73,6 +73,12 @@ from ..runtime_event_outbox import (
 from ..runtime_events import RuntimeEventProjector, TrustedScope
 from . import SUPPORTED_LOCAL_DRIVERS, UnsupportedDriver, build_driver
 from .child_env import build_child_environment
+from .pi_bridge import (
+    build_bridge_environment,
+    install_pi_tool_bridge,
+    mint_bridge_nonce,
+    ready_file_path,
+)
 from .driver import (
     Driver,
     HarnessEvent,
@@ -381,7 +387,9 @@ class LocalRuntimePreparer:
         controlled, opencode_config = self._prepare_executable_configuration(
             executable, system_prompt
         )
-        mcp_servers = self._project_protocol_mcp(opencode_config)
+        mcp_servers = self._project_protocol_mcp(
+            controlled, opencode_config
+        )
         if opencode_config:
             controlled["OPENCODE_CONFIG_CONTENT"] = json.dumps(
                 opencode_config
@@ -458,7 +466,9 @@ class LocalRuntimePreparer:
         return controlled, opencode_config
 
     def _project_protocol_mcp(
-        self, opencode_config: dict[str, Any]
+        self,
+        controlled: dict[str, str],
+        opencode_config: dict[str, Any],
     ) -> tuple[McpServerSpec, ...]:
         """Project Puffo tools according to the selected Driver protocol.
 
@@ -470,14 +480,19 @@ class LocalRuntimePreparer:
         if self._puffo_core_env:
             puffo_command = default_python_executable()
             puffo_args = ("-m", "puffo_agent.mcp.puffo_core_server")
-            mcp_servers = (
-                McpServerSpec(
-                    name="puffo",
-                    command=puffo_command,
-                    args=puffo_args,
-                    environment=self._puffo_core_env,
-                ),
+            puffo_server = McpServerSpec(
+                name="puffo",
+                command=puffo_command,
+                args=puffo_args,
+                environment=self._puffo_core_env,
             )
+            if self.harness_name == "pi":
+                # Pi has no MCP client. Its attested extension bridge carries
+                # only Puffo's core server; keeping mcp_servers empty is part
+                # of the Driver admission contract.
+                controlled.update(self._prepare_pi_bridge(puffo_server))
+            else:
+                mcp_servers = (puffo_server,)
             if self.harness_name == "opencode":
                 opencode_config["mcp"] = {
                     "puffo": {
@@ -493,6 +508,20 @@ class LocalRuntimePreparer:
                 self.agent_id,
             )
         return mcp_servers
+
+    def _prepare_pi_bridge(self, mcp: McpServerSpec) -> dict[str, str]:
+        """Install the bridge and mint fresh per-spec readiness evidence."""
+        pi_home = agent_dir(self.agent_id) / ".pi" / "agent"
+        install_pi_tool_bridge(pi_home)
+        controlled = {"PI_CODING_AGENT_DIR": str(pi_home)}
+        controlled.update(
+            build_bridge_environment(
+                mcp=mcp,
+                ready_file=ready_file_path(pi_home),
+                nonce=mint_bridge_nonce(),
+            )
+        )
+        return controlled
 
     def _build_puffo_core_env(self) -> dict[str, str] | None:
         pc = self.agent_cfg.puffo_core
