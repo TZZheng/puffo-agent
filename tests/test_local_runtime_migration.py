@@ -35,6 +35,7 @@ from puffo_agent.portal.state import (
     PuffoCoreConfig,
     RuntimeConfig,
     agent_codex_user_dir,
+    agent_dir,
     agent_home_dir,
     cli_session_json_path,
 )
@@ -63,6 +64,46 @@ def test_generic_harness_ignores_legacy_claude_session(
 
     assert native_session_id == ""
     assert migration_source == "harness_changed"
+
+
+@pytest.mark.asyncio
+async def test_legacy_claude_file_cannot_reach_switched_opencode(
+    puffo_home, monkeypatch,
+):
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(
+        local_runtime,
+        "resolve_opencode_bin",
+        lambda: "/opt/bin/opencode",
+    )
+    agent_id = "switched-agent"
+    config = AgentConfig(
+        id=agent_id,
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            harness="opencode",
+            model="deepseek/deepseek-chat",
+        ),
+    )
+    agent_dir(agent_id).mkdir(parents=True, exist_ok=True)
+    # Old Claude files can predate the model field, so model comparison
+    # cannot establish ownership of this session.
+    cli_session_json_path(agent_id).write_text(
+        json.dumps({"session_id": "claude-era-session"}),
+        encoding="utf-8",
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(
+        system_prompt="managed prompt",
+        persisted_native_session_id="claude-era-session",
+        persisted_native_session_harness="claude-code",
+    )
+
+    assert prepared.native_session_id == ""
+    assert prepared.migration_source == "harness_changed"
 
 
 @pytest.mark.asyncio
