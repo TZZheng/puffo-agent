@@ -1067,6 +1067,7 @@ class PuffoCoreMessageClient:
             inviter_by_event_id=getattr(self, "_inviter_by_invitation_event_id", {}),
             processed_event_ids=getattr(self, "_processed_membership_event_ids", set()),
             enqueue_message=self._enqueue_membership_system_message,
+            rewarm_channels=self.rewarm_channel_caches,
             log=self._log,
         )
 

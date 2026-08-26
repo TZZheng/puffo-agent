@@ -36,8 +36,13 @@ class RuntimeSpy:
         self.delivery += 1
 
 
-async def _wired_stack(tmp_path):
-    """Real MessageStore + core client, WS client wired to it."""
+async def _wired_stack(tmp_path, *, channel_space=None, warm_reveals=None):
+    """Real MessageStore + core client, WS client wired to it.
+
+    ``warm_reveals`` is what the (stubbed) member-cache warm learns
+    from the server; the real ``rewarm_channel_caches`` (lock +
+    debounce) runs on cache misses.
+    """
     store = MessageStore(tmp_path / "messages.db")
     await store.open()
     client = PuffoCoreMessageClient.__new__(PuffoCoreMessageClient)
@@ -45,7 +50,20 @@ async def _wired_stack(tmp_path):
     client.store = store
     client.global_runtime = RuntimeSpy()
     client._log = logging.getLogger(__name__)
-    client._channel_space = {"ch_general": "sp_1", "ch_priv": "sp_1"}
+    client._channel_space = (
+        {"ch_general": "sp_1", "ch_priv": "sp_1"}
+        if channel_space is None
+        else channel_space
+    )
+    client._rewarm_lock = asyncio.Lock()
+    client._last_rewarm = 0.0
+    client._warm_calls = 0
+
+    async def warm():
+        client._warm_calls += 1
+        client._channel_space.update(warm_reveals or {})
+
+    client._warm_member_caches = warm
     client._space_name_cache = {}
     client._channel_name_cache = {}
     client._channel_encrypted = {}
@@ -160,13 +178,38 @@ async def test_redelivered_join_frame_persists_once(tmp_path):
 
 @pytest.mark.asyncio
 async def test_join_frame_for_unknown_channel_persists_nothing(tmp_path):
-    """Agent isn't a member of the channel: nothing durable, no wake."""
+    """Agent isn't a member of the channel: a rewarm runs (the miss
+    could be the connect-time warm race) but still doesn't list the
+    channel, so nothing durable and no wake."""
     ws, client, store = await _wired_stack(tmp_path)
 
     await ws._handle_frame(_join_frame(channel_id="ch_not_mine"))
 
+    assert client._warm_calls == 1
     assert await store.get_pending() == ()
     assert client.global_runtime.work == 0
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_join_frame_racing_connect_warm_rewarms_and_persists(tmp_path):
+    """Regression: on first connect ``_channel_space`` starts empty
+    and the warm task is fire-and-forget. A join frame arriving first
+    must trigger a rewarm and still produce the system message."""
+    ws, client, store = await _wired_stack(
+        tmp_path,
+        channel_space={},
+        warm_reveals={"ch_general": "sp_1"},
+    )
+
+    await ws._handle_frame(_join_frame())
+
+    assert client._warm_calls == 1
+    rows = await store.get_pending()
+    assert len(rows) == 1
+    assert rows[0].channel_id == "ch_general"
+    assert "joined channel #general" in rows[0].content["text"]
+    assert client.global_runtime.work == 1
     await store.close()
 
 

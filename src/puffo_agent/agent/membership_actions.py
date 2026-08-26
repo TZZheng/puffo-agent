@@ -245,11 +245,22 @@ async def maybe_announce_membership_change(
     inviter_by_event_id: Mapping[str, str],
     processed_event_ids: set[str],
     enqueue_message: AsyncCall,
+    rewarm_channels: AsyncCall | None = None,
     log: Log,
 ) -> None:
     channel_id = payload.get("channel_id") or ""
-    if not channel_id or channel_id not in channel_spaces:
+    if not channel_id:
         return
+    if channel_id not in channel_spaces:
+        if kind != EventKind.ADD_TO_CHANNEL or rewarm_channels is None:
+            return
+        # The server delivers add_to_channel only to that channel's
+        # members, so a cache miss usually means the connect-time warm
+        # task hasn't landed yet — rewarm once before deciding the
+        # channel isn't ours.
+        await rewarm_channels()
+        if channel_id not in channel_spaces:
+            return
     actor = _channel_membership_actor(
         kind=kind,
         event=event,
