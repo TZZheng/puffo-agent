@@ -1,8 +1,9 @@
-"""Opt-in live acceptance checks against an installed OpenCode binary.
+"""Live acceptance checks against an installed OpenCode binary.
 
-These tests do not call a model or require provider credentials.  They exercise
-the real OpenCode CLI in an isolated home/config/data/cache environment so a
-passing unit test cannot hide a projection path that OpenCode itself ignores.
+The default check is network-free.  A separately gated check runs a real free
+model turn, proving that OpenCode exposes the installed skill to the model and
+that the model can load and follow it.  Both use isolated OpenCode state so a
+passing test cannot be explained by unrelated host-level skills.
 """
 from __future__ import annotations
 
@@ -25,10 +26,11 @@ class _SkillTemplateHttp:
                 "body": (
                     "---\n"
                     "name: puffo-e2e\n"
-                    "description: E2E sentinel installed by Puffo.\n"
+                    "description: Use only for the Puffo OpenCode E2E sentinel.\n"
                     "---\n\n"
                     "# Puffo E2E\n\n"
-                    "SENTINEL-OPENCODE-SKILL\n"
+                    "After loading this skill, reply with exactly "
+                    "`SENTINEL-OPENCODE-SKILL`.\n"
                 )
             }
         raise AssertionError(path)
@@ -65,6 +67,11 @@ def test_desired_skill_is_discoverable_by_real_opencode_cli(tmp_path: Path):
         )
     )
 
+    environment = _isolated_opencode_environment(tmp_path)
+    # OpenCode consults PWD while resolving project-local skills.  Keep it
+    # consistent with cwd so the test cannot accidentally discover skills
+    # from the repository that launched pytest.
+    environment["PWD"] = str(workspace)
     result = subprocess.run(
         [shutil.which("opencode") or "opencode", "debug", "skill"],
         cwd=workspace,
@@ -95,3 +102,65 @@ def test_desired_skill_is_discoverable_by_real_opencode_cli(tmp_path: Path):
     )
     disabled_skills = json.loads(disabled.stdout)
     assert not any(item["name"] == "puffo-e2e" for item in disabled_skills)
+
+
+@pytest.mark.skipif(
+    os.environ.get("PUFFO_RUN_LIVE_OPENCODE_E2E") != "1",
+    reason="set PUFFO_RUN_LIVE_OPENCODE_E2E=1 for a real model turn",
+)
+@pytest.mark.skipif(shutil.which("opencode") is None, reason="OpenCode absent")
+def test_real_opencode_model_loads_and_follows_desired_skill(tmp_path: Path):
+    """Opt-in user journey: install, model tool-call, and skill-directed reply."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    asyncio.run(
+        install_desired(
+            http=_SkillTemplateHttp(),
+            agent_home=tmp_path / "agent-home",
+            workspace_dir=workspace,
+            agent_id="opencode-live-model-e2e",
+            harness_name="opencode",
+            desired_skills=["puffo-e2e"],
+            desired_mcps=[],
+        )
+    )
+
+    model = os.environ.get(
+        "PUFFO_OPENCODE_E2E_MODEL", "opencode/mimo-v2.5-free"
+    )
+    environment = _isolated_opencode_environment(tmp_path)
+    environment["PWD"] = str(workspace)
+    result = subprocess.run(
+        [
+            shutil.which("opencode") or "opencode",
+            "run",
+            "--format",
+            "json",
+            "--model",
+            model,
+            (
+                "Load the puffo-e2e skill, follow it, and return only its "
+                "required sentinel."
+            ),
+        ],
+        cwd=workspace,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    frames = [json.loads(line) for line in result.stdout.splitlines() if line]
+
+    assert any(
+        frame.get("type") == "tool_use"
+        and frame.get("part", {}).get("tool") == "skill"
+        and frame.get("part", {}).get("state", {}).get("input", {}).get("name")
+        == "puffo-e2e"
+        for frame in frames
+    ), result.stdout
+    assert any(
+        frame.get("type") == "text"
+        and frame.get("part", {}).get("text") == "SENTINEL-OPENCODE-SKILL"
+        for frame in frames
+    ), result.stdout
