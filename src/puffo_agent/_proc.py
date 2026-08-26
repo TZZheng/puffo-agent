@@ -31,6 +31,7 @@ async def spawn_framed_child(
     env: Mapping[str, str],
     cwd: str | None = None,
     stdin: int = asyncio.subprocess.PIPE,
+    start_new_session: bool = False,
 ) -> asyncio.subprocess.Process:
     """Spawn a child whose stdout is consumed frame by frame.
 
@@ -53,6 +54,15 @@ async def spawn_framed_child(
     ``stdin`` is the one parameter because a one-shot child that is never
     written to takes DEVNULL; every long-lived one takes a pipe.
 
+    ``start_new_session`` makes the child the leader of its own process
+    group (POSIX ``setsid``; accepted and inert on Windows). Callers whose
+    children re-spawn themselves — gemini's CLI replaces itself with a
+    ``--max-old-space-size`` grandchild — need this so shutdown can signal
+    the whole group; killing only the direct child pid leaves a grandchild
+    that inherits the stdio pipes, which keeps the stream readers from
+    reaching EOF and turns ``close()`` into a hang. Pair it with
+    ``signal_process_group`` at shutdown.
+
     This does not spawn short-lived commands read to EOF with
     ``communicate()`` -- those never reach the reader limit and have their
     own environment policy.
@@ -65,5 +75,36 @@ async def spawn_framed_child(
         cwd=cwd,
         env=dict(env),
         limit=STREAM_READER_LIMIT_BYTES,
+        start_new_session=start_new_session,
         **no_window_kwargs(),
     )
+
+
+def signal_process_group(proc: object, sig: int) -> bool:
+    """Signal the child's whole process group; report whether that happened.
+
+    Returns True only when the group signal was actually sent. The caller
+    falls back to single-pid ``terminate()``/``kill()`` on False, so every
+    guard here fails toward the old behavior:
+
+    * Windows has no ``killpg``.
+    * A factory-injected process may have no real pid (test fakes).
+    * The group signal is sent only when the child leads its own group
+      (``pgid == pid``) — exactly what ``start_new_session=True`` produces.
+      A child left in the parent's group must never be group-signalled:
+      ``killpg`` would hit this process too.
+    """
+    killpg = getattr(os, "killpg", None)
+    getpgid = getattr(os, "getpgid", None)
+    if killpg is None or getpgid is None:
+        return False
+    pid = getattr(proc, "pid", None)
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        if getpgid(pid) != pid:
+            return False
+        killpg(pid, sig)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True

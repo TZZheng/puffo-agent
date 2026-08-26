@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import signal
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
@@ -31,7 +32,7 @@ from acp.schema import (
     WaitForTerminalExitResponse,
 )
 
-from ..._proc import spawn_framed_child
+from ..._proc import signal_process_group, spawn_framed_child
 from ..cli_bin import normalize_launch_argv
 from .driver import (
     BusyDelivery,
@@ -287,6 +288,11 @@ class AcpDriver(Driver):
             command,
             env=spec.environment,
             cwd=spec.workspace_dir or None,
+            # ACP CLIs may re-spawn themselves (gemini execs a
+            # --max-old-space-size grandchild); group leadership lets
+            # close() take down the whole tree instead of orphaning a
+            # grandchild that holds our stdio pipes open.
+            start_new_session=True,
         )
 
     async def start_turn(self, input: TurnInput):
@@ -432,12 +438,22 @@ class AcpDriver(Driver):
             self._conn = None
         proc, self._proc = self._proc, None
         if proc is not None and getattr(proc, "returncode", None) is None:
-            proc.terminate()
+            if not signal_process_group(proc, signal.SIGTERM):
+                proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=3)
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+                if not signal_process_group(proc, signal.SIGKILL):
+                    proc.kill()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    # wait() outliving SIGKILL means the event loop is
+                    # still waiting on stdio transports held open by an
+                    # orphan outside the group we signalled. Abandon the
+                    # wait rather than hang close(); the reader tasks are
+                    # cancelled below.
+                    pass
         current = asyncio.current_task()
         for task in (self._prompt_task, self._watcher, self._stderr_reader):
             if task is not None and task is not current:
