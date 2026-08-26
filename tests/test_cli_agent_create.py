@@ -54,3 +54,17 @@ def test_create_generic_acp_requires_command(tmp_path, monkeypatch, capsys):
 
     assert rc == 2
     assert "requires --harness-command" in capsys.readouterr().err
+
+
+def test_create_pi_uses_builtin_binary_resolution(tmp_path, monkeypatch):
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+
+    rc = main([
+        "agent", "create", "--id", "pi-agent",
+        "--provider", "openai", "--harness", "pi",
+    ])
+
+    assert rc == 0
+    cfg = AgentConfig.load("pi-agent")
+    assert cfg.runtime.harness == "pi"
+    assert cfg.runtime.harness_command == []

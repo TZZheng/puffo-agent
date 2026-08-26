@@ -278,7 +278,7 @@ class AgentDetail(QWidget):
         layout.addRow("Runtime", self._runtime_kind)
 
         self._harness = QComboBox()
-        for h in ("claude-code", "codex", "opencode", "acp"):
+        for h in ("claude-code", "codex", "pi", "opencode", "acp"):
             self._harness.addItem(h)
         self._harness.currentTextChanged.connect(self._on_harness_changed)
         layout.addRow("Harness", self._harness)
