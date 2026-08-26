@@ -201,9 +201,19 @@ class AutonomousTurnLifecycleMixin:
         """Settle and release the turn opened for an autonomous provider run."""
         async with self._turn_state_lock:
             turn_id = self._autonomous_turn_id
-            if not turn_id or self.active.turn_id != turn_id:
-                self._autonomous_turn_id = ""
+            if not turn_id:
                 return False
+            if self.active.turn_id != turn_id:
+                # The adopted turn lost its active binding to another writer.
+                # Its durable row must still settle: a row left in_turn reads
+                # as "agent busy" to the scheduler, so notices arm but never
+                # come due, permanently.
+                if not await self._settle_orphaned_autonomous_row(
+                    turn_id, outcome=outcome
+                ):
+                    return False
+                self.notify()
+                return True
             self._autonomous_turn_id = ""
             self._autonomous_settle_pending = None
             planned = self._autonomous_planned or self._empty_autonomous_plan(turn_id)
@@ -221,6 +231,53 @@ class AutonomousTurnLifecycleMixin:
                 succeeded=succeeded,
             )
         self.notify()
+        return True
+
+    async def _settle_orphaned_autonomous_row(
+        self, turn_id: str, *, outcome: str
+    ) -> bool:
+        """Settle the durable row of an adopted turn that lost its binding.
+
+        Requeued semantics: once the binding is gone the run's outcome can no
+        longer be attributed to this row, the same convention crash recovery
+        uses for stale in_turn accounting. Rows admitted into the turn go back
+        to pending; an empty turn finalizes directly.
+        """
+        try:
+            run = await self.store.get_turn_run(turn_id)
+            if run is not None and run.state == "in_turn":
+                if run.message_ids:
+                    await self.store.requeue_messages(
+                        run.message_ids, turn_id=turn_id
+                    )
+                else:
+                    await self.store.finalize_empty_turn(
+                        turn_id=turn_id, state="requeued"
+                    )
+        except Exception as exc:  # noqa: BLE001 - retained for bounded retry
+            self._autonomous_settle_pending = outcome
+            self._degrade(f"orphaned autonomous turn settle failed: {exc}")
+            log_runtime_event(
+                logger,
+                "turn.autonomous_finalized",
+                level=logging.ERROR,
+                agent_id=self.agent_id,
+                turn_id=turn_id,
+                outcome="failed",
+                error_category=type(exc).__name__,
+            )
+            return False
+        self._autonomous_turn_id = ""
+        self._autonomous_planned = None
+        self._autonomous_settle_pending = None
+        log_runtime_event(
+            logger,
+            "turn.autonomous_finalized",
+            agent_id=self.agent_id,
+            turn_id=turn_id,
+            state="requeued",
+            outcome="orphaned",
+        )
         return True
 
     async def _settle_autonomous_turn(

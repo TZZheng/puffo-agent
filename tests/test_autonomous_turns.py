@@ -121,7 +121,8 @@ async def test_daemon_turn_queues_behind_an_in_flight_autonomous_run(tmp_path):
 @pytest.mark.asyncio
 async def test_finish_autonomous_turn_ignores_a_superseded_adoption(tmp_path):
     """If a daemon turn took over, the autonomous terminal frame must not
-    clear the daemon's active state."""
+    clear the daemon's active state -- but the adopted turn's durable row must
+    still settle rather than leak in_turn."""
     store = await make_store(tmp_path)
     runtime = GlobalInboxRuntime(
         store=store,
@@ -130,11 +131,15 @@ async def test_finish_autonomous_turn_ignores_a_superseded_adoption(tmp_path):
         workspace=tmp_path,
     )
     assert await runtime.adopt_autonomous_turn(provider_session_id="p-1")
+    orphan_id = runtime._autonomous_turn_id
     # Simulate a daemon turn replacing the adopted one.
     runtime.active.turn_id = "turn_daemon_owned"
 
-    assert await runtime.finish_autonomous_turn() is False
+    assert await runtime.finish_autonomous_turn() is True
     assert runtime.active.turn_id == "turn_daemon_owned"
+    assert runtime._autonomous_turn_id == ""
+    run = await store.get_turn_run(orphan_id)
+    assert run is not None and run.state == "requeued"
     await store.close()
 
 
@@ -378,4 +383,95 @@ async def test_notice_cleanup_failure_resumes_after_terminal_commit(tmp_path, ou
     row = await store.get_message_by_envelope("admitted-row")
     assert row.processing_state == ("processed" if outcome == "succeeded" else "pending")
     assert runtime._autonomous_settle_pending is None
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_adoption_during_notice_planning_queues_instead_of_clobbering(tmp_path):
+    """Production wedge (boris, 2026-08-24 15:31): adoption landed while a
+    notice turn was mid-planning -- context resolution stretched the window
+    between the top-of-loop autonomous guard and _start_local_turn to seconds.
+    Admission then overwrote the adopted turn's active binding, the manager
+    refused the doomed start, and the adopted row leaked in_turn forever.
+    The admission must recheck adoption under the turn-state lock and queue."""
+    store = await make_store(tmp_path)
+    adapter = Adapter()
+    await receipt(store, "inbound", 1)
+    started_turns: list[str] = []
+
+    async def run(planned):
+        started_turns.append(planned.turn_id)
+        await adapter.admit()
+
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=run, workspace=tmp_path,
+    )
+    original_plan = runtime.plan_pending
+
+    async def plan_with_adoption_race(*args, **kwargs):
+        planned = await original_plan(*args, **kwargs)
+        if planned is not None and not runtime._autonomous_turn_id:
+            assert await runtime.adopt_autonomous_turn(
+                provider_session_id="provider-1"
+            )
+        return planned
+
+    runtime.plan_pending = plan_with_adoption_race  # type: ignore[method-assign]
+
+    # The raced cycle must queue: no daemon turn starts, the adopted binding
+    # survives, and the inbox row stays pending for the retry.
+    assert await runtime.process_once() is False
+    adopted_id = runtime._autonomous_turn_id
+    assert adopted_id
+    assert runtime.active.turn_id == adopted_id
+    assert started_turns == []
+    row = await store.get_message_by_envelope("inbound")
+    assert row.processing_state == "pending"
+
+    # The autonomous terminal settles its row and releases the queue.
+    assert await runtime.finish_autonomous_turn() is True
+    adopted_run = await store.get_turn_run(adopted_id)
+    assert adopted_run is not None and adopted_run.state == "processed"
+
+    # Admission is unblocked: a real daemon turn starts on the retry.
+    runtime.plan_pending = original_plan  # type: ignore[method-assign]
+    assert await runtime.process_once() is True
+    assert started_turns and started_turns[0] != adopted_id
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_orphaned_adopted_turn_settles_its_row_on_terminal(tmp_path):
+    """Defense in depth for the same wedge: if the adopted turn ever loses its
+    active binding anyway, the terminal must still settle the durable row.
+    A row left in_turn reads as "agent busy" to the scheduler -- notices arm
+    but never come due, permanently."""
+    store = await make_store(tmp_path)
+    adapter = Adapter()
+    runtime = GlobalInboxRuntime(
+        store=store, adapter=adapter, run_turn=lambda _planned: None,
+        workspace=tmp_path,
+    )
+    assert await runtime.adopt_autonomous_turn(provider_session_id="provider-1")
+    orphan_id = runtime._autonomous_turn_id
+    # Simulate the binding being lost to another writer.
+    runtime.active.clear()
+
+    assert await runtime.finish_autonomous_turn(outcome="succeeded") is True
+    assert runtime._autonomous_turn_id == ""
+    assert runtime._autonomous_settle_pending is None
+    run = await store.get_turn_run(orphan_id)
+    assert run is not None and run.state == "requeued"
+
+    # Admission is unblocked: a daemon turn starts on pending work afterwards.
+    await receipt(store, "inbound", 1)
+    started_turns: list[str] = []
+
+    async def run_turn(planned):
+        started_turns.append(planned.turn_id)
+        await adapter.admit()
+
+    runtime.run_turn = run_turn  # type: ignore[method-assign]
+    assert await runtime.process_once() is True
+    assert started_turns
     await store.close()
