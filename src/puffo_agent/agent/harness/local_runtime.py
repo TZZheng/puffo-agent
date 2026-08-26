@@ -404,6 +404,11 @@ class LocalRuntimePreparer:
 
     def _resolve_generic_command(self) -> tuple[str, list[str]]:
         command = tuple(self.agent_cfg.runtime.harness_command)
+        # Older web clients persisted the bare argv ["pi"]. Normalize that at
+        # this compatibility boundary so both old configs and new commandless
+        # presets use the daemon's broad PATH / PUFFO_PI_BIN resolver.
+        if self.harness_name == "pi" and command == ("pi",):
+            command = ()
         if command:
             executable, *launch_args = command
         elif self.harness_name in {"opencode", "pi"}:
