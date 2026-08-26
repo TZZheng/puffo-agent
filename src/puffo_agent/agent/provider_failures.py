@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import Mapping
 
 from ._auth_markers import looks_like_provider_auth_error
+from ._usage_markers import looks_like_usage_limit
 from .errors import AgentAPIError, ProviderFailureError
 
 
@@ -29,6 +30,11 @@ PROVIDER_FAILURES: Mapping[str, ProviderFailure] = MappingProxyType(
         "permission_denied": ProviderFailure(
             "The requested operation was not permitted.",
             runtime_event_code="permission_denied",
+        ),
+        "plan_drained": ProviderFailure(
+            "The provider plan's usage quota is spent; wait for the "
+            "usage window to reset.",
+            runtime_event_code="provider_unavailable",
         ),
         "quota_exhausted": ProviderFailure(
             "The selected provider model has reached its usage limit; "
@@ -127,8 +133,11 @@ def classify_provider_failure(*, status: int | None, diagnostic: str) -> str:
     if status is None:
         match = _DIAGNOSTIC_HTTP_STATUS.search(normalized)
         status = int(match.group(1)) if match is not None else None
-    if status == 401 or looks_like_provider_auth_error(normalized):
+    # order: hard 401 -> plan quota -> broad quota -> auth substrings
+    if status == 401:
         return "authentication"
+    if looks_like_usage_limit(normalized):
+        return "plan_drained"
     if (
         ("reached your" in normalized and "limit" in normalized)
         or ("hit your" in normalized and "limit" in normalized)
@@ -138,6 +147,8 @@ def classify_provider_failure(*, status: int | None, diagnostic: str) -> str:
         or re.search(r"\bquota\b", normalized) is not None
     ):
         return "quota_exhausted"
+    if looks_like_provider_auth_error(normalized):
+        return "authentication"
     if status == 429 or any(
         marker in normalized
         for marker in ("rate_limit", "rate limit", "too many requests")

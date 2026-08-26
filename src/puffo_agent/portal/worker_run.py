@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import time
 import uuid
@@ -20,7 +21,9 @@ from .workspace_layout import (
     AVAILABLE_SHARED_WORKSPACE_STATES,
     prepare_workspace_shared_access,
 )
+from ..agent.errors import ProviderFailureError
 from ..agent.processing_receipts import processing_run_id
+from ..agent._usage_markers import parse_reset_epoch
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -505,7 +508,11 @@ class StandardWorkerRun:
     @staticmethod
     def _retryable_local_warm_error(exc: Exception) -> bool:
         if isinstance(exc, worker_module.AgentAPIError):
-            return not exc.is_auth
+            # drained: hold-no-retry, same as auth
+            return not exc.is_auth and not exc.is_drained
+        if isinstance(exc, ProviderFailureError):
+            # plan quota arrives here, not as AgentAPIError
+            return exc.error_code != "plan_drained"
         return not isinstance(
             exc,
             (
@@ -727,6 +734,8 @@ class StandardWorkerRun:
             covers_renotice_enabled=(
                 True if worker.daemon_cfg.covers_renotice else None
             ),
+            # unpark = snapshot-cleared health + a wake
+            drained_check=lambda: worker.runtime.health == "drained",
         )
         coordinator = SendCoordinator(
             slug=client.slug,
@@ -803,41 +812,49 @@ class StandardWorkerRun:
         reporter = self.worker._build_status_reporter(client)
         return reporter if reporter is not None else _NoopStatusReporter()
 
+    @staticmethod
+    def _settle_process_health(
+        worker: Worker, agent_id: str, outcome: str, error_text: str | None
+    ) -> None:
+        try:
+            if outcome == "succeeded":
+                worker._resolve_health_after_success(agent_id)
+            elif outcome == "cancelled":
+                worker_module.Worker._resolve_health_on_success(
+                    worker.runtime, agent_id, logger
+                )
+            elif outcome == "auth_failed":
+                worker._enter_auth_failed(agent_id)
+            elif outcome == "drained":
+                worker._enter_drained(
+                    agent_id, parse_reset_epoch(error_text or "")
+                )
+            elif outcome == "api_error_abandoned":
+                worker_module.Worker._mark_api_error_abandoned_if_in_progress(
+                    worker.runtime, agent_id, error_text, logger
+                )
+            elif outcome == "provider_failed":
+                worker_module.Worker._mark_provider_failure_if_in_progress(
+                    worker.runtime, agent_id, error_text, logger
+                )
+            else:
+                worker_module.Worker._fallback_unhandled_error_if_stuck_in_progress(
+                    worker.runtime, agent_id, error_text, logger
+                )
+        except Exception:
+            logger.warning("process health settlement failed", exc_info=True)
+
     async def _start_services(self, context: WorkerRunContext) -> WorkerRunServices:
         worker = self.worker
         uploader = self._build_runtime_event_uploader(context)
         reporter = self._build_reporter(context.client)
 
-        def settle_process_health(outcome: str, error_text: str | None) -> None:
-            try:
-                agent_id = context.paths.agent_id
-                if outcome == "succeeded":
-                    worker._resolve_health_after_success(agent_id)
-                elif outcome == "cancelled":
-                    worker_module.Worker._resolve_health_on_success(
-                        worker.runtime, agent_id, logger
-                    )
-                elif outcome == "auth_failed":
-                    worker._enter_auth_failed(agent_id)
-                elif outcome == "api_error_abandoned":
-                    worker_module.Worker._mark_api_error_abandoned_if_in_progress(
-                        worker.runtime, agent_id, error_text, logger
-                    )
-                elif outcome == "provider_failed":
-                    worker_module.Worker._mark_provider_failure_if_in_progress(
-                        worker.runtime, agent_id, error_text, logger
-                    )
-                else:
-                    worker_module.Worker._fallback_unhandled_error_if_stuck_in_progress(
-                        worker.runtime, agent_id, error_text, logger
-                    )
-            except Exception:
-                logger.warning("process health settlement failed", exc_info=True)
-
         global_runtime = self._build_global_runtime(
             context,
             status_lifecycle=GlobalInboxStatusLifecycle(reporter),
-            process_outcome=settle_process_health,
+            process_outcome=functools.partial(
+                self._settle_process_health, worker, context.paths.agent_id
+            ),
         )
         reminder_sync = await self._prepare_reminder_sync(context, global_runtime)
         global_task = asyncio.ensure_future(global_runtime.run())
