@@ -34,6 +34,8 @@ from acp.schema import (
 
 from ..._proc import signal_process_group, spawn_framed_child
 from ..cli_bin import normalize_launch_argv
+from ..provider_failures import PROVIDER_FAILURES, classify_provider_failure
+from .acp_presets import model_launch_args, operator_pinned_model
 from .driver import (
     BusyDelivery,
     CancelCapability,
@@ -63,6 +65,12 @@ from .driver import (
     UnsupportedCapability,
 )
 from .subprocess_io import drain_subprocess_stream_keeping_tail
+
+
+# JSON-RPC code of the ACP SDK's RequestError.auth_required() — the only
+# structured error class ACP v1 defines; everything else arrives as free
+# text and goes through the shared provider-failure classifier.
+AUTH_REQUIRED_CODE = -32000
 
 
 def acp_capabilities(*, session_resume: bool) -> DriverCapabilities:
@@ -171,6 +179,8 @@ class AcpDriver(Driver):
         self._output_blocks: set[str] = set()
         self._fallback_block_id = ""
         self._capabilities = acp_capabilities(session_resume=False)
+        self._model_selection = ""
+        self._spawn_warnings: tuple[str, ...] = ()
         self._closed = False
 
     def current_capabilities(self) -> DriverCapabilities:
@@ -250,6 +260,8 @@ class AcpDriver(Driver):
         capability_names = ["cancel", "permission_bridge"]
         if can_load:
             capability_names.append("session/load")
+        if self._model_selection:
+            capability_names.append(f"model_selection/{self._model_selection}")
         return RuntimeOpened(
             self._runtime_ref,
             self._session_ref,
@@ -260,6 +272,7 @@ class AcpDriver(Driver):
                 executable_version=self.executable_version,
                 schema_source="agent-client-protocol==0.10.1/protocol-v1",
                 native_capabilities=tuple(capability_names),
+                warnings=self._spawn_warnings,
             ),
         )
 
@@ -276,7 +289,35 @@ class AcpDriver(Driver):
         )
 
     async def _spawn(self, spec: RuntimeSpec) -> Any:
-        command = (*normalize_launch_argv(spec.executable), *spec.launch_args)
+        # ACP v1 cannot express model selection; supplement it natively at
+        # launch where a verified preset exists, and say so either way —
+        # a dropped spec.model must surface as a warning, never silently
+        # run the CLI's default model.
+        model_args: tuple[str, ...] = ()
+        self._model_selection = ""
+        self._spawn_warnings = ()
+        if spec.model:
+            if operator_pinned_model(spec.launch_args):
+                self._model_selection = "operator_launch_args"
+                self._spawn_warnings = (
+                    "launch_args already pin a model flag; spec.model "
+                    f"{spec.model!r} was not applied",
+                )
+            else:
+                model_args = model_launch_args(spec.executable, spec.model)
+                if model_args:
+                    self._model_selection = "launch_preset"
+                else:
+                    self._spawn_warnings = (
+                        "model selection is not supported for this ACP "
+                        f"executable; spec.model {spec.model!r} was dropped "
+                        "and the agent runs its default model",
+                    )
+        command = (
+            *normalize_launch_argv(spec.executable),
+            *spec.launch_args,
+            *model_args,
+        )
         if self.process_factory is not None:
             # One call with the declared signature. Retrying on TypeError
             # cannot tell "wrong arity" from "the factory raised TypeError
@@ -336,7 +377,36 @@ class AcpDriver(Driver):
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except RequestError as exc:
+            error_obj = exc.to_error_obj()
+            detail = " ".join(
+                str(part)
+                for part in (error_obj.get("message"), error_obj.get("data"))
+                if part
+            )
+            if exc.code == AUTH_REQUIRED_CODE:
+                # The one structured code ACP gives us; everything else is
+                # free text through the shared classifier.
+                error_code = "authentication"
+            else:
+                error_code = classify_provider_failure(
+                    status=None, diagnostic=detail
+                )
+            failure = PROVIDER_FAILURES.get(error_code)
+            await self._finish_turn(
+                turn,
+                HarnessEventType.TURN_ABANDONED,
+                {
+                    "outcome": "abandoned",
+                    "error_code": error_code,
+                    "retryable": failure.retryable if failure else True,
+                    # The raw agent diagnostic used to be dropped here,
+                    # leaving nothing to debug from. Bounded, not gone.
+                    "diagnostic": detail[:2000],
+                },
+            )
+            return
+        except Exception as exc:
             await self._finish_turn(
                 turn,
                 HarnessEventType.TURN_ABANDONED,
@@ -344,6 +414,7 @@ class AcpDriver(Driver):
                     "outcome": "abandoned",
                     "error_code": "acp_prompt_failed",
                     "retryable": True,
+                    "diagnostic": repr(exc)[:2000],
                 },
             )
             return
