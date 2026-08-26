@@ -22,14 +22,18 @@ without `--pure` in a local admission probe.
 
 | Capability | Pi RPC | OpenCode JSON mode | Generic ACP v1 |
 | --- | --- | --- | --- |
-| Model selection | `--model <model>` when configured | Provider-qualified `<provider>/<model>` | Agent-specific; the base ACP v1 driver does not claim a model-control extension. |
+| Model selection | `--model <model>` when configured | Provider-qualified `<provider>/<model>` | Known executable presets (currently Gemini and Kimi) inject their native `-m`; unknown targets run their default model and emit an explicit diagnostic instead of silently claiming selection. |
 | Session resume | `switch_session` on the persistent child | `--session` on the next per-turn child | Advertised only when `loadSession` is negotiated. |
 | Cancel | Typed Pi `abort` command | Process termination for the active one-shot child | Typed ACP cancellation. |
 | Steer while busy | Available only when the Pi bridge and runtime state permit it | Not supported | Not claimed by the base ACP v1 profile. |
-| Context/usage | Pi message usage and compaction events | Usage from OpenCode step-finish events | Agent-specific; the base ACP v1 profile makes no usage claim. |
+| Context/usage | Pi message usage and compaction events | Usage from OpenCode step-finish events | Context occupancy may be pushed; the base ACP v1 profile makes no token-usage claim. |
 | Compact | Typed Pi compaction command/events | Not supported | Not claimed by the base ACP v1 profile. |
 | Permissions/tools | Puffo's attested Pi extension bridge | OpenCode owns its tool policy; Puffo does not claim a permission bridge | ACP permission requests are bridged through the typed client callback. |
 | Lifecycle | Persistent child | Per-turn child | Persistent child |
+
+ACP prompt failures preserve a bounded diagnostic and pass structured auth
+errors or free-text provider failures through Puffo's shared failure classifier.
+This is an error-normalization profile, not a private ACP wire extension.
 
 The Web model picker intentionally does not borrow Codex's model catalog or
 inference-level list for Pi, OpenCode, or generic ACP. Until a selected
