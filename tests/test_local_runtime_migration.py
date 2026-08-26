@@ -21,7 +21,10 @@ from puffo_agent.agent.harness.driver import (
     TurnRef,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+from puffo_agent.agent.harness.local_runtime import (
+    LocalRuntimePreparer,
+    select_native_session,
+)
 from puffo_agent.agent.harness.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
@@ -45,6 +48,21 @@ def puffo_home(tmp_path, monkeypatch) -> Path:
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(home))
     monkeypatch.setattr(Path, "home", staticmethod(lambda: host))
     return home
+
+
+@pytest.mark.parametrize("harness_name", ["pi", "opencode", "acp"])
+def test_generic_harness_ignores_legacy_claude_session(
+    harness_name: str,
+):
+    native_session_id, migration_source = select_native_session(
+        harness_name=harness_name,
+        persisted_native_session_id="tagged-claude-session",
+        persisted_native_session_harness="claude-code",
+        legacy_native_session_id="legacy-claude-session",
+    )
+
+    assert native_session_id == ""
+    assert migration_source == "harness_changed"
 
 
 @pytest.mark.asyncio
