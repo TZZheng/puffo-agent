@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import uuid
 from collections.abc import AsyncIterator, Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from ....tasks import spawn
@@ -21,6 +23,7 @@ from ..driver import (
     CancelReceipt,
     CompactCapability,
     CompactRequest,
+    ContextStatus,
     ContextStatusCapability,
     Driver,
     DriverCapabilities,
@@ -52,12 +55,43 @@ from ..support.subprocess_io import (
 )
 
 
+def _window_from_models_output(text: str, model_id: str) -> int | None:
+    """Pick ``limit.context`` for ``model_id`` out of ``models --verbose``.
+
+    The output interleaves ``provider/id`` header lines with pretty-printed
+    JSON objects; decode each object where it opens and match on its
+    ``id`` field rather than trusting line pairing.
+    """
+    decoder = json.JSONDecoder()
+    index = 0
+    while True:
+        start = text.find("{", index)
+        if start < 0:
+            return None
+        try:
+            obj, consumed = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            index = start + 1
+            continue
+        index = start + consumed
+        if not isinstance(obj, dict) or obj.get("id") != model_id:
+            continue
+        limit = obj.get("limit")
+        window = limit.get("context") if isinstance(limit, dict) else None
+        if isinstance(window, int) and window > 0:
+            return window
+        return None
+
+
 OPENCODE_CAPABILITIES = DriverCapabilities(
     session_resume=True,
     inflight_turn_recovery=False,
     steer=SteerCapability.NONE,
     cancel=CancelCapability.TYPED,
-    context_status=ContextStatusCapability.NONE,
+    # step_finish frames carry tokens.total — the provider-reported context
+    # occupancy of the step's call (verified additive on 1.18.16). The
+    # driver absorbs those pushes; nothing here is estimated.
+    context_status=ContextStatusCapability.PUSH,
     compact=CompactCapability.NONE,
     permission_bridge=False,
     lifecycle=RuntimeLifecycle.PER_TURN_CHILD,
@@ -101,6 +135,9 @@ class OpenCodeDriver(Driver):
         self._events: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
         self._terminal_reason = ""
         self._provider_failed = False
+        self._context = ContextStatus(stale=True)
+        self._context_window: int | None = None
+        self._window_task: asyncio.Task[None] | None = None
         self._closed = False
 
     def current_capabilities(self) -> DriverCapabilities:
@@ -118,6 +155,11 @@ class OpenCodeDriver(Driver):
         self._resumed = resume is not None
         self._native_session_id = str(resume or "")
         self._session_announced = False
+        if spec.model and self._window_task is None:
+            self._window_task = spawn(
+                self._resolve_context_window(spec),
+                name="opencode.context_window",
+            )
         return RuntimeOpened(
             self._runtime_ref,
             self._session_ref,
@@ -214,7 +256,75 @@ class OpenCodeDriver(Driver):
         return CancelReceipt(True, turn)
 
     async def context_status(self):
-        return UnsupportedCapability("context_status")
+        if self._context.used_tokens is not None and (
+            self._context.context_window is None
+            and self._context_window is not None
+        ):
+            # The window resolved after the last push; fold it in.
+            self._context = dataclasses.replace(
+                self._context, context_window=self._context_window
+            )
+        return self._context
+
+    async def _resolve_context_window(self, spec: RuntimeSpec) -> None:
+        """Resolve ``limit.context`` for spec.model from the model registry.
+
+        ``opencode models <provider> --verbose`` prints, per model, a
+        ``provider/id`` line followed by a JSON object carrying
+        ``limit.context``. Best-effort: any failure leaves the window None
+        — used_tokens still flows, the UI just cannot show a percentage.
+        """
+        provider, _, model_id = spec.model.partition("/")
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *normalize_launch_argv(spec.executable),
+                "models",
+                provider,
+                "--verbose",
+                env=dict(spec.environment),
+                cwd=spec.workspace_dir or None,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=16 * 1024 * 1024,
+                **process_group_spawn_kwargs(),
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except (OSError, asyncio.TimeoutError):
+            return
+        finally:
+            if proc is not None and proc.returncode is None:
+                await shutdown_process_tree(
+                    proc,
+                    waiter=None,
+                    timeout=_SHUTDOWN_GRACE_SECONDS,
+                    task_name="opencode.context_window.wait",
+                )
+        self._context_window = _window_from_models_output(
+            out.decode("utf-8", "replace"), model_id
+        )
+
+    def _absorb_context_update(self, event: HarnessEvent) -> HarnessEvent:
+        total = event.data.get("total_tokens")
+        if not isinstance(total, int) or total <= 0:
+            # A step_finish without a usable total (e.g. an aborted step)
+            # must not clobber the last good measurement.
+            return event
+        self._context = ContextStatus(
+            used_tokens=total,
+            context_window=self._context_window,
+            stale=False,
+            measured_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return dataclasses.replace(
+            event,
+            data={
+                **event.data,
+                "used_tokens": total,
+                "context_window": self._context_window,
+            },
+        )
 
     async def compact(self, request: CompactRequest):
         return UnsupportedCapability("compact")
@@ -254,12 +364,25 @@ class OpenCodeDriver(Driver):
                 timeout=CLEANUP_TIMEOUT_SECONDS,
             )
             self._stderr_reader = None
+        if self._window_task is not None:
+            self._window_task.cancel()
+            await collect_cleanup_errors(
+                asyncio.gather(self._window_task, return_exceptions=True),
+                errors,
+                timeout=CLEANUP_TIMEOUT_SECONDS,
+            )
+            self._window_task = None
         self._proc = None
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         self._accepted = None
         self._turn_task = None
         self._spec = None
+        self._context = ContextStatus(stale=True)
+        # A reopened driver may carry a different model; the old window
+        # must not be paired with the new model's totals while the fresh
+        # lookup is still running.
+        self._context_window = None
         await collect_cleanup_errors(
             self._events.put(None), errors, timeout=CLEANUP_TIMEOUT_SECONDS
         )
@@ -373,6 +496,8 @@ class OpenCodeDriver(Driver):
             ):
                 if event.type is HarnessEventType.RUNTIME_FAILED:
                     self._provider_failed = True
+                if event.type is HarnessEventType.CONTEXT_UPDATED:
+                    event = self._absorb_context_update(event)
                 await self._events.put(event)
 
     async def _finish_turn(

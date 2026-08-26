@@ -125,6 +125,12 @@ def _usage_data(part: dict[str, Any]) -> dict[str, int]:
         "reasoning_tokens": _nonnegative_int(tokens.get("reasoning")),
         "cache_read_tokens": _nonnegative_int(cache.get("read")),
         "cache_write_tokens": _nonnegative_int(cache.get("write")),
+        # Measured on 1.18.16: step_finish tokens.total is the full context
+        # occupancy of the step's provider call (input + cache.read +
+        # output), not a session-cumulative counter — the one number
+        # context tracking needs. With several tool steps in a turn the
+        # last step_finish carries the current value.
+        "total_tokens": _nonnegative_int(tokens.get("total")),
     }
 
 
