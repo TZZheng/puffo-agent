@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -35,20 +36,69 @@ _resolve_memcache: dict[str, str] = {}
 _real_path_cache: str | None = None
 
 
-def cli_tool_status(
-    resolver: Callable[[], str | None], credential_check: Callable[[], bool],
-) -> str:
-    """Return ``not_installed``, ``need_login``, or ``ready`` for a host CLI."""
+@dataclass(frozen=True)
+class HarnessReadiness:
+    """Explicit three-state readiness for one harness.
+
+    ``state`` is one of:
+
+    * ``ready`` — resolved and verified usable.
+    * ``degraded`` — startable, but with a caveat the caller should surface
+      (typically: this harness has no checkable local credential store, so
+      usability is unknown until a turn runs).
+    * ``unavailable`` — cannot run (no binary, or credentials known absent).
+
+    ``reason`` is empty for ``ready`` and machine-readable otherwise.
+    ``legacy`` reproduces exactly the string the portal's frozen
+    ``cli_tools`` field carried before this model existed — including its
+    lie of reporting an unknown credential state as ``ready``. That wire
+    contract stays byte-stable for old consumers; new consumers read
+    ``state``/``reason`` and must not re-derive them from ``legacy``.
+    """
+
+    state: str
+    reason: str
+    legacy: str
+
+
+def harness_readiness(
+    resolver: Callable[[], str | None],
+    credential_check: Callable[[], bool] | None,
+) -> HarnessReadiness:
+    """Compute three-state readiness for a host CLI harness.
+
+    Pass ``credential_check=None`` when the harness has no local
+    credential store this daemon can inspect — the honest answer is
+    ``degraded``/``credentials_unknown``, never ``ready``.
+    """
     try:
         path = resolver()
     except Exception:
         path = None
     if not path:
-        return "not_installed"
+        return HarnessReadiness("unavailable", "not_installed", "not_installed")
+    if credential_check is None:
+        return HarnessReadiness("degraded", "credentials_unknown", "ready")
     try:
-        return "ready" if credential_check() else "need_login"
+        has_credentials = credential_check()
     except Exception:
-        return "need_login"
+        # The check itself failed; that is not evidence of missing
+        # credentials. Legacy reported need_login here — preserved.
+        return HarnessReadiness("degraded", "credential_check_error", "need_login")
+    if has_credentials:
+        return HarnessReadiness("ready", "", "ready")
+    return HarnessReadiness("unavailable", "need_login", "need_login")
+
+
+def cli_tool_status(
+    resolver: Callable[[], str | None], credential_check: Callable[[], bool],
+) -> str:
+    """Return ``not_installed``, ``need_login``, or ``ready`` for a host CLI.
+
+    Legacy string view of ``harness_readiness``; kept for callers bound to
+    the frozen portal vocabulary.
+    """
+    return harness_readiness(resolver, credential_check).legacy
 
 
 def resolve_codex_bin() -> str | None:
