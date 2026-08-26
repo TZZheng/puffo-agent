@@ -6,6 +6,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Invite-link channel joins are announced to the agent.** When someone
+  joins channels by redeeming an invite link, the server's synthetic
+  `add_to_channel` events now produce a per-channel system message
+  ("X joined channel #name (invited by Y)", with Y the link's creator)
+  in each affected channel the agent is a member of, alongside the
+  existing space-level join announcement.
+
 ## [2.0.2] - 2026-08-25
 
 ### Fixed

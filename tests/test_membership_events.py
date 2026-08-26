@@ -545,3 +545,158 @@ async def test_membership_change_with_no_operator_slug_logs_but_doesnt_crash():
     assert "ch_1" not in client._channel_space
     # No DM attempted.
     assert sent == []
+
+
+# ─── add_to_channel (synthetic invite-link channel join) ───────────
+
+
+def _announce_client() -> tuple[PuffoCoreMessageClient, list[dict]]:
+    client, _ = _make_client()
+    client._processed_membership_event_ids = set()
+    client._log = logging.getLogger(__name__)
+    announcements: list[dict] = []
+
+    async def enqueue(**message):
+        announcements.append(message)
+
+    client._enqueue_membership_system_message = enqueue
+    return client, announcements
+
+
+def _add_to_channel_event(
+    added_slug: str = "alice-0001",
+    channel_id: str = "ch_1",
+    event_id: str = "ev_add_1",
+) -> dict:
+    """Wire shape from puffo-server #325: server-signed synthetic
+    join, ``signer_slug`` is the invite link's issuer."""
+    return {
+        "event_id": event_id,
+        "kind": "add_to_channel",
+        "signer_slug": "op-1",
+        "signer_device_id": "",
+        "signer_subkey_id": "",
+        "signature": "server-auto:invite-capability-add-to-channel",
+        "payload": {
+            "space_id": "sp_1",
+            "channel_id": channel_id,
+            "added_slug": added_slug,
+            "source_invite_id": "inv_1",
+            "source_redemption_id": "red_1",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_announces_join_with_link_issuer_as_inviter():
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(scope="sp_1", event=_add_to_channel_event())
+
+    assert announcements == [{
+        "channel_id": "ch_1",
+        "actor_slug": "alice-0001",
+        "action": "joined",
+        "kicker_slug": "",
+        "inviter_slug": "op-1",
+        "event_id": "ev_add_1",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_for_unknown_channel_is_noop():
+    """The agent isn't in the channel (or hasn't learned it yet):
+    no announcement, matching the server's members-only delivery."""
+    client, announcements = _announce_client()
+
+    await client._handle_event(
+        scope="sp_1",
+        event=_add_to_channel_event(channel_id="ch_elsewhere"),
+    )
+
+    assert announcements == []
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_for_self_is_noop():
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event=_add_to_channel_event(added_slug="agent-1"),
+    )
+
+    assert announcements == []
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_missing_added_slug_is_noop():
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+    event = _add_to_channel_event()
+    del event["payload"]["added_slug"]
+
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert announcements == []
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_ws_redelivery_announces_once():
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+    event = _add_to_channel_event()
+
+    await client._handle_event(scope="sp_1", event=event)
+    await client._handle_event(scope="sp_1", event=event)
+
+    assert len(announcements) == 1
+
+
+@pytest.mark.asyncio
+async def test_add_to_channel_per_channel_events_each_announce():
+    """One redemption can grant several channels; the server emits
+    one event per channel and each gets its own announcement."""
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+    client._channel_space["ch_priv"] = "sp_1"
+
+    await client._handle_event(scope="sp_1", event=_add_to_channel_event())
+    await client._handle_event(
+        scope="sp_1",
+        event=_add_to_channel_event(channel_id="ch_priv", event_id="ev_add_2"),
+    )
+
+    assert [(a["channel_id"], a["event_id"]) for a in announcements] == [
+        ("ch_1", "ev_add_1"),
+        ("ch_priv", "ev_add_2"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_other_member_leave_channel_still_announces_left():
+    """Kinds behind ``add_to_channel`` in the actor dispatch keep
+    working: another member's voluntary exit announces "left"."""
+    client, announcements = _announce_client()
+    client._channel_space["ch_1"] = "sp_1"
+
+    await client._handle_event(
+        scope="sp_1",
+        event={
+            "event_id": "ev_leave_1",
+            "kind": "leave_channel",
+            "signer_slug": "alice-0001",
+            "payload": {"space_id": "sp_1", "channel_id": "ch_1"},
+        },
+    )
+
+    assert announcements == [{
+        "channel_id": "ch_1",
+        "actor_slug": "alice-0001",
+        "action": "left",
+        "kicker_slug": "",
+        "inviter_slug": "",
+        "event_id": "ev_leave_1",
+    }]

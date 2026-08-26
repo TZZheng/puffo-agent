@@ -283,6 +283,12 @@ def _channel_membership_actor(
     if kind == EventKind.ACCEPT_CHANNEL_INVITE:
         inviter = _inviter_slug(payload, inviter_by_event_id)
         return event.get("signer_slug") or "", "joined", "", inviter
+    if kind == EventKind.ADD_TO_CHANNEL:
+        # Server-synthesized invite-link join; signer is the link's
+        # issuer, so it doubles as the inviter label.
+        return payload.get("added_slug") or "", "joined", "", (
+            event.get("signer_slug") or ""
+        )
     if kind == EventKind.LEAVE_CHANNEL:
         return event.get("signer_slug") or "", "left", "", ""
     if kind == EventKind.REMOVE_FROM_CHANNEL:

@@ -507,7 +507,8 @@ class PuffoCoreMessageClient:
         event: dict,
         payload: dict,
     ) -> bool:
-        if kind in (EventKind.LEAVE_CHANNEL, EventKind.REMOVE_FROM_CHANNEL):
+        if kind in (EventKind.LEAVE_CHANNEL, EventKind.REMOVE_FROM_CHANNEL,
+                    EventKind.ADD_TO_CHANNEL):
             await self._maybe_announce_membership_change(kind, event, payload)
             return True
         if kind in (
