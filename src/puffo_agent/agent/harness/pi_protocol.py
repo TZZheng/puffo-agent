@@ -21,6 +21,7 @@ Two Pi-specific facts drive the shape of this module:
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from ..provider_failures import classify_provider_failure
@@ -133,7 +134,33 @@ def normalize_pi_event(
     if type_ not in PI_EVENT_DISPATCH_KEYS:
         return unknown_event()
 
-    # --- agent run lifecycle -------------------------------------------------
+    normalized = _normalize_pi_lifecycle(type_, frame, event, record)
+    if normalized is not None:
+        return normalized
+    normalized = _normalize_pi_tool_event(type_, frame, event, record)
+    if normalized is not None:
+        return normalized
+    normalized = _normalize_pi_runtime_event(type_, frame, event, record)
+    if normalized is not None:
+        return normalized
+
+    # A dispatch key without a branch is a production programming error. It is
+    # deliberately distinct from an upstream protocol event we do not know.
+    raise AssertionError(
+        f"Pi event {type_!r} is admitted but has no normalization branch"
+    )
+
+
+EventBuilder = Callable[[HarnessEventType, dict[str, Any]], HarnessEvent]
+RecordBuilder = Callable[..., tuple[HarnessEvent, ...]]
+
+
+def _normalize_pi_lifecycle(
+    type_: str,
+    frame: dict[str, Any],
+    event: EventBuilder,
+    record: RecordBuilder,
+) -> tuple[HarnessEvent, ...] | None:
     if type_ == "agent_start":
         return (event(HarnessEventType.TURN_STARTED, {}),)
     if type_ == "agent_end":
@@ -165,8 +192,15 @@ def normalize_pi_event(
         if usage:
             events.append(event(HarnessEventType.CONTEXT_UPDATED, usage))
         return tuple(events)
+    return None
 
-    # --- tools ---------------------------------------------------------------
+
+def _normalize_pi_tool_event(
+    type_: str,
+    frame: dict[str, Any],
+    event: EventBuilder,
+    record: RecordBuilder,
+) -> tuple[HarnessEvent, ...] | None:
     if type_ == "tool_execution_start":
         return (
             event(
@@ -214,8 +248,15 @@ def normalize_pi_event(
             steering=_length(frame.get("steering")),
             follow_up=_length(frame.get("followUp")),
         )
+    return None
 
-    # --- compaction ----------------------------------------------------------
+
+def _normalize_pi_runtime_event(
+    type_: str,
+    frame: dict[str, Any],
+    event: EventBuilder,
+    record: RecordBuilder,
+) -> tuple[HarnessEvent, ...] | None:
     if type_ == "compaction_start":
         return (
             event(
@@ -290,12 +331,7 @@ def normalize_pi_event(
                 },
             ),
         )
-
-    # A dispatch key without a branch is a production programming error. It is
-    # deliberately distinct from an upstream protocol event we do not know.
-    raise AssertionError(
-        f"Pi event {type_!r} is admitted but has no normalization branch"
-    )
+    return None
 
 
 def _normalize_message_update(
