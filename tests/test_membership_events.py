@@ -564,7 +564,7 @@ def _announce_client(
     client._enqueue_membership_system_message = enqueue
     client._rewarm_calls = 0
 
-    async def rewarm():
+    async def rewarm(*, force: bool = False):
         client._rewarm_calls += 1
         client._channel_space.update(rewarm_reveals or {})
 

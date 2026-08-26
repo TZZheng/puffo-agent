@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 import pytest
 
@@ -267,4 +268,41 @@ async def test_concurrent_multi_channel_grant_persists_each_once(tmp_path):
     rows = await store.get_pending()
     assert sorted(row.channel_id for row in rows) == ["ch_general", "ch_priv"]
     assert client.global_runtime.work == 2
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_join_frame_after_recent_rewarm_bypasses_debounce(tmp_path):
+    """Regression: a warm can finish moments before the grant lands
+    server-side. The event-driven recheck must bypass the 5s rewarm
+    debounce, or the one-shot WS event is dropped for good."""
+    ws, client, store = await _wired_stack(
+        tmp_path,
+        channel_space={},
+        warm_reveals={"ch_general": "sp_1"},
+    )
+    client._last_rewarm = time.monotonic()  # a rewarm "just ran"
+
+    await ws._handle_frame(_join_frame())
+
+    assert client._warm_calls == 1
+    rows = await store.get_pending()
+    assert len(rows) == 1
+    assert rows[0].channel_id == "ch_general"
+    assert client.global_runtime.work == 1
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_unforced_rewarm_keeps_debounce(tmp_path):
+    """The shared on-miss rewarm entry point stays debounced for its
+    other (non-event) callers; only ``force`` bypasses it."""
+    ws, client, store = await _wired_stack(tmp_path)
+
+    await client.rewarm_channel_caches()
+    await client.rewarm_channel_caches()
+    assert client._warm_calls == 1
+
+    await client.rewarm_channel_caches(force=True)
+    assert client._warm_calls == 2
     await store.close()

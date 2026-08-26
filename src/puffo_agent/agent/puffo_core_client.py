@@ -855,14 +855,14 @@ class PuffoCoreMessageClient:
             expected_self_slug=getattr(self, "slug", ""),
         )
 
-    async def rewarm_channel_caches(self) -> None:
-        """On-miss re-warm; serialized + 5s-debounced (no stampede)."""
+    async def rewarm_channel_caches(self, *, force: bool = False) -> None:
+        """On-miss re-warm; serialized + 5s-debounced (no stampede).
+        ``force`` skips only the debounce (event-driven rechecks)."""
         async with self._rewarm_lock:
-            now = time.monotonic()
-            if now - self._last_rewarm < 5.0:
+            if not force and time.monotonic() - self._last_rewarm < 5.0:
                 return
             await self._warm_member_caches()
-            self._last_rewarm = now
+            self._last_rewarm = time.monotonic()
 
     async def _on_ws_connect(self) -> None:
         """Fire-and-forget re-warm; handle kept (asyncio weak-refs tasks)."""
@@ -1067,7 +1067,7 @@ class PuffoCoreMessageClient:
             inviter_by_event_id=getattr(self, "_inviter_by_invitation_event_id", {}),
             processed_event_ids=getattr(self, "_processed_membership_event_ids", set()),
             enqueue_message=self._enqueue_membership_system_message,
-            rewarm_channels=self.rewarm_channel_caches,
+            rewarm_channels=lambda: self.rewarm_channel_caches(force=True),
             log=self._log,
         )
 
