@@ -775,6 +775,13 @@ class RuntimeManager:
             # still publishes so subscribers and persistence see it.
             self._resolve_compaction_locked()
         if event.type in {
+            HarnessEventType.COMPACTION_FAILED,
+            "compaction.failed",
+        }:
+            self._fail_compaction_locked(
+                str(event.data.get("diagnostic") or "provider compaction failed")
+            )
+        if event.type in {
             HarnessEventType.RUNTIME_EXITED,
             "runtime.exited",
         }:

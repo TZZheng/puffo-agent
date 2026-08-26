@@ -5,10 +5,14 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import re
+import shutil
+import tempfile
 import uuid
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 from ....tasks import spawn
 from ...cli_bin import normalize_launch_argv
@@ -22,6 +26,7 @@ from ..driver import (
     CancelCapability,
     CancelReceipt,
     CompactCapability,
+    CompactReceipt,
     CompactRequest,
     ContextStatus,
     ContextStatusCapability,
@@ -47,12 +52,87 @@ from .opencode_protocol import (
     build_opencode_run_command,
     normalize_opencode_frame,
 )
+from ..support.redaction import safe_provider_message
 from ..support.subprocess_io import (
     drain_subprocess_stream_keeping_tail,
     process_group_spawn_kwargs,
     shutdown_process_tree,
     signal_process_tree,
 )
+
+
+_SERVER_URL_RE = re.compile(rb"listening on (http://[\w.\[\]:-]+)")
+
+
+def _loopback_server_url(candidate: str) -> str | None:
+    """Return a normalized loopback URL or reject untrusted log noise."""
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme != "http"
+        or host not in {"127.0.0.1", "::1"}
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"http://{rendered_host}:{port}"
+
+
+async def _server_url_from_streams(proc: Any) -> str:
+    """Return the base URL a fresh ``opencode serve`` announces.
+
+    The announcement line's stream is not contractual, so watch stdout and
+    stderr concurrently and take the first match. The caller bounds this
+    with a timeout and owns draining the streams afterwards.
+    """
+
+    async def scan(stream: Any) -> str:
+        while True:
+            line = await stream.readline()
+            if not line:
+                raise RuntimeError("opencode serve exited before announcing its URL")
+            match = _SERVER_URL_RE.search(line)
+            if match:
+                trusted = _loopback_server_url(match.group(1).decode())
+                if trusted is not None:
+                    return trusted
+
+    tasks = [
+        spawn(scan(proc.stdout), name="opencode.serve.stdout_url"),
+        spawn(scan(proc.stderr), name="opencode.serve.stderr_url"),
+    ]
+    try:
+        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            if task.exception() is None:
+                return task.result()
+        raise next(iter(done)).exception()
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _require_summarize_ack(status: int, body: str) -> None:
+    """Accept only the documented HTTP 200 + JSON true acknowledgement."""
+    if status != 200:
+        raise RuntimeError(
+            f"summarize returned HTTP {status}: {body[:300]}"
+        )
+    try:
+        acknowledged = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("summarize returned a non-JSON acknowledgement") from exc
+    if acknowledged is not True:
+        raise RuntimeError(
+            f"summarize returned an unexpected acknowledgement: {body[:300]}"
+        )
 
 
 def _window_from_models_output(text: str, model_id: str) -> int | None:
@@ -92,7 +172,11 @@ OPENCODE_CAPABILITIES = DriverCapabilities(
     # occupancy of the step's call (verified additive on 1.18.16). The
     # driver absorbs those pushes; nothing here is estimated.
     context_status=ContextStatusCapability.PUSH,
-    compact=CompactCapability.NONE,
+    # Native summarize via a transient `opencode serve` on loopback: the
+    # stable POST /session/{id}/summarize surface (the v2 /api/.../compact
+    # endpoint is a 503 placeholder on 1.18.16 — do not wire it). The turn
+    # path stays PER_TURN_CHILD; the server exists only for the operation.
+    compact=CompactCapability.TYPED,
     permission_bridge=False,
     lifecycle=RuntimeLifecycle.PER_TURN_CHILD,
     busy_delivery=BusyDelivery.REJECT,
@@ -138,6 +222,9 @@ class OpenCodeDriver(Driver):
         self._context = ContextStatus(stale=True)
         self._context_window: int | None = None
         self._window_task: asyncio.Task[None] | None = None
+        self._compact_task: asyncio.Task[None] | None = None
+        self._compact_ref = ""
+        self._serve_proc: Any = None
         self._closed = False
 
     def current_capabilities(self) -> DriverCapabilities:
@@ -155,6 +242,16 @@ class OpenCodeDriver(Driver):
         self._resumed = resume is not None
         self._native_session_id = str(resume or "")
         self._session_announced = False
+        if spec.model:
+            # Resolved synchronously ON PURPOSE: any other opencode process
+            # on this agent's data dir contends on its sqlite lock, and the
+            # loser dies with "database is locked" — measured live, with
+            # the victim being the user's first turn when this ran as a
+            # background task. At open() no turn child or summarize server
+            # exists yet, so this is the one moment the lookup cannot race
+            # anything. (A scratch-HOME lookup does not work instead:
+            # provider model lists only appear in a configured home.)
+            await self._resolve_context_window(spec)
         return RuntimeOpened(
             self._runtime_ref,
             self._session_ref,
@@ -173,6 +270,11 @@ class OpenCodeDriver(Driver):
             raise RuntimeError("driver is not open")
         if self._active.value or self._turn_task is not None:
             raise RuntimeError("one turn is already active")
+        if self._compact_task is not None and not self._compact_task.done():
+            # The transient summarize server holds opencode's storage; a
+            # concurrent `opencode run` would die on its sqlite lock. Turns
+            # wait out the compaction instead of losing to it.
+            raise RuntimeError("compaction in progress; retry when it completes")
         turn = TurnRef(f"turn_{uuid.uuid4().hex}")
         self._active = turn
         self._active_native_turn_id = ""
@@ -271,31 +373,48 @@ class OpenCodeDriver(Driver):
         """
         provider, _, model_id = spec.model.partition("/")
         proc = None
+        # The registry lookup must NOT share opencode's data storage with the
+        # turn children: two opencode processes on one data dir contend on
+        # its sqlite lock, and the loser dies with "database is locked" —
+        # measured live, with the victim being the user's first turn. The
+        # model registry needs no session state, so point data-dir anchors at
+        # a throwaway. Preserve HOME, config roots, and the workspace cwd:
+        # custom providers/plugins and project opencode.json are part of the
+        # real model registry and must remain visible.
+        scratch = tempfile.mkdtemp(prefix="oc-models-")
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *normalize_launch_argv(spec.executable),
-                "models",
-                provider,
-                "--verbose",
-                env=dict(spec.environment),
-                cwd=spec.workspace_dir or None,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                limit=16 * 1024 * 1024,
-                **process_group_spawn_kwargs(),
-            )
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-        except (OSError, asyncio.TimeoutError):
-            return
-        finally:
-            if proc is not None and proc.returncode is None:
-                await shutdown_process_tree(
-                    proc,
-                    waiter=None,
-                    timeout=_SHUTDOWN_GRACE_SECONDS,
-                    task_name="opencode.context_window.wait",
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *normalize_launch_argv(spec.executable),
+                    "models",
+                    provider,
+                    "--verbose",
+                    env={
+                        **dict(spec.environment),
+                        "XDG_DATA_HOME": f"{scratch}/xdg-data",
+                        "APPDATA": f"{scratch}/appdata",
+                        "LOCALAPPDATA": f"{scratch}/localappdata",
+                    },
+                    cwd=spec.workspace_dir or None,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    limit=16 * 1024 * 1024,
+                    **process_group_spawn_kwargs(),
                 )
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            except (OSError, asyncio.TimeoutError):
+                return
+            finally:
+                if proc is not None and proc.returncode is None:
+                    await shutdown_process_tree(
+                        proc,
+                        waiter=None,
+                        timeout=_SHUTDOWN_GRACE_SECONDS,
+                        task_name="opencode.context_window.wait",
+                    )
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
         self._context_window = _window_from_models_output(
             out.decode("utf-8", "replace"), model_id
         )
@@ -344,7 +463,131 @@ class OpenCodeDriver(Driver):
         )
 
     async def compact(self, request: CompactRequest):
-        return UnsupportedCapability("compact")
+        spec = self._spec
+        if spec is None or self._closed:
+            raise RuntimeError("driver is not open")
+        if self._turn_task is not None and not self._turn_task.done():
+            raise RuntimeError("compaction requires an idle session")
+        if not self._native_session_id:
+            raise RuntimeError("no native session to compact yet")
+        if not spec.model:
+            raise RuntimeError(
+                "OpenCode summarize needs an explicit '<provider>/<model>'"
+            )
+        if self._compact_task is not None and not self._compact_task.done():
+            return CompactReceipt(True, self._compact_ref)
+        self._compact_ref = f"compact_{uuid.uuid4().hex}"
+        # The manager awaits this method BEFORE it creates the future it
+        # resolves on COMPACTION_COMPLETED — completing synchronously here
+        # would emit into a void and hang the caller. Hand the work to a
+        # task and return; the task yields before it emits anything.
+        self._compact_task = spawn(
+            self._run_compaction(spec, self._native_session_id, self._compact_ref),
+            name="opencode.compact",
+        )
+        return CompactReceipt(True, self._compact_ref)
+
+    async def _run_compaction(
+        self, spec: RuntimeSpec, native_session_id: str, ref: str
+    ) -> None:
+        await asyncio.sleep(0)
+        await self._emit(
+            HarnessEventType.COMPACTION_STARTED,
+            data={"operation_ref": ref},
+        )
+        try:
+            await self._summarize_via_serve(spec, native_session_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._emit(
+                HarnessEventType.COMPACTION_FAILED,
+                data={
+                    "operation_ref": ref,
+                    "diagnostic": safe_provider_message(str(exc)),
+                },
+            )
+            return
+        await self._emit(
+            HarnessEventType.COMPACTION_COMPLETED,
+            data={"operation_ref": ref},
+        )
+
+    async def _summarize_via_serve(
+        self, spec: RuntimeSpec, native_session_id: str
+    ) -> None:
+        """Run one summarize against a transient loopback server.
+
+        The server shares the per-turn children's storage (same env, same
+        workspace), exists only for this operation, and is spawned as a
+        group leader so shutdown takes its whole tree. It is secured with
+        a one-shot password even on loopback.
+        """
+        import aiohttp
+
+        password = uuid.uuid4().hex
+        proc = await asyncio.create_subprocess_exec(
+            *normalize_launch_argv(spec.executable),
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            "0",
+            env={**dict(spec.environment), "OPENCODE_SERVER_PASSWORD": password},
+            cwd=spec.workspace_dir or None,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=16 * 1024 * 1024,
+            **process_group_spawn_kwargs(),
+        )
+        self._serve_proc = proc
+        try:
+            base_url = await asyncio.wait_for(
+                _server_url_from_streams(proc), timeout=30
+            )
+            # Keep both pipes drained while the request runs; serve keeps
+            # logging and a full pipe would wedge it.
+            drains = (
+                spawn(
+                    drain_subprocess_stream_keeping_tail(proc.stdout),
+                    name="opencode.serve.stdout",
+                ),
+                spawn(
+                    drain_subprocess_stream_keeping_tail(proc.stderr),
+                    name="opencode.serve.stderr",
+                ),
+            )
+            try:
+                provider, _, model_id = spec.model.partition("/")
+                timeout = aiohttp.ClientTimeout(total=300)
+                async with aiohttp.ClientSession(timeout=timeout) as http:
+                    response = await http.post(
+                        f"{base_url}/session/{native_session_id}/summarize",
+                        json={
+                            "providerID": provider,
+                            "modelID": model_id,
+                            "auto": False,
+                        },
+                        auth=aiohttp.BasicAuth("opencode", password),
+                    )
+                    body = await response.text()
+                    _require_summarize_ack(response.status, body)
+            finally:
+                for drain in drains:
+                    drain.cancel()
+                await asyncio.gather(*drains, return_exceptions=True)
+        finally:
+            try:
+                await shutdown_process_tree(
+                    proc,
+                    waiter=None,
+                    timeout=_SHUTDOWN_GRACE_SECONDS,
+                    task_name="opencode.serve.wait",
+                )
+            finally:
+                if self._serve_proc is proc:
+                    self._serve_proc = None
 
     async def resolve_permission(
         self, request: PermissionRef, decision: PermissionDecision
@@ -394,6 +637,29 @@ class OpenCodeDriver(Driver):
         self._active_native_turn_id = ""
         self._accepted = None
         self._turn_task = None
+        if self._compact_task is not None:
+            self._compact_task.cancel()
+            await collect_cleanup_errors(
+                asyncio.gather(self._compact_task, return_exceptions=True),
+                errors,
+                timeout=CLEANUP_TIMEOUT_SECONDS,
+            )
+            self._compact_task = None
+        serve = self._serve_proc
+        if serve is not None:
+            # Cancellation unwound _summarize_via_serve before its own
+            # cleanup ran; take the whole serve tree down here.
+            await collect_cleanup_errors(
+                shutdown_process_tree(
+                    serve,
+                    waiter=None,
+                    timeout=_SHUTDOWN_GRACE_SECONDS,
+                    task_name="opencode.serve.close_wait",
+                ),
+                errors,
+                timeout=CLEANUP_TIMEOUT_SECONDS,
+            )
+            self._serve_proc = None
         self._spec = None
         self._context = ContextStatus(stale=True)
         # A reopened driver may carry a different model; the old window

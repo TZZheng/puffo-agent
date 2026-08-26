@@ -1306,6 +1306,39 @@ async def test_compaction_completes_only_on_the_event_and_never_starts_twice():
 
 
 @pytest.mark.asyncio
+async def test_compaction_failed_event_fails_waiters_fast_with_the_diagnostic():
+    """COMPACTION_FAILED must release waiters immediately, not by timeout.
+
+    A provider 4xx/5xx during a driver-run compaction (e.g. OpenCode's
+    summarize) emits the event; the manager fails its outstanding future so
+    every coalesced caller returns with the diagnostic well inside the
+    bounded wait, and a later compaction can start fresh.
+    """
+    driver, manager, adapter = await _open_compacting_manager(wait_seconds=10)
+
+    first = asyncio.create_task(adapter.compact_context())
+    second = asyncio.create_task(adapter.compact_context())
+    await asyncio.sleep(0)
+    assert driver.compact_calls == 1
+
+    await driver.queue.put(HarnessEvent(
+        type="compaction.failed",
+        driver="codex",
+        session_ref=SessionRef(manager.native_session_id),
+        data={"diagnostic": "summarize returned HTTP 500: provider melted"},
+    ))
+    results = await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+    assert [value.completed for value in results] == [False, False]
+    assert all("HTTP 500" in value.diagnostic for value in results)
+
+    # The failed operation is cleared: a retry issues a new provider pass.
+    adapter.compaction_wait_seconds = 0.01
+    await adapter.compact_context()
+    assert driver.compact_calls == 2
+    await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_context_commands_are_locked_and_fail_closed_after_close():
     driver = _CompactingDriver()
     manager = RuntimeManager(
