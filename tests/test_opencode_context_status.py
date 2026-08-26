@@ -79,6 +79,37 @@ def test_capability_declares_push_not_none():
 
 
 @pytest.mark.asyncio
+async def test_window_lookup_waits_until_first_turn_is_accepted(monkeypatch):
+    """Do not race two OpenCode schema initializers in a fresh user home."""
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda command, spec: proc)
+    lookup_started = asyncio.Event()
+
+    async def fake_lookup(spec):
+        lookup_started.set()
+
+    monkeypatch.setattr(driver, "_resolve_context_window", fake_lookup)
+    await driver.open(RuntimeSpec("/workspace", model="opencode/hy3-free"))
+    assert driver._window_task is None
+
+    started = asyncio.create_task(driver.start_turn(TurnInput("hi")))
+    await asyncio.sleep(0)
+    assert not lookup_started.is_set()
+
+    proc.feed({
+        "type": "step_start",
+        "sessionID": "ses_fresh_home",
+        "part": {"messageID": "msg_1"},
+    })
+    await asyncio.wait_for(started, timeout=1)
+    await asyncio.wait_for(lookup_started.wait(), timeout=1)
+
+    proc.exit()
+    proc.eof()
+    await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_step_finish_total_becomes_context_status_and_augments_event():
     proc = _TurnProcess()
     driver = OpenCodeDriver(lambda command, spec: proc)

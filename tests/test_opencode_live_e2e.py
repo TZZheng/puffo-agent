@@ -17,6 +17,12 @@ from pathlib import Path
 import pytest
 
 from puffo_agent.agent.adapters.desired_install import install_desired
+from puffo_agent.agent.harness.driver import (
+    HarnessEventType,
+    RuntimeSpec,
+    TurnInput,
+)
+from puffo_agent.agent.harness.drivers.opencode import OpenCodeDriver
 
 
 class _SkillTemplateHttp:
@@ -109,20 +115,19 @@ def test_desired_skill_is_discoverable_by_real_opencode_cli(tmp_path: Path):
     reason="set PUFFO_RUN_LIVE_OPENCODE_E2E=1 for a real model turn",
 )
 @pytest.mark.skipif(shutil.which("opencode") is None, reason="OpenCode absent")
-def test_real_opencode_model_loads_and_follows_desired_skill(tmp_path: Path):
-    """Opt-in user journey: install, model tool-call, and skill-directed reply."""
+@pytest.mark.asyncio
+async def test_real_opencode_driver_loads_skill_and_reports_context(tmp_path: Path):
+    """Opt-in user journey through the real driver, CLI, model, and skill."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    asyncio.run(
-        install_desired(
-            http=_SkillTemplateHttp(),
-            agent_home=tmp_path / "agent-home",
-            workspace_dir=workspace,
-            agent_id="opencode-live-model-e2e",
-            harness_name="opencode",
-            desired_skills=["puffo-e2e"],
-            desired_mcps=[],
-        )
+    await install_desired(
+        http=_SkillTemplateHttp(),
+        agent_home=tmp_path / "agent-home",
+        workspace_dir=workspace,
+        agent_id="opencode-live-model-e2e",
+        harness_name="opencode",
+        desired_skills=["puffo-e2e"],
+        desired_mcps=[],
     )
 
     model = os.environ.get(
@@ -130,37 +135,44 @@ def test_real_opencode_model_loads_and_follows_desired_skill(tmp_path: Path):
     )
     environment = _isolated_opencode_environment(tmp_path)
     environment["PWD"] = str(workspace)
-    result = subprocess.run(
-        [
-            shutil.which("opencode") or "opencode",
-            "run",
-            "--format",
-            "json",
-            "--model",
-            model,
-            (
+    driver = OpenCodeDriver(executable_version="live-e2e")
+    await driver.open(
+        RuntimeSpec(
+            workspace_dir=str(workspace),
+            executable=shutil.which("opencode") or "opencode",
+            model=model,
+            environment=environment,
+            task_timeout_seconds=120,
+        )
+    )
+    try:
+        await driver.start_turn(
+            TurnInput(
                 "Load the puffo-e2e skill, follow it, and return only its "
                 "required sentinel."
-            ),
-        ],
-        cwd=workspace,
-        env=environment,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    frames = [json.loads(line) for line in result.stdout.splitlines() if line]
+            )
+        )
+        events = []
+        async for event in driver.events():
+            events.append(event)
+            if event.type is HarnessEventType.TURN_COMPLETED:
+                break
 
-    assert any(
-        frame.get("type") == "tool_use"
-        and frame.get("part", {}).get("tool") == "skill"
-        and frame.get("part", {}).get("state", {}).get("input", {}).get("name")
-        == "puffo-e2e"
-        for frame in frames
-    ), result.stdout
-    assert any(
-        frame.get("type") == "text"
-        and frame.get("part", {}).get("text") == "SENTINEL-OPENCODE-SKILL"
-        for frame in frames
-    ), result.stdout
+        assert any(
+            event.type is HarnessEventType.TOOL_COMPLETED
+            and event.data.get("label") == "skill"
+            and event.data.get("outcome") == "succeeded"
+            for event in events
+        ), events
+        assert "".join(
+            str(event.data.get("delta") or "")
+            for event in events
+            if event.type is HarnessEventType.ASSISTANT_DELTA
+        ) == "SENTINEL-OPENCODE-SKILL"
+
+        context = await driver.context_status()
+        assert context.used_tokens and context.used_tokens > 0
+        assert context.context_window and context.context_window > 0
+        assert not context.stale
+    finally:
+        await driver.close()
