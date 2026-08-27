@@ -393,7 +393,6 @@ class GlobalInboxRuntime(
         reminder_task = spawn(
             self.reminder_scheduler.run(),
             name="reminder_scheduler.run",
-            report_failure=False,
         )
         try:
             await self.recover_current_turn()
@@ -412,7 +411,6 @@ class GlobalInboxRuntime(
                 burst_task = spawn(
                     self.coalescer.wait_for_burst(),
                     name="coalescer.wait_for_burst",
-                    report_failure=False,
                 )
                 done, _pending = await asyncio.wait(
                     {burst_task, reminder_task},
@@ -421,10 +419,11 @@ class GlobalInboxRuntime(
                 if reminder_task in done:
                     if not burst_task.done():
                         burst_task.cancel()
-                        try:
-                            await burst_task
-                        except asyncio.CancelledError:
-                            pass
+                    # Settle the sibling even when both tasks completed in the
+                    # same event-loop turn.  Otherwise a simultaneous burst
+                    # failure can escape inspection while the scheduler error
+                    # is propagated below.
+                    await asyncio.gather(burst_task, return_exceptions=True)
                     # A scheduler error is an owning-runtime error, never a
                     # silently disabled timer loop.
                     await reminder_task
