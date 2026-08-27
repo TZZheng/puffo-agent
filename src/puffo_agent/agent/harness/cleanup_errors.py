@@ -90,13 +90,28 @@ async def collect_cleanup_errors(
     deadline = asyncio.get_running_loop().time() + timeout
     cancellation: asyncio.CancelledError | None = None
 
+    def settle_done_task() -> bool:
+        """Collect the task's actual terminal state when it has one."""
+        nonlocal cancellation
+        if not task.done():
+            return False
+        try:
+            task.result()
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+                errors.append(exc)
+        except BaseException as exc:
+            errors.append(exc)
+        return True
+
     async def cancel_without_waiting_forever() -> None:
         nonlocal cancellation
         task.cancel()
         try:
-            # Give ordinary cancellation-aware coroutines one turn to run
-            # their ``finally`` blocks.  A coroutine that suppresses
-            # cancellation is deliberately left to the task supervisor.
+            # Give cancellation-aware coroutines one scheduling turn.  A
+            # coroutine that needs longer or suppresses cancellation remains
+            # owned by the task supervisor rather than blocking this caller.
             await asyncio.sleep(0)
         except asyncio.CancelledError as exc:
             if cancellation is None:
@@ -119,10 +134,14 @@ async def collect_cleanup_errors(
             if cancellation is None:
                 cancellation = exc
                 errors.append(exc)
-            if task.done():
+            if settle_done_task():
                 return
             continue
         except TimeoutError:
+            # ``wait_for`` also propagates TimeoutError raised by the task.
+            # Inspect a completed task before synthesizing our own deadline.
+            if settle_done_task():
+                return
             await cancel_without_waiting_forever()
             errors.append(
                 CleanupTimeoutError(
@@ -138,7 +157,13 @@ async def collect_cleanup_errors(
 def raise_collected_errors(
     label: str, errors: list[BaseException]
 ) -> None:
-    """Raise failures without ever grouping or replacing cancellation."""
+    """Raise ordered failures without grouping or replacing cancellation.
+
+    Callers append a primary operation failure first, then failures from
+    cleanup operations in execution order.  Entries before cancellation are
+    therefore classified as suppressed primary failures; entries after it
+    are classified as cleanup failures.
+    """
     if not errors:
         return
     cancelled_index = next(

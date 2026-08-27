@@ -137,6 +137,68 @@ async def test_cleanup_supervision_has_an_explicit_upper_bound():
 
 
 @pytest.mark.asyncio
+async def test_cleanup_completion_failure_is_kept_during_caller_cancellation():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fail_after_release():
+        entered.set()
+        await release.wait()
+        raise RuntimeError("cleanup boom")
+
+    errors: list[BaseException] = []
+    collector = asyncio.create_task(
+        collect_cleanup_errors(
+            fail_after_release(), errors, timeout=1.0
+        )
+    )
+    await entered.wait()
+
+    release.set()
+    collector.cancel()
+    await collector
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        raise_collected_errors("cancelled cleanup", errors)
+
+    assert len(errors) == 2
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert isinstance(errors[1], RuntimeError)
+    assert str(errors[1]) == "cleanup boom"
+    assert cleanup_errors(exc_info.value) == (errors[1],)
+
+
+@pytest.mark.asyncio
+async def test_inner_cleanup_timeout_propagates_through_outer_collector():
+    async def nested_cleanup():
+        inner_errors: list[BaseException] = []
+        await collect_cleanup_errors(
+            asyncio.Future(), inner_errors, timeout=0.01
+        )
+        raise_collected_errors("inner cleanup", inner_errors)
+
+    errors: list[BaseException] = []
+    await collect_cleanup_errors(nested_cleanup(), errors, timeout=1.0)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], CleanupTimeoutError)
+    assert str(errors[0]) == "cleanup exceeded 0.01 seconds"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_timeout_error_is_not_rewritten_as_collector_timeout():
+    original = TimeoutError("operation timed out")
+
+    async def fail():
+        raise original
+
+    errors: list[BaseException] = []
+    await collect_cleanup_errors(fail(), errors, timeout=1.0)
+
+    assert errors == [original]
+
+
+@pytest.mark.asyncio
 async def test_adapter_post_close_hook_cannot_block_close_forever(monkeypatch):
     monkeypatch.setattr(
         "puffo_agent.agent.harness.runtime_manager.CLEANUP_TIMEOUT_SECONDS",
