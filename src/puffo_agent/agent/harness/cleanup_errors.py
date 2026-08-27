@@ -23,9 +23,17 @@ def attach_cleanup_error(
     )
 
 
+def mark_cleanup_checked(primary: BaseException) -> None:
+    """Record that the structured cleanup protocol ran without a failure."""
+    if not hasattr(primary, _CLEANUP_ERRORS_ATTR):
+        setattr(primary, _CLEANUP_ERRORS_ATTR, ())
+
+
 def cleanup_errors(error: BaseException) -> tuple[BaseException, ...]:
     """Return structured cleanup failures attached to an error."""
-    value = getattr(error, _CLEANUP_ERRORS_ATTR, ())
+    if not hasattr(error, _CLEANUP_ERRORS_ATTR):
+        raise LookupError("error has no structured cleanup evidence")
+    value = getattr(error, _CLEANUP_ERRORS_ATTR)
     return value if isinstance(value, tuple) else ()
 
 
@@ -61,6 +69,7 @@ def raise_collected_errors(
         None,
     )
     if cancelled is not None:
+        mark_cleanup_checked(cancelled)
         for error in errors:
             if error is not cancelled:
                 attach_cleanup_error(cancelled, error)
@@ -70,6 +79,7 @@ def raise_collected_errors(
         None,
     )
     if non_exception is not None:
+        mark_cleanup_checked(non_exception)
         for error in errors:
             if error is not non_exception:
                 attach_cleanup_error(non_exception, error)

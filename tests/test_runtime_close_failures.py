@@ -67,6 +67,11 @@ class _CloseErrorDriver(Driver):
         raise RuntimeError("process-tree cleanup failed")
 
 
+def test_cleanup_reader_rejects_missing_protocol_marker():
+    with pytest.raises(LookupError, match="no structured cleanup evidence"):
+        cleanup_errors(asyncio.CancelledError())
+
+
 @pytest.mark.asyncio
 async def test_manager_close_finishes_state_cleanup_before_propagating_error():
     driver = _CloseErrorDriver()
