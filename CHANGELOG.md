@@ -8,6 +8,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Invite-link channel joins are announced to the agent.** When someone
+  joins channels by redeeming an invite link, the server's synthetic
+  `add_to_channel` events now produce a per-channel system message
+  ("X joined channel #name (invited by Y)", with Y the link's creator)
+  in each affected channel the agent is a member of, alongside the
+  existing space-level join announcement.
 - **`drained` runtime health for a spent plan quota.** When the Claude Code /
   Codex usage limit is exhausted, the agent flips to `drained` instead of the
   misleading `auth_failed` ("run `claude auth login`"), holds messages without
