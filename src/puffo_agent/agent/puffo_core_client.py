@@ -868,12 +868,8 @@ class PuffoCoreMessageClient:
     async def _on_ws_connect(self) -> None:
         """Fire-and-forget re-warm; handle kept (asyncio weak-refs tasks)."""
         self._warm_task = spawn(
-            asyncio.gather(
-                self._warm_member_caches(),
-                # Allow/block hydration rides the same tick so a restart
-                # doesn't re-gate already-allowlisted senders.
-                self._contacts.refresh(),
-            ),
+            # allow/block hydration same tick: restart must not re-gate
+            asyncio.gather(self._warm_member_caches(), self._contacts.refresh()),
             name="warm_after_ws_connect",
         )
         await self._notify_connected_callbacks()
