@@ -1,6 +1,10 @@
 import asyncio
+import os
+import sys
+import time
 from types import SimpleNamespace
 
+import psutil
 import pytest
 
 from acp import PROTOCOL_VERSION
@@ -34,6 +38,7 @@ from puffo_agent.agent.harness.driver import (
     SessionRef,
     TurnInput,
 )
+from puffo_agent.agent.harness.subprocess_io import ProcessTreeShutdownError
 
 
 class _FakeProcess:
@@ -57,6 +62,14 @@ class _FakeProcess:
 
     def kill(self) -> None:
         self.exit(-9)
+
+
+class _UncloseableProcess(_FakeProcess):
+    def terminate(self) -> None:
+        pass
+
+    def kill(self) -> None:
+        pass
 
 
 class _FakeConnection:
@@ -365,3 +378,101 @@ async def test_process_factory_type_error_is_not_retried():
     with pytest.raises(TypeError, match="factory failed after starting"):
         await driver.open(RuntimeSpec("/workspace", executable="agent"))
     assert calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group regression")
+async def test_close_reaps_acp_descendant_and_closes_transports(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        "puffo_agent.agent.harness.acp_driver._SHUTDOWN_GRACE_SECONDS",
+        0.2,
+    )
+    pid_path = tmp_path / "acp-descendant.pid"
+    child_script = (
+        "import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(60)"
+    )
+    parent_script = (
+        "import subprocess, sys, time; "
+        "child = subprocess.Popen([sys.executable, '-c', "
+        f"{child_script!r}], stdout=sys.stdout, stderr=sys.stderr); "
+        f"open({str(pid_path)!r}, 'w').write(str(child.pid)); "
+        "time.sleep(60)"
+    )
+    spawned = {}
+
+    async def process_factory(_command, _plan):
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            parent_script,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        spawned["proc"] = proc
+        return proc
+
+    harness = _Harness()
+    driver = AcpDriver(
+        process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    await driver.open(RuntimeSpec("/workspace", executable="agent"))
+    await _wait_for_path(pid_path)
+
+    await asyncio.wait_for(driver.close(), timeout=2)
+
+    descendant_pid = int(pid_path.read_text())
+    _assert_process_exited(descendant_pid)
+    proc = spawned["proc"]
+    assert proc._transport.is_closing()
+    assert proc.stdin.transport.is_closing()
+    assert proc.stdout._transport.is_closing()
+    assert proc.stderr._transport.is_closing()
+
+
+@pytest.mark.asyncio
+async def test_close_reports_acp_transport_abandonment(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.agent.harness.acp_driver._SHUTDOWN_GRACE_SECONDS",
+        0.01,
+    )
+    harness = _Harness()
+    harness.proc = _UncloseableProcess()
+    driver = AcpDriver(
+        harness.process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    await driver.open(RuntimeSpec("/workspace", executable="agent"))
+
+    with pytest.raises(ProcessTreeShutdownError):
+        await driver.close()
+
+
+def _assert_process_exited(pid: int) -> None:
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        if not psutil.pid_exists(pid):
+            return
+        try:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                return
+        except psutil.NoSuchProcess:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"descendant process {pid} is still alive")
+
+
+async def _wait_for_path(path) -> None:
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"child did not create {path}")

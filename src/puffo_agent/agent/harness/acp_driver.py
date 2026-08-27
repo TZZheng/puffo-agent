@@ -32,7 +32,6 @@ from acp.schema import (
 )
 from acp.transports import default_environment
 
-from ..._proc import no_window_kwargs
 from ...tasks import spawn
 from ..cli_bin import normalize_launch_argv
 from .driver import (
@@ -61,7 +60,12 @@ from .driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from .subprocess_io import drain_subprocess_stream_keeping_tail
+from .subprocess_io import (
+    ProcessTreeShutdownError,
+    drain_subprocess_stream_keeping_tail,
+    process_group_spawn_kwargs,
+    shutdown_process_tree,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +89,7 @@ class AcpLaunchPlan:
 
 
 _VALIDATED_LAUNCH_TOKEN = object()
+_SHUTDOWN_GRACE_SECONDS = 3.0
 
 
 class ValidatedLaunchPlan:
@@ -290,7 +295,9 @@ class AcpDriver(Driver):
             raise RuntimeError("ACP session response omitted sessionId")
         self._native_session_id = native_session_id
         self._session_ref = SessionRef(native_session_id)
-        self._watcher = spawn(self._watch_process(), name="acp.watch")
+        self._watcher = spawn(
+            self._watch_process(self._proc), name="acp.watch"
+        )
         await self._emit(
             HarnessEventType.SESSION_RESUMED
             if resumed
@@ -349,7 +356,7 @@ class AcpDriver(Driver):
             cwd=plan.cwd or None,
             env=plan.environment,
             limit=16 * 1024 * 1024,
-            **no_window_kwargs(),
+            **process_group_spawn_kwargs(),
         )
 
     async def start_turn(self, input: TurnInput):
@@ -496,13 +503,16 @@ class AcpDriver(Driver):
                 pass
             self._conn = None
         proc, self._proc = self._proc, None
-        if proc is not None and getattr(proc, "returncode", None) is None:
-            proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=3)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+        shutdown_error: ProcessTreeShutdownError | None = None
+        try:
+            await shutdown_process_tree(
+                proc,
+                waiter=self._watcher,
+                timeout=_SHUTDOWN_GRACE_SECONDS,
+                task_name="acp.shutdown_wait",
+            )
+        except ProcessTreeShutdownError as exc:
+            shutdown_error = exc
         current = asyncio.current_task()
         for task in (self._prompt_task, self._watcher, self._stderr_reader):
             if task is not None and task is not current:
@@ -521,11 +531,10 @@ class AcpDriver(Driver):
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         await self._events.put(None)
+        if shutdown_error is not None:
+            raise shutdown_error
 
-    async def _watch_process(self) -> None:
-        proc = self._proc
-        if proc is None:
-            return
+    async def _watch_process(self, proc: Any) -> None:
         returncode = await proc.wait()
         if not self._closed:
             await self._emit(

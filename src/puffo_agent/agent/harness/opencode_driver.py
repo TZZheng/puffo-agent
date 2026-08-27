@@ -5,12 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import signal
 import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from ..._proc import no_window_kwargs
 from ...tasks import spawn
 from ..cli_bin import normalize_launch_argv
 from .driver import (
@@ -42,7 +40,13 @@ from .opencode_protocol import (
     build_opencode_run_command,
     normalize_opencode_frame,
 )
-from .subprocess_io import drain_subprocess_stream_keeping_tail
+from .subprocess_io import (
+    ProcessTreeShutdownError,
+    drain_subprocess_stream_keeping_tail,
+    process_group_spawn_kwargs,
+    shutdown_process_tree,
+    signal_process_tree,
+)
 
 
 OPENCODE_CAPABILITIES = DriverCapabilities(
@@ -58,7 +62,6 @@ OPENCODE_CAPABILITIES = DriverCapabilities(
 )
 
 _SHUTDOWN_GRACE_SECONDS = 5.0
-_CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 
 class OpenCodeDriver(Driver):
@@ -186,7 +189,7 @@ class OpenCodeDriver(Driver):
             cwd=spec.workspace_dir or None,
             env=env,
             limit=16 * 1024 * 1024,
-            **_process_group_spawn_kwargs(),
+            **process_group_spawn_kwargs(),
         )
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput):
@@ -198,7 +201,9 @@ class OpenCodeDriver(Driver):
         if proc is None or getattr(proc, "returncode", None) is not None:
             return CancelReceipt(False, turn)
         self._terminal_reason = "cancelled"
-        await _signal_process_tree(proc, force=False)
+        await signal_process_tree(
+            proc, force=False, timeout=_SHUTDOWN_GRACE_SECONDS
+        )
         return CancelReceipt(True, turn)
 
     async def context_status(self):
@@ -228,9 +233,11 @@ class OpenCodeDriver(Driver):
         self._closed = True
         self._terminal_reason = "runtime_closed"
         proc = self._proc
-        if proc is not None and getattr(proc, "returncode", None) is None:
-            await _signal_process_tree(proc, force=False)
-        await self._settle_turn_task(proc)
+        shutdown_error: ProcessTreeShutdownError | None = None
+        try:
+            await self._settle_turn_task(proc)
+        except ProcessTreeShutdownError as exc:
+            shutdown_error = exc
         if self._stderr_reader is not None:
             self._stderr_reader.cancel()
             await asyncio.gather(
@@ -244,6 +251,8 @@ class OpenCodeDriver(Driver):
         self._turn_task = None
         self._spec = None
         await self._events.put(None)
+        if shutdown_error is not None:
+            raise shutdown_error
 
     async def _drive_turn(
         self, proc: Any, turn: TurnRef, generation: int
@@ -265,7 +274,9 @@ class OpenCodeDriver(Driver):
                 and not wait_task.done()
                 and getattr(proc, "returncode", None) is None
             ):
-                await _signal_process_tree(proc, force=False)
+                await signal_process_tree(
+                    proc, force=False, timeout=_SHUTDOWN_GRACE_SECONDS
+                )
             results = await asyncio.gather(
                 read_task, wait_task, return_exceptions=True
             )
@@ -418,8 +429,6 @@ class OpenCodeDriver(Driver):
 
     async def _abort_failed_start(self, generation: int) -> None:
         proc = self._proc
-        if proc is not None and getattr(proc, "returncode", None) is None:
-            await _signal_process_tree(proc, force=False)
         task = self._turn_task
         if task is not None and task is not asyncio.current_task():
             await self._settle_turn_task(proc)
@@ -432,38 +441,14 @@ class OpenCodeDriver(Driver):
 
     async def _settle_turn_task(self, proc: Any) -> None:
         task = self._turn_task
-        if task is None or task is asyncio.current_task():
+        if task is asyncio.current_task():
             return
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(task), timeout=_SHUTDOWN_GRACE_SECONDS
-            )
-            return
-        except TimeoutError:
-            pass
-        if proc is not None:
-            await _signal_process_tree(proc, force=True)
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(task), timeout=_SHUTDOWN_GRACE_SECONDS
-            )
-            return
-        except TimeoutError:
-            # A descendant can keep inherited stdout/stderr descriptors open
-            # after the direct child dies.  asyncio's subprocess transport then
-            # keeps ``wait()`` pending forever.  Explicitly abandon those pipe
-            # transports before cancelling the supervising task.
-            _abandon_process_transport(proc)
-            task.cancel()
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(task, return_exceptions=True),
-                timeout=_SHUTDOWN_GRACE_SECONDS,
-            )
-        except TimeoutError:
-            # The transport has already been abandoned. Do not let a task
-            # that suppresses cancellation make Driver.close() unbounded.
-            pass
+        await shutdown_process_tree(
+            proc,
+            waiter=task,
+            timeout=_SHUTDOWN_GRACE_SECONDS,
+            task_name="opencode.shutdown_wait",
+        )
 
     async def _emit(
         self,
@@ -490,76 +475,5 @@ class OpenCodeDriver(Driver):
         if turn != self._active or not self._active.value:
             raise RuntimeError("stale or foreign active turn")
 
-
-def _process_group_spawn_kwargs() -> dict[str, Any]:
-    """Isolate each per-turn child so shutdown can target its whole tree."""
-    kwargs = no_window_kwargs()
-    if os.name == "nt":
-        kwargs["creationflags"] = (
-            int(kwargs.get("creationflags", 0)) | _CREATE_NEW_PROCESS_GROUP
-        )
-    else:
-        kwargs["start_new_session"] = True
-    return kwargs
-
-
-async def _signal_process_tree(proc: Any, *, force: bool) -> None:
-    """Best-effort signal of the isolated process tree, with test fallback."""
-    pid = getattr(proc, "pid", None)
-    if os.name != "nt" and isinstance(pid, int):
-        try:
-            os.killpg(pid, signal.SIGKILL if force else signal.SIGTERM)
-            return
-        except ProcessLookupError:
-            return
-        except OSError:
-            # A caller-supplied factory may not have created a new session.
-            # Fall back to the direct-child API in that case.
-            pass
-    elif os.name == "nt" and isinstance(pid, int):
-        command = ["taskkill", "/PID", str(pid), "/T"]
-        if force:
-            command.append("/F")
-        taskkill = None
-        try:
-            taskkill = await asyncio.create_subprocess_exec(
-                *command,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                **no_window_kwargs(),
-            )
-            returncode = await asyncio.wait_for(
-                taskkill.wait(), timeout=_SHUTDOWN_GRACE_SECONDS
-            )
-            if returncode == 0:
-                return
-        except (OSError, TimeoutError):
-            # Direct-child fallback below still gives bounded best effort.
-            if taskkill is not None and taskkill.returncode is None:
-                taskkill.kill()
-                try:
-                    await asyncio.wait_for(
-                        taskkill.wait(), timeout=_SHUTDOWN_GRACE_SECONDS
-                    )
-                except TimeoutError:
-                    pass
-    if getattr(proc, "returncode", None) is not None:
-        return
-    getattr(proc, "kill" if force else "terminate")()
-
-
-def _abandon_process_transport(proc: Any) -> None:
-    """Close asyncio pipe/process transports after bounded shutdown expires."""
-    if proc is None:
-        return
-    for stream_name in ("stdin", "stdout", "stderr"):
-        stream = getattr(proc, stream_name, None)
-        transport = getattr(stream, "_transport", None)
-        if transport is not None:
-            transport.close()
-    transport = getattr(proc, "_transport", None)
-    if transport is not None:
-        transport.close()
 
 OpenCodeCliDriver = OpenCodeDriver

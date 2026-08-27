@@ -2,7 +2,9 @@ import asyncio
 import json
 import os
 import sys
+import time
 
+import psutil
 import pytest
 
 from puffo_agent.agent.harness import build_driver
@@ -20,6 +22,7 @@ from puffo_agent.agent.harness.opencode_driver import (
 )
 from puffo_agent.agent.harness.runtime_manager import RuntimeManager
 from puffo_agent.agent.harness.runtime_manager import RuntimeManagerAdapter
+from puffo_agent.agent.harness.subprocess_io import ProcessTreeShutdownError
 
 
 class _TurnProcess:
@@ -67,6 +70,13 @@ class _HungTurnProcess(_TurnProcess):
     def terminate(self) -> None:
         self.terminated += 1
 
+    def kill(self) -> None:
+        self.killed += 1
+        self.exit(-9)
+        self.eof()
+
+
+class _UncloseableTurnProcess(_HungTurnProcess):
     def kill(self) -> None:
         self.killed += 1
         self.exit(-9)
@@ -326,10 +336,10 @@ async def test_close_kills_then_cancels_a_child_with_inherited_stdout(
 
 
 def test_default_spawn_isolates_the_per_turn_process_group(monkeypatch):
-    from puffo_agent.agent.harness import opencode_driver
+    from puffo_agent.agent.harness import subprocess_io
 
-    monkeypatch.setattr(opencode_driver.os, "name", "posix")
-    kwargs = opencode_driver._process_group_spawn_kwargs()
+    monkeypatch.setattr(subprocess_io.os, "name", "posix")
+    kwargs = subprocess_io.process_group_spawn_kwargs()
     assert kwargs["start_new_session"] is True
 
 
@@ -337,28 +347,33 @@ def test_default_spawn_isolates_the_per_turn_process_group(monkeypatch):
 async def test_force_signal_targets_group_after_direct_child_has_exited(
     monkeypatch,
 ):
-    from puffo_agent.agent.harness import opencode_driver
+    from puffo_agent.agent.harness import subprocess_io
 
     class ExitedParent:
         pid = 4321
         returncode = -15
 
     signals = []
-    monkeypatch.setattr(opencode_driver.os, "name", "posix")
+    monkeypatch.setattr(subprocess_io.os, "name", "posix")
     monkeypatch.setattr(
-        opencode_driver.os,
+        subprocess_io.os,
         "killpg",
         lambda pid, sig: signals.append((pid, sig)),
     )
 
-    await opencode_driver._signal_process_tree(ExitedParent(), force=True)
+    await subprocess_io.signal_process_tree(
+        ExitedParent(), force=True, timeout=0.1
+    )
 
-    assert signals == [(4321, opencode_driver.signal.SIGKILL)]
+    assert signals == [(4321, subprocess_io.signal.SIGKILL)]
 
 
 @pytest.mark.asyncio
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group regression")
-async def test_close_reaps_descendant_that_holds_inherited_stdout(monkeypatch):
+async def test_close_reaps_descendant_that_holds_inherited_stdout(
+    monkeypatch,
+    tmp_path,
+):
     monkeypatch.setattr(
         "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
         0.2,
@@ -368,17 +383,21 @@ async def test_close_reaps_descendant_that_holds_inherited_stdout(monkeypatch):
         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
         "time.sleep(60)"
     )
+    pid_path = tmp_path / "descendant.pid"
     parent_script = (
         "import json, subprocess, sys, time; "
-        "subprocess.Popen([sys.executable, '-c', "
+        "child = subprocess.Popen([sys.executable, '-c', "
         f"{child_script!r}], stdout=sys.stdout, stderr=sys.stderr); "
+        f"open({str(pid_path)!r}, 'w').write(str(child.pid)); "
         "print(json.dumps({'type': 'step_start', 'sessionID': 'ses_tree', "
         "'part': {'messageID': 'msg_tree'}}), flush=True); "
         "time.sleep(60)"
     )
 
+    spawned = {}
+
     async def factory(_command, _spec):
-        return await asyncio.create_subprocess_exec(
+        proc = await asyncio.create_subprocess_exec(
             sys.executable,
             "-c",
             parent_script,
@@ -387,6 +406,8 @@ async def test_close_reaps_descendant_that_holds_inherited_stdout(monkeypatch):
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
+        spawned["proc"] = proc
+        return proc
 
     driver = OpenCodeDriver(factory)
     await driver.open(RuntimeSpec("/workspace"))
@@ -396,4 +417,45 @@ async def test_close_reaps_descendant_that_holds_inherited_stdout(monkeypatch):
 
     await asyncio.wait_for(driver.close(), timeout=2)
 
+    descendant_pid = int(pid_path.read_text())
+    _assert_process_exited(descendant_pid)
+    proc = spawned["proc"]
+    assert proc._transport.is_closing()
+    assert proc.stdout._transport.is_closing()
+    assert proc.stderr._transport.is_closing()
     assert driver._turn_task is None
+
+
+@pytest.mark.asyncio
+async def test_close_reports_transport_abandonment(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
+        0.01,
+    )
+    proc = _UncloseableTurnProcess()
+    driver = OpenCodeDriver(lambda *_args: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    proc.feed({
+        "type": "step_start",
+        "sessionID": "ses_timeout",
+        "part": {"messageID": "msg_timeout"},
+    })
+    await started
+
+    with pytest.raises(ProcessTreeShutdownError):
+        await driver.close()
+
+
+def _assert_process_exited(pid: int) -> None:
+    deadline = time.monotonic() + 1
+    while time.monotonic() < deadline:
+        if not psutil.pid_exists(pid):
+            return
+        try:
+            if psutil.Process(pid).status() == psutil.STATUS_ZOMBIE:
+                return
+        except psutil.NoSuchProcess:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"descendant process {pid} is still alive")
