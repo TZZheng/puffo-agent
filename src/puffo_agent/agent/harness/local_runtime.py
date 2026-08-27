@@ -9,7 +9,6 @@ those responsibilities belong to :mod:`codex_driver`,
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -75,6 +74,7 @@ from .driver import (
     SessionRef,
 )
 from .runtime_manager import RuntimeManager, RuntimeManagerAdapter
+from ...tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -673,7 +673,7 @@ def _normalized_tool_label(label: str) -> str:
 def _emit_status(agent_id: str, event: str, payload: dict[str, Any]) -> None:
     from ...portal.control.reporter import get_reporter
 
-    asyncio.ensure_future(get_reporter().emit(agent_id, event, payload))
+    spawn(get_reporter().emit(agent_id, event, payload), name="reporter.emit")
 
 
 class _LegacyStatusProjector:

@@ -17,6 +17,7 @@ from .http_client import PuffoCoreHttpClient
 from .http_session import create_remote_ssl_context
 from .keystore import KeyStore, decode_secret
 from .primitives import Ed25519KeyPair
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -416,4 +417,4 @@ class PuffoCoreWsClient:
     def stop(self) -> None:
         self._running = False
         if self._ws:
-            asyncio.ensure_future(self._ws.close())
+            spawn(self._ws.close(), name="ws.close")

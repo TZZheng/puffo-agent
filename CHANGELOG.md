@@ -27,6 +27,15 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   them too. Quota-exhausted refresh probes no longer count toward the
   `refresh_broken` streak. (#228)
 
+### Fixed
+
+- **Worker tasks no longer die unclaimed.** Every background task the daemon
+  spawns now carries a done-callback that logs `worker task died: <name>` with
+  the full traceback when the task ends on an unhandled exception, instead of
+  the exception vanishing into the event loop. Shutdown cancellation stays
+  silent. A start-up failure such as an unreadable message-backup key now
+  surfaces on the first restart rather than presenting as a silent hang.
+
 ## [2.0.2] - 2026-08-25
 
 ### Fixed
