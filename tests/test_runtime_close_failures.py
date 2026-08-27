@@ -137,6 +137,56 @@ async def test_cleanup_supervision_has_an_explicit_upper_bound():
 
 
 @pytest.mark.asyncio
+async def test_cleanup_failure_during_timeout_cancellation_is_kept():
+    async def fail_during_cancellation():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            raise RuntimeError("cleanup failed during cancellation")
+
+    errors: list[BaseException] = []
+    await collect_cleanup_errors(
+        fail_during_cancellation(), errors, timeout=0.01
+    )
+
+    assert len(errors) == 2
+    assert isinstance(errors[0], CleanupTimeoutError)
+    assert isinstance(errors[1], RuntimeError)
+    assert str(errors[1]) == "cleanup failed during cancellation"
+
+
+@pytest.mark.asyncio
+async def test_caller_cancellation_during_timeout_settlement_stays_distinct():
+    collector: asyncio.Task[None]
+
+    async def fail_and_cancel_caller():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            collector.cancel("caller cancellation")
+            raise RuntimeError("cleanup failed during cancellation")
+
+    errors: list[BaseException] = []
+    collector = asyncio.create_task(
+        collect_cleanup_errors(
+            fail_and_cancel_caller(), errors, timeout=0.01
+        )
+    )
+    await collector
+
+    assert len(errors) == 3
+    assert isinstance(errors[0], asyncio.CancelledError)
+    assert isinstance(errors[1], CleanupTimeoutError)
+    assert isinstance(errors[2], RuntimeError)
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        raise_collected_errors("cancelled cleanup", errors)
+
+    assert exc_info.value is errors[0]
+    assert cleanup_errors(exc_info.value) == (errors[1], errors[2])
+
+
+@pytest.mark.asyncio
 async def test_cleanup_completion_failure_is_kept_during_caller_cancellation():
     entered = asyncio.Event()
     release = asyncio.Event()

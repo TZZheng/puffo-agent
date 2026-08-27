@@ -90,19 +90,24 @@ async def collect_cleanup_errors(
     deadline = asyncio.get_running_loop().time() + timeout
     cancellation: asyncio.CancelledError | None = None
 
-    def settle_done_task() -> bool:
+    def settle_done_task(
+        *,
+        preserve_cancellation: bool = True,
+        destination: list[BaseException] | None = None,
+    ) -> bool:
         """Collect the task's actual terminal state when it has one."""
         nonlocal cancellation
         if not task.done():
             return False
+        settled_errors = errors if destination is None else destination
         try:
             task.result()
         except asyncio.CancelledError as exc:
-            if cancellation is None:
+            if preserve_cancellation and cancellation is None:
                 cancellation = exc
-                errors.append(exc)
+                settled_errors.append(exc)
         except BaseException as exc:
-            errors.append(exc)
+            settled_errors.append(exc)
         return True
 
     async def cancel_without_waiting_forever() -> None:
@@ -118,15 +123,25 @@ async def collect_cleanup_errors(
                 cancellation = exc
                 errors.append(exc)
 
+    async def record_collector_timeout() -> None:
+        """Cancel at the deadline and preserve any immediate terminal state."""
+        await cancel_without_waiting_forever()
+        terminal_errors: list[BaseException] = []
+        # Settle after the helper's yield and before recording our conclusion.
+        # Cancellation is the expected result of enforcing our own deadline;
+        # retain only a distinct terminal failure produced while handling it.
+        settle_done_task(
+            preserve_cancellation=False, destination=terminal_errors
+        )
+        errors.append(
+            CleanupTimeoutError(f"cleanup exceeded {timeout:g} seconds")
+        )
+        errors.extend(terminal_errors)
+
     while True:
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
-            await cancel_without_waiting_forever()
-            errors.append(
-                CleanupTimeoutError(
-                    f"cleanup exceeded {timeout:g} seconds"
-                )
-            )
+            await record_collector_timeout()
             return
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
@@ -142,12 +157,7 @@ async def collect_cleanup_errors(
             # Inspect a completed task before synthesizing our own deadline.
             if settle_done_task():
                 return
-            await cancel_without_waiting_forever()
-            errors.append(
-                CleanupTimeoutError(
-                    f"cleanup exceeded {timeout:g} seconds"
-                )
-            )
+            await record_collector_timeout()
             return
         except BaseException as exc:
             errors.append(exc)
