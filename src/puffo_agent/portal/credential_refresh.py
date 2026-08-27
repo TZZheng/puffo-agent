@@ -1146,13 +1146,10 @@ class CredentialRefresher:
             self._detect_external_rotation()
 
     async def _sleep_until_next_tick(self, stop_event: asyncio.Event) -> None:
-        stop_task = spawn(
-            stop_event.wait(), name="stop_event.wait", report_failure=False
-        )
+        stop_task = spawn(stop_event.wait(), name="stop_event.wait")
         refresh_task = spawn(
             self._refresh_request.wait(),
             name="refresh_request.wait",
-            report_failure=False,
         )
         try:
             await asyncio.wait(
@@ -1161,8 +1158,10 @@ class CredentialRefresher:
                 return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            stop_task.cancel()
-            refresh_task.cancel()
+            for task in (stop_task, refresh_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stop_task, refresh_task, return_exceptions=True)
 
     def _current_credential_revision(self) -> CredentialRevision | None:
         fingerprint = getattr(self.backend, "fingerprint", None)
