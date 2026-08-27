@@ -1390,15 +1390,8 @@ class GlobalInboxRuntime(
                 self.health = RuntimeHealth()
                 return False
             self.attempts.reset()
-            async with self._turn_state_lock:
-                if self._autonomous_turn_id:
-                    # Adoption can land while this notice was being planned --
-                    # context resolution stretches the window past the
-                    # top-of-loop guard. Queue behind the run instead of
-                    # clobbering its active binding; its terminal notify()
-                    # re-enters processing.
-                    return False
-                await self._start_local_turn(planned)
+            if not await self._start_notice_unless_autonomous(planned):
+                return False
             self.adapter.register_admission_callback(
                 lambda event: self._admit(planned, event),
                 planned.planning_cycle_key,

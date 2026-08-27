@@ -145,6 +145,14 @@ class AutonomousTurnLifecycleMixin:
             )
             return True
 
+    async def _start_notice_unless_autonomous(self, planned: PlannedTurn) -> bool:
+        """Start a planned notice only if adoption did not win the race."""
+        async with self._turn_state_lock:
+            if self._autonomous_turn_id:
+                return False
+            await self._start_local_turn(planned)
+            return True
+
     def _activate_autonomous_turn(
         self,
         *,
