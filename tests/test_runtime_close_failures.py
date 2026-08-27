@@ -3,7 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from puffo_agent.agent.harness.cleanup_errors import cleanup_errors
+from puffo_agent.agent.harness.cleanup_errors import (
+    CleanupTimeoutError,
+    cleanup_errors,
+    collect_cleanup_errors,
+    raise_collected_errors,
+    suppressed_primary_errors,
+)
 from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     Driver,
@@ -70,6 +76,90 @@ class _CloseErrorDriver(Driver):
 def test_cleanup_reader_rejects_missing_protocol_marker():
     with pytest.raises(LookupError, match="no structured cleanup evidence"):
         cleanup_errors(asyncio.CancelledError())
+
+
+def test_cleanup_reader_distinguishes_checked_clean_from_missing_protocol():
+    failure = RuntimeError("primary")
+    with pytest.raises(RuntimeError) as exc_info:
+        raise_collected_errors("single failure", [failure])
+
+    assert cleanup_errors(exc_info.value) == ()
+
+
+def test_cleanup_reader_rejects_malformed_protocol_marker():
+    failure = RuntimeError("primary")
+    failure._puffo_cleanup_errors = "not-a-tuple"  # type: ignore[attr-defined]
+
+    with pytest.raises(TypeError, match="malformed structured cleanup"):
+        cleanup_errors(failure)
+
+
+def test_cancellation_separates_suppressed_primary_from_cleanup_failure():
+    primary = ValueError("business failure")
+    cancellation = asyncio.CancelledError()
+    cleanup = RuntimeError("cleanup failure")
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        raise_collected_errors(
+            "cancelled cleanup", [primary, cancellation, cleanup]
+        )
+
+    assert suppressed_primary_errors(exc_info.value) == (primary,)
+    assert cleanup_errors(exc_info.value) == (cleanup,)
+    assert any(
+        "primary failure suppressed by cancellation" in note
+        for note in exc_info.value.__notes__
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_supervision_has_an_explicit_upper_bound():
+    release = asyncio.Event()
+
+    async def resist_cancellation_once():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    errors: list[BaseException] = []
+    await asyncio.wait_for(
+        collect_cleanup_errors(
+            resist_cancellation_once(), errors, timeout=0.01
+        ),
+        timeout=0.2,
+    )
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], CleanupTimeoutError)
+    release.set()
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_adapter_post_close_hook_cannot_block_close_forever(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.agent.harness.runtime_manager.CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+    release = asyncio.Event()
+
+    async def hanging_post_close():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    manager = RuntimeManager(_CloseErrorDriver(), RuntimeSpec("/tmp"))
+    # Keep the assertion focused on the caller-provided hook.
+    manager.driver.close = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
+    adapter = RuntimeManagerAdapter(manager, post_close=hanging_post_close)
+
+    with pytest.raises(CleanupTimeoutError, match="exceeded 0.01 seconds"):
+        await asyncio.wait_for(adapter.aclose(), timeout=0.2)
+
+    release.set()
+    await asyncio.sleep(0)
 
 
 @pytest.mark.asyncio

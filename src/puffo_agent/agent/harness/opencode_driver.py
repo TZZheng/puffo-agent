@@ -11,7 +11,11 @@ from typing import Any
 
 from ...tasks import spawn
 from ..cli_bin import normalize_launch_argv
-from .cleanup_errors import collect_cleanup_errors, raise_collected_errors
+from .cleanup_errors import (
+    CLEANUP_TIMEOUT_SECONDS,
+    collect_cleanup_errors,
+    raise_collected_errors,
+)
 from .driver import (
     BusyDelivery,
     CancelCapability,
@@ -159,7 +163,9 @@ class OpenCodeDriver(Driver):
         except BaseException as exc:
             errors: list[BaseException] = [exc]
             await collect_cleanup_errors(
-                self._abort_failed_start(generation), errors
+                self._abort_failed_start(generation),
+                errors,
+                timeout=CLEANUP_TIMEOUT_SECONDS,
             )
             raise_collected_errors("OpenCode turn start cleanup failed", errors)
         return TurnStarted(
@@ -237,12 +243,17 @@ class OpenCodeDriver(Driver):
         self._terminal_reason = "runtime_closed"
         proc = self._proc
         errors: list[BaseException] = []
-        await collect_cleanup_errors(self._settle_turn_task(proc), errors)
+        await collect_cleanup_errors(
+            self._settle_turn_task(proc),
+            errors,
+            timeout=CLEANUP_TIMEOUT_SECONDS,
+        )
         if self._stderr_reader is not None:
             self._stderr_reader.cancel()
             await collect_cleanup_errors(
                 asyncio.gather(self._stderr_reader, return_exceptions=True),
                 errors,
+                timeout=CLEANUP_TIMEOUT_SECONDS,
             )
             self._stderr_reader = None
         self._proc = None
@@ -251,7 +262,9 @@ class OpenCodeDriver(Driver):
         self._accepted = None
         self._turn_task = None
         self._spec = None
-        await collect_cleanup_errors(self._events.put(None), errors)
+        await collect_cleanup_errors(
+            self._events.put(None), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+        )
         raise_collected_errors("OpenCode driver close failed", errors)
 
     async def _drive_turn(

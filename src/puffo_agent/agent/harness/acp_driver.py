@@ -34,7 +34,11 @@ from acp.transports import default_environment
 
 from ...tasks import spawn
 from ..cli_bin import normalize_launch_argv
-from .cleanup_errors import collect_cleanup_errors, raise_collected_errors
+from .cleanup_errors import (
+    CLEANUP_TIMEOUT_SECONDS,
+    collect_cleanup_errors,
+    raise_collected_errors,
+)
 from .driver import (
     BusyDelivery,
     CancelCapability,
@@ -498,7 +502,9 @@ class AcpDriver(Driver):
         self._permissions.clear()
         errors: list[BaseException] = []
         if self._conn is not None:
-            await collect_cleanup_errors(self._conn.close(), errors)
+            await collect_cleanup_errors(
+                self._conn.close(), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+            )
             self._conn = None
         proc, self._proc = self._proc, None
         await collect_cleanup_errors(
@@ -509,6 +515,7 @@ class AcpDriver(Driver):
                 task_name="acp.shutdown_wait",
             ),
             errors,
+            timeout=CLEANUP_TIMEOUT_SECONDS,
         )
         current = asyncio.current_task()
         tasks = tuple(
@@ -523,14 +530,18 @@ class AcpDriver(Driver):
         for task in tasks:
             task.cancel()
         await collect_cleanup_errors(
-            asyncio.gather(*tasks, return_exceptions=True), errors
+            asyncio.gather(*tasks, return_exceptions=True),
+            errors,
+            timeout=CLEANUP_TIMEOUT_SECONDS,
         )
         self._prompt_task = None
         self._watcher = None
         self._stderr_reader = None
         self._active = TurnRef("")
         self._active_native_turn_id = ""
-        await collect_cleanup_errors(self._events.put(None), errors)
+        await collect_cleanup_errors(
+            self._events.put(None), errors, timeout=CLEANUP_TIMEOUT_SECONDS
+        )
         raise_collected_errors("ACP driver close failed", errors)
 
     async def _watch_process(self, proc: Any) -> None:

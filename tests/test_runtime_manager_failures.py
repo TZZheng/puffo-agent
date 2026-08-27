@@ -11,6 +11,7 @@ from puffo_agent.agent.harness.claude_code_driver import (
     ClaudeCodeCliDriver,
     _provider_error,
 )
+from puffo_agent.agent.harness.cleanup_errors import cleanup_errors
 from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
@@ -18,6 +19,7 @@ from puffo_agent.agent.harness.driver import (
     ContextStatus,
     Driver,
     HarnessEvent,
+    HarnessEventType,
     RuntimeOpened,
     RuntimeRef,
     RuntimeSpec,
@@ -1099,6 +1101,41 @@ async def test_timeout_cleanup_cannot_retire_the_next_turn_runtime():
     assert manager.active_turn_ref == second.turn_ref
     await manager.abandon_turn(second.turn_ref, reason="test_cleanup")
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_timeout_still_publishes_and_retires_runtime():
+    class CloseFailingPausedCancelDriver(_PausedCancelDriver):
+        async def close(self):
+            self.close_calls += 1
+            raise RuntimeError("timeout retirement cleanup failed")
+
+    driver = CloseFailingPausedCancelDriver()
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp", task_timeout_seconds=1),
+        driver_name="codex",
+    )
+    await manager.open()
+    stream = manager.events()
+    started = await manager.start_turn(TurnInput("first"))
+
+    timeout = asyncio.create_task(manager.timeout_turn(started.turn_ref))
+    await asyncio.wait_for(driver.cancel_entered.wait(), timeout=1)
+    timeout.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await asyncio.wait_for(timeout, timeout=1)
+
+    terminal = await asyncio.wait_for(anext(stream), timeout=1)
+    assert terminal.type == HarnessEventType.TURN_ABANDONED
+    assert terminal.data["error_code"] == "turn_timeout"
+    assert [str(error) for error in cleanup_errors(exc_info.value)] == [
+        "timeout retirement cleanup failed"
+    ]
+    assert manager.active_turn_ref is None
+    assert manager.opened is None
+    assert driver.close_calls == 1
 
 
 @pytest.mark.asyncio
