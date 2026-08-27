@@ -29,6 +29,7 @@ from ..provider_failures import (
     provider_failure_message,
     provider_failure_retryable,
 )
+from .cleanup_errors import collect_cleanup_errors, raise_collected_errors
 from .driver import (
     CompactRequest,
     ContextStatus,
@@ -139,17 +140,6 @@ def _native_resume_is_unavailable(exc: Exception) -> bool:
     return identifies_session and unavailable
 
 
-def _raise_collected_errors(label: str, errors: list[BaseException]) -> None:
-    """Raise every cleanup failure without replacing an earlier failure."""
-    if not errors:
-        return
-    if len(errors) == 1:
-        raise errors[0]
-    if all(isinstance(error, Exception) for error in errors):
-        raise ExceptionGroup(label, errors)  # type: ignore[arg-type]
-    raise BaseExceptionGroup(label, errors)
-
-
 class _EventStream(AsyncIterator[HarnessEvent]):
     """Subscriber handle that releases its queue whether or not it is iterated.
 
@@ -248,11 +238,13 @@ class RuntimeManager:
         )
         try:
             opened = await self.driver.open(self.spec, native_resume)
-        except Exception as exc:
-            try:
-                await self.driver.close()
-            except Exception:
-                logger.exception("failed to close runtime after open failure")
+        except BaseException as exc:
+            errors: list[BaseException] = [exc]
+            await collect_cleanup_errors(self.driver.close(), errors)
+            if len(errors) > 1:
+                raise_collected_errors("runtime open cleanup failed", errors)
+            if not isinstance(exc, Exception):
+                raise_collected_errors("runtime open cancelled", errors)
             # transient -> retry same session; invalid -> fresh at once;
             # unclassified -> fresh after a bounded streak (no forever-wedge)
             if native_resume is None:
@@ -273,14 +265,12 @@ class RuntimeManager:
             self._clear_native_session()
             try:
                 opened = await self.driver.open(self.spec, None)
-            except Exception:
-                try:
-                    await self.driver.close()
-                except Exception:
-                    logger.exception(
-                        "failed to close runtime after fresh open failure"
-                    )
-                raise
+            except BaseException as exc:
+                errors = [exc]
+                await collect_cleanup_errors(self.driver.close(), errors)
+                raise_collected_errors(
+                    "fresh runtime open cleanup failed", errors
+                )
         self.native_session_id = opened.native_session_id
         self._resume_failure_streak = 0
         # Preserve the durable Puffo logical reference independently of the
@@ -319,9 +309,15 @@ class RuntimeManager:
             self._terminal[logical] = loop.create_future()
             try:
                 receipt = await self.driver.start_turn(input)
-            except BaseException:
-                await self._discard_failed_start_locked(logical, retire=True)
-                raise
+            except BaseException as exc:
+                errors: list[BaseException] = [exc]
+                await collect_cleanup_errors(
+                    self._discard_failed_start_locked(logical, retire=True),
+                    errors,
+                )
+                raise_collected_errors(
+                    "turn start retirement failed", errors
+                )
             if isinstance(receipt, UnsupportedCapability):
                 await self._discard_failed_start_locked(logical, retire=False)
                 return receipt
@@ -351,12 +347,8 @@ class RuntimeManager:
         self._continuation_admissions.clear()
         if not retire:
             return
-        try:
-            # Keep session: close prevents overlap; dead -> invalid_resume.
-            await self._retire_runtime_locked(preserve_session=True)
-        except Exception:
-            logger.exception("failed to retire runtime after turn start failure")
-            self.opened = None
+        # Keep session: close prevents overlap; dead -> invalid_resume.
+        await self._retire_runtime_locked(preserve_session=True)
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput) -> Any:
         async with self._command_lock:
@@ -428,16 +420,12 @@ class RuntimeManager:
                 )
             previous = self.native_session_id
             self._fail_compaction_locked("native session rollover")
-            await self._stop_reader()
-            close_error: Exception | None = None
-            try:
-                await self.driver.close()
-            except Exception as exc:
-                close_error = exc
+            errors: list[BaseException] = []
+            await collect_cleanup_errors(self._stop_reader(), errors)
+            await collect_cleanup_errors(self.driver.close(), errors)
             self.opened = None
             self._clear_native_session()
-            if close_error is not None:
-                raise close_error
+            raise_collected_errors("native session rollover failed", errors)
             opened = await self._open_locked(resume=False)
             return previous, opened.native_session_id
 
@@ -570,7 +558,7 @@ class RuntimeManager:
                 await self._retire_runtime_locked(preserve_session=False)
             except Exception as exc:
                 errors.append(exc)
-            _raise_collected_errors("timed-out runtime retirement failed", errors)
+            raise_collected_errors("timed-out runtime retirement failed", errors)
             return event
 
     async def retire_runtime(self, *, preserve_session: bool) -> None:
@@ -586,18 +574,14 @@ class RuntimeManager:
         if self.active_turn_ref is not None:
             raise RuntimeStateError("cannot retire while a turn is active")
         self._fail_compaction_locked("runtime was retired")
-        await self._stop_reader()
-        close_error: Exception | None = None
-        try:
-            await self.driver.close()
-        except Exception as exc:
-            close_error = exc
+        errors: list[BaseException] = []
+        await collect_cleanup_errors(self._stop_reader(), errors)
+        await collect_cleanup_errors(self.driver.close(), errors)
         self.opened = None
         if not preserve_session:
             self.session_ref = SessionRef(f"session_{uuid.uuid4().hex}")
             self._clear_native_session()
-        if close_error is not None:
-            raise close_error
+        raise_collected_errors("runtime retirement failed", errors)
 
     def events(self) -> AsyncIterator[HarnessEvent]:
         queue: asyncio.Queue[HarnessEvent | None] = asyncio.Queue()
@@ -612,12 +596,9 @@ class RuntimeManager:
             if self.agent_id:
                 unregister_runtime_manager(self.agent_id, self)
             self._fail_compaction_locked("runtime is closed")
-            await self._stop_reader()
-            close_error: Exception | None = None
-            try:
-                await self.driver.close()
-            except Exception as exc:
-                close_error = exc
+            errors: list[BaseException] = []
+            await collect_cleanup_errors(self._stop_reader(), errors)
+            await collect_cleanup_errors(self.driver.close(), errors)
             self.opened = None
             autonomous = self._autonomous_turn
             if autonomous is not None:
@@ -655,8 +636,7 @@ class RuntimeManager:
             self._terminal.clear()
             for queue in tuple(self._subscribers):
                 queue.put_nowait(None)
-            if close_error is not None:
-                raise close_error
+            raise_collected_errors("runtime manager close failed", errors)
 
     async def _stop_reader(self) -> None:
         if self._reader is not None:
@@ -843,12 +823,9 @@ class RuntimeManager:
         except BaseException as exc:
             errors.append(exc)
         finally:
-            try:
-                await self.driver.close()
-            except BaseException as exc:
-                errors.append(exc)
             self.opened = None
-        _raise_collected_errors("runtime exit handling failed", errors)
+            await collect_cleanup_errors(self.driver.close(), errors)
+        raise_collected_errors("runtime exit handling failed", errors)
 
     def _adopt_driver_turn_locked(self, native: HarnessEvent) -> None:
         """Track a provider turn the driver opened on its own.
@@ -903,12 +880,9 @@ class RuntimeManager:
         except BaseException as exc:
             errors.append(exc)
         finally:
-            try:
-                await self.driver.close()
-            except BaseException as exc:
-                errors.append(exc)
             self.opened = None
-        _raise_collected_errors("invalid resume retirement failed", errors)
+            await collect_cleanup_errors(self.driver.close(), errors)
+        raise_collected_errors("invalid resume retirement failed", errors)
 
     async def _publish_event(self, event: HarnessEvent) -> None:
         if self.event_sink is not None:
@@ -980,11 +954,20 @@ class RuntimeManager:
                     "failed to persist terminal runtime event after %s",
                     reason,
                 )
-        try:
-            await self.driver.close()
-        except Exception:
-            logger.exception("failed to close provider runtime after %s", reason)
         self.opened = None
+        errors: list[BaseException] = []
+        await collect_cleanup_errors(self.driver.close(), errors)
+        for error in errors:
+            if isinstance(error, Exception):
+                logger.error(
+                    "failed to close provider runtime after %s: %s",
+                    reason,
+                    error,
+                )
+        if any(
+            isinstance(error, asyncio.CancelledError) for error in errors
+        ):
+            raise_collected_errors("runtime failure cleanup cancelled", errors)
 
     def _complete_turn(self, event: HarnessEvent, turn: TurnRef) -> None:
         future = self._terminal.get(turn)
@@ -1434,17 +1417,11 @@ class RuntimeManagerAdapter(Adapter):
         )
 
     async def aclose(self) -> None:
-        errors: list[Exception] = []
-        try:
-            await self.manager.close()
-        except Exception as exc:
-            errors.append(exc)
+        errors: list[BaseException] = []
+        await collect_cleanup_errors(self.manager.close(), errors)
         if self.post_close is not None:
-            try:
-                await self.post_close()
-            except Exception as exc:
-                errors.append(exc)
-        _raise_collected_errors("runtime adapter close failed", errors)
+            await collect_cleanup_errors(self.post_close(), errors)
+        raise_collected_errors("runtime adapter close failed", errors)
 
     def get_provider_session_id(self) -> str | None:
         return self.manager.native_session_id or None

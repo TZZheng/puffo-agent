@@ -8,6 +8,7 @@ import psutil
 import pytest
 
 from puffo_agent.agent.harness import build_driver
+from puffo_agent.agent.harness.cleanup_errors import cleanup_errors
 from puffo_agent.agent.harness.driver import (
     BusyDelivery,
     HarnessEventType,
@@ -483,6 +484,55 @@ async def test_close_reports_transport_abandonment(monkeypatch):
 
     with pytest.raises(ProcessTreeShutdownError):
         await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_start_preserves_cancellation_and_shutdown_error(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
+        0.01,
+    )
+    proc = _UncloseableTurnProcess()
+    driver = OpenCodeDriver(lambda *_args: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+    task = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await task
+
+    assert task.cancelled()
+    attached = cleanup_errors(exc_info.value)
+    assert len(attached) == 1
+    assert isinstance(attached[0], ProcessTreeShutdownError)
+    assert proc.returncode == -9
+    assert driver._proc is None
+    assert driver._turn_task is None
+    assert not driver._active.value
+
+
+@pytest.mark.asyncio
+async def test_failed_start_and_shutdown_failure_are_grouped(monkeypatch):
+    driver = OpenCodeDriver(lambda *_args: (_ for _ in ()).throw(
+        ValueError("primary start failure")
+    ))
+    await driver.open(RuntimeSpec("/workspace"))
+
+    async def fail_cleanup(_generation):
+        raise ProcessTreeShutdownError("cleanup failure")
+
+    monkeypatch.setattr(driver, "_abort_failed_start", fail_cleanup)
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await driver.start_turn(TurnInput("hello"))
+
+    assert [str(exc) for exc in exc_info.value.exceptions] == [
+        "primary start failure",
+        "cleanup failure",
+    ]
 
 
 def _assert_process_exited(pid: int) -> None:

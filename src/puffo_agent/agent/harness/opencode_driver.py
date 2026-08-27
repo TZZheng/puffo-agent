@@ -11,6 +11,7 @@ from typing import Any
 
 from ...tasks import spawn
 from ..cli_bin import normalize_launch_argv
+from .cleanup_errors import collect_cleanup_errors, raise_collected_errors
 from .driver import (
     BusyDelivery,
     CancelCapability,
@@ -41,7 +42,6 @@ from .opencode_protocol import (
     normalize_opencode_frame,
 )
 from .subprocess_io import (
-    ProcessTreeShutdownError,
     drain_subprocess_stream_keeping_tail,
     process_group_spawn_kwargs,
     shutdown_process_tree,
@@ -156,9 +156,12 @@ class OpenCodeDriver(Driver):
             native_session_id, native_turn_id = await asyncio.shield(
                 self._accepted
             )
-        except BaseException:
-            await self._abort_failed_start(generation)
-            raise
+        except BaseException as exc:
+            errors: list[BaseException] = [exc]
+            await collect_cleanup_errors(
+                self._abort_failed_start(generation), errors
+            )
+            raise_collected_errors("OpenCode turn start cleanup failed", errors)
         return TurnStarted(
             turn,
             native_turn_id=native_turn_id,
@@ -233,15 +236,13 @@ class OpenCodeDriver(Driver):
         self._closed = True
         self._terminal_reason = "runtime_closed"
         proc = self._proc
-        shutdown_error: ProcessTreeShutdownError | None = None
-        try:
-            await self._settle_turn_task(proc)
-        except ProcessTreeShutdownError as exc:
-            shutdown_error = exc
+        errors: list[BaseException] = []
+        await collect_cleanup_errors(self._settle_turn_task(proc), errors)
         if self._stderr_reader is not None:
             self._stderr_reader.cancel()
-            await asyncio.gather(
-                self._stderr_reader, return_exceptions=True
+            await collect_cleanup_errors(
+                asyncio.gather(self._stderr_reader, return_exceptions=True),
+                errors,
             )
             self._stderr_reader = None
         self._proc = None
@@ -250,9 +251,8 @@ class OpenCodeDriver(Driver):
         self._accepted = None
         self._turn_task = None
         self._spec = None
-        await self._events.put(None)
-        if shutdown_error is not None:
-            raise shutdown_error
+        await collect_cleanup_errors(self._events.put(None), errors)
+        raise_collected_errors("OpenCode driver close failed", errors)
 
     async def _drive_turn(
         self, proc: Any, turn: TurnRef, generation: int
@@ -430,14 +430,16 @@ class OpenCodeDriver(Driver):
     async def _abort_failed_start(self, generation: int) -> None:
         proc = self._proc
         task = self._turn_task
-        if task is not None and task is not asyncio.current_task():
-            await self._settle_turn_task(proc)
-        if generation == self._turn_generation:
-            self._proc = None
-            self._active = TurnRef("")
-            self._active_native_turn_id = ""
-            self._accepted = None
-            self._turn_task = None
+        try:
+            if task is not None and task is not asyncio.current_task():
+                await self._settle_turn_task(proc)
+        finally:
+            if generation == self._turn_generation:
+                self._proc = None
+                self._active = TurnRef("")
+                self._active_native_turn_id = ""
+                self._accepted = None
+                self._turn_task = None
 
     async def _settle_turn_task(self, proc: Any) -> None:
         task = self._turn_task

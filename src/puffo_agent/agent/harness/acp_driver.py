@@ -34,6 +34,7 @@ from acp.transports import default_environment
 
 from ...tasks import spawn
 from ..cli_bin import normalize_launch_argv
+from .cleanup_errors import collect_cleanup_errors, raise_collected_errors
 from .driver import (
     BusyDelivery,
     CancelCapability,
@@ -497,51 +498,40 @@ class AcpDriver(Driver):
         self._permissions.clear()
         errors: list[BaseException] = []
         if self._conn is not None:
-            try:
-                await self._conn.close()
-            except BaseException as exc:
-                errors.append(exc)
+            await collect_cleanup_errors(self._conn.close(), errors)
             self._conn = None
         proc, self._proc = self._proc, None
-        try:
-            await shutdown_process_tree(
+        await collect_cleanup_errors(
+            shutdown_process_tree(
                 proc,
                 waiter=self._watcher,
                 timeout=_SHUTDOWN_GRACE_SECONDS,
                 task_name="acp.shutdown_wait",
+            ),
+            errors,
+        )
+        current = asyncio.current_task()
+        tasks = tuple(
+            task
+            for task in (
+                self._prompt_task,
+                self._watcher,
+                self._stderr_reader,
             )
-        except BaseException as exc:
-            errors.append(exc)
-        finally:
-            current = asyncio.current_task()
-            tasks = tuple(
-                task
-                for task in (
-                    self._prompt_task,
-                    self._watcher,
-                    self._stderr_reader,
-                )
-                if task is not None and task is not current
-            )
-            for task in tasks:
-                task.cancel()
-            try:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            except BaseException as exc:
-                errors.append(exc)
-            self._prompt_task = None
-            self._watcher = None
-            self._stderr_reader = None
-            self._active = TurnRef("")
-            self._active_native_turn_id = ""
-            try:
-                await self._events.put(None)
-            except BaseException as exc:
-                errors.append(exc)
-        if len(errors) == 1:
-            raise errors[0]
-        if errors:
-            raise BaseExceptionGroup("ACP driver close failed", errors)
+            if task is not None and task is not current
+        )
+        for task in tasks:
+            task.cancel()
+        await collect_cleanup_errors(
+            asyncio.gather(*tasks, return_exceptions=True), errors
+        )
+        self._prompt_task = None
+        self._watcher = None
+        self._stderr_reader = None
+        self._active = TurnRef("")
+        self._active_native_turn_id = ""
+        await collect_cleanup_errors(self._events.put(None), errors)
+        raise_collected_errors("ACP driver close failed", errors)
 
     async def _watch_process(self, proc: Any) -> None:
         returncode = await proc.wait()

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from puffo_agent.agent.harness.cleanup_errors import cleanup_errors
 from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     Driver,
@@ -108,6 +109,7 @@ async def test_runtime_exit_preserves_primary_and_cleanup_failures():
         "process-tree cleanup failed",
     ]
     assert manager.opened is None
+    await manager._stop_reader()
 
 
 @pytest.mark.asyncio
@@ -124,20 +126,24 @@ async def test_runtime_exit_cancellation_still_closes_and_preserves_both():
     )
     await manager.open()
 
-    with pytest.raises(BaseExceptionGroup) as exc_info:
-        await manager._handle_runtime_exit_locked(HarnessEvent(
+    task = asyncio.create_task(
+        manager._handle_runtime_exit_locked(HarnessEvent(
             type=HarnessEventType.RUNTIME_EXITED,
             driver="fake",
             session_ref=manager.session_ref,
             data={"returncode": 1},
         ))
+    )
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await task
 
-    assert [type(exc) for exc in exc_info.value.exceptions] == [
-        asyncio.CancelledError,
-        RuntimeError,
+    assert task.cancelled()
+    assert [str(exc) for exc in cleanup_errors(exc_info.value)] == [
+        "process-tree cleanup failed"
     ]
     assert driver.close_calls == 1
     assert manager.opened is None
+    await manager._stop_reader()
 
 
 @pytest.mark.asyncio
@@ -157,8 +163,8 @@ async def test_invalid_resume_cancellation_still_closes_and_preserves_both(
         cancelled_terminal,
     )
 
-    with pytest.raises(BaseExceptionGroup) as exc_info:
-        await manager._retire_invalid_resume_locked(
+    task = asyncio.create_task(
+        manager._retire_invalid_resume_locked(
             HarnessEvent(
                 type=HarnessEventType.TURN_ABANDONED,
                 driver="fake",
@@ -166,10 +172,61 @@ async def test_invalid_resume_cancellation_still_closes_and_preserves_both(
             ),
             TurnRef("turn_cancelled"),
         )
+    )
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await task
 
-    assert [type(exc) for exc in exc_info.value.exceptions] == [
-        asyncio.CancelledError,
-        RuntimeError,
+    assert task.cancelled()
+    assert [str(exc) for exc in cleanup_errors(exc_info.value)] == [
+        "process-tree cleanup failed"
+    ]
+    assert driver.close_calls == 1
+    assert manager.opened is None
+    await manager._stop_reader()
+
+
+@pytest.mark.asyncio
+async def test_open_and_close_failures_are_grouped_without_fresh_fallback():
+    class OpenAndCloseErrorDriver(_CloseErrorDriver):
+        def __init__(self):
+            super().__init__()
+            self.open_calls = 0
+
+        async def open(self, spec, resume=None):
+            self.open_calls += 1
+            raise ValueError("primary open failure")
+
+    driver = OpenAndCloseErrorDriver()
+    manager = RuntimeManager(driver, RuntimeSpec("/tmp"))
+    manager.native_session_id = "resume-me"
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await manager.open()
+
+    assert [str(exc) for exc in exc_info.value.exceptions] == [
+        "primary open failure",
+        "process-tree cleanup failed",
+    ]
+    assert driver.open_calls == 1
+    assert driver.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_start_and_retire_failures_are_grouped():
+    class StartAndCloseErrorDriver(_CloseErrorDriver):
+        async def start_turn(self, input):
+            raise ValueError("primary start failure")
+
+    driver = StartAndCloseErrorDriver()
+    manager = RuntimeManager(driver, RuntimeSpec("/tmp"))
+    await manager.open()
+
+    with pytest.raises(ExceptionGroup) as exc_info:
+        await manager.start_turn(SimpleNamespace(content="hello"))
+
+    assert [str(exc) for exc in exc_info.value.exceptions] == [
+        "primary start failure",
+        "process-tree cleanup failed",
     ]
     assert driver.close_calls == 1
     assert manager.opened is None

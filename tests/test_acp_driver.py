@@ -24,6 +24,7 @@ from acp.schema import (
 )
 
 from puffo_agent.agent.harness import build_driver
+from puffo_agent.agent.harness.cleanup_errors import cleanup_errors
 from puffo_agent.agent.harness.acp_driver import (
     AcpDriver,
     AcpLaunchPlan,
@@ -481,6 +482,48 @@ async def test_close_finishes_tail_cleanup_after_unexpected_shutdown_error(
     assert driver._watcher is None
     assert driver._stderr_reader is None
     assert [event async for event in events]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_finishes_process_shutdown(monkeypatch):
+    from puffo_agent.agent.harness import acp_driver
+
+    monkeypatch.setattr(acp_driver, "_SHUTDOWN_GRACE_SECONDS", 0.01)
+    entered = asyncio.Event()
+    original_shutdown = acp_driver.shutdown_process_tree
+
+    async def observed_shutdown(*args, **kwargs):
+        entered.set()
+        await original_shutdown(*args, **kwargs)
+
+    monkeypatch.setattr(acp_driver, "shutdown_process_tree", observed_shutdown)
+
+    class SlowKillProcess(_FakeProcess):
+        def terminate(self):
+            pass
+
+        def kill(self):
+            asyncio.get_running_loop().call_later(0.001, self.exit, -9)
+
+    harness = _Harness()
+    harness.proc = SlowKillProcess()
+    driver = AcpDriver(
+        harness.process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    await driver.open(RuntimeSpec("/workspace", executable="agent"))
+    task = asyncio.create_task(driver.close())
+    await entered.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await task
+
+    assert task.cancelled()
+    assert cleanup_errors(exc_info.value) == ()
+    assert harness.proc.returncode == -9
+    assert driver._proc is None
+    assert driver._watcher is None
 
 
 def _assert_process_exited(pid: int) -> None:
