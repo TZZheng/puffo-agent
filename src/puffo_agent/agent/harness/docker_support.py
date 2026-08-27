@@ -168,7 +168,6 @@ async def communicate_with_timeout(
     communicate_task = spawn(
         proc.communicate(input_data),
         name="proc.communicate",
-        report_failure=False,
     )
     try:
         return await asyncio.wait_for(

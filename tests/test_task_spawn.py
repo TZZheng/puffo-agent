@@ -3,6 +3,7 @@ done-callback, and no bare ensure_future/create_task remains in the tree."""
 
 import ast
 import asyncio
+import inspect
 import logging
 from pathlib import Path
 
@@ -152,17 +153,25 @@ async def test_existing_done_callback_still_runs(caplog):
 
 
 @pytest.mark.asyncio
-async def test_owned_companion_leaves_reporting_to_awaiter(caplog):
+async def test_owned_companion_is_still_reported_once(caplog):
     async def boom():
         raise ValueError("claimed")
 
     with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
-        task = spawn(boom(), name="claimed", report_failure=False)
+        task = spawn(boom(), name="claimed")
         with pytest.raises(ValueError):
             await task
         await _settle()
 
-    assert _errors(caplog) == []
+    records = _errors(caplog)
+    assert len(records) == 1
+    assert records[0].getMessage() == "worker task died: claimed"
+    assert records[0].exc_info is not None
+    assert isinstance(records[0].exc_info[1], ValueError)
+
+
+def test_failure_reporting_cannot_be_disabled():
+    assert "report_failure" not in inspect.signature(spawn).parameters
 
 
 @pytest.mark.asyncio

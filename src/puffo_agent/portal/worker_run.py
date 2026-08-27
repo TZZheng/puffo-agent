@@ -864,7 +864,6 @@ class StandardWorkerRun:
         global_task = spawn(
             global_runtime.run(),
             name="global_runtime.run",
-            report_failure=False,
         )
         reminder_task = None
         if reminder_sync is not None:

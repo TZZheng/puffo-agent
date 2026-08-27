@@ -25,7 +25,7 @@ async def await_listener_with_runtime(
     label: str,
 ) -> Any:
     """Stop a transport listener as soon as its Inbox consumer exits."""
-    listener_task = spawn(listener, name="listener", report_failure=False)
+    listener_task = spawn(listener, name="listener")
     try:
         done, _pending = await asyncio.wait(
             {listener_task, runtime_task},
