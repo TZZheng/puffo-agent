@@ -38,9 +38,10 @@ def spawn(
 ) -> asyncio.Future[Any]:
     """Schedule ``coro`` and optionally report an otherwise detached failure.
 
-    Pass ``report_failure=False`` when an owning path promptly awaits or
-    otherwise inspects the returned future.  That owner remains responsible
-    for surfacing the failure with its richer context.
+    Pass ``report_failure=False`` only when an owning path is guaranteed to
+    await or inspect the returned future and emit exactly one alertable,
+    traceback-bearing failure record.  Merely intending to inspect it, or
+    logging at DEBUG, is not sufficient.
     """
     if asyncio.iscoroutine(coro):
         # running-loop only: preserves create_task's RuntimeError contract

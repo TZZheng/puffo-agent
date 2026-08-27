@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from puffo_agent.agent.directory_cache import warm_member_caches
 from puffo_agent.tasks import spawn
 
 _SRC = Path(__file__).resolve().parent.parent / "src" / "puffo_agent"
@@ -186,6 +187,40 @@ async def test_start_services_shaped_failure_surfaces(caplog):
     assert "reminder_sync.run" in records[0].getMessage()
 
 
+@pytest.mark.asyncio
+async def test_cache_warm_reports_both_failed_siblings_once(caplog):
+    class Http:
+        async def get(self, path):
+            assert path == "/spaces"
+            return {"spaces": [{"space_id": "sp_1", "name": "One"}]}
+
+    async def get_members(_space_id):
+        raise ValueError("members failed")
+
+    async def warm_channels(_space_id):
+        await asyncio.sleep(0)
+        raise RuntimeError("channels failed")
+
+    async def fetch_profiles(_slugs):
+        raise AssertionError("no profiles should be fetched")
+
+    with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
+        await warm_member_caches(
+            http=Http(),
+            log=logging.getLogger("test.directory_cache"),
+            space_name_cache={},
+            profile_cache={},
+            get_members=get_members,
+            warm_channels=warm_channels,
+            fetch_profiles=fetch_profiles,
+        )
+        await _settle()
+
+    records = _errors(caplog)
+    assert len(records) == 2
+    assert {type(record.exc_info[1]) for record in records} == {ValueError, RuntimeError}
+
+
 def test_spawn_without_running_loop_raises():
     async def never():
         return None
@@ -200,15 +235,74 @@ def test_spawn_without_running_loop_raises():
 
 def _bare_spawn_sites(path: Path) -> list[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"))
+    asyncio_modules: set[str] = set()
+    direct_spawners: set[str] = set()
+    task_group_factories: set[str] = set()
+    task_group_owners: set[str] = set()
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "asyncio":
+                    asyncio_modules.add(alias.asname or alias.name)
+        elif isinstance(node, ast.ImportFrom) and node.module == "asyncio":
+            for alias in node.names:
+                local_name = alias.asname or alias.name
+                if alias.name in _SPAWNERS:
+                    direct_spawners.add(local_name)
+                elif alias.name == "TaskGroup":
+                    task_group_factories.add(local_name)
+
+    def is_task_group_factory(expr: ast.expr) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id in task_group_factories
+        return (
+            isinstance(expr, ast.Attribute)
+            and expr.attr == "TaskGroup"
+            and isinstance(expr.value, ast.Name)
+            and expr.value.id in asyncio_modules
+        )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.With, ast.AsyncWith)):
+            continue
+        for item in node.items:
+            context = item.context_expr
+            if (
+                isinstance(context, ast.Call)
+                and is_task_group_factory(context.func)
+                and isinstance(item.optional_vars, ast.Name)
+            ):
+                task_group_owners.add(item.optional_vars.id)
+
+    def is_loop_owner(expr: ast.expr) -> bool:
+        if isinstance(expr, ast.Name):
+            return expr.id in asyncio_modules or "loop" in expr.id.lower()
+        if isinstance(expr, ast.Attribute):
+            return "loop" in expr.attr.lower()
+        if not isinstance(expr, ast.Call) or not isinstance(expr.func, ast.Attribute):
+            return False
+        return (
+            expr.func.attr in {"get_running_loop", "get_event_loop"}
+            and isinstance(expr.func.value, ast.Name)
+            and expr.func.value.id in asyncio_modules
+        )
+
     hits = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if isinstance(func, ast.Attribute) and func.attr in _SPAWNERS:
-            hits.append(f"{path}:{node.lineno} attribute.{func.attr}")
-        elif isinstance(func, ast.Name) and func.id in _SPAWNERS:
+        if isinstance(func, ast.Name) and func.id in direct_spawners:
             hits.append(f"{path}:{node.lineno} name.{func.id}")
+        elif isinstance(func, ast.Attribute) and func.attr == "ensure_future":
+            if isinstance(func.value, ast.Name) and func.value.id in asyncio_modules:
+                hits.append(f"{path}:{node.lineno} attribute.{func.attr}")
+        elif isinstance(func, ast.Attribute) and func.attr == "create_task":
+            if isinstance(func.value, ast.Name) and func.value.id in task_group_owners:
+                continue
+            if is_loop_owner(func.value):
+                hits.append(f"{path}:{node.lineno} attribute.{func.attr}")
     return hits
 
 
@@ -229,13 +323,29 @@ def test_helper_owns_both_low_level_spawn_shapes():
 @pytest.mark.parametrize(
     "source",
     [
-        "asyncio.get_running_loop().create_task(work())",
-        "self._loop.create_task(work())",
-        "create_task(work())",
-        "aio.ensure_future(work())",
+        "import asyncio\nasyncio.get_running_loop().create_task(work())",
+        "import asyncio\nloop = asyncio.get_running_loop()\nloop.create_task(work())",
+        "import asyncio\nself._loop.create_task(work())",
+        "from asyncio import create_task\ncreate_task(work())",
+        "from asyncio import create_task as schedule\nschedule(work())",
+        "import asyncio as aio\naio.ensure_future(work())",
     ],
 )
 def test_fleet_lint_detects_indirect_spawn_shapes(tmp_path, source):
     path = tmp_path / "indirect.py"
     path.write_text(source, encoding="utf-8")
     assert len(_bare_spawn_sites(path)) == 1
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import asyncio\nasync with asyncio.TaskGroup() as tg:\n    tg.create_task(work())",
+        "from asyncio import TaskGroup as Group\nasync with Group() as owner:\n    owner.create_task(work())",
+        "domain.create_task(record())",
+    ],
+)
+def test_fleet_lint_allows_supervised_and_unrelated_create_task(tmp_path, source):
+    path = tmp_path / "owned.py"
+    path.write_text(source, encoding="utf-8")
+    assert _bare_spawn_sites(path) == []

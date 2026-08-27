@@ -124,14 +124,19 @@ async def warm_member_caches(
         return
 
     async def warm_one(space_id: str) -> set[str]:
-        members_task = spawn(
-            get_members(space_id), name="get_members", report_failure=False
+        # These failures are intentionally tolerated by the outer cache warm,
+        # so the tasks retain their reporters as the sole authoritative log.
+        # Gather both results before re-raising one: a failed member lookup
+        # must not leave the channel warmer's exception unobserved.
+        members_task = spawn(get_members(space_id), name="get_members")
+        channels_task = spawn(warm_channels(space_id), name="warm_channels")
+        members, channels = await asyncio.gather(
+            members_task, channels_task, return_exceptions=True
         )
-        channels_task = spawn(
-            warm_channels(space_id), name="warm_channels", report_failure=False
-        )
-        members = await members_task
-        await channels_task
+        if isinstance(members, BaseException):
+            raise members
+        if isinstance(channels, BaseException):
+            raise channels
         return set(members)
 
     all_slugs: set[str] = set()

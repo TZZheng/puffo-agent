@@ -109,13 +109,12 @@ async def _run_attached(
     async def on_message(root_id, batch, channel_meta):
         await bridge.dispatch(session, root_id, batch, channel_meta)
 
-    session_task = spawn(
-        session.run(), name="session.run", report_failure=False
-    )
+    # Cleanup below only records diagnostic DEBUG context.  Keep the central
+    # reporter as the single alertable, traceback-bearing failure record.
+    session_task = spawn(session.run(), name="session.run")
     consumer_task = spawn(
         start_consumer(authed, on_message),
         name="start_consumer",
-        report_failure=False,
     )
     try:
         await asyncio.wait(
