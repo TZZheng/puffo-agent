@@ -150,10 +150,15 @@ async def test_adapter_post_close_hook_cannot_block_close_forever(monkeypatch):
         except asyncio.CancelledError:
             await release.wait()
 
-    manager = RuntimeManager(_CloseErrorDriver(), RuntimeSpec("/tmp"))
-    # Keep the assertion focused on the caller-provided hook.
-    manager.driver.close = lambda: asyncio.sleep(0)  # type: ignore[method-assign]
-    adapter = RuntimeManagerAdapter(manager, post_close=hanging_post_close)
+    class ImmediateManager:
+        async def close(self):
+            return None
+
+    # Keep the assertion focused on the caller-provided hook; a real manager
+    # has its own separately tested bounded cleanup operations.
+    adapter = RuntimeManagerAdapter(  # type: ignore[arg-type]
+        ImmediateManager(), post_close=hanging_post_close
+    )
 
     with pytest.raises(CleanupTimeoutError, match="exceeded 0.01 seconds"):
         await asyncio.wait_for(adapter.aclose(), timeout=0.2)
