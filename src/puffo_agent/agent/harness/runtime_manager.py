@@ -139,13 +139,15 @@ def _native_resume_is_unavailable(exc: Exception) -> bool:
     return identifies_session and unavailable
 
 
-def _raise_collected_errors(label: str, errors: list[Exception]) -> None:
+def _raise_collected_errors(label: str, errors: list[BaseException]) -> None:
     """Raise every cleanup failure without replacing an earlier failure."""
     if not errors:
         return
     if len(errors) == 1:
         raise errors[0]
-    raise ExceptionGroup(label, errors)
+    if all(isinstance(error, Exception) for error in errors):
+        raise ExceptionGroup(label, errors)  # type: ignore[arg-type]
+    raise BaseExceptionGroup(label, errors)
 
 
 class _EventStream(AsyncIterator[HarnessEvent]):
@@ -793,51 +795,59 @@ class RuntimeManager:
 
     async def _handle_runtime_exit_locked(self, event: HarnessEvent) -> None:
         self._fail_compaction_locked("runtime exited")
-        errors: list[Exception] = []
+        errors: list[BaseException] = []
         try:
-            await self._publish_event(event)
-        except Exception as exc:
+            try:
+                await self._publish_event(event)
+            except Exception as exc:
+                errors.append(exc)
+            active = self.active_turn_ref
+            unconfirmed = self._resume_unconfirmed
+            self._resume_unconfirmed = False
+            failed_native_session_id = self.native_session_id
+            if unconfirmed:
+                self._clear_native_session()
+            try:
+                if active is not None:
+                    provider_error_code = str(
+                        event.data.get("error_code") or ""
+                    )
+                    if provider_error_code:
+                        failure_data: dict[str, Any] = {
+                            "outcome": "abandoned",
+                            "error_code": provider_error_code,
+                        }
+                    else:
+                        failure_data = {
+                            "outcome": "abandoned",
+                            "error_code": (
+                                "resume_unconfirmed"
+                                if unconfirmed
+                                else "runtime_exited"
+                            ),
+                            "retryable": True,
+                        }
+                    abandoned = HarnessEvent(
+                        type=HarnessEventType.TURN_ABANDONED,
+                        driver=self.driver_name,
+                        session_ref=self.session_ref,
+                        turn_ref=active,
+                        native_session_id=failed_native_session_id,
+                        native_turn_id=self.native_turn_id,
+                        occurred_at=event.occurred_at,
+                        data=failure_data,
+                    )
+                    await self._publish_terminal_locked(abandoned, active)
+            except Exception as exc:
+                errors.append(exc)
+        except BaseException as exc:
             errors.append(exc)
-        active = self.active_turn_ref
-        unconfirmed = self._resume_unconfirmed
-        self._resume_unconfirmed = False
-        failed_native_session_id = self.native_session_id
-        if unconfirmed:
-            self._clear_native_session()
-        try:
-            if active is not None:
-                provider_error_code = str(event.data.get("error_code") or "")
-                if provider_error_code:
-                    failure_data: dict[str, Any] = {
-                        "outcome": "abandoned",
-                        "error_code": provider_error_code,
-                    }
-                else:
-                    failure_data = {
-                        "outcome": "abandoned",
-                        "error_code": (
-                            "resume_unconfirmed" if unconfirmed else "runtime_exited"
-                        ),
-                        "retryable": True,
-                    }
-                abandoned = HarnessEvent(
-                    type=HarnessEventType.TURN_ABANDONED,
-                    driver=self.driver_name,
-                    session_ref=self.session_ref,
-                    turn_ref=active,
-                    native_session_id=failed_native_session_id,
-                    native_turn_id=self.native_turn_id,
-                    occurred_at=event.occurred_at,
-                    data=failure_data,
-                )
-                await self._publish_terminal_locked(abandoned, active)
-        except Exception as exc:
-            errors.append(exc)
-        try:
-            await self.driver.close()
-        except Exception as exc:
-            errors.append(exc)
-        self.opened = None
+        finally:
+            try:
+                await self.driver.close()
+            except BaseException as exc:
+                errors.append(exc)
+            self.opened = None
         _raise_collected_errors("runtime exit handling failed", errors)
 
     def _adopt_driver_turn_locked(self, native: HarnessEvent) -> None:
@@ -887,16 +897,17 @@ class RuntimeManager:
         self._fail_compaction_locked("resume unconfirmed")
         terminal = replace(event, data={**event.data, "retryable": True})
         self._clear_native_session()
-        errors: list[Exception] = []
+        errors: list[BaseException] = []
         try:
             await self._publish_terminal_locked(terminal, logical_turn)
-        except Exception as exc:
+        except BaseException as exc:
             errors.append(exc)
-        try:
-            await self.driver.close()
-        except Exception as exc:
-            errors.append(exc)
-        self.opened = None
+        finally:
+            try:
+                await self.driver.close()
+            except BaseException as exc:
+                errors.append(exc)
+            self.opened = None
         _raise_collected_errors("invalid resume retirement failed", errors)
 
     async def _publish_event(self, event: HarnessEvent) -> None:

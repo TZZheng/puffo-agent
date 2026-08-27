@@ -455,6 +455,34 @@ async def test_close_reports_acp_transport_abandonment(monkeypatch):
         await driver.close()
 
 
+@pytest.mark.asyncio
+async def test_close_finishes_tail_cleanup_after_unexpected_shutdown_error(
+    monkeypatch,
+):
+    async def fail_shutdown(*_args, **_kwargs):
+        raise RuntimeError("unexpected shutdown failure")
+
+    monkeypatch.setattr(
+        "puffo_agent.agent.harness.acp_driver.shutdown_process_tree",
+        fail_shutdown,
+    )
+    harness = _Harness()
+    driver = AcpDriver(
+        harness.process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    await driver.open(RuntimeSpec("/workspace", executable="agent"))
+    events = driver.events()
+
+    with pytest.raises(RuntimeError, match="unexpected shutdown failure"):
+        await driver.close()
+
+    assert driver._prompt_task is None
+    assert driver._watcher is None
+    assert driver._stderr_reader is None
+    assert [event async for event in events]
+
+
 def _assert_process_exited(pid: int) -> None:
     deadline = time.monotonic() + 1
     while time.monotonic() < deadline:

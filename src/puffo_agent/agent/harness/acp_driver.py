@@ -61,7 +61,6 @@ from .driver import (
     UnsupportedCapability,
 )
 from .subprocess_io import (
-    ProcessTreeShutdownError,
     drain_subprocess_stream_keeping_tail,
     process_group_spawn_kwargs,
     shutdown_process_tree,
@@ -496,14 +495,14 @@ class AcpDriver(Driver):
             if not future.done():
                 future.set_result(PermissionDecision.DENY)
         self._permissions.clear()
+        errors: list[BaseException] = []
         if self._conn is not None:
             try:
                 await self._conn.close()
-            except Exception:
-                pass
+            except BaseException as exc:
+                errors.append(exc)
             self._conn = None
         proc, self._proc = self._proc, None
-        shutdown_error: ProcessTreeShutdownError | None = None
         try:
             await shutdown_process_tree(
                 proc,
@@ -511,28 +510,38 @@ class AcpDriver(Driver):
                 timeout=_SHUTDOWN_GRACE_SECONDS,
                 task_name="acp.shutdown_wait",
             )
-        except ProcessTreeShutdownError as exc:
-            shutdown_error = exc
-        current = asyncio.current_task()
-        for task in (self._prompt_task, self._watcher, self._stderr_reader):
-            if task is not None and task is not current:
-                task.cancel()
-        await asyncio.gather(
-            *(
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            current = asyncio.current_task()
+            tasks = tuple(
                 task
-                for task in (self._prompt_task, self._watcher, self._stderr_reader)
+                for task in (
+                    self._prompt_task,
+                    self._watcher,
+                    self._stderr_reader,
+                )
                 if task is not None and task is not current
-            ),
-            return_exceptions=True,
-        )
-        self._prompt_task = None
-        self._watcher = None
-        self._stderr_reader = None
-        self._active = TurnRef("")
-        self._active_native_turn_id = ""
-        await self._events.put(None)
-        if shutdown_error is not None:
-            raise shutdown_error
+            )
+            for task in tasks:
+                task.cancel()
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except BaseException as exc:
+                errors.append(exc)
+            self._prompt_task = None
+            self._watcher = None
+            self._stderr_reader = None
+            self._active = TurnRef("")
+            self._active_native_turn_id = ""
+            try:
+                await self._events.put(None)
+            except BaseException as exc:
+                errors.append(exc)
+        if len(errors) == 1:
+            raise errors[0]
+        if errors:
+            raise BaseExceptionGroup("ACP driver close failed", errors)
 
     async def _watch_process(self, proc: Any) -> None:
         returncode = await proc.wait()

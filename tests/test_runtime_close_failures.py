@@ -12,6 +12,7 @@ from puffo_agent.agent.harness.driver import (
     RuntimeRef,
     RuntimeSpec,
     SessionRef,
+    TurnRef,
     UnsupportedCapability,
 )
 from puffo_agent.agent.harness.runtime_manager import (
@@ -23,6 +24,7 @@ from puffo_agent.agent.harness.runtime_manager import (
 class _CloseErrorDriver(Driver):
     def __init__(self) -> None:
         self.queue = asyncio.Queue()
+        self.close_calls = 0
 
     async def open(self, spec, resume=None):
         return RuntimeOpened(
@@ -60,6 +62,7 @@ class _CloseErrorDriver(Driver):
         return iterate()
 
     async def close(self):
+        self.close_calls += 1
         raise RuntimeError("process-tree cleanup failed")
 
 
@@ -104,6 +107,71 @@ async def test_runtime_exit_preserves_primary_and_cleanup_failures():
         "primary persistence failure",
         "process-tree cleanup failed",
     ]
+    assert manager.opened is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_exit_cancellation_still_closes_and_preserves_both():
+    driver = _CloseErrorDriver()
+
+    async def cancelled_sink(_event):
+        raise asyncio.CancelledError
+
+    manager = RuntimeManager(
+        driver,
+        RuntimeSpec("/tmp"),
+        event_sink=cancelled_sink,
+    )
+    await manager.open()
+
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        await manager._handle_runtime_exit_locked(HarnessEvent(
+            type=HarnessEventType.RUNTIME_EXITED,
+            driver="fake",
+            session_ref=manager.session_ref,
+            data={"returncode": 1},
+        ))
+
+    assert [type(exc) for exc in exc_info.value.exceptions] == [
+        asyncio.CancelledError,
+        RuntimeError,
+    ]
+    assert driver.close_calls == 1
+    assert manager.opened is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_resume_cancellation_still_closes_and_preserves_both(
+    monkeypatch,
+):
+    driver = _CloseErrorDriver()
+    manager = RuntimeManager(driver, RuntimeSpec("/tmp"))
+    await manager.open()
+
+    async def cancelled_terminal(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(
+        manager,
+        "_publish_terminal_locked",
+        cancelled_terminal,
+    )
+
+    with pytest.raises(BaseExceptionGroup) as exc_info:
+        await manager._retire_invalid_resume_locked(
+            HarnessEvent(
+                type=HarnessEventType.TURN_ABANDONED,
+                driver="fake",
+                session_ref=manager.session_ref,
+            ),
+            TurnRef("turn_cancelled"),
+        )
+
+    assert [type(exc) for exc in exc_info.value.exceptions] == [
+        asyncio.CancelledError,
+        RuntimeError,
+    ]
+    assert driver.close_calls == 1
     assert manager.opened is None
 
 

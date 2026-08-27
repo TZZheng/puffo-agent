@@ -369,6 +369,44 @@ async def test_force_signal_targets_group_after_direct_child_has_exited(
 
 
 @pytest.mark.asyncio
+async def test_missing_process_group_falls_back_to_direct_child(monkeypatch):
+    from puffo_agent.agent.harness import subprocess_io
+
+    class UngroupedProcess:
+        pid = 4321
+        returncode = None
+
+        def __init__(self):
+            self.terminated = 0
+
+        def terminate(self):
+            self.terminated += 1
+
+    proc = UngroupedProcess()
+    monkeypatch.setattr(subprocess_io.os, "name", "posix")
+    monkeypatch.setattr(
+        subprocess_io.os,
+        "killpg",
+        lambda _pid, _sig: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+
+    await subprocess_io.signal_process_tree(proc, force=False, timeout=0.1)
+
+    assert proc.terminated == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_waiter_is_not_process_exit_evidence():
+    from puffo_agent.agent.harness import subprocess_io
+
+    proc = type("RunningProcess", (), {"returncode": None})()
+    waiter = asyncio.create_task(asyncio.sleep(60))
+    waiter.cancel()
+
+    assert not await subprocess_io._waiter_settled(proc, waiter, 0.1)
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process-group regression")
 async def test_close_reaps_descendant_that_holds_inherited_stdout(
     monkeypatch,

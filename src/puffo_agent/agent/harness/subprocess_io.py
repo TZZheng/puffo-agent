@@ -43,7 +43,11 @@ async def signal_process_tree(
             os.killpg(pid, signal.SIGKILL if force else signal.SIGTERM)
             return
         except ProcessLookupError:
-            return
+            # ESRCH is ambiguous: either the isolated group is already gone,
+            # or a caller-supplied factory never made ``pid`` a group leader.
+            # Only the direct child's return code distinguishes those cases.
+            if getattr(proc, "returncode", None) is not None:
+                return
         except OSError:
             # A caller-supplied factory may not have created a new session.
             # Fall back to the direct-child API in that case.
@@ -115,14 +119,14 @@ async def shutdown_process_tree(
 
     if getattr(proc, "returncode", None) is None:
         await signal_process_tree(proc, force=False, timeout=timeout)
-    if await _waiter_settled(waiter, timeout):
+    if await _waiter_settled(proc, waiter, timeout):
         abandon_process_transport(proc)
         return
 
     # The direct parent may already have exited while a descendant remains in
     # its process group holding inherited pipes. Always target the group/tree.
     await signal_process_tree(proc, force=True, timeout=timeout)
-    if await _waiter_settled(waiter, timeout):
+    if await _waiter_settled(proc, waiter, timeout):
         abandon_process_transport(proc)
         return
 
@@ -142,7 +146,9 @@ async def shutdown_process_tree(
     )
 
 
-async def _waiter_settled(waiter: asyncio.Task[Any], timeout: float) -> bool:
+async def _waiter_settled(
+    proc: Any, waiter: asyncio.Task[Any], timeout: float
+) -> bool:
     try:
         await asyncio.wait_for(asyncio.shield(waiter), timeout=timeout)
     except TimeoutError:
@@ -151,9 +157,11 @@ async def _waiter_settled(waiter: asyncio.Task[Any], timeout: float) -> bool:
         if not waiter.cancelled():
             raise
     except Exception:
-        # The waiter is still settled; lifecycle cleanup can continue.
+        # A failed waiter is settled as a task, but that says nothing about
+        # whether the process exited. The return-code check below remains the
+        # authoritative lifecycle oracle.
         pass
-    return True
+    return getattr(proc, "returncode", None) is not None
 
 
 async def drain_subprocess_stream(stream: Any) -> None:
