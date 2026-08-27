@@ -172,6 +172,11 @@ async def test_owned_companion_is_still_reported_once(caplog):
 
 def test_failure_reporting_cannot_be_disabled():
     assert "report_failure" not in inspect.signature(spawn).parameters
+    # Supervised paths can add another authoritative record for the same
+    # exception, so incident counters must not equate ERROR lines with faults.
+    doc = inspect.getdoc(spawn)
+    assert doc is not None
+    assert "deduplicate by exception" in doc
 
 
 @pytest.mark.asyncio

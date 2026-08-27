@@ -35,11 +35,15 @@ def spawn(
     *,
     name: str | None = None,
 ) -> asyncio.Future[Any]:
-    """Schedule ``coro`` and report every failed task exactly once.
+    """Schedule ``coro`` and centrally report every failed task exactly once.
 
     Callers may still own cancellation and settlement of the returned future,
     but failure reporting is deliberately not optional: an awaiter propagating
     an exception is not itself an alertable, traceback-bearing record.
+
+    A supervisor may also emit its own authoritative record for the same
+    failure. Incident counts must therefore deduplicate by exception rather
+    than treating ``puffo_agent.tasks`` ERROR log lines as distinct failures.
     """
     if asyncio.iscoroutine(coro):
         # running-loop only: preserves create_task's RuntimeError contract
