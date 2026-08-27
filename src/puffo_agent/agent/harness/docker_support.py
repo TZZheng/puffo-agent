@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
+from ...tasks import spawn
 
 
 logger = logging.getLogger(__name__)
@@ -164,7 +165,7 @@ async def communicate_with_timeout(
     timeout_seconds: float,
     operation: str,
 ) -> tuple[bytes, bytes]:
-    communicate_task = asyncio.create_task(proc.communicate(input_data))
+    communicate_task = spawn(proc.communicate(input_data), name="proc.communicate")
     try:
         return await asyncio.wait_for(
             asyncio.shield(communicate_task),

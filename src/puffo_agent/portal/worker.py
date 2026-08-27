@@ -51,6 +51,7 @@ from .state import (
     claude_cli_api_key,
     docker_shared_dir as docker_shared_dir,
 )
+from ..tasks import spawn
 
 
 def _rebuild_managed_system_prompt(
@@ -409,7 +410,10 @@ class Worker:
             self._api_key_auth_recovery_pending = True
         self._auth_failed_notification_sent = True
         try:
-            asyncio.create_task(self._notify_operator_of_auth_failed_oauth())
+            spawn(
+                self._notify_operator_of_auth_failed_oauth(),
+                name="notify_operator_of_auth_failed_oauth",
+            )
         except Exception as exc:  # noqa: BLE001
             # Re-arm so a schedule failure retries on the next ENTER.
             self._auth_failed_notification_sent = False
@@ -510,7 +514,7 @@ class Worker:
             return
         self._drained_notification_sent = True
         try:
-            asyncio.create_task(self._notify_operator_of_drained())
+            spawn(self._notify_operator_of_drained(), name="notify_operator_of_drained")
         except Exception as exc:  # noqa: BLE001
             self._drained_notification_sent = False  # re-arm
             logger.warning(
@@ -835,7 +839,7 @@ class Worker:
     def start(self) -> asyncio.Task:
         if self._task is not None and not self._task.done():
             return self._task
-        self._task = asyncio.ensure_future(self._run())
+        self._task = spawn(self._run(), name="run")
         return self._task
 
     @property
@@ -1128,7 +1132,7 @@ class Worker:
                     "agent %s: ws-local profile sync failed: %s", agent_id, exc
                 )
 
-        asyncio.ensure_future(_ws_local_profile_sync())
+        spawn(_ws_local_profile_sync(), name="ws_local_profile_sync")
         logger.info("agent %s: ws-local idle, awaiting tool attach", agent_id)
         try:
             await self._stop.wait()

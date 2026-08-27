@@ -46,6 +46,7 @@ from .driver import (
     TurnRef,
     UnsupportedCapability,
 )
+from ...tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -278,7 +279,7 @@ class RuntimeManager:
             opened.resumed
             and opened.native_session_id != self._confirmed_native_session_id
         )
-        self._reader = asyncio.create_task(self._consume_events())
+        self._reader = spawn(self._consume_events(), name="consume_events")
         if self.agent_id:
             register_runtime_manager(self.agent_id, self)
         return self.opened

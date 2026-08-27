@@ -24,6 +24,7 @@ from .workspace_layout import (
 from ..agent.errors import ProviderFailureError
 from ..agent.processing_receipts import processing_run_id
 from ..agent._usage_markers import parse_reset_epoch
+from ..tasks import spawn
 
 if TYPE_CHECKING:
     from .worker import Worker
@@ -215,7 +216,10 @@ class StandardWorkerRun:
         context = await self._initialize()
         if context is None or not await self._warm(context):
             return
-        asyncio.ensure_future(self._sync_profile_after_warm(context.paths.agent_id))
+        spawn(
+            self._sync_profile_after_warm(context.paths.agent_id),
+            name="sync_profile_after_warm",
+        )
         services = await self._start_services(context)
         try:
             await self._listen(context, services)
@@ -857,21 +861,23 @@ class StandardWorkerRun:
             ),
         )
         reminder_sync = await self._prepare_reminder_sync(context, global_runtime)
-        global_task = asyncio.ensure_future(global_runtime.run())
+        global_task = spawn(global_runtime.run(), name="global_runtime.run")
         reminder_task = None
         if reminder_sync is not None:
-            reminder_task = asyncio.ensure_future(
-                reminder_sync.run(request_snapshot_on_start=False)
+            reminder_task = spawn(
+                reminder_sync.run(request_snapshot_on_start=False),
+                name="reminder_sync.run",
             )
-        heartbeat_task = asyncio.ensure_future(self._heartbeat(context.paths.agent_id))
-        status_task = asyncio.ensure_future(reporter.run_heartbeat_loop())
-        watch_task = asyncio.ensure_future(
+        heartbeat_task = spawn(self._heartbeat(context.paths.agent_id), name="heartbeat")
+        status_task = spawn(reporter.run_heartbeat_loop(), name="reporter.run_heartbeat_loop")
+        watch_task = spawn(
             worker._refresh_watcher_loop(
                 context.paths.refresh_flags,
                 lambda: self._apply_refresh(context),
-            )
+            ),
+            name="worker.refresh_watcher_loop",
         )
-        upload_task = asyncio.ensure_future(self._upload_runtime_events(uploader))
+        upload_task = spawn(self._upload_runtime_events(uploader), name="upload_runtime_events")
         return WorkerRunServices(
             global_runtime=global_runtime,
             global_runtime_task=global_task,

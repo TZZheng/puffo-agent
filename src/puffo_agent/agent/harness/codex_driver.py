@@ -46,6 +46,7 @@ from .driver import (
     TurnStarted,
 )
 from .subprocess_io import drain_subprocess_stream
+from ...tasks import spawn
 
 CODEX_CAPABILITIES = DriverCapabilities(
     session_resume=True,
@@ -278,9 +279,10 @@ class CodexAppServerDriver(Driver):
         if self._closed:
             self._prepare_reopen()
         await self._start_process(spec)
-        self._reader = asyncio.create_task(self._read_loop())
-        self._stderr_reader = asyncio.create_task(
-            drain_subprocess_stream(getattr(self._proc, "stderr", None))
+        self._reader = spawn(self._read_loop(), name="read_loop")
+        self._stderr_reader = spawn(
+            drain_subprocess_stream(getattr(self._proc, "stderr", None)),
+            name="drain_subprocess_stream",
         )
         await self._initialize_app_server()
         result, resumed = await self._open_thread(spec, resume)

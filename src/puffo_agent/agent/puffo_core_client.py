@@ -28,6 +28,7 @@ from ..limits import (
 from . import disk_cache as _disk_cache
 from . import inbound_attachments as _attachment_helpers
 from . import message_context as _message_context
+from ..tasks import spawn
 
 if TYPE_CHECKING:
     from .bridge_client import CloudBridgeClient
@@ -269,7 +270,7 @@ class PuffoCoreMessageClient:
             read_plaintext=read_plaintext_message,
         )
 
-        invite_poll_task = asyncio.ensure_future(self._invite_poll_loop())
+        invite_poll_task = spawn(self._invite_poll_loop(), name="invite_poll_loop")
         self._ws = PuffoCoreWsClient(
             server_url=self.keystore.load_identity(self.slug).server_url,
             keystore=self.keystore,
@@ -866,13 +867,14 @@ class PuffoCoreMessageClient:
 
     async def _on_ws_connect(self) -> None:
         """Fire-and-forget re-warm; handle kept (asyncio weak-refs tasks)."""
-        self._warm_task = asyncio.ensure_future(
+        self._warm_task = spawn(
             asyncio.gather(
                 self._warm_member_caches(),
                 # Allow/block hydration rides the same tick so a restart
                 # doesn't re-gate already-allowlisted senders.
                 self._contacts.refresh(),
-            )
+            ),
+            name="warm_after_ws_connect",
         )
         await self._notify_connected_callbacks()
 

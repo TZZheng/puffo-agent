@@ -29,6 +29,7 @@ from . import machine_auth
 from .envelope import TS_WINDOW_MS, ControlError, decrypt_command
 from .store import load_or_create_machine, load_pairings, now_ms
 from .usage_snapshot import apply_drained_health, collect_usage_snapshot
+from ...tasks import spawn
 
 log = logging.getLogger("puffo_agent.control")
 
@@ -552,7 +553,7 @@ class MachineControlClient:
                 # Initial capability snapshot on connect.
                 last_caps = await asyncio.to_thread(build_capabilities)
                 await self._send(ws, {"type": "capabilities", "capabilities": last_caps})
-                sender = asyncio.create_task(self._heartbeat_loop(ws, stop, last_caps))
+                sender = spawn(self._heartbeat_loop(ws, stop, last_caps), name="heartbeat_loop")
 
                 # Register the reverse-channel sender on this live socket.
                 from .reporter import get_reporter
@@ -678,9 +679,9 @@ class ControlManager:
                     machine = load_or_create_machine()
                 if pairings and ws_task is None:
                     client = MachineControlClient(machine)
-                    ws_task = asyncio.create_task(client.run(self._stop))
-                    me_task = asyncio.create_task(self._me_loop(machine))
-                    usage_task = asyncio.create_task(self._usage_loop(machine))
+                    ws_task = spawn(client.run(self._stop), name="client.run")
+                    me_task = spawn(self._me_loop(machine), name="me_loop")
+                    usage_task = spawn(self._usage_loop(machine), name="usage_loop")
                 if not pairings and ws_task is not None:
                     ws_task.cancel()
                     me_task.cancel()

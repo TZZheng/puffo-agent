@@ -9,6 +9,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from . import disk_cache
+from ..tasks import spawn
 
 PROFILE_CACHE_TTL_SECONDS = 10 * 60
 PROFILE_FETCH_CHUNK_SIZE = 50
@@ -76,7 +77,7 @@ async def fetch_user_profile(
     owner_cache[slug] = (owner_slug, now)
     disk_cache.persist_profile(slug, name, avatar_url)
     if avatar_url:
-        asyncio.create_task(fetch_avatar(avatar_url))
+        spawn(fetch_avatar(avatar_url), name="fetch_avatar")
     return name, avatar_url
 
 
@@ -123,8 +124,8 @@ async def warm_member_caches(
         return
 
     async def warm_one(space_id: str) -> set[str]:
-        members_task = asyncio.create_task(get_members(space_id))
-        channels_task = asyncio.create_task(warm_channels(space_id))
+        members_task = spawn(get_members(space_id), name="get_members")
+        channels_task = spawn(warm_channels(space_id), name="warm_channels")
         members = await members_task
         await channels_task
         return set(members)
@@ -223,7 +224,7 @@ async def bulk_fetch_profiles(
             profile_cache[slug] = (name, avatar_url, now)
             disk_cache.persist_profile(slug, name, avatar_url)
             if avatar_url:
-                asyncio.create_task(fetch_avatar(avatar_url))
+                spawn(fetch_avatar(avatar_url), name="fetch_avatar")
 
 
 async def fetch_and_cache_avatar(

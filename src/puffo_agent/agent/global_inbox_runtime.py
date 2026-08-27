@@ -58,6 +58,7 @@ from .message_projection import (
 from .reminder_scheduler import ReminderScheduler
 from .shared_content import INBOX_TURN_CUE
 from .provider_failures import operator_failure_text
+from ..tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -389,7 +390,7 @@ class GlobalInboxRuntime(
         )
 
     async def run(self) -> None:
-        reminder_task = asyncio.create_task(self.reminder_scheduler.run())
+        reminder_task = spawn(self.reminder_scheduler.run(), name="reminder_scheduler.run")
         try:
             await self.recover_current_turn()
             await self.recover_orphaned_turns()
@@ -404,7 +405,10 @@ class GlobalInboxRuntime(
                 ):
                     self.notify()
             while not self._stopping:
-                burst_task = asyncio.create_task(self.coalescer.wait_for_burst())
+                burst_task = spawn(
+                    self.coalescer.wait_for_burst(),
+                    name="coalescer.wait_for_burst",
+                )
                 done, _pending = await asyncio.wait(
                     {burst_task, reminder_task},
                     return_when=asyncio.FIRST_COMPLETED,
