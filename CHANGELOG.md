@@ -6,7 +6,13 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.3] - 2026-08-27
+
 ### Added
+
+- **Generic ACP v1 harness foundation.** ACP and OpenCode Drivers now share
+  validated launch plans, bounded lifecycle handling, per-turn protocol
+  support, and explicit process-tree cleanup semantics. (#297)
 
 - **Invite-link channel joins are announced to the agent.** When someone
   joins channels by redeeming an invite link, the server's synthetic
@@ -28,6 +34,10 @@ this project adheres to [Semantic Versioning](https://semver.org/).
   `refresh_broken` streak. (#228)
 
 ### Fixed
+
+- **Autonomous-turn admission race.** Autonomous runs reserve admission
+  atomically and settle losing or orphaned runs instead of wedging the Agent.
+  (#296)
 
 - **Worker tasks no longer die unclaimed.** Every background task the daemon
   spawns now carries a done-callback that logs `worker task died: <name>` with
