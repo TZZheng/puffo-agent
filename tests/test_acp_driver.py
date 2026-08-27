@@ -20,7 +20,11 @@ from acp.schema import (
 )
 
 from puffo_agent.agent.harness import build_driver
-from puffo_agent.agent.harness.acp_driver import AcpDriver
+from puffo_agent.agent.harness.acp_driver import (
+    AcpDriver,
+    AcpLaunchPlan,
+    ValidatedLaunchPlan,
+)
 from puffo_agent.agent.harness.driver import (
     HarnessEventType,
     PermissionDecision,
@@ -292,3 +296,72 @@ async def test_unknown_extension_is_explicitly_unsupported_and_observable():
 
 def test_acp_factory_is_closed_and_explicit():
     assert isinstance(build_driver("acp"), AcpDriver)
+
+
+@pytest.mark.asyncio
+async def test_launch_validator_sees_complete_immutable_plan_at_spawn_boundary():
+    events = []
+    harness = _Harness()
+
+    def validate(plan):
+        events.append(("validate", plan))
+        assert plan.executable == "agent"
+        assert plan.argv == ("agent", "acp", "--agent-dir", "/agent")
+        assert plan.environment["ACP_TOKEN"] == "secret"
+        assert plan.cwd == "/workspace"
+        assert plan.mcp_servers == ()
+        with pytest.raises(TypeError):
+            plan.environment["ACP_TOKEN"] = "changed"
+
+    def process_factory(command, plan):
+        events.append(("spawn", plan))
+        assert command == plan.argv
+        return harness.proc
+
+    driver = AcpDriver(
+        process_factory,
+        connection_factory=harness.connection_factory,
+        launch_validator=validate,
+    )
+    await driver.open(RuntimeSpec(
+        "/workspace",
+        executable="agent",
+        launch_args=("acp", "--agent-dir", "/agent"),
+        environment={"ACP_TOKEN": "secret"},
+    ))
+
+    assert [name for name, _ in events] == ["validate", "spawn"]
+    assert events[0][1] is events[1][1]
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_validated_launch_plan_cannot_be_minted_or_spawn_bypassed():
+    raw = AcpLaunchPlan(
+        executable="agent",
+        argv=("agent",),
+        environment={},
+        cwd="/workspace",
+        mcp_servers=(),
+    )
+    with pytest.raises(TypeError, match="only be created by AcpDriver"):
+        ValidatedLaunchPlan(raw, _token=object())
+
+    driver = AcpDriver()
+    with pytest.raises(TypeError, match="requires a ValidatedLaunchPlan"):
+        await driver._spawn(RuntimeSpec("/workspace", executable="agent"))
+
+
+@pytest.mark.asyncio
+async def test_process_factory_type_error_is_not_retried():
+    calls = 0
+
+    def failing_factory(_command, _plan):
+        nonlocal calls
+        calls += 1
+        raise TypeError("factory failed after starting")
+
+    driver = AcpDriver(failing_factory)
+    with pytest.raises(TypeError, match="factory failed after starting"):
+        await driver.open(RuntimeSpec("/workspace", executable="agent"))
+    assert calls == 1

@@ -17,6 +17,7 @@ from puffo_agent.agent.harness.opencode_driver import (
     OpenCodeDriver,
 )
 from puffo_agent.agent.harness.runtime_manager import RuntimeManager
+from puffo_agent.agent.harness.runtime_manager import RuntimeManagerAdapter
 
 
 class _TurnProcess:
@@ -54,6 +55,19 @@ class _TurnProcess:
 
     async def wait(self) -> int:
         return await self._exit
+
+
+class _HungTurnProcess(_TurnProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.killed = 0
+
+    def terminate(self) -> None:
+        self.terminated += 1
+
+    def kill(self) -> None:
+        self.killed += 1
+        self.exit(-9)
 
 
 async def _next_matching(stream, type_: HarnessEventType):
@@ -251,6 +265,11 @@ async def test_manager_adopts_session_learned_by_per_turn_child():
     })
     receipt = await asyncio.wait_for(started, timeout=1)
     assert manager.native_session_id == "ses_discovered"
+    assert manager.opened is not None
+    assert manager.opened.native_session_id == "ses_discovered"
+    assert RuntimeManagerAdapter(manager).get_provider_session_id() == (
+        "ses_discovered"
+    )
     proc.eof()
     proc.exit()
     terminal = await asyncio.wait_for(
@@ -258,3 +277,29 @@ async def test_manager_adopts_session_learned_by_per_turn_child():
     )
     assert terminal.type is HarnessEventType.TURN_COMPLETED
     await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_close_kills_then_cancels_a_child_with_inherited_stdout(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
+        0.01,
+    )
+    proc = _HungTurnProcess()
+    driver = OpenCodeDriver(lambda *_args: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    proc.feed({
+        "type": "step_start",
+        "sessionID": "ses_hung",
+        "part": {"messageID": "msg_hung"},
+    })
+    await asyncio.wait_for(started, timeout=1)
+
+    await asyncio.wait_for(driver.close(), timeout=1)
+
+    assert proc.terminated == 1
+    assert proc.killed == 1
+    assert driver._turn_task is None

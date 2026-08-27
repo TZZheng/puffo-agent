@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 from ..._proc import no_window_kwargs
+from ...tasks import spawn
 from ..cli_bin import normalize_launch_argv
 from .driver import (
     BusyDelivery,
@@ -55,9 +56,16 @@ OPENCODE_CAPABILITIES = DriverCapabilities(
     busy_delivery=BusyDelivery.REJECT,
 )
 
+_SHUTDOWN_GRACE_SECONDS = 5.0
+
 
 class OpenCodeDriver(Driver):
-    """Logical session whose only native process exists during a turn."""
+    """Logical session whose only native process exists during a turn.
+
+    This driver is not a trusted ``puffo-v0`` identity-binding entrypoint.
+    Profiles requiring that binding must use the ACP driver's validated
+    launch seam.
+    """
 
     static_steer_capability = SteerCapability.NONE
 
@@ -130,13 +138,15 @@ class OpenCodeDriver(Driver):
         self._accepted = asyncio.get_running_loop().create_future()
         try:
             self._proc = await self._spawn(self._spec, input.content)
-            self._stderr_reader = asyncio.create_task(
+            self._stderr_reader = spawn(
                 drain_subprocess_stream_keeping_tail(
                     getattr(self._proc, "stderr", None)
-                )
+                ),
+                name="opencode.stderr",
             )
-            self._turn_task = asyncio.create_task(
-                self._drive_turn(self._proc, turn, generation)
+            self._turn_task = spawn(
+                self._drive_turn(self._proc, turn, generation),
+                name="opencode.turn",
             )
             native_session_id, native_turn_id = await asyncio.shield(
                 self._accepted
@@ -219,47 +229,66 @@ class OpenCodeDriver(Driver):
         proc = self._proc
         if proc is not None and getattr(proc, "returncode", None) is None:
             proc.terminate()
-        if self._turn_task is not None:
-            await asyncio.gather(self._turn_task, return_exceptions=True)
+        await self._settle_turn_task(proc)
+        if self._stderr_reader is not None:
+            self._stderr_reader.cancel()
+            await asyncio.gather(
+                self._stderr_reader, return_exceptions=True
+            )
+            self._stderr_reader = None
+        self._proc = None
+        self._active = TurnRef("")
+        self._active_native_turn_id = ""
+        self._accepted = None
+        self._turn_task = None
         self._spec = None
         await self._events.put(None)
 
     async def _drive_turn(
         self, proc: Any, turn: TurnRef, generation: int
     ) -> None:
-        read_task = asyncio.create_task(
-            self._read_turn_frames(proc, turn, generation)
+        read_task = spawn(
+            self._read_turn_frames(proc, turn, generation),
+            name="opencode.frames",
         )
-        wait_task = asyncio.create_task(proc.wait())
-        done, _ = await asyncio.wait(
-            {read_task, wait_task},
-            return_when=asyncio.FIRST_EXCEPTION,
-        )
-        if (
-            read_task in done
-            and not read_task.cancelled()
-            and read_task.exception() is not None
-            and not wait_task.done()
-            and getattr(proc, "returncode", None) is None
-        ):
-            proc.terminate()
-        results = await asyncio.gather(
-            read_task, wait_task, return_exceptions=True
-        )
-        read_result, wait_result = results
-        returncode = (
-            wait_result
-            if isinstance(wait_result, int)
-            else getattr(proc, "returncode", None)
-        )
-        if isinstance(read_result, BaseException):
-            self._provider_failed = True
-            await self._emit(
-                HarnessEventType.RUNTIME_WARNING,
-                turn=turn,
-                data={"code": "opencode_stream_read"},
+        wait_task = spawn(proc.wait(), name="opencode.wait")
+        try:
+            done, _ = await asyncio.wait(
+                {read_task, wait_task},
+                return_when=asyncio.FIRST_EXCEPTION,
             )
-        await self._finish_turn(turn, generation, returncode)
+            if (
+                read_task in done
+                and not read_task.cancelled()
+                and read_task.exception() is not None
+                and not wait_task.done()
+                and getattr(proc, "returncode", None) is None
+            ):
+                proc.terminate()
+            results = await asyncio.gather(
+                read_task, wait_task, return_exceptions=True
+            )
+            read_result, wait_result = results
+            returncode = (
+                wait_result
+                if isinstance(wait_result, int)
+                else getattr(proc, "returncode", None)
+            )
+            if isinstance(read_result, BaseException):
+                self._provider_failed = True
+                await self._emit(
+                    HarnessEventType.RUNTIME_WARNING,
+                    turn=turn,
+                    data={"code": "opencode_stream_read"},
+                )
+            await self._finish_turn(turn, generation, returncode)
+        finally:
+            for task in (read_task, wait_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                read_task, wait_task, return_exceptions=True
+            )
 
     async def _read_turn_frames(
         self, proc: Any, turn: TurnRef, generation: int
@@ -392,13 +421,35 @@ class OpenCodeDriver(Driver):
             proc.terminate()
         task = self._turn_task
         if task is not None and task is not asyncio.current_task():
-            await asyncio.gather(task, return_exceptions=True)
+            await self._settle_turn_task(proc)
         if generation == self._turn_generation:
             self._proc = None
             self._active = TurnRef("")
             self._active_native_turn_id = ""
             self._accepted = None
             self._turn_task = None
+
+    async def _settle_turn_task(self, proc: Any) -> None:
+        task = self._turn_task
+        if task is None or task is asyncio.current_task():
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=_SHUTDOWN_GRACE_SECONDS
+            )
+            return
+        except TimeoutError:
+            pass
+        if proc is not None and getattr(proc, "returncode", None) is None:
+            proc.kill()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=_SHUTDOWN_GRACE_SECONDS
+            )
+            return
+        except TimeoutError:
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     async def _emit(
         self,

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any
 
 from acp import PROTOCOL_VERSION, connect_to_agent, text_block
@@ -31,6 +33,7 @@ from acp.schema import (
 from acp.transports import default_environment
 
 from ..._proc import no_window_kwargs
+from ...tasks import spawn
 from ..cli_bin import normalize_launch_argv
 from .driver import (
     BusyDelivery,
@@ -59,6 +62,38 @@ from .driver import (
     UnsupportedCapability,
 )
 from .subprocess_io import drain_subprocess_stream_keeping_tail
+
+
+@dataclass(frozen=True, slots=True)
+class AcpLaunchPlan:
+    """Complete ACP process and session inputs presented to one validator."""
+
+    executable: str
+    argv: tuple[str, ...]
+    environment: Mapping[str, str]
+    cwd: str
+    mcp_servers: tuple[Any, ...]
+
+
+_VALIDATED_LAUNCH_TOKEN = object()
+
+
+class ValidatedLaunchPlan:
+    """An ACP launch plan that passed the final pre-spawn validation seam.
+
+    Construction is deliberately guarded: callers can provide a validator,
+    but only :meth:`AcpDriver._validate_launch_plan` can mint the value that
+    ``_spawn`` accepts.
+    """
+
+    __slots__ = ("plan",)
+
+    def __init__(self, plan: AcpLaunchPlan, *, _token: object) -> None:
+        if _token is not _VALIDATED_LAUNCH_TOKEN:
+            raise TypeError(
+                "ValidatedLaunchPlan can only be created by AcpDriver"
+            )
+        self.plan = plan
 
 
 def acp_capabilities(*, session_resume: bool) -> DriverCapabilities:
@@ -134,7 +169,12 @@ class _PuffoAcpClient:
 
 
 class AcpDriver(Driver):
-    """Persistent ACP agent process with negotiated session semantics."""
+    """Persistent ACP agent process with negotiated session semantics.
+
+    This is the only trusted entrypoint for ``puffo-v0`` identity binding.
+    The complete process/session launch plan is validated immediately before
+    spawn; the separate OpenCode driver is explicitly outside that contract.
+    """
 
     static_steer_capability = SteerCapability.NONE
 
@@ -144,10 +184,12 @@ class AcpDriver(Driver):
         *,
         connection_factory: Callable[..., Any] = connect_to_agent,
         executable_version: str = "",
+        launch_validator: Callable[[AcpLaunchPlan], None] | None = None,
     ) -> None:
         self.process_factory = process_factory
         self.connection_factory = connection_factory
         self.executable_version = executable_version
+        self.launch_validator = launch_validator
         self._proc: Any = None
         self._conn: Any = None
         self._watcher: asyncio.Task[None] | None = None
@@ -182,11 +224,13 @@ class AcpDriver(Driver):
         if self._closed:
             self._closed = False
             self._events = asyncio.Queue()
-        self._proc = await self._spawn(spec)
+        launch = self._validate_launch_plan(spec)
+        self._proc = await self._spawn(launch)
         if self._proc.stdin is None or self._proc.stdout is None:
             raise RuntimeError("ACP child did not expose stdio pipes")
-        self._stderr_reader = asyncio.create_task(
-            drain_subprocess_stream_keeping_tail(self._proc.stderr)
+        self._stderr_reader = spawn(
+            drain_subprocess_stream_keeping_tail(self._proc.stderr),
+            name="acp.stderr",
         )
         client = _PuffoAcpClient(self)
         self._conn = self.connection_factory(
@@ -218,16 +262,16 @@ class AcpDriver(Driver):
             if not can_load:
                 raise RuntimeError("ACP agent does not support session/load")
             await self._conn.load_session(
-                cwd=spec.workspace_dir,
+                cwd=launch.plan.cwd,
                 session_id=str(resume),
-                mcp_servers=[],
+                mcp_servers=launch.plan.mcp_servers,
             )
             native_session_id = str(resume)
             resumed = True
         else:
             session = await self._conn.new_session(
-                cwd=spec.workspace_dir,
-                mcp_servers=[],
+                cwd=launch.plan.cwd,
+                mcp_servers=launch.plan.mcp_servers,
             )
             native_session_id = session.session_id
             resumed = False
@@ -235,7 +279,7 @@ class AcpDriver(Driver):
             raise RuntimeError("ACP session response omitted sessionId")
         self._native_session_id = native_session_id
         self._session_ref = SessionRef(native_session_id)
-        self._watcher = asyncio.create_task(self._watch_process())
+        self._watcher = spawn(self._watch_process(), name="acp.watch")
         await self._emit(
             HarnessEventType.SESSION_RESUMED
             if resumed
@@ -257,25 +301,42 @@ class AcpDriver(Driver):
             ),
         )
 
-    async def _spawn(self, spec: RuntimeSpec) -> Any:
-        command = (*normalize_launch_argv(spec.executable), *spec.launch_args)
+    def _validate_launch_plan(self, spec: RuntimeSpec) -> ValidatedLaunchPlan:
+        """Resolve and validate every launch input at the pre-spawn boundary."""
+        argv = (*normalize_launch_argv(spec.executable), *spec.launch_args)
+        plan = AcpLaunchPlan(
+            executable=spec.executable,
+            argv=argv,
+            environment=MappingProxyType({
+                **default_environment(),
+                **spec.environment,
+            }),
+            cwd=spec.workspace_dir,
+            # puffo-v0 uses the Puffo-projected tool surface, never an
+            # independently supplied ACP MCP server list.
+            mcp_servers=(),
+        )
+        if self.launch_validator is not None:
+            self.launch_validator(plan)
+        return ValidatedLaunchPlan(plan, _token=_VALIDATED_LAUNCH_TOKEN)
+
+    async def _spawn(self, launch: ValidatedLaunchPlan) -> Any:
+        if not isinstance(launch, ValidatedLaunchPlan):
+            raise TypeError("ACP spawn requires a ValidatedLaunchPlan")
+        plan = launch.plan
         if self.process_factory is not None:
-            try:
-                proc = self.process_factory(command, spec)
-            except TypeError:
-                proc = self.process_factory(command)
+            # One call with the declared signature. Retrying on TypeError
+            # cannot distinguish wrong arity from an internal factory failure
+            # and could spawn a second child on the error path.
+            proc = self.process_factory(plan.argv, plan)
             return await proc if asyncio.iscoroutine(proc) else proc
-        # The official SDK's transport allowlist supplies only process basics;
-        # provider credentials enter through the explicit RuntimeSpec delta.
-        env = default_environment()
-        env.update(spec.environment)
         return await asyncio.create_subprocess_exec(
-            *command,
+            *plan.argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=spec.workspace_dir or None,
-            env=env,
+            cwd=plan.cwd or None,
+            env=plan.environment,
             limit=16 * 1024 * 1024,
             **no_window_kwargs(),
         )
@@ -293,11 +354,13 @@ class AcpDriver(Driver):
         self._fallback_block_id = f"assistant_{uuid.uuid4().hex}"
         self._prompt_sent = asyncio.get_running_loop().create_future()
         prompt_sent = self._prompt_sent
-        prompt_task = asyncio.create_task(
-            self._run_prompt(turn, input.content)
+        prompt_task = spawn(
+            self._run_prompt(turn, input.content), name="acp.prompt"
         )
         self._prompt_task = prompt_task
-        sent_wait = asyncio.ensure_future(asyncio.shield(prompt_sent))
+        sent_wait = spawn(
+            asyncio.shield(prompt_sent), name="acp.prompt_admission"
+        )
         done, _ = await asyncio.wait(
             {sent_wait, prompt_task},
             return_when=asyncio.FIRST_COMPLETED,

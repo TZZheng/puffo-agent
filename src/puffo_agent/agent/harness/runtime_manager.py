@@ -659,6 +659,11 @@ class RuntimeManager:
                         and native.native_session_id
                     ):
                         self.native_session_id = native.native_session_id
+                        if self.opened is not None:
+                            self.opened = replace(
+                                self.opened,
+                                native_session_id=native.native_session_id,
+                            )
                     await self._publish_event(replace(
                         native,
                         session_ref=self.session_ref,
@@ -1382,12 +1387,7 @@ class RuntimeManagerAdapter(Adapter):
                 await self.post_close()
 
     def get_provider_session_id(self) -> str | None:
-        value = (
-            self.manager.opened.native_session_id
-            if self.manager.opened is not None
-            else self.manager.native_session_id
-        )
-        return value or None
+        return self.manager.native_session_id or None
 
     def inbox_notice_delivery_capability(self) -> str:
         """Whether an inbox notice can reach a turn that is already running.
