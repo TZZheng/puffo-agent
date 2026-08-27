@@ -146,7 +146,12 @@ class AutonomousTurnLifecycleMixin:
             return True
 
     async def _start_notice_unless_autonomous(self, planned: PlannedTurn) -> bool:
-        """Start a planned notice only if adoption did not win the race."""
+        """Start a notice unless adoption won while its context was resolved.
+
+        Context resolution stretches the race window past the top-of-loop
+        guard. Queue behind the autonomous run instead of clobbering its
+        active binding; the run's terminal ``notify()`` re-enters processing.
+        """
         async with self._turn_state_lock:
             if self._autonomous_turn_id:
                 return False
