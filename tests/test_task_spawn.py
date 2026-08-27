@@ -50,10 +50,25 @@ async def test_unclaimed_exception_is_logged_with_name_and_traceback(caplog):
     records = _errors(caplog)
     assert len(records) == 1
     record = records[0]
-    assert "reminder_sync.run" in record.getMessage()
+    assert record.getMessage() == "worker task died: reminder_sync.run"
     assert record.exc_info is not None
     assert isinstance(record.exc_info[1], ValueError)
     assert "message backup key has invalid length" in str(record.exc_info[1])
+
+
+@pytest.mark.asyncio
+async def test_pre_built_task_is_renamed_before_reporting(caplog):
+    async def boom():
+        raise ValueError("prebuilt")
+
+    with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
+        task = asyncio.get_running_loop().create_task(boom(), name="original")
+        returned = spawn(task, name="renamed")
+        await _settle()
+
+    assert returned is task
+    assert task.get_name() == "renamed"
+    assert _errors(caplog)[0].getMessage() == "worker task died: renamed"
 
 
 @pytest.mark.asyncio
