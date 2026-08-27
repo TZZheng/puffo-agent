@@ -13,6 +13,8 @@ from .driver import (
 )
 from .codex_driver import CodexAppServerDriver, CodexDriver
 from .claude_code_driver import ClaudeCodeCliDriver, ClaudeDriver
+from .opencode_driver import OpenCodeCliDriver, OpenCodeDriver
+from .acp_driver import AcpDriver, GenericAcpDriver
 
 @dataclass(frozen=True)
 class UnsupportedDriver:
@@ -27,6 +29,10 @@ def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
     """
     if name == "codex":
         return CodexAppServerDriver(**kwargs)
+    if name == "opencode":
+        return OpenCodeDriver(**kwargs)
+    if name == "acp":
+        return AcpDriver(**kwargs)
     if not name or name == "claude-code":
         return ClaudeCodeCliDriver(**kwargs)
     return UnsupportedDriver(name)
@@ -44,5 +50,9 @@ __all__ = [
     "CodexDriver",
     "ClaudeCodeCliDriver",
     "ClaudeDriver",
+    "OpenCodeCliDriver",
+    "OpenCodeDriver",
+    "AcpDriver",
+    "GenericAcpDriver",
     "build_driver",
 ]
