@@ -861,7 +861,11 @@ class StandardWorkerRun:
             ),
         )
         reminder_sync = await self._prepare_reminder_sync(context, global_runtime)
-        global_task = spawn(global_runtime.run(), name="global_runtime.run")
+        global_task = spawn(
+            global_runtime.run(),
+            name="global_runtime.run",
+            report_failure=False,
+        )
         reminder_task = None
         if reminder_sync is not None:
             reminder_task = spawn(

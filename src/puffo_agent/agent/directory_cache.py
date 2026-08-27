@@ -124,8 +124,12 @@ async def warm_member_caches(
         return
 
     async def warm_one(space_id: str) -> set[str]:
-        members_task = spawn(get_members(space_id), name="get_members")
-        channels_task = spawn(warm_channels(space_id), name="warm_channels")
+        members_task = spawn(
+            get_members(space_id), name="get_members", report_failure=False
+        )
+        channels_task = spawn(
+            warm_channels(space_id), name="warm_channels", report_failure=False
+        )
         members = await members_task
         await channels_task
         return set(members)

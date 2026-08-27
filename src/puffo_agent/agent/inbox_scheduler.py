@@ -248,8 +248,12 @@ class InboxCoalescer:
 
     async def _sleep_or_pull(self, remaining: float) -> bool:
         """Sleep ``remaining``; report whether a pulled deadline cut it short."""
-        sleeper = spawn(self._sleep(remaining), name="sleep")
-        pull = spawn(self._pulled.wait(), name="pulled.wait")
+        sleeper = spawn(
+            self._sleep(remaining), name="sleep", report_failure=False
+        )
+        pull = spawn(
+            self._pulled.wait(), name="pulled.wait", report_failure=False
+        )
         try:
             done, _pending = await asyncio.wait(
                 {sleeper, pull}, return_when=asyncio.FIRST_COMPLETED,

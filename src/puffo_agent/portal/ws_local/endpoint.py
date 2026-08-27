@@ -109,8 +109,14 @@ async def _run_attached(
     async def on_message(root_id, batch, channel_meta):
         await bridge.dispatch(session, root_id, batch, channel_meta)
 
-    session_task = spawn(session.run(), name="session.run")
-    consumer_task = spawn(start_consumer(authed, on_message), name="start_consumer")
+    session_task = spawn(
+        session.run(), name="session.run", report_failure=False
+    )
+    consumer_task = spawn(
+        start_consumer(authed, on_message),
+        name="start_consumer",
+        report_failure=False,
+    )
     try:
         await asyncio.wait(
             {session_task, consumer_task}, return_when=asyncio.FIRST_COMPLETED

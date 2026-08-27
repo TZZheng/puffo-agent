@@ -390,7 +390,11 @@ class GlobalInboxRuntime(
         )
 
     async def run(self) -> None:
-        reminder_task = spawn(self.reminder_scheduler.run(), name="reminder_scheduler.run")
+        reminder_task = spawn(
+            self.reminder_scheduler.run(),
+            name="reminder_scheduler.run",
+            report_failure=False,
+        )
         try:
             await self.recover_current_turn()
             await self.recover_orphaned_turns()
@@ -408,6 +412,7 @@ class GlobalInboxRuntime(
                 burst_task = spawn(
                     self.coalescer.wait_for_burst(),
                     name="coalescer.wait_for_burst",
+                    report_failure=False,
                 )
                 done, _pending = await asyncio.wait(
                     {burst_task, reminder_task},

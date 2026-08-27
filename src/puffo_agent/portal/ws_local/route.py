@@ -435,7 +435,9 @@ async def _start_ws_consumer(
                 reminder_sync.run(request_snapshot_on_start=False),
                 name="reminder_sync.run",
             )
-            runtime_task = spawn(owned.run(), name="owned.run")
+            runtime_task = spawn(
+                owned.run(), name="owned.run", report_failure=False
+            )
             await await_listener_with_runtime(
                 client.listen(on_message),
                 runtime_task,

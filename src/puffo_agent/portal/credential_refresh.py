@@ -1146,8 +1146,14 @@ class CredentialRefresher:
             self._detect_external_rotation()
 
     async def _sleep_until_next_tick(self, stop_event: asyncio.Event) -> None:
-        stop_task = spawn(stop_event.wait(), name="stop_event.wait")
-        refresh_task = spawn(self._refresh_request.wait(), name="refresh_request.wait")
+        stop_task = spawn(
+            stop_event.wait(), name="stop_event.wait", report_failure=False
+        )
+        refresh_task = spawn(
+            self._refresh_request.wait(),
+            name="refresh_request.wait",
+            report_failure=False,
+        )
         try:
             await asyncio.wait(
                 {stop_task, refresh_task},

@@ -165,7 +165,11 @@ async def communicate_with_timeout(
     timeout_seconds: float,
     operation: str,
 ) -> tuple[bytes, bytes]:
-    communicate_task = spawn(proc.communicate(input_data), name="proc.communicate")
+    communicate_task = spawn(
+        proc.communicate(input_data),
+        name="proc.communicate",
+        report_failure=False,
+    )
     try:
         return await asyncio.wait_for(
             asyncio.shield(communicate_task),

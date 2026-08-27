@@ -13,7 +13,6 @@ from puffo_agent.tasks import spawn
 _SRC = Path(__file__).resolve().parent.parent / "src" / "puffo_agent"
 _HELPER = _SRC / "tasks.py"
 _SPAWNERS = {"ensure_future", "create_task"}
-_SPAWNER_OWNERS = {"asyncio", "loop"}
 
 
 async def _settle():
@@ -57,18 +56,21 @@ async def test_unclaimed_exception_is_logged_with_name_and_traceback(caplog):
 
 
 @pytest.mark.asyncio
-async def test_pre_built_task_is_renamed_before_reporting(caplog):
+async def test_pre_built_task_is_renamed_before_reporting_once(caplog):
     async def boom():
         raise ValueError("prebuilt")
 
     with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
         task = asyncio.get_running_loop().create_task(boom(), name="original")
         returned = spawn(task, name="renamed")
+        returned_again = spawn(task, name="renamed-again")
         await _settle()
 
     assert returned is task
-    assert task.get_name() == "renamed"
-    assert _errors(caplog)[0].getMessage() == "worker task died: renamed"
+    assert returned_again is task
+    assert task.get_name() == "renamed-again"
+    assert len(_errors(caplog)) == 1
+    assert _errors(caplog)[0].getMessage() == "worker task died: renamed-again"
 
 
 @pytest.mark.asyncio
@@ -149,17 +151,17 @@ async def test_existing_done_callback_still_runs(caplog):
 
 
 @pytest.mark.asyncio
-async def test_awaited_companion_still_receives_the_exception(caplog):
+async def test_owned_companion_leaves_reporting_to_awaiter(caplog):
     async def boom():
         raise ValueError("claimed")
 
     with caplog.at_level(logging.ERROR, logger="puffo_agent.tasks"):
-        task = spawn(boom(), name="claimed")
+        task = spawn(boom(), name="claimed", report_failure=False)
         with pytest.raises(ValueError):
             await task
         await _settle()
 
-    assert len(_errors(caplog)) == 1
+    assert _errors(caplog) == []
 
 
 @pytest.mark.asyncio
@@ -203,10 +205,10 @@ def _bare_spawn_sites(path: Path) -> list[str]:
         if not isinstance(node, ast.Call):
             continue
         func = node.func
-        if not isinstance(func, ast.Attribute) or func.attr not in _SPAWNERS:
-            continue
-        if isinstance(func.value, ast.Name) and func.value.id in _SPAWNER_OWNERS:
-            hits.append(f"{path}:{node.lineno} {func.value.id}.{func.attr}")
+        if isinstance(func, ast.Attribute) and func.attr in _SPAWNERS:
+            hits.append(f"{path}:{node.lineno} attribute.{func.attr}")
+        elif isinstance(func, ast.Name) and func.id in _SPAWNERS:
+            hits.append(f"{path}:{node.lineno} name.{func.id}")
     return hits
 
 
@@ -217,7 +219,23 @@ def test_no_bare_task_spawn_remains_in_tree():
     assert hits == []
 
 
-def test_helper_is_the_only_ensure_future_owner():
+def test_helper_owns_both_low_level_spawn_shapes():
     hits = _bare_spawn_sites(_HELPER)
-    assert len(hits) == 1
-    assert "asyncio.ensure_future" in hits[0]
+    assert len(hits) == 2
+    assert any("attribute.create_task" in hit for hit in hits)
+    assert any("attribute.ensure_future" in hit for hit in hits)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "asyncio.get_running_loop().create_task(work())",
+        "self._loop.create_task(work())",
+        "create_task(work())",
+        "aio.ensure_future(work())",
+    ],
+)
+def test_fleet_lint_detects_indirect_spawn_shapes(tmp_path, source):
+    path = tmp_path / "indirect.py"
+    path.write_text(source, encoding="utf-8")
+    assert len(_bare_spawn_sites(path)) == 1
