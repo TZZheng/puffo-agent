@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import sys
 
 import pytest
 
@@ -209,6 +211,24 @@ async def test_start_rejects_process_that_never_emits_valid_acceptance_frame():
 
 
 @pytest.mark.asyncio
+async def test_process_factory_type_error_is_not_retried():
+    calls = 0
+
+    def factory(_command, _spec):
+        nonlocal calls
+        calls += 1
+        raise TypeError("factory failed after side effect")
+
+    driver = OpenCodeDriver(factory)
+    await driver.open(RuntimeSpec("/workspace"))
+
+    with pytest.raises(TypeError, match="factory failed after side effect"):
+        await driver.start_turn(TurnInput("hello"))
+    assert calls == 1
+    await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_jsonl_reader_does_not_split_valid_unicode_line_separators():
     proc = _TurnProcess()
     driver = OpenCodeDriver(lambda *_args: proc)
@@ -302,4 +322,78 @@ async def test_close_kills_then_cancels_a_child_with_inherited_stdout(
 
     assert proc.terminated == 1
     assert proc.killed == 1
+    assert driver._turn_task is None
+
+
+def test_default_spawn_isolates_the_per_turn_process_group(monkeypatch):
+    from puffo_agent.agent.harness import opencode_driver
+
+    monkeypatch.setattr(opencode_driver.os, "name", "posix")
+    kwargs = opencode_driver._process_group_spawn_kwargs()
+    assert kwargs["start_new_session"] is True
+
+
+@pytest.mark.asyncio
+async def test_force_signal_targets_group_after_direct_child_has_exited(
+    monkeypatch,
+):
+    from puffo_agent.agent.harness import opencode_driver
+
+    class ExitedParent:
+        pid = 4321
+        returncode = -15
+
+    signals = []
+    monkeypatch.setattr(opencode_driver.os, "name", "posix")
+    monkeypatch.setattr(
+        opencode_driver.os,
+        "killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    await opencode_driver._signal_process_tree(ExitedParent(), force=True)
+
+    assert signals == [(4321, opencode_driver.signal.SIGKILL)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group regression")
+async def test_close_reaps_descendant_that_holds_inherited_stdout(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
+        0.2,
+    )
+    child_script = (
+        "import signal, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(60)"
+    )
+    parent_script = (
+        "import json, subprocess, sys, time; "
+        "subprocess.Popen([sys.executable, '-c', "
+        f"{child_script!r}], stdout=sys.stdout, stderr=sys.stderr); "
+        "print(json.dumps({'type': 'step_start', 'sessionID': 'ses_tree', "
+        "'part': {'messageID': 'msg_tree'}}), flush=True); "
+        "time.sleep(60)"
+    )
+
+    async def factory(_command, _spec):
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            parent_script,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+
+    driver = OpenCodeDriver(factory)
+    await driver.open(RuntimeSpec("/workspace"))
+    await asyncio.wait_for(
+        driver.start_turn(TurnInput("hello")), timeout=1
+    )
+
+    await asyncio.wait_for(driver.close(), timeout=2)
+
     assert driver._turn_task is None

@@ -66,7 +66,16 @@ from .subprocess_io import drain_subprocess_stream_keeping_tail
 
 @dataclass(frozen=True, slots=True)
 class AcpLaunchPlan:
-    """Complete ACP process and session inputs presented to one validator."""
+    """Complete ACP process and session inputs presented to one validator.
+
+    ``argv`` is the authoritative execution vector. ``executable`` records
+    the unresolved source value for policy/audit purposes; validators that
+    constrain what will run must inspect ``argv`` as well.
+
+    The plan intentionally captures values, not filesystem identities. The
+    producer of ``RuntimeSpec`` remains responsible for any stronger
+    ``lstat``/device/inode or symlink-stability guarantee required by policy.
+    """
 
     executable: str
     argv: tuple[str, ...]
@@ -79,11 +88,13 @@ _VALIDATED_LAUNCH_TOKEN = object()
 
 
 class ValidatedLaunchPlan:
-    """An ACP launch plan that passed the final pre-spawn validation seam.
+    """An ACP launch plan sealed at the final pre-spawn validation seam.
 
-    Construction is deliberately guarded: callers can provide a validator,
-    but only :meth:`AcpDriver._validate_launch_plan` can mint the value that
-    ``_spawn`` accepts.
+    This means all five inputs were assembled, frozen, and presented to an
+    injected validator when one exists; it does not claim built-in content
+    validation. Construction is deliberately guarded against accidental
+    bypass. A determined caller could explicitly import the private module
+    token, but such a bypass is grep-visible and reviewable.
     """
 
     __slots__ = ("plan",)
@@ -302,7 +313,7 @@ class AcpDriver(Driver):
         )
 
     def _validate_launch_plan(self, spec: RuntimeSpec) -> ValidatedLaunchPlan:
-        """Resolve and validate every launch input at the pre-spawn boundary."""
+        """Assemble, seal, and optionally validate every launch input."""
         argv = (*normalize_launch_argv(spec.executable), *spec.launch_args)
         plan = AcpLaunchPlan(
             executable=spec.executable,
