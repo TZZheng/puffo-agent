@@ -135,4 +135,3 @@ def test_step_finish_updates_usage_but_is_not_turn_terminal():
         "cache_read_tokens": 8,
         "cache_write_tokens": 1,
     }
-
