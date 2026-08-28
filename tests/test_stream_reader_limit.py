@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+import os
 from pathlib import Path
 
 import pytest
@@ -126,6 +127,16 @@ async def test_stdin_is_a_pipe_unless_the_caller_says_otherwise(spawned):
         ["agent"], env={}, stdin=asyncio.subprocess.DEVNULL
     )
     assert spawned.kwargs["stdin"] == asyncio.subprocess.DEVNULL
+
+
+@pytest.mark.skipif(os.name != "posix", reason="pass_fds is POSIX-only")
+@pytest.mark.asyncio
+async def test_framed_child_inherits_only_explicit_control_fds(spawned):
+    """A Driver authority socket must reach the child without opening ambient fds."""
+
+    await spawn_framed_child(["agent"], env={}, pass_fds=(17,))
+
+    assert spawned.kwargs["pass_fds"] == (17,)
 
 
 def _direct_spawns(path: Path) -> list[int]:

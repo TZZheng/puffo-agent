@@ -31,6 +31,7 @@ async def spawn_framed_child(
     env: Mapping[str, str],
     cwd: str | None = None,
     stdin: int = asyncio.subprocess.PIPE,
+    pass_fds: Sequence[int] = (),
 ) -> asyncio.subprocess.Process:
     """Spawn a child whose stdout is consumed frame by frame.
 
@@ -50,13 +51,18 @@ async def spawn_framed_child(
       its own and must not pop one per child.
     * stdout and stderr both piped, so the caller owns backpressure on both.
 
-    ``stdin`` is the one parameter because a one-shot child that is never
-    written to takes DEVNULL; every long-lived one takes a pipe.
+    ``stdin`` is explicit because a one-shot child that is never written to
+    takes DEVNULL; every long-lived one takes a pipe. ``pass_fds`` is the
+    POSIX-only path for Driver-owned control sockets. It is omitted entirely
+    when empty so Windows retains its normal subprocess contract.
 
     This does not spawn short-lived commands read to EOF with
     ``communicate()`` -- those never reach the reader limit and have their
     own environment policy.
     """
+    if pass_fds and os.name != "posix":
+        raise RuntimeError("inherited control fds require a POSIX runtime")
+    inherited = {"pass_fds": tuple(pass_fds)} if pass_fds else {}
     return await asyncio.create_subprocess_exec(
         *command,
         stdin=stdin,
@@ -65,5 +71,6 @@ async def spawn_framed_child(
         cwd=cwd,
         env=dict(env),
         limit=STREAM_READER_LIMIT_BYTES,
+        **inherited,
         **no_window_kwargs(),
     )

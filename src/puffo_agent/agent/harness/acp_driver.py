@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 from typing import Any
 
 from acp import PROTOCOL_VERSION, connect_to_agent, text_block
@@ -60,6 +61,10 @@ from .driver import (
     TurnRef,
     TurnStarted,
     UnsupportedCapability,
+)
+from .driver_authority_server import (
+    DRIVER_AUTHORITY_FD_ENV,
+    DriverAuthorityServer,
 )
 from .subprocess_io import drain_subprocess_stream_keeping_tail
 
@@ -170,6 +175,7 @@ class AcpDriver(Driver):
         self._output_blocks: set[str] = set()
         self._fallback_block_id = ""
         self._capabilities = acp_capabilities(session_resume=False)
+        self._driver_authority: DriverAuthorityServer | None = None
         self._closed = False
 
     def current_capabilities(self) -> DriverCapabilities:
@@ -276,18 +282,48 @@ class AcpDriver(Driver):
 
     async def _spawn(self, spec: RuntimeSpec) -> Any:
         command = (*normalize_launch_argv(spec.executable), *spec.launch_args)
+        environment = dict(spec.environment)
+        # This is a Driver-owned carrier, never caller-supplied ambient state.
+        environment.pop(DRIVER_AUTHORITY_FD_ENV, None)
+        uses_driver_authority = _uses_lingtai_driver_authority(command)
         if self.process_factory is not None:
+            if uses_driver_authority:
+                raise RuntimeError(
+                    "constrained LingTai ACP requires the POSIX local spawn path"
+                )
             # One call with the declared signature. Retrying on TypeError
             # cannot tell "wrong arity" from "the factory raised TypeError
             # internally", and the retry would spawn a second child after the
             # first already exists.
-            proc = self.process_factory(command, spec)
+            proc = self.process_factory(
+                command, replace(spec, environment=environment)
+            )
             return await proc if asyncio.iscoroutine(proc) else proc
-        return await spawn_framed_child(
-            command,
-            env=spec.environment,
-            cwd=spec.workspace_dir or None,
-        )
+        if not uses_driver_authority:
+            return await spawn_framed_child(
+                command,
+                env=environment,
+                cwd=spec.workspace_dir or None,
+            )
+
+        authority = DriverAuthorityServer()
+        endpoint = authority.issue_root(launch_id=str(self._runtime_ref))
+        endpoint_fd = endpoint.fileno()
+        environment[DRIVER_AUTHORITY_FD_ENV] = str(endpoint_fd)
+        try:
+            proc = await spawn_framed_child(
+                command,
+                env=environment,
+                cwd=spec.workspace_dir or None,
+                pass_fds=(endpoint_fd,),
+            )
+        except BaseException:
+            authority.close()
+            raise
+        finally:
+            endpoint.close()
+        self._driver_authority = authority
+        return proc
 
     async def start_turn(self, input: TurnInput):
         if self._conn is None:
@@ -453,6 +489,9 @@ class AcpDriver(Driver):
         self._prompt_task = None
         self._watcher = None
         self._stderr_reader = None
+        authority, self._driver_authority = self._driver_authority, None
+        if authority is not None:
+            authority.close()
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         await self._events.put(None)
@@ -652,3 +691,22 @@ def _preferred_permission(
 
 
 GenericAcpDriver = AcpDriver
+
+
+def _uses_lingtai_driver_authority(command: tuple[str, ...]) -> bool:
+    """Select only LingTai's constrained ACP profile, independent of argv[0]."""
+
+    try:
+        acp_index = command.index("acp")
+    except ValueError:
+        return False
+    profile_args = command[acp_index + 1 :]
+    return any(
+        (
+            arg == "--profile"
+            and index + 1 < len(profile_args)
+            and profile_args[index + 1] == "puffo-v0"
+        )
+        or arg == "--profile=puffo-v0"
+        for index, arg in enumerate(profile_args)
+    )
