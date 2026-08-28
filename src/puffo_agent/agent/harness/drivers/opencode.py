@@ -108,11 +108,18 @@ async def _server_url_from_streams(proc: Any) -> str:
         spawn(scan(proc.stderr), name="opencode.serve.stderr_url"),
     ]
     try:
-        done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            if task.exception() is None:
-                return task.result()
-        raise next(iter(done)).exception()
+        pending = set(tasks)
+        failures: list[BaseException] = []
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                try:
+                    return task.result()
+                except Exception as exc:
+                    failures.append(exc)
+        raise failures[0]
     finally:
         for task in tasks:
             task.cancel()

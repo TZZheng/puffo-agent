@@ -214,6 +214,25 @@ async def test_server_url_parsed_from_either_stream():
         ))
 
 
+@pytest.mark.asyncio
+async def test_server_url_waits_when_one_stream_closes_first():
+    class _Proc:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+
+    proc = _Proc()
+    reading = asyncio.create_task(_server_url_from_streams(proc))
+    proc.stdout.feed_eof()
+    await asyncio.sleep(0)
+    assert not reading.done()
+
+    proc.stderr.feed_data(
+        b"opencode server listening on http://127.0.0.1:4096\n"
+    )
+    assert await asyncio.wait_for(reading, timeout=1) == "http://127.0.0.1:4096"
+
+
 def test_summarize_requires_documented_true_acknowledgement():
     _require_summarize_ack(200, "true")
     with pytest.raises(RuntimeError, match="HTTP 503"):
