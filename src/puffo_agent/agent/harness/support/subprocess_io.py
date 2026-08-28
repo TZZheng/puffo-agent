@@ -7,8 +7,8 @@ import os
 import signal
 from typing import Any
 
-from ..._proc import no_window_kwargs
-from ...tasks import spawn
+from ...._proc import no_window_kwargs
+from ....tasks import spawn
 
 
 _CREATE_NEW_PROCESS_GROUP = 0x00000200

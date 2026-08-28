@@ -25,8 +25,8 @@ import warnings
 import pytest
 
 from puffo_agent.agent.core import AgentAPIError
-from puffo_agent.agent.harness.codex_driver import CodexAppServerDriver
-from puffo_agent.agent.harness.pi_driver import PiDriver
+from puffo_agent.agent.harness.drivers.codex import CodexAppServerDriver
+from puffo_agent.agent.harness.drivers.pi import PiDriver
 
 
 class _RecordingStdin:

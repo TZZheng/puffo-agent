@@ -126,7 +126,7 @@ def build_docker_runtime(
     The returned preparer owns only container placement and host assets;
     Claude Code and Codex protocol behavior stays in the normal Drivers.
     """
-    from ..agent.harness.docker_runtime import DockerRuntimePreparer
+    from ..agent.harness.runtime.docker_runtime import DockerRuntimePreparer
 
     return DockerRuntimePreparer(daemon_cfg, agent_cfg)
 

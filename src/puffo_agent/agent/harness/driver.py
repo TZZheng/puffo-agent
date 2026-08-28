@@ -291,6 +291,11 @@ class HarnessEventType(str, Enum):
     AUTONOMOUS_COMPLETED = "turn.autonomous_completed"
     COMPACTION_STARTED = "compaction.started"
     COMPACTION_COMPLETED = "compaction.completed"
+    # Provider compaction failed; the session itself stays usable. The
+    # runtime manager fails the outstanding compaction future on this
+    # instead of letting callers wait out their timeout — and it must
+    # never be spelled as RUNTIME_EXITED, which retires the session.
+    COMPACTION_FAILED = "compaction.failed"
 
 
 class _NativeDiagnostic:

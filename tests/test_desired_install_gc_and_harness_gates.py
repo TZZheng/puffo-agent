@@ -26,7 +26,7 @@ from puffo_agent.agent.adapters.desired_install import (
     install_desired,
     prune_stale_desired_skills,
 )
-from puffo_agent.agent.harness.assets import (
+from puffo_agent.agent.harness.support.assets import (
     McpProjection,
     SkillBodyTransform,
     get_harness_assets_profile,
@@ -337,8 +337,8 @@ async def test_docker_install_desired_passes_assets_once(
     monkeypatch, tmp_path,
 ):
     """The Docker owner forwards both asset classes once."""
-    import puffo_agent.agent.harness.docker_runtime as docker_runtime
-    from puffo_agent.agent.harness.docker_runtime import DockerRuntimePreparer
+    import puffo_agent.agent.harness.runtime.docker_runtime as docker_runtime
+    from puffo_agent.agent.harness.runtime.docker_runtime import DockerRuntimePreparer
     from puffo_agent.portal.state import AgentConfig, DaemonConfig, RuntimeConfig
 
     calls: dict = {}

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
@@ -30,16 +31,15 @@ from acp.schema import (
     UsageUpdate,
     WaitForTerminalExitResponse,
 )
-from ...tasks import spawn
-from ..cli_bin import normalize_launch_argv
-from .cleanup_errors import (
+from ....tasks import spawn
+from ...cli_bin import normalize_launch_argv
+from ..support.cleanup_errors import (
     CLEANUP_TIMEOUT_SECONDS,
     collect_cleanup_errors,
     raise_collected_errors,
 )
-from ..provider_failures import PROVIDER_FAILURES, classify_provider_failure
-from .acp_presets import model_launch_args, operator_pinned_model
-from .driver import (
+from ...provider_failures import PROVIDER_FAILURES, classify_provider_failure
+from ..driver import (
     BusyDelivery,
     CancelCapability,
     CancelReceipt,
@@ -65,7 +65,7 @@ from .driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from .subprocess_io import (
+from ..support.subprocess_io import (
     drain_subprocess_stream_keeping_tail,
     process_group_spawn_kwargs,
     shutdown_process_tree,
@@ -798,3 +798,40 @@ def _preferred_permission(
 
 
 GenericAcpDriver = AcpDriver
+
+
+# Executable basename -> verified model flag. Keep this private and small:
+# unverified flags must never enter the table, because a guessed flag can be
+# ignored while Puffo incorrectly reports that the requested model is active.
+_MODEL_FLAG_BY_EXECUTABLE = {
+    "gemini": "-m",  # gemini-cli 0.57.0, verified
+    "kimi": "-m",  # kimi-cli 1.49.0, verified
+}
+
+_MODEL_FLAG_SPELLINGS = ("-m", "--model")
+
+
+def _basename(executable: str) -> str:
+    name = Path(executable).name.lower()
+    for suffix in (".exe", ".cmd", ".bat", ".ps1"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def operator_pinned_model(launch_args: Sequence[str]) -> bool:
+    """True when launch_args already carry a model flag (any spelling)."""
+    return any(
+        arg in _MODEL_FLAG_SPELLINGS or arg.startswith("--model=")
+        for arg in launch_args
+    )
+
+
+def model_launch_args(executable: str, model: str) -> tuple[str, ...]:
+    """Return verified model-selection launch arguments for an ACP target."""
+    if not model:
+        return ()
+    flag = _MODEL_FLAG_BY_EXECUTABLE.get(_basename(executable))
+    if flag is None:
+        return ()
+    return (flag, model)

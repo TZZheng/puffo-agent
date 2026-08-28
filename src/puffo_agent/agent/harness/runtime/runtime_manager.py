@@ -12,8 +12,8 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
-from ..adapters.base import Adapter, TurnContext, TurnResult
-from ..context_controller import (
+from ...adapters.base import Adapter, TurnContext, TurnResult
+from ...context_controller import (
     CompactionResult,
     ContextCapabilities,
     ContextSnapshot,
@@ -22,20 +22,20 @@ from ..context_controller import (
     ToolResultAdmission,
     normalize_context_snapshot,
 )
-from ..errors import AgentAPIError, ProviderFailureError
-from ..provider_failures import (
+from ...errors import AgentAPIError, ProviderFailureError
+from ...provider_failures import (
     is_provider_failure_code,
     provider_failure,
     provider_failure_message,
     provider_failure_retryable,
 )
-from .cleanup_errors import (
+from ..support.cleanup_errors import (
     CLEANUP_TIMEOUT_SECONDS,
     collect_cleanup_errors,
     mark_cleanup_checked,
     raise_collected_errors,
 )
-from .driver import (
+from ..driver import (
     CompactRequest,
     ContextStatus,
     Driver,
@@ -52,7 +52,7 @@ from .driver import (
     TurnRef,
     UnsupportedCapability,
 )
-from ...tasks import spawn
+from ....tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,7 @@ def _resolve_claude_autocompact_tokens(
     *, model: str, pct: float, environment: Mapping[str, str]
 ) -> int | None:
     """Resolve a missing threshold from the runtime's launch environment."""
-    from ...portal.control.context_telemetry import claude_autocompact_tokens
+    from ....portal.control.context_telemetry import claude_autocompact_tokens
 
     return claude_autocompact_tokens(
         model=model,
@@ -774,6 +774,13 @@ class RuntimeManager:
             # The single consumption point for provider completion; the event
             # still publishes so subscribers and persistence see it.
             self._resolve_compaction_locked()
+        if event.type in {
+            HarnessEventType.COMPACTION_FAILED,
+            "compaction.failed",
+        }:
+            self._fail_compaction_locked(
+                str(event.data.get("diagnostic") or "provider compaction failed")
+            )
         if event.type in {
             HarnessEventType.RUNTIME_EXITED,
             "runtime.exited",

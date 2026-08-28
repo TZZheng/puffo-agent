@@ -8,7 +8,7 @@ import psutil
 import pytest
 
 from puffo_agent.agent.harness import build_driver
-from puffo_agent.agent.harness.cleanup_errors import cleanup_errors
+from puffo_agent.agent.harness.support.cleanup_errors import cleanup_errors
 from puffo_agent.agent.harness.driver import (
     BusyDelivery,
     HarnessEventType,
@@ -17,13 +17,13 @@ from puffo_agent.agent.harness.driver import (
     TurnInput,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.opencode_driver import (
+from puffo_agent.agent.harness.drivers.opencode import (
     OPENCODE_CAPABILITIES,
     OpenCodeDriver,
 )
-from puffo_agent.agent.harness.runtime_manager import RuntimeManager
-from puffo_agent.agent.harness.runtime_manager import RuntimeManagerAdapter
-from puffo_agent.agent.harness.subprocess_io import ProcessTreeShutdownError
+from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManager
+from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManagerAdapter
+from puffo_agent.agent.harness.support.subprocess_io import ProcessTreeShutdownError
 
 
 class _TurnProcess:
@@ -311,11 +311,127 @@ async def test_manager_adopts_session_learned_by_per_turn_child():
 
 
 @pytest.mark.asyncio
+async def test_error_frame_detail_reaches_the_failed_turn():
+    """Provider errors stay distinguishable without leaking raw payloads."""
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda _command, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+    stream = driver.events()
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    proc.feed({
+        "type": "step_start",
+        "sessionID": "ses_1",
+        "part": {"messageID": "msg_1"},
+    })
+    await asyncio.wait_for(started, timeout=1)
+    proc.feed({
+        "type": "error",
+        "sessionID": "ses_1",
+        "error": {
+            "name": "UnknownError",
+            "data": {
+                "message": (
+                    "Unexpected server error. "
+                    "Authorization: Basic dXNlcjpwYXNz, ref err_3bf8"
+                )
+            },
+        },
+    })
+    proc.exit(1)
+    proc.eof()
+
+    events = await asyncio.wait_for(
+        _collect_through(stream, HarnessEventType.TURN_COMPLETED), timeout=1
+    )
+
+    failed_frame = next(
+        event
+        for event in events
+        if event.type is HarnessEventType.RUNTIME_FAILED
+    )
+    assert "Unexpected server error" in failed_frame.data.get("diagnostic", "")
+    assert "dXNlcjpwYXNz" not in failed_frame.data.get("diagnostic", "")
+    terminal = events[-1]
+    assert terminal.data["outcome"] == "failed"
+    assert "Unexpected server error" in terminal.data.get("diagnostic", "")
+    assert "dXNlcjpwYXNz" not in terminal.data.get("diagnostic", "")
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_acceptance_exit_carries_redacted_stderr_tail():
+    """Pre-acceptance stderr reaches the caller, but credentials do not."""
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda _command, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    await asyncio.sleep(0)
+    proc.stderr.feed_data(
+        b"Session not found; rejected api_key=sk_live_abcdef1234567890; "
+        b"Authorization: Basic dXNlcjpwYXNz, denied\n"
+    )
+    proc.exit(1)
+    proc.eof()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await asyncio.wait_for(started, timeout=1)
+
+    diagnostic = str(exc_info.value)
+    assert "Session not found" in diagnostic
+    assert "sk_live_abcdef1234567890" not in diagnostic
+    assert "dXNlcjpwYXNz" not in diagnostic
+    assert "[REDACTED]" in diagnostic
+    await driver.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_exited_child_with_open_stderr_cannot_block_turn_boundary(
+    monkeypatch, accepted
+):
+    monkeypatch.setattr(
+        "puffo_agent.agent.harness.drivers.opencode."
+        "_STDERR_TAIL_GRACE_SECONDS",
+        0.01,
+    )
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda _command, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+    stream = driver.events()
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+
+    if accepted:
+        proc.feed({
+            "type": "step_start",
+            "sessionID": "ses_1",
+            "part": {"messageID": "msg_1"},
+        })
+        await asyncio.wait_for(started, timeout=1)
+
+    # Model a descendant that inherited stderr after the direct child exits.
+    proc.stdout.feed_eof()
+    proc.exit(1)
+
+    if accepted:
+        terminal = await asyncio.wait_for(
+            _next_matching(stream, HarnessEventType.TURN_COMPLETED), timeout=1
+        )
+        assert terminal.data["outcome"] == "failed"
+    else:
+        with pytest.raises(RuntimeError, match="before accepting"):
+            await asyncio.wait_for(started, timeout=1)
+
+    assert driver._stderr_reader is None
+    await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_close_kills_then_cancels_a_child_with_inherited_stdout(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
+        "puffo_agent.agent.harness.drivers.opencode._SHUTDOWN_GRACE_SECONDS",
         0.01,
     )
     proc = _HungTurnProcess()
@@ -337,7 +453,7 @@ async def test_close_kills_then_cancels_a_child_with_inherited_stdout(
 
 
 def test_default_spawn_isolates_the_per_turn_process_group(monkeypatch):
-    from puffo_agent.agent.harness import subprocess_io
+    from puffo_agent.agent.harness.support import subprocess_io
 
     monkeypatch.setattr(subprocess_io.os, "name", "posix")
     kwargs = subprocess_io.process_group_spawn_kwargs()
@@ -348,7 +464,7 @@ def test_default_spawn_isolates_the_per_turn_process_group(monkeypatch):
 async def test_force_signal_targets_group_after_direct_child_has_exited(
     monkeypatch,
 ):
-    from puffo_agent.agent.harness import subprocess_io
+    from puffo_agent.agent.harness.support import subprocess_io
 
     class ExitedParent:
         pid = 4321
@@ -371,7 +487,7 @@ async def test_force_signal_targets_group_after_direct_child_has_exited(
 
 @pytest.mark.asyncio
 async def test_missing_process_group_falls_back_to_direct_child(monkeypatch):
-    from puffo_agent.agent.harness import subprocess_io
+    from puffo_agent.agent.harness.support import subprocess_io
 
     class UngroupedProcess:
         pid = 4321
@@ -398,7 +514,7 @@ async def test_missing_process_group_falls_back_to_direct_child(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_cancelled_waiter_is_not_process_exit_evidence():
-    from puffo_agent.agent.harness import subprocess_io
+    from puffo_agent.agent.harness.support import subprocess_io
 
     proc = type("RunningProcess", (), {"returncode": None})()
     waiter = asyncio.create_task(asyncio.sleep(60))
@@ -414,7 +530,7 @@ async def test_close_reaps_descendant_that_holds_inherited_stdout(
     tmp_path,
 ):
     monkeypatch.setattr(
-        "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
+        "puffo_agent.agent.harness.drivers.opencode._SHUTDOWN_GRACE_SECONDS",
         0.2,
     )
     child_script = (
@@ -468,7 +584,7 @@ async def test_close_reaps_descendant_that_holds_inherited_stdout(
 @pytest.mark.asyncio
 async def test_close_reports_transport_abandonment(monkeypatch):
     monkeypatch.setattr(
-        "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
+        "puffo_agent.agent.harness.drivers.opencode._SHUTDOWN_GRACE_SECONDS",
         0.01,
     )
     proc = _UncloseableTurnProcess()
@@ -491,7 +607,7 @@ async def test_cancelled_start_preserves_cancellation_and_shutdown_error(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
+        "puffo_agent.agent.harness.drivers.opencode._SHUTDOWN_GRACE_SECONDS",
         0.01,
     )
     proc = _UncloseableTurnProcess()

@@ -11,7 +11,7 @@ from puffo_agent.agent.harness.driver import (
     SessionRef,
     TurnRef,
 )
-from puffo_agent.agent.harness.opencode_protocol import (
+from puffo_agent.agent.harness.drivers.opencode_protocol import (
     build_opencode_run_command,
     normalize_opencode_frame,
 )
@@ -116,6 +116,7 @@ def test_step_finish_updates_usage_but_is_not_turn_terminal():
                 "output": 3,
                 "reasoning": 2,
                 "cache": {"read": 8, "write": 1},
+                "total": 23,
             },
             "cost": 0.01,
         },
@@ -134,4 +135,7 @@ def test_step_finish_updates_usage_but_is_not_turn_terminal():
         "reasoning_tokens": 2,
         "cache_read_tokens": 8,
         "cache_write_tokens": 1,
+        # tokens.total is the step's full context occupancy (input +
+        # cache.read + output) — the number context tracking runs on.
+        "total_tokens": 23,
     }

@@ -287,7 +287,7 @@ async def _execute_runtime_command(
     params: dict,
     command_id: str | None,
 ) -> dict:
-    from ...agent.harness.runtime_commands import execute_runtime_command
+    from ...agent.harness.runtime.runtime_commands import execute_runtime_command
 
     command = dict(params)
     command.update(

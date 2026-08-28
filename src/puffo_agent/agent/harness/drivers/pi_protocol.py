@@ -24,8 +24,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from ..provider_failures import classify_provider_failure
-from .driver import (
+from ...provider_failures import classify_provider_failure
+from ..driver import (
     HarnessEvent,
     HarnessEventType,
     RuntimeSpec,

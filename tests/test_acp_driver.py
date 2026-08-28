@@ -24,8 +24,8 @@ from acp.schema import (
 )
 
 from puffo_agent.agent.harness import build_driver
-from puffo_agent.agent.harness.cleanup_errors import cleanup_errors
-from puffo_agent.agent.harness.acp_driver import (
+from puffo_agent.agent.harness.support.cleanup_errors import cleanup_errors
+from puffo_agent.agent.harness.drivers.acp import (
     AcpDriver,
     AcpLaunchPlan,
     ValidatedLaunchPlan,
@@ -39,7 +39,7 @@ from puffo_agent.agent.harness.driver import (
     SessionRef,
     TurnInput,
 )
-from puffo_agent.agent.harness.subprocess_io import ProcessTreeShutdownError
+from puffo_agent.agent.harness.support.subprocess_io import ProcessTreeShutdownError
 
 
 class _FakeProcess:
@@ -388,7 +388,7 @@ async def test_close_reaps_acp_descendant_and_closes_transports(
     tmp_path,
 ):
     monkeypatch.setattr(
-        "puffo_agent.agent.harness.acp_driver._SHUTDOWN_GRACE_SECONDS",
+        "puffo_agent.agent.harness.drivers.acp._SHUTDOWN_GRACE_SECONDS",
         0.2,
     )
     pid_path = tmp_path / "acp-descendant.pid"
@@ -441,7 +441,7 @@ async def test_close_reaps_acp_descendant_and_closes_transports(
 @pytest.mark.asyncio
 async def test_close_reports_acp_transport_abandonment(monkeypatch):
     monkeypatch.setattr(
-        "puffo_agent.agent.harness.acp_driver._SHUTDOWN_GRACE_SECONDS",
+        "puffo_agent.agent.harness.drivers.acp._SHUTDOWN_GRACE_SECONDS",
         0.01,
     )
     harness = _Harness()
@@ -464,7 +464,7 @@ async def test_close_finishes_tail_cleanup_after_unexpected_shutdown_error(
         raise RuntimeError("unexpected shutdown failure")
 
     monkeypatch.setattr(
-        "puffo_agent.agent.harness.acp_driver.shutdown_process_tree",
+        "puffo_agent.agent.harness.drivers.acp.shutdown_process_tree",
         fail_shutdown,
     )
     harness = _Harness()
@@ -486,7 +486,7 @@ async def test_close_finishes_tail_cleanup_after_unexpected_shutdown_error(
 
 @pytest.mark.asyncio
 async def test_cancelled_close_finishes_process_shutdown(monkeypatch):
-    from puffo_agent.agent.harness import acp_driver
+    from puffo_agent.agent.harness.drivers import acp as acp_driver
 
     monkeypatch.setattr(acp_driver, "_SHUTDOWN_GRACE_SECONDS", 0.01)
     entered = asyncio.Event()

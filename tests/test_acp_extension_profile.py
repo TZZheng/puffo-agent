@@ -11,8 +11,8 @@ of a bare ``acp_prompt_failed`` with the detail thrown away.
 import pytest
 from acp.exceptions import RequestError
 
-from puffo_agent.agent.harness.acp_driver import AcpDriver, HarnessEventType
-from puffo_agent.agent.harness.acp_presets import (
+from puffo_agent.agent.harness.drivers.acp import AcpDriver, HarnessEventType
+from puffo_agent.agent.harness.drivers.acp import (
     model_launch_args,
     operator_pinned_model,
 )

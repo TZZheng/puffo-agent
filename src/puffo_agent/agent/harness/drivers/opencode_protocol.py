@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from .driver import (
+from ..support.redaction import safe_provider_message
+from ..driver import (
     HarnessEvent,
     HarnessEventType,
     RuntimeSpec,
@@ -37,6 +38,24 @@ def build_opencode_run_command(
     command.extend(spec.launch_args)
     command.append(prompt)
     return tuple(command)
+
+
+def opencode_error_detail(frame: dict[str, Any]) -> str:
+    """A bounded, credential-safe description of an OpenCode error frame.
+
+    OpenCode wraps most failures as ``{"error": {"name": ..., "data":
+    {"message": ...}}}`` and the name alone ("UnknownError") diagnoses
+    nothing -- a wrong model name and a provider outage read identically.
+    The message text is what distinguishes them, so it is kept, sanitized.
+    """
+    error = frame.get("error")
+    error = error if isinstance(error, dict) else {}
+    data = error.get("data")
+    data = data if isinstance(data, dict) else {}
+    message = str(data.get("message") or "")
+    name = str(error.get("name") or "")
+    combined = f"{name}: {message}" if name and message else (message or name)
+    return safe_provider_message(combined) if combined else ""
 
 
 def normalize_opencode_frame(
@@ -98,7 +117,10 @@ def normalize_opencode_frame(
         return (
             event(
                 HarnessEventType.RUNTIME_FAILED,
-                {"code": "opencode_run_error"},
+                {
+                    "code": "opencode_run_error",
+                    "diagnostic": opencode_error_detail(frame),
+                },
             ),
         )
     return (
@@ -125,6 +147,12 @@ def _usage_data(part: dict[str, Any]) -> dict[str, int]:
         "reasoning_tokens": _nonnegative_int(tokens.get("reasoning")),
         "cache_read_tokens": _nonnegative_int(cache.get("read")),
         "cache_write_tokens": _nonnegative_int(cache.get("write")),
+        # Measured on 1.18.16: step_finish tokens.total is the full context
+        # occupancy of the step's provider call (input + cache.read +
+        # output), not a session-cumulative counter — the one number
+        # context tracking needs. With several tool steps in a turn the
+        # last step_finish carries the current value.
+        "total_tokens": _nonnegative_int(tokens.get("total")),
     }
 
 

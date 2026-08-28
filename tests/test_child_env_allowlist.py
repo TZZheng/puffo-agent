@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from puffo_agent.agent.harness.child_env import (
+from puffo_agent.agent.harness.support.child_env import (
     PROVIDER_CREDENTIAL_ENV_NAMES,
     build_child_environment,
 )
@@ -196,8 +196,8 @@ def _implicit_subprocess_envs(
 # was in exactly that position -- it reads os.environ and was never on the old
 # six-module list.
 AMBIENT_ENV_EXEMPTIONS = {
-    "src/puffo_agent/agent/harness/child_env.py": "the allowlist boundary itself; it is what reads ambient",
-    "src/puffo_agent/agent/harness/docker_runtime.py": "os.environ there is the host docker *client* env, not the agent "
+    "src/puffo_agent/agent/harness/support/child_env.py": "the allowlist boundary itself; it is what reads ambient",
+    "src/puffo_agent/agent/harness/runtime/docker_runtime.py": "os.environ there is the host docker *client* env, not the agent "
     "child's: the container's environment is set by `docker exec -e` "
     "flags, and API keys travel by name so they stay out of argv",
 }
@@ -206,10 +206,10 @@ AMBIENT_ENV_EXEMPTIONS = {
 # Keep exemptions function-scoped so another subprocess added to the same
 # module does not silently inherit the host environment.
 IMPLICIT_SUBPROCESS_ENV_EXEMPTIONS = {
-    "src/puffo_agent/agent/harness/subprocess_io.py": {
+    "src/puffo_agent/agent/harness/support/subprocess_io.py": {
         "signal_process_tree": "Windows taskkill is a host process-tree utility",
     },
-    "src/puffo_agent/agent/harness/docker_support.py": {
+    "src/puffo_agent/agent/harness/runtime/docker_support.py": {
         "_build_image": "docker build is a host container-management command",
         "run_cmd": "docker inspection commands run on the host",
     },
@@ -227,8 +227,8 @@ def test_the_ambient_scan_actually_walks_the_harness_package():
     """A directory walk that matches nothing would pass in silence."""
     modules = _harness_modules()
 
-    assert "src/puffo_agent/agent/harness/local_runtime.py" in modules
-    assert "src/puffo_agent/agent/harness/pi_driver.py" in modules
+    assert "src/puffo_agent/agent/harness/runtime/local_runtime.py" in modules
+    assert "src/puffo_agent/agent/harness/drivers/pi.py" in modules
     assert len(modules) > 10
 
 

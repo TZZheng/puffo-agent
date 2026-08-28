@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 from puffo_agent.agent.harness.driver import McpServerSpec, RuntimeSpec
-from puffo_agent.agent.harness.pi_bridge import (
+from puffo_agent.agent.harness.drivers.pi_bridge import (
     BRIDGE_CONFIG_ENV,
     BRIDGE_NONCE_ENV,
     BRIDGE_READY_FILE_ENV,
@@ -35,7 +35,7 @@ from puffo_agent.agent.harness.pi_bridge import (
     read_ready_attestation,
     ready_file_path,
 )
-from puffo_agent.agent.harness.pi_driver import (
+from puffo_agent.agent.harness.drivers.pi import (
     PI_AGENT_DIR_ENV,
     PiDriver,
     PiToolBridgeUnavailableError,
@@ -472,7 +472,7 @@ def test_bridge_source_is_declared_as_package_data():
     with (root / "pyproject.toml").open("rb") as handle:
         config = tomllib.load(handle)
     package_data = config["tool"]["setuptools"]["package-data"]
-    patterns = package_data.get("puffo_agent.agent.harness.pi_bridge", [])
+    patterns = package_data.get("puffo_agent.agent.harness.drivers.pi_bridge", [])
     assert any(p.endswith(".ts") for p in patterns), (
         "puffo-tools.ts must ship as package data or the installed bridge "
         "is missing at runtime"
