@@ -329,7 +329,12 @@ async def test_error_frame_detail_reaches_the_failed_turn():
         "sessionID": "ses_1",
         "error": {
             "name": "UnknownError",
-            "data": {"message": "Unexpected server error. ref err_3bf8"},
+            "data": {
+                "message": (
+                    "Unexpected server error. "
+                    "Authorization: Basic dXNlcjpwYXNz, ref err_3bf8"
+                )
+            },
         },
     })
     proc.exit(1)
@@ -345,9 +350,11 @@ async def test_error_frame_detail_reaches_the_failed_turn():
         if event.type is HarnessEventType.RUNTIME_FAILED
     )
     assert "Unexpected server error" in failed_frame.data.get("diagnostic", "")
+    assert "dXNlcjpwYXNz" not in failed_frame.data.get("diagnostic", "")
     terminal = events[-1]
     assert terminal.data["outcome"] == "failed"
     assert "Unexpected server error" in terminal.data.get("diagnostic", "")
+    assert "dXNlcjpwYXNz" not in terminal.data.get("diagnostic", "")
     await driver.close()
 
 
@@ -361,7 +368,8 @@ async def test_pre_acceptance_exit_carries_redacted_stderr_tail():
     started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
     await asyncio.sleep(0)
     proc.stderr.feed_data(
-        b"Session not found; rejected api_key=sk_live_abcdef1234567890\n"
+        b"Session not found; rejected api_key=sk_live_abcdef1234567890; "
+        b"Authorization: Basic dXNlcjpwYXNz, denied\n"
     )
     proc.exit(1)
     proc.eof()
@@ -372,7 +380,49 @@ async def test_pre_acceptance_exit_carries_redacted_stderr_tail():
     diagnostic = str(exc_info.value)
     assert "Session not found" in diagnostic
     assert "sk_live_abcdef1234567890" not in diagnostic
+    assert "dXNlcjpwYXNz" not in diagnostic
     assert "[REDACTED]" in diagnostic
+    await driver.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_exited_child_with_open_stderr_cannot_block_turn_boundary(
+    monkeypatch, accepted
+):
+    monkeypatch.setattr(
+        "puffo_agent.agent.harness.drivers.opencode."
+        "_STDERR_TAIL_GRACE_SECONDS",
+        0.01,
+    )
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda _command, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+    stream = driver.events()
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+
+    if accepted:
+        proc.feed({
+            "type": "step_start",
+            "sessionID": "ses_1",
+            "part": {"messageID": "msg_1"},
+        })
+        await asyncio.wait_for(started, timeout=1)
+
+    # Model a descendant that inherited stderr after the direct child exits.
+    proc.stdout.feed_eof()
+    proc.exit(1)
+
+    if accepted:
+        terminal = await asyncio.wait_for(
+            _next_matching(stream, HarnessEventType.TURN_COMPLETED), timeout=1
+        )
+        assert terminal.data["outcome"] == "failed"
+    else:
+        with pytest.raises(RuntimeError, match="before accepting"):
+            await asyncio.wait_for(started, timeout=1)
+
+    assert driver._stderr_reader is None
     await driver.close()
 
 

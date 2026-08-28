@@ -191,6 +191,7 @@ OPENCODE_CAPABILITIES = DriverCapabilities(
 )
 
 _SHUTDOWN_GRACE_SECONDS = 5.0
+_STDERR_TAIL_GRACE_SECONDS = 1.0
 
 
 class OpenCodeDriver(Driver):
@@ -775,19 +776,34 @@ class OpenCodeDriver(Driver):
     ) -> None:
         if generation != self._turn_generation:
             return
-        # The child has exited (or been killed) by the time we get here, so
-        # its stderr is at EOF and the drain task finishes promptly. Collect
-        # the tail NOW: it often carries the only human-readable cause
-        # (e.g. "Error: Session not found") for a start that died before
-        # accepting the turn, and the exception below must include it.
+        # The direct child has exited (or been killed) by the time we get
+        # here, but a descendant can still hold the inherited stderr fd.
+        # Collect the tail within a strict budget: it often carries the only
+        # human-readable cause for a failed start, but diagnostics must never
+        # block turn admission or its terminal boundary indefinitely.
         stderr_tail = b""
         if self._stderr_reader is not None:
-            results = await asyncio.gather(
-                self._stderr_reader, return_exceptions=True
-            )
+            stderr_reader = self._stderr_reader
             self._stderr_reader = None
-            if results and isinstance(results[0], bytes):
-                stderr_tail = results[0]
+            try:
+                done, _ = await asyncio.wait(
+                    {stderr_reader}, timeout=_STDERR_TAIL_GRACE_SECONDS
+                )
+            except asyncio.CancelledError:
+                stderr_reader.cancel()
+                raise
+            if stderr_reader in done:
+                try:
+                    result = stderr_reader.result()
+                except (asyncio.CancelledError, Exception):
+                    pass
+                else:
+                    if isinstance(result, bytes):
+                        stderr_tail = result
+            else:
+                # Do not await cancellation here: a misbehaving drain must
+                # not turn this bounded diagnostic path back into a hang.
+                stderr_reader.cancel()
         diagnostic = self._last_provider_error
         if not diagnostic and stderr_tail:
             diagnostic = safe_provider_message(

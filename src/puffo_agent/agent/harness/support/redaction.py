@@ -5,9 +5,16 @@ from __future__ import annotations
 import re
 from typing import Any
 
+_AUTHORIZATION_FIELD = re.compile(
+    r"(?i)(?P<prefix>[\"']?authorization[\"']?\s*[:=]\s*)"
+    # An unquoted Authorization value can contain both a scheme and payload.
+    # Consume conservatively through the next structured-value delimiter;
+    # losing adjacent diagnostic prose is preferable to leaking credentials.
+    r"(?P<value>\"[^\"]*\"|'[^']*'|[^,}\]]+)"
+)
 _SENSITIVE_ERROR_FIELD = re.compile(
     r"(?i)(?P<prefix>[\"']?(?:api[_-]?key|access[_-]?token|"
-    r"refresh[_-]?token|authorization)[\"']?\s*[:=]\s*)"
+    r"refresh[_-]?token)[\"']?\s*[:=]\s*)"
     r"(?P<value>(?:bearer\s+)?(?:\"[^\"]*\"|'[^']*'|[^\s,}\]]+))"
 )
 _BEARER_VALUE = re.compile(r"(?i)\bbearer\s+(?:\"[^\"]*\"|'[^']*'|[^\s,}\]]+)")
@@ -22,8 +29,11 @@ def safe_provider_message(message: Any) -> str:
     if not isinstance(message, str):
         return "(missing or invalid provider message)"
     compact = " ".join(message.split())
-    redacted = _SENSITIVE_ERROR_FIELD.sub(
+    redacted = _AUTHORIZATION_FIELD.sub(
         lambda match: f"{match.group('prefix')}[REDACTED]", compact
+    )
+    redacted = _SENSITIVE_ERROR_FIELD.sub(
+        lambda match: f"{match.group('prefix')}[REDACTED]", redacted
     )
     redacted = _BEARER_VALUE.sub("Bearer [REDACTED]", redacted)
     redacted = _TOKENISH.sub("[REDACTED]", redacted)
