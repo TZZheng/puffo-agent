@@ -137,11 +137,13 @@ def _fetch_anthropic_models() -> tuple[ModelOption, ...] | None:
     return tuple(out) or None
 
 
-def _claude_concrete(*, fetch: bool) -> tuple[ModelOption, ...]:
+def _claude_concrete(
+    *, fetch: bool, force_refresh: bool = False,
+) -> tuple[ModelOption, ...]:
     now = time.time()
     with _lock:
         cached = _cache.get("claude-code")
-    if cached and now - cached[0] < _CACHE_TTL_S:
+    if cached and not force_refresh and now - cached[0] < _CACHE_TTL_S:
         return cached[1]
     if fetch:
         live = _fetch_anthropic_models()
@@ -195,8 +197,10 @@ def _run_catalog_command(command: list[str]) -> str | None:
     return completed.stdout
 
 
-def _pi_models(*, fetch: bool) -> tuple[ModelOption, ...]:
-    cached = _cached_models("pi")
+def _pi_models(
+    *, fetch: bool, force_refresh: bool = False,
+) -> tuple[ModelOption, ...]:
+    cached = None if force_refresh else _cached_models("pi")
     if cached is not None or not fetch:
         return cached or ()
     from .cli_bin import resolve_pi_bin
@@ -220,8 +224,10 @@ def _pi_models(*, fetch: bool) -> tuple[ModelOption, ...]:
     return _store_models("pi", tuple(models))
 
 
-def _opencode_models(*, fetch: bool) -> tuple[ModelOption, ...]:
-    cached = _cached_models("opencode")
+def _opencode_models(
+    *, fetch: bool, force_refresh: bool = False,
+) -> tuple[ModelOption, ...]:
+    cached = None if force_refresh else _cached_models("opencode")
     if cached is not None or not fetch:
         return cached or ()
     from .cli_bin import resolve_opencode_bin
@@ -291,25 +297,40 @@ def _store_models(
     return models
 
 
-def provider_models(harness: str, *, fetch: bool = False) -> list[ModelOption]:
+def provider_models(
+    harness: str,
+    *,
+    fetch: bool = False,
+    force_refresh: bool = False,
+) -> list[ModelOption]:
     """Selectable models for ``harness``: daemon-default + aliases +
     concrete versions.
 
-    ``fetch`` only affects claude-code: when True it may hit
-    ``/v1/models`` synchronously (use off the UI thread — see
-    ``prefetch``); when False it serves the cache or the static
-    fallback without blocking. codex reads its local cache; the rest
-    are static.
+    ``fetch`` may synchronously refresh a dynamic backend (Claude, Pi, or
+    OpenCode; use off the UI thread — see ``prefetch``).  ``force_refresh`` is
+    reserved for admission: it bypasses the display TTL so the user's earlier
+    UI snapshot is never reused as authorization truth.  Stale-cache fallback
+    remains available when a backend itself cannot be reached.
     """
     if harness == "claude-code":
         # General aliases (opus/sonnet) sort after the concrete versions.
-        return [_DAEMON_DEFAULT, *_claude_concrete(fetch=fetch), *_CLAUDE_ALIASES]
+        return [
+            _DAEMON_DEFAULT,
+            *_claude_concrete(fetch=fetch, force_refresh=force_refresh),
+            *_CLAUDE_ALIASES,
+        ]
     if harness == "codex":
         return [_DAEMON_DEFAULT, *_codex_models()]
     if harness == "pi":
-        return [_DAEMON_DEFAULT, *_pi_models(fetch=fetch)]
+        return [
+            _DAEMON_DEFAULT,
+            *_pi_models(fetch=fetch, force_refresh=force_refresh),
+        ]
     if harness == "opencode":
-        return [_DAEMON_DEFAULT, *_opencode_models(fetch=fetch)]
+        return [
+            _DAEMON_DEFAULT,
+            *_opencode_models(fetch=fetch, force_refresh=force_refresh),
+        ]
     if harness == "acp":
         # Puffo's built-in ACP preset is OpenCode ACP. It accepts the default
         # model through OPENCODE_CONFIG_CONTENT, but ACP v1 has no standard
@@ -318,7 +339,10 @@ def provider_models(harness: str, *, fetch: bool = False) -> list[ModelOption]:
             _DAEMON_DEFAULT,
             *(
                 ModelOption(option.id, option.label, option.is_alias)
-                for option in _opencode_models(fetch=fetch)
+                for option in _opencode_models(
+                    fetch=fetch,
+                    force_refresh=force_refresh,
+                )
             ),
         ]
     return [_DAEMON_DEFAULT, *_STATIC.get(harness, ())]

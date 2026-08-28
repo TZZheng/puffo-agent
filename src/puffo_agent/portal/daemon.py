@@ -1052,9 +1052,10 @@ def _validate_daemon_refresh_model(harness: str, model: str) -> None:
     }[harness]
     if resolver() is None:
         raise ValueError(f"harness={harness!r} CLI not installed on host")
-    from ..agent.model_catalog import provider_models
+    from ..agent.harness.registry import DEFAULT_HARNESS_REGISTRY
 
-    supported = [m.id for m in provider_models(harness) if m.id]
+    snapshot = DEFAULT_HARNESS_REGISTRY.catalog_service.refresh(harness)
+    supported = [m.id for m in snapshot.models if m.id]
     if model not in supported:
         raise ValueError(
             f"model={model!r} not supported by harness={harness!r}; "

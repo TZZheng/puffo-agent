@@ -21,6 +21,13 @@ from .pi_driver import (
     PiToolBridgeUnavailableError,
     verify_pi_tool_bridge,
 )
+from .registry import (
+    CatalogService,
+    DEFAULT_HARNESS_REGISTRY,
+    HarnessRegistry,
+    SelectionPolicy,
+    ValidatedSelection,
+)
 
 @dataclass(frozen=True)
 class UnsupportedDriver:
@@ -33,19 +40,9 @@ def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
 
     Process placement is supplied separately through ``process_factory``.
     """
-    if name == "codex":
-        return CodexAppServerDriver(**kwargs)
-    if name == "opencode":
-        return OpenCodeDriver(**kwargs)
-    if name == "acp":
-        return AcpDriver(**kwargs)
-    if name == "pi":
-        # Admission remains fail-closed in PiDriver.open(): every spawned Pi
-        # process must load and attest the shipped Puffo tool bridge.
-        return PiDriver(**kwargs)
-    if not name or name == "claude-code":
-        return ClaudeCodeCliDriver(**kwargs)
-    return UnsupportedDriver(name)
+    effective = name or "claude-code"
+    driver = DEFAULT_HARNESS_REGISTRY.build_driver(effective, **kwargs)
+    return driver if driver is not None else UnsupportedDriver(effective)
 
 
 __all__ = [
@@ -68,5 +65,9 @@ __all__ = [
     "PI_CAPABILITIES",
     "PiToolBridgeUnavailableError",
     "verify_pi_tool_bridge",
+    "CatalogService",
+    "HarnessRegistry",
+    "SelectionPolicy",
+    "ValidatedSelection",
     "build_driver",
 ]

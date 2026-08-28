@@ -57,8 +57,9 @@ def _validate_refresh_model(harness: str, model: Optional[str]) -> None:
             f"harness={harness!r} not installed on host — the CLI "
             "binary is missing from PATH."
         )
-    from ..agent.model_catalog import provider_models
-    supported = [m.id for m in provider_models(harness) if m.id]
+    from ..agent.harness.registry import DEFAULT_HARNESS_REGISTRY
+    snapshot = DEFAULT_HARNESS_REGISTRY.catalog_service.refresh(harness)
+    supported = [m.id for m in snapshot.models if m.id]
     if (model or "") not in supported:
         raise RuntimeError(
             f"model={model!r} not supported by harness={harness!r}; "

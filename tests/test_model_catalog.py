@@ -10,6 +10,7 @@ import pytest
 
 from puffo_agent.agent import model_catalog as mc
 from puffo_agent.agent.model_catalog import ModelOption, provider_models
+from puffo_agent.agent.harness import registry as harness_registry
 
 
 @pytest.fixture(autouse=True)
@@ -228,3 +229,51 @@ def test_stale_cache_served_when_refetch_fails(monkeypatch):
     monkeypatch.setattr(mc, "_fetch_anthropic_models", lambda: None)  # refetch fails
     ids = _ids(provider_models("claude-code", fetch=True))
     assert "claude-x" in ids  # stale cache served, not the static fallback
+
+
+def test_admission_refresh_does_not_trust_display_snapshot(monkeypatch):
+    calls: list[tuple[bool, bool]] = []
+
+    def _models(_harness, *, fetch=False, force_refresh=False):
+        calls.append((fetch, force_refresh))
+        levels = ("low",) if force_refresh else ("high",)
+        return [ModelOption("openai/gpt", "GPT", supported_inference_levels=levels)]
+
+    monkeypatch.setattr(mc, "provider_models", _models)
+    service = harness_registry.CatalogService()
+    stale = service.display_snapshot("opencode")
+    assert stale.models[0].supported_inference_levels == ("high",)
+
+    registry = harness_registry.HarnessRegistry(catalog_service=service)
+    with pytest.raises(ValueError, match=r"expected one of \['low'\]"):
+        registry.admit_selection(
+            "opencode", model="openai/gpt", inference_level="high",
+        )
+    assert calls == [(False, False), (True, True)]
+
+
+def test_selection_policy_keeps_pi_opencode_unknown_model_asymmetry(monkeypatch):
+    monkeypatch.setattr(
+        mc,
+        "provider_models",
+        lambda *_args, **_kwargs: [],
+    )
+    registry = harness_registry.HarnessRegistry()
+    pi = registry.admit_selection(
+        "pi", model="custom/model", inference_level="high",
+    )
+    assert pi.supported_inference_levels == mc._PI_THINKING_LEVELS
+    with pytest.raises(ValueError, match=r"expected one of \[\]"):
+        registry.admit_selection(
+            "opencode", model="custom/model", inference_level="high",
+        )
+
+
+def test_global_harness_registry_is_literal_and_immutable():
+    assert tuple(harness_registry.HARNESS_DEFINITIONS) == mc.KNOWN_HARNESSES
+    with pytest.raises(TypeError):
+        harness_registry.HARNESS_DEFINITIONS["dynamic"] = (  # type: ignore[index]
+            harness_registry.HarnessDefinition(
+                harness_registry.SelectionPolicy(), None,
+            )
+        )

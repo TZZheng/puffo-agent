@@ -482,7 +482,8 @@ def build_capabilities() -> dict:
         resolve_opencode_bin,
         resolve_pi_bin,
     )
-    from ...agent.model_catalog import KNOWN_HARNESSES, provider_models
+    from ...agent.harness.registry import DEFAULT_HARNESS_REGISTRY
+    from ...agent.model_catalog import KNOWN_HARNESSES
 
     import importlib.metadata
 
@@ -506,11 +507,11 @@ def build_capabilities() -> dict:
                 {"id": o.id, "label": o.label, "alias": o.is_alias}
                 | ({"supported_inference_levels": list(o.supported_inference_levels)}
                    if o.supported_inference_levels else {})
-                for o in provider_models(
+                for o in DEFAULT_HARNESS_REGISTRY.catalog_service.display_snapshot(
                     h,
-                    fetch=(h == "claude-code" and claude_ready)
+                    warm=(h == "claude-code" and claude_ready)
                     or (h in {"pi", "opencode", "acp"} and cli_tools[h] == "ready"),
-                )
+                ).models
                 if o.id
             ],
         }

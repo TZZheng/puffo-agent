@@ -41,17 +41,12 @@ PI_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
 def supported_inference_levels(harness: str) -> tuple[str, ...]:
     """Reasoning-effort values implemented by a specific harness."""
-    if harness == "codex":
-        return REASONING_EFFORTS
-    if harness == "claude-code":
-        return INFERENCE_LEVELS
-    if harness == "pi":
-        return PI_THINKING_LEVELS
-    # OpenCode variants are model-specific. Admission validates them against
-    # the selected model catalog instead of pretending there is one global set.
-    if harness == "opencode":
-        return ("minimal", "low", "medium", "high", "xhigh", "max")
-    return ()
+    # Lazy import avoids coupling Driver modules back into config at import
+    # time.  The literal registry remains the single policy source.
+    from ..agent.harness.registry import HARNESS_DEFINITIONS
+
+    definition = HARNESS_DEFINITIONS.get(harness)
+    return definition.selection_policy.supported_levels if definition else ()
 
 
 def validate_inference_for_model(
@@ -64,23 +59,14 @@ def validate_inference_for_model(
     absent from its credential-filtered list we retain its documented CLI
     levels so custom provider configuration remains usable.
     """
-    levels = supported_inference_levels(harness)
-    if not inference_level or harness not in {"pi", "opencode"}:
-        return levels
-    from ..agent.model_catalog import provider_models
+    from ..agent.harness.registry import DEFAULT_HARNESS_REGISTRY
 
-    catalog = provider_models(harness, fetch=True)
-    selected = next((item for item in catalog if item.id == model), None)
-    if selected is not None:
-        levels = selected.supported_inference_levels
-    elif harness == "opencode":
-        levels = ()
-    if inference_level not in levels:
-        raise ValueError(
-            f"inference_level={inference_level!r} not supported by "
-            f"model={model!r} on harness={harness!r}; expected one of {list(levels)}"
-        )
-    return levels
+    selection = DEFAULT_HARNESS_REGISTRY.admit_selection(
+        harness,
+        model=model,
+        inference_level=inference_level,
+    )
+    return selection.supported_inference_levels
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 

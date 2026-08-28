@@ -11,7 +11,8 @@ from typing import Any
 from ...crypto.canonical import canonicalize_for_signing
 from ...crypto.encoding import base64url_decode
 from ...crypto.primitives import ed25519_verify
-from ...mcp.config import supported_inference_levels, validate_inference_for_model
+from ...agent.harness.registry import DEFAULT_HARNESS_REGISTRY, ValidatedSelection
+from ...mcp.config import supported_inference_levels
 from ..host_assets import _atomic_write_private, _ensure_private_directory
 from ..runtime_matrix import (
     RUNTIME_CLI_LOCAL,
@@ -229,41 +230,78 @@ def _verify_runtime(runtime_input: dict) -> RuntimeConfig:
         inference_level = normalize_inference_level(
             kind, provider, harness, inference_level
         )
-    runtime = RuntimeConfig(
-        kind=kind,
-        provider=provider,
-        model=str(runtime_input.get("model", "")),
-        api_key=str(runtime_input.get("api_key", "")),
-        harness=harness,
-        harness_command=list(harness_command),
-        permission_mode=str(runtime_input.get("permission_mode", "bypassPermissions")),
-        inference_level=inference_level,
-        max_turns=int(runtime_input.get("max_turns", 10)),
-    )
-    validation = validate_triple(runtime.kind, runtime.provider, runtime.harness)
+    validation = validate_triple(kind, provider, harness)
     if not validation.ok:
         raise ProvisionError(f"runtime: {validation.error}")
-    if runtime.kind == RUNTIME_CLI_LOCAL and runtime.harness == "acp" and not runtime.harness_command:
+    if kind == RUNTIME_CLI_LOCAL and harness == "acp" and not harness_command:
         raise ProvisionError(
             "runtime.harness_command is required when runtime.harness='acp'"
         )
     effective_harness = resolve_effective_harness(
-        runtime.kind,
-        resolve_effective_provider(runtime.kind, runtime.provider),
-        runtime.harness,
+        kind,
+        resolve_effective_provider(kind, provider),
+        harness,
     )
     levels = supported_inference_levels(effective_harness)
-    if runtime.inference_level and runtime.inference_level not in levels:
+    if inference_level and inference_level not in levels:
         raise ProvisionError(
             "runtime.inference_level must be one of: " + ", ".join(levels)
         )
-    try:
-        validate_inference_for_model(
-            effective_harness, runtime.model, runtime.inference_level,
+    if effective_harness:
+        try:
+            selection = DEFAULT_HARNESS_REGISTRY.admit_selection(
+                effective_harness,
+                model=str(runtime_input.get("model", "")),
+                inference_level=inference_level,
+            )
+        except ValueError as exc:
+            raise ProvisionError(str(exc)) from exc
+    else:
+        # Non-Driver runtimes (for example ws-local) have no harness catalog.
+        # They still cross the same typed materialization boundary.
+        selection = ValidatedSelection(
+            harness="",
+            model=str(runtime_input.get("model", "")),
+            inference_level=inference_level,
+            supported_inference_levels=(),
+            admitted_at=time.time(),
         )
-    except ValueError as exc:
-        raise ProvisionError(str(exc)) from exc
-    return runtime
+    return _runtime_from_validated_selection(
+        selection,
+        kind=kind,
+        provider=provider,
+        harness=harness,
+        harness_command=harness_command,
+        runtime_input=runtime_input,
+    )
+
+
+def _runtime_from_validated_selection(
+    selection: ValidatedSelection,
+    *,
+    kind: str,
+    provider: str,
+    harness: str,
+    harness_command: list[str],
+    runtime_input: dict,
+) -> RuntimeConfig:
+    """Materialize persisted config only from an admitted selection.
+
+    Keeping this constructor typed to ``ValidatedSelection`` prevents future
+    provisioning paths from accidentally bypassing catalog admission with raw
+    model/variant strings.
+    """
+    return RuntimeConfig(
+        kind=kind,
+        provider=provider,
+        model=selection.model,
+        api_key=str(runtime_input.get("api_key", "")),
+        harness=harness,
+        harness_command=list(harness_command),
+        permission_mode=str(runtime_input.get("permission_mode", "bypassPermissions")),
+        inference_level=selection.inference_level,
+        max_turns=int(runtime_input.get("max_turns", 10)),
+    )
 
 
 def _verify_desired(payload: dict) -> tuple[list[str], list[str]]:
