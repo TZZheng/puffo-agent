@@ -197,7 +197,7 @@ def test_supported_levels_are_per_harness():
     assert supported_inference_levels("codex") == REASONING_EFFORTS
     assert supported_inference_levels("claude-code") == INFERENCE_LEVELS
     assert supported_inference_levels("pi") == (
-        "minimal", "low", "medium", "high", "xhigh", "max"
+        "off", "minimal", "low", "medium", "high", "xhigh", "max"
     )
     assert supported_inference_levels("opencode") == (
         "minimal", "low", "medium", "high", "xhigh", "max"
@@ -209,6 +209,12 @@ def test_supported_levels_are_per_harness():
 
 def test_supported_levels_unknown_harness_is_empty():
     assert supported_inference_levels("") == ()
+
+
+def test_pi_explicit_off_is_valid():
+    assert validate_inference_for_model("pi", "custom/provider-model", "off") == (
+        "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    )
 
 
 def test_opencode_model_validation_rejects_a_variant_from_another_model(monkeypatch):

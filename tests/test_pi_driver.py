@@ -762,6 +762,19 @@ def test_pi_launch_forwards_selected_thinking_level():
     )
 
 
+def test_pi_launch_forwards_explicit_thinking_off():
+    """Omitting --thinking is auto/default; explicit off must reach Pi."""
+    from puffo_agent.agent.harness.pi_protocol import build_pi_launch_command
+
+    spec = RuntimeSpec(
+        workspace_dir="/tmp/ws",
+        model="deepseek/deepseek-v4-flash",
+        inference_level="off",
+        executable="/bin/pi",
+    )
+    assert build_pi_launch_command(spec)[-2:] == ("--thinking", "off")
+
+
 def test_admission_refuses_when_the_bridge_is_missing(tmp_path):
     bare = tmp_path / "bare"
     (bare / "extensions").mkdir(parents=True)

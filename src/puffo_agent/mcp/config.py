@@ -33,9 +33,10 @@ INFERENCE_LEVELS = ("low", "medium", "high", "xhigh")
 # codex model_reasoning_effort values.
 REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 
-# Pi's documented --thinking values. ``off`` is represented by the empty
-# inference setting in Puffo, so only explicit effort choices are published.
-PI_THINKING_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
+# Pi's documented --thinking values. Keep ``off`` explicit: omitting the flag
+# asks Pi to use its model/default behavior and is not equivalent to disabling
+# thinking.
+PI_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def supported_inference_levels(harness: str) -> tuple[str, ...]:

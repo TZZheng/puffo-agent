@@ -92,7 +92,7 @@ KNOWN_HARNESSES: tuple[str, ...] = (
 _ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
 _CACHE_TTL_S = 3600.0
 _FETCH_TIMEOUT_S = 6.0
-_PI_THINKING_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
+_PI_THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
 
 # harness -> (fetched_at, concrete_models). Guarded by _lock.
 _cache: dict[str, tuple[float, tuple[ModelOption, ...]]] = {}
