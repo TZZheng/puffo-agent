@@ -479,6 +479,8 @@ def build_capabilities() -> dict:
         codex_has_credentials,
         resolve_claude_bin,
         resolve_codex_bin,
+        resolve_opencode_bin,
+        resolve_pi_bin,
     )
     from ...agent.model_catalog import KNOWN_HARNESSES, provider_models
 
@@ -492,6 +494,9 @@ def build_capabilities() -> dict:
     cli_tools = {
         "claude-code": cli_tool_status(resolve_claude_bin, claude_has_credentials),
         "codex": cli_tool_status(resolve_codex_bin, codex_has_credentials),
+        "pi": "ready" if resolve_pi_bin() else "not_installed",
+        "opencode": "ready" if resolve_opencode_bin() else "not_installed",
+        "acp": "ready" if resolve_opencode_bin() else "not_installed",
     }
     claude_ready = cli_tools["claude-code"] == "ready"
     providers = [
@@ -499,9 +504,12 @@ def build_capabilities() -> dict:
             "provider": h,
             "models": [
                 {"id": o.id, "label": o.label, "alias": o.is_alias}
+                | ({"supported_inference_levels": list(o.supported_inference_levels)}
+                   if o.supported_inference_levels else {})
                 for o in provider_models(
                     h,
-                    fetch=h == "claude-code" and claude_ready,
+                    fetch=(h == "claude-code" and claude_ready)
+                    or (h in {"pi", "opencode", "acp"} and cli_tools[h] == "ready"),
                 )
                 if o.id
             ],

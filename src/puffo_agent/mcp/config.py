@@ -33,6 +33,10 @@ INFERENCE_LEVELS = ("low", "medium", "high", "xhigh")
 # codex model_reasoning_effort values.
 REASONING_EFFORTS = ("minimal", "low", "medium", "high")
 
+# Pi's documented --thinking values. ``off`` is represented by the empty
+# inference setting in Puffo, so only explicit effort choices are published.
+PI_THINKING_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
+
 
 def supported_inference_levels(harness: str) -> tuple[str, ...]:
     """Reasoning-effort values implemented by a specific harness."""
@@ -40,7 +44,42 @@ def supported_inference_levels(harness: str) -> tuple[str, ...]:
         return REASONING_EFFORTS
     if harness == "claude-code":
         return INFERENCE_LEVELS
+    if harness == "pi":
+        return PI_THINKING_LEVELS
+    # OpenCode variants are model-specific. Admission validates them against
+    # the selected model catalog instead of pretending there is one global set.
+    if harness == "opencode":
+        return ("minimal", "low", "medium", "high", "xhigh", "max")
     return ()
+
+
+def validate_inference_for_model(
+    harness: str, model: str, inference_level: str,
+) -> tuple[str, ...]:
+    """Validate a selected model and return its exact accepted levels.
+
+    OpenCode variants are model-specific and an unknown/custom model provides
+    no evidence for a variant. Pi publishes a thinking yes/no bit; for models
+    absent from its credential-filtered list we retain its documented CLI
+    levels so custom provider configuration remains usable.
+    """
+    levels = supported_inference_levels(harness)
+    if not inference_level or harness not in {"pi", "opencode"}:
+        return levels
+    from ..agent.model_catalog import provider_models
+
+    catalog = provider_models(harness, fetch=True)
+    selected = next((item for item in catalog if item.id == model), None)
+    if selected is not None:
+        levels = selected.supported_inference_levels
+    elif harness == "opencode":
+        levels = ()
+    if inference_level not in levels:
+        raise ValueError(
+            f"inference_level={inference_level!r} not supported by "
+            f"model={model!r} on harness={harness!r}; expected one of {list(levels)}"
+        )
+    return levels
 
 _TOML_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 

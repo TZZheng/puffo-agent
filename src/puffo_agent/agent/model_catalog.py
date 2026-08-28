@@ -4,14 +4,15 @@ Each harness exposes selectable models = aliases (the CLI resolves
 these to the latest model in the family at runtime, so they never go
 stale) + concrete versions. claude-code refreshes its concrete list
 from the live, account-authoritative ``/v1/models`` — so new models
-appear without a code change; codex reads its local CLI cache; the rest
-are static.
+appear without a code change; codex reads its local CLI cache; Pi and
+OpenCode query their installed CLIs; the rest are static.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import threading
 import time
 import urllib.error
@@ -27,6 +28,7 @@ class ModelOption:
     id: str  # the ``--model`` value; "" means the daemon default
     label: str  # combo-box display text
     is_alias: bool = False
+    supported_inference_levels: tuple[str, ...] = ()
 
 
 _DAEMON_DEFAULT = ModelOption("", "(daemon default)")
@@ -82,14 +84,17 @@ _STATIC: dict[str, tuple[ModelOption, ...]] = {
     ),
 }
 
-# Harnesses the catalog can answer for (claude-code + codex are dynamic).
-KNOWN_HARNESSES: tuple[str, ...] = ("claude-code", "codex", "gemini-cli", "hermes")
+# Harnesses the catalog can answer for.
+KNOWN_HARNESSES: tuple[str, ...] = (
+    "claude-code", "codex", "pi", "opencode", "acp", "gemini-cli", "hermes"
+)
 
 _ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
 _CACHE_TTL_S = 3600.0
 _FETCH_TIMEOUT_S = 6.0
+_PI_THINKING_LEVELS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
-# "claude-code" -> (fetched_at, concrete_models). Guarded by _lock.
+# harness -> (fetched_at, concrete_models). Guarded by _lock.
 _cache: dict[str, tuple[float, tuple[ModelOption, ...]]] = {}
 _lock = threading.Lock()
 
@@ -172,6 +177,120 @@ def _codex_models() -> tuple[ModelOption, ...]:
     return out or _CODEX_STATIC
 
 
+def _run_catalog_command(command: list[str]) -> str | None:
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=_FETCH_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("model catalog command failed: %s", exc)
+        return None
+    if completed.returncode != 0:
+        logger.debug("model catalog command exited %s", completed.returncode)
+        return None
+    return completed.stdout
+
+
+def _pi_models(*, fetch: bool) -> tuple[ModelOption, ...]:
+    cached = _cached_models("pi")
+    if cached is not None or not fetch:
+        return cached or ()
+    from .cli_bin import resolve_pi_bin
+
+    executable = resolve_pi_bin()
+    output = _run_catalog_command([executable, "--list-models"]) if executable else None
+    if not output:
+        return _stale_models("pi")
+    models: list[ModelOption] = []
+    for line in output.splitlines()[1:]:
+        columns = line.split()
+        if len(columns) < 6:
+            continue
+        provider, model = columns[0], columns[1]
+        thinking = columns[-2].lower() == "yes"
+        models.append(ModelOption(
+            f"{provider}/{model}",
+            f"{model} ({provider})",
+            supported_inference_levels=_PI_THINKING_LEVELS if thinking else (),
+        ))
+    return _store_models("pi", tuple(models))
+
+
+def _opencode_models(*, fetch: bool) -> tuple[ModelOption, ...]:
+    cached = _cached_models("opencode")
+    if cached is not None or not fetch:
+        return cached or ()
+    from .cli_bin import resolve_opencode_bin
+
+    executable = resolve_opencode_bin()
+    output = _run_catalog_command([executable, "models", "--verbose"]) if executable else None
+    if not output:
+        return _stale_models("opencode")
+    decoder = json.JSONDecoder()
+    models: list[ModelOption] = []
+    offset = 0
+    while True:
+        start = output.find("{", offset)
+        if start < 0:
+            break
+        try:
+            item, end = decoder.raw_decode(output, start)
+        except ValueError:
+            offset = start + 1
+            continue
+        offset = end
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("providerID") or "")
+        model_id = str(item.get("id") or "")
+        if not provider or not model_id:
+            continue
+        variants = item.get("variants") or {}
+        if isinstance(variants, dict):
+            levels = tuple(str(value) for value in variants if value)
+        elif isinstance(variants, list):
+            levels = tuple(
+                str(value.get("id")) for value in variants
+                if isinstance(value, dict) and value.get("id")
+            )
+        else:
+            levels = ()
+        models.append(ModelOption(
+            f"{provider}/{model_id}",
+            str(item.get("name") or model_id),
+            supported_inference_levels=levels,
+        ))
+    return _store_models("opencode", tuple(models))
+
+
+def _cached_models(harness: str) -> tuple[ModelOption, ...] | None:
+    now = time.time()
+    with _lock:
+        cached = _cache.get(harness)
+    if cached and now - cached[0] < _CACHE_TTL_S:
+        return cached[1]
+    return None
+
+
+def _stale_models(harness: str) -> tuple[ModelOption, ...]:
+    with _lock:
+        cached = _cache.get(harness)
+    return cached[1] if cached else ()
+
+
+def _store_models(
+    harness: str, models: tuple[ModelOption, ...]
+) -> tuple[ModelOption, ...]:
+    if models:
+        with _lock:
+            _cache[harness] = (time.time(), models)
+    return models
+
+
 def provider_models(harness: str, *, fetch: bool = False) -> list[ModelOption]:
     """Selectable models for ``harness``: daemon-default + aliases +
     concrete versions.
@@ -187,15 +306,33 @@ def provider_models(harness: str, *, fetch: bool = False) -> list[ModelOption]:
         return [_DAEMON_DEFAULT, *_claude_concrete(fetch=fetch), *_CLAUDE_ALIASES]
     if harness == "codex":
         return [_DAEMON_DEFAULT, *_codex_models()]
+    if harness == "pi":
+        return [_DAEMON_DEFAULT, *_pi_models(fetch=fetch)]
+    if harness == "opencode":
+        return [_DAEMON_DEFAULT, *_opencode_models(fetch=fetch)]
+    if harness == "acp":
+        # Puffo's built-in ACP preset is OpenCode ACP. It accepts the default
+        # model through OPENCODE_CONFIG_CONTENT, but ACP v1 has no standard
+        # inference/variant field, so deliberately strip those levels.
+        return [
+            _DAEMON_DEFAULT,
+            *(
+                ModelOption(option.id, option.label, option.is_alias)
+                for option in _opencode_models(fetch=fetch)
+            ),
+        ]
     return [_DAEMON_DEFAULT, *_STATIC.get(harness, ())]
 
 
 def prefetch() -> threading.Thread:
-    """Warm the claude-code live list in a background thread (call once
+    """Warm dynamic model lists in a background thread (call once
     at UI/daemon start so later ``provider_models`` reads hit cache).
     Returns the thread; callers may ignore it."""
     t = threading.Thread(
-        target=lambda: provider_models("claude-code", fetch=True),
+        target=lambda: [
+            provider_models(harness, fetch=True)
+            for harness in ("claude-code", "pi", "opencode")
+        ],
         daemon=True,
     )
     t.start()

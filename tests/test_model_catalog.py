@@ -106,6 +106,41 @@ def test_unknown_harness_is_just_default():
     assert provider_models("nope") == [mc._DAEMON_DEFAULT]
 
 
+def test_pi_catalog_publishes_canonical_models_and_thinking_levels(monkeypatch):
+    """Regression: Pi's live model table must not disappear from capabilities."""
+    monkeypatch.setattr(
+        "puffo_agent.agent.cli_bin.resolve_pi_bin", lambda: "/bin/pi"
+    )
+    monkeypatch.setattr(mc, "_run_catalog_command", lambda _command: """provider  model  context  max-out  thinking  images
+deepseek  deepseek-v4-flash  1M  384K  yes  no
+local  tiny  8K  2K  no  no
+""")
+    opts = provider_models("pi", fetch=True)
+    assert _ids(opts)[1:] == ["deepseek/deepseek-v4-flash", "local/tiny"]
+    assert opts[1].supported_inference_levels == mc._PI_THINKING_LEVELS
+    assert opts[2].supported_inference_levels == ()
+
+
+def test_opencode_catalog_keeps_model_specific_variants(monkeypatch):
+    """Regression: OpenCode variants must not be flattened to one fake set."""
+    monkeypatch.setattr(
+        "puffo_agent.agent.cli_bin.resolve_opencode_bin", lambda: "/bin/opencode"
+    )
+    monkeypatch.setattr(mc, "_run_catalog_command", lambda _command: """openai/gpt-5
+{"id":"gpt-5","providerID":"openai","name":"GPT-5","variants":{"low":{},"high":{},"max":{}}}
+anthropic/sonnet
+{"id":"sonnet","providerID":"anthropic","name":"Sonnet","variants":{"high":{}}}
+""")
+    opts = provider_models("opencode", fetch=True)
+    assert _ids(opts)[1:] == ["openai/gpt-5", "anthropic/sonnet"]
+    assert opts[1].supported_inference_levels == ("low", "high", "max")
+    assert opts[2].supported_inference_levels == ("high",)
+
+    acp = provider_models("acp", fetch=True)
+    assert _ids(acp)[1:] == ["openai/gpt-5", "anthropic/sonnet"]
+    assert all(option.supported_inference_levels == () for option in acp)
+
+
 def test_fetch_returns_none_without_token(monkeypatch):
     monkeypatch.setattr(mc, "_anthropic_oauth_token", lambda: None)
     assert mc._fetch_anthropic_models() is None

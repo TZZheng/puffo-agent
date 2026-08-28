@@ -394,6 +394,13 @@ class LocalRuntimePreparer:
 
     def _prepare_generic_spec(self, system_prompt: str) -> RuntimeSpec:
         executable, launch_args = self._generic_launch_command()
+        from ...mcp.config import validate_inference_for_model
+
+        validate_inference_for_model(
+            self.harness_name,
+            self.model,
+            self.agent_cfg.runtime.inference_level,
+        )
         controlled: dict[str, str] = {}
         mcp_servers: tuple[McpServerSpec, ...] = ()
         is_opencode = Path(executable).name.lower() in {
@@ -408,6 +415,8 @@ class LocalRuntimePreparer:
             instruction_path.parent.mkdir(parents=True, exist_ok=True)
             instruction_path.write_text(system_prompt, encoding="utf-8")
             opencode_config["instructions"] = [str(instruction_path)]
+            if self.harness_name == "acp" and self.model:
+                opencode_config["model"] = self.model
         is_pi = self.harness_name == "pi"
         if self._puffo_core_env:
             puffo_command = default_python_executable()
@@ -462,6 +471,7 @@ class LocalRuntimePreparer:
         return RuntimeSpec(
             workspace_dir=str(self.workspace_dir),
             model=self.model,
+            inference_level=self.agent_cfg.runtime.inference_level,
             system_prompt=system_prompt,
             executable=executable,
             launch_args=tuple(launch_args),

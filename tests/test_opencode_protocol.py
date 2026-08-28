@@ -50,6 +50,19 @@ def test_run_command_resumes_by_session_and_keeps_prompt_positional():
     )
 
 
+def test_run_command_forwards_selected_model_variant():
+    """Regression: saving inference must change the OpenCode child command."""
+    spec = RuntimeSpec(
+        workspace_dir="/workspace",
+        model="openai/gpt-5",
+        inference_level="high",
+        executable="/bin/opencode",
+    )
+    command = build_opencode_run_command(spec, prompt="hello")
+    assert command[-5:] == (
+        "openai/gpt-5", "--variant", "high", "--auto", "hello"
+    )
+
 def test_text_frame_emits_one_completed_output_block():
     frame = {
         "type": "text",
@@ -135,4 +148,3 @@ def test_step_finish_updates_usage_but_is_not_turn_terminal():
         "cache_read_tokens": 8,
         "cache_write_tokens": 1,
     }
-

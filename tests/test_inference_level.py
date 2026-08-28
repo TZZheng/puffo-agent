@@ -179,7 +179,10 @@ def test_docker_claude_argv_skips_invalid(tmp_path, monkeypatch):
 # ─── inference_level via the self-serve refresh MCP ──────────
 
 
-from puffo_agent.mcp.config import supported_inference_levels  # noqa: E402
+from puffo_agent.mcp.config import (  # noqa: E402
+    supported_inference_levels,
+    validate_inference_for_model,
+)
 from puffo_agent.mcp.puffo_core_server import (  # noqa: E402
     _validate_refresh_inference_level,
 )
@@ -193,6 +196,12 @@ from puffo_agent.portal.state import refresh_model_flag_path  # noqa: E402
 def test_supported_levels_are_per_harness():
     assert supported_inference_levels("codex") == REASONING_EFFORTS
     assert supported_inference_levels("claude-code") == INFERENCE_LEVELS
+    assert supported_inference_levels("pi") == (
+        "minimal", "low", "medium", "high", "xhigh", "max"
+    )
+    assert supported_inference_levels("opencode") == (
+        "minimal", "low", "medium", "high", "xhigh", "max"
+    )
     # codex has minimal but not xhigh; claude-code the reverse.
     assert "xhigh" not in supported_inference_levels("codex")
     assert "minimal" not in supported_inference_levels("claude-code")
@@ -200,6 +209,23 @@ def test_supported_levels_are_per_harness():
 
 def test_supported_levels_unknown_harness_is_empty():
     assert supported_inference_levels("") == ()
+
+
+def test_opencode_model_validation_rejects_a_variant_from_another_model(monkeypatch):
+    """Regression: a global effort list must not admit a model-invalid variant."""
+    from puffo_agent.agent.model_catalog import ModelOption
+
+    monkeypatch.setattr(
+        "puffo_agent.agent.model_catalog.provider_models",
+        lambda *_args, **_kwargs: [
+            ModelOption("openai/gpt", "GPT", supported_inference_levels=("low", "high")),
+        ],
+    )
+    assert validate_inference_for_model("opencode", "openai/gpt", "high") == (
+        "low", "high",
+    )
+    with pytest.raises(ValueError, match="expected one of.*low.*high"):
+        validate_inference_for_model("opencode", "openai/gpt", "max")
 
 
 @pytest.mark.parametrize(

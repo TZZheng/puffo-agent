@@ -11,7 +11,7 @@ from typing import Any
 from ...crypto.canonical import canonicalize_for_signing
 from ...crypto.encoding import base64url_decode
 from ...crypto.primitives import ed25519_verify
-from ...mcp.config import supported_inference_levels
+from ...mcp.config import supported_inference_levels, validate_inference_for_model
 from ..host_assets import _atomic_write_private, _ensure_private_directory
 from ..runtime_matrix import (
     RUNTIME_CLI_LOCAL,
@@ -257,6 +257,12 @@ def _verify_runtime(runtime_input: dict) -> RuntimeConfig:
         raise ProvisionError(
             "runtime.inference_level must be one of: " + ", ".join(levels)
         )
+    try:
+        validate_inference_for_model(
+            effective_harness, runtime.model, runtime.inference_level,
+        )
+    except ValueError as exc:
+        raise ProvisionError(str(exc)) from exc
     return runtime
 
 

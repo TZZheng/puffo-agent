@@ -249,6 +249,7 @@ async def test_generic_runtime_projects_puffo_tools(
             provider="anthropic",
             harness=harness,
             harness_command=command,
+            model="openai/gpt-live" if harness == "acp" else "",
         ),
         puffo_core=PuffoCoreConfig(
             server_url="http://localhost:3000",
@@ -277,6 +278,7 @@ async def test_generic_runtime_projects_puffo_tools(
         ]
     else:
         assert "mcp" not in inline
+        assert inline["model"] == "openai/gpt-live"
 
 
 @pytest.mark.asyncio

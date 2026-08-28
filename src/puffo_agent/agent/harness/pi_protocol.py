@@ -63,6 +63,8 @@ def build_pi_launch_command(spec: RuntimeSpec) -> tuple[str, ...]:
     command = [spec.executable or "pi", "--mode", "rpc"]
     if spec.model:
         command.extend(("--model", spec.model))
+    if spec.inference_level:
+        command.extend(("--thinking", spec.inference_level))
     command.extend(spec.launch_args)
     return tuple(command)
 

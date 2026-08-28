@@ -746,6 +746,22 @@ def test_pi_is_selectable_now_that_admission_verifies_the_bridge():
     assert isinstance(build_driver("pi"), PiDriver)
 
 
+def test_pi_launch_forwards_selected_thinking_level():
+    """Regression: saving Pi inference must change the persistent child argv."""
+    from puffo_agent.agent.harness.pi_protocol import build_pi_launch_command
+
+    spec = RuntimeSpec(
+        workspace_dir="/tmp/ws",
+        model="deepseek/deepseek-v4-flash",
+        inference_level="xhigh",
+        executable="/bin/pi",
+    )
+    assert build_pi_launch_command(spec) == (
+        "/bin/pi", "--mode", "rpc", "--model",
+        "deepseek/deepseek-v4-flash", "--thinking", "xhigh",
+    )
+
+
 def test_admission_refuses_when_the_bridge_is_missing(tmp_path):
     bare = tmp_path / "bare"
     (bare / "extensions").mkdir(parents=True)

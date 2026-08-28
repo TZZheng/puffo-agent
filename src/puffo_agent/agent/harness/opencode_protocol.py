@@ -31,6 +31,8 @@ def build_opencode_run_command(
     ]
     if spec.model:
         command.extend(("--model", spec.model))
+    if spec.inference_level:
+        command.extend(("--variant", spec.inference_level))
     if native_session_id:
         command.extend(("--session", native_session_id))
     if spec.permission_mode == "bypassPermissions":
@@ -157,4 +159,3 @@ def _nonnegative_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
-

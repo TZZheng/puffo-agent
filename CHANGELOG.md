@@ -6,6 +6,20 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Pi, OpenCode, and the built-in OpenCode ACP preset now publish live model
+  catalogs to linked clients. OpenCode entries include their model-specific
+  variants, and Pi entries identify models that support thinking levels.
+
+### Changed
+
+- Pi forwards the selected inference level through `--thinking`; OpenCode
+  forwards it through `--variant` and rejects variants outside the selected
+  model's catalog. The OpenCode ACP preset applies its selected default model
+  through `OPENCODE_CONFIG_CONTENT` but does not claim unsupported ACP v1
+  inference controls.
+
 ## [2.0.2] - 2026-08-25
 
 ### Fixed
