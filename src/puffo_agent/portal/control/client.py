@@ -480,11 +480,14 @@ async def _sleep_or_stop(stop: asyncio.Event, timeout: float) -> None:
 def build_capabilities() -> dict:
     """Return CLI authentication and model capabilities for the portal."""
     from ...agent.cli_bin import (
+        HarnessReadiness,
         claude_has_credentials,
-        cli_tool_status,
         codex_has_credentials,
+        harness_readiness,
         resolve_claude_bin,
         resolve_codex_bin,
+        resolve_opencode_bin,
+        resolve_pi_bin,
     )
     from ...agent.model_catalog import KNOWN_HARNESSES, provider_models
 
@@ -495,10 +498,24 @@ def build_capabilities() -> dict:
     except Exception:  # noqa: BLE001
         daemon_version = ""
 
-    cli_tools = {
-        "claude-code": cli_tool_status(resolve_claude_bin, claude_has_credentials),
-        "codex": cli_tool_status(resolve_codex_bin, codex_has_credentials),
+    readiness = {
+        "claude-code": harness_readiness(resolve_claude_bin, claude_has_credentials),
+        "codex": harness_readiness(resolve_codex_bin, codex_has_credentials),
+        # pi/opencode have no local credential store this daemon can
+        # inspect: three-state says so (degraded/credentials_unknown)
+        # instead of the old constant-True "ready".
+        "pi": harness_readiness(resolve_pi_bin, None),
+        "opencode": harness_readiness(resolve_opencode_bin, None),
+        # The ACP driver targets whatever executable the agent config
+        # names (gemini, kimi, opencode …), so no single binary probe can
+        # stand for it; admission is checked per-target at creation time.
+        "acp": HarnessReadiness("degraded", "target_probe_required", "ready"),
     }
+    cli_tools = {name: r.legacy for name, r in readiness.items()}
+    # Frozen wire quirk, kept byte-stable for old portal consumers: the
+    # legacy "acp" value has always been the *opencode* binary's status.
+    # New consumers read harness_readiness and must not inherit this.
+    cli_tools["acp"] = harness_readiness(resolve_opencode_bin, None).legacy
     claude_ready = cli_tools["claude-code"] == "ready"
     providers = [
         {
@@ -514,7 +531,15 @@ def build_capabilities() -> dict:
         }
         for h in KNOWN_HARNESSES
     ]
-    return {"cli_tools": cli_tools, "providers": providers, "daemon_version": daemon_version}
+    return {
+        "cli_tools": cli_tools,
+        "harness_readiness": {
+            name: {"state": r.state, "reason": r.reason}
+            for name, r in readiness.items()
+        },
+        "providers": providers,
+        "daemon_version": daemon_version,
+    }
 
 
 class MachineControlClient:

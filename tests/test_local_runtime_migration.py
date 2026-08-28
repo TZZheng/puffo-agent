@@ -29,6 +29,7 @@ from puffo_agent.agent.harness.runtime_manager import (
 from puffo_agent.portal.state import (
     AgentConfig,
     DaemonConfig,
+    PuffoCoreConfig,
     RuntimeConfig,
     agent_codex_user_dir,
     agent_home_dir,
@@ -167,14 +168,207 @@ async def test_durable_session_resumes_across_prompt_refresh(
     resumed = await preparer.prepare(
         system_prompt="stable prompt",
         persisted_native_session_id="native-old",
+        persisted_native_session_harness="claude-code",
     )
     refreshed = await preparer.prepare(
         system_prompt="changed identity prompt",
         persisted_native_session_id="native-old",
+        persisted_native_session_harness="claude-code",
     )
 
     assert resumed.native_session_id == "native-old"
     assert refreshed.native_session_id == "native-old"
+
+
+@pytest.mark.asyncio
+async def test_durable_session_is_not_reused_after_harness_change(
+    puffo_home, monkeypatch,
+):
+    """A Claude session ID must never be passed to OpenCode on restart."""
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(
+        local_runtime, "resolve_opencode_bin", lambda: "/opt/bin/opencode"
+    )
+    config = AgentConfig(
+        id="swapped-to-opencode",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="openai",
+            harness="opencode",
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(
+        system_prompt="managed prompt",
+        persisted_native_session_id="claude-session-old",
+        persisted_native_session_harness="claude-code",
+    )
+
+    assert prepared.native_session_id == ""
+    assert prepared.migration_source == "harness_changed"
+
+
+@pytest.mark.asyncio
+async def test_generic_acp_command_projects_to_runtime_spec(puffo_home):
+    config = AgentConfig(
+        id="generic-acp",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="google",
+            harness="acp",
+            harness_command=["/opt/bin/gemini", "--experimental-acp"],
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(system_prompt="managed prompt")
+
+    assert prepared.harness_name == "acp"
+    assert prepared.spec.executable == "/opt/bin/gemini"
+    assert prepared.spec.launch_args == ("--experimental-acp",)
+
+
+@pytest.mark.asyncio
+async def test_opencode_uses_shared_binary_resolver(puffo_home, monkeypatch):
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(
+        local_runtime, "resolve_opencode_bin", lambda: "/opt/bin/opencode"
+    )
+    config = AgentConfig(
+        id="opencode-agent",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="anthropic",
+            harness="opencode",
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(system_prompt="managed prompt")
+
+    assert prepared.harness_name == "opencode"
+    assert prepared.spec.executable == "/opt/bin/opencode"
+    inline = json.loads(prepared.spec.environment["OPENCODE_CONFIG_CONTENT"])
+    instruction_path = Path(inline["instructions"][0])
+    assert instruction_path.read_text(encoding="utf-8") == "managed prompt"
+
+
+@pytest.mark.asyncio
+async def test_pi_uses_shared_binary_resolver(puffo_home, monkeypatch):
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(
+        local_runtime, "resolve_pi_bin", lambda: "/opt/bin/pi"
+    )
+    config = AgentConfig(
+        id="pi-agent",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="openai",
+            harness="pi",
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(system_prompt="managed prompt")
+
+    assert prepared.harness_name == "pi"
+    assert prepared.spec.executable == "/opt/bin/pi"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness", "command"),
+    [
+        ("opencode", []),
+        ("acp", ["/opt/bin/opencode", "acp"]),
+    ],
+)
+async def test_generic_runtime_projects_puffo_tools(
+    puffo_home, monkeypatch, harness, command,
+):
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(
+        local_runtime, "resolve_opencode_bin", lambda: "/opt/bin/opencode"
+    )
+    config = AgentConfig(
+        id=f"{harness}-tools",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="anthropic",
+            harness=harness,
+            harness_command=command,
+        ),
+        puffo_core=PuffoCoreConfig(
+            server_url="http://localhost:3000",
+            slug="bot-0001",
+            device_id="dev_1",
+            space_id="sp_test",
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(system_prompt="managed prompt")
+
+    assert len(prepared.spec.mcp_servers) == 1
+    server = prepared.spec.mcp_servers[0]
+    assert server.name == "puffo"
+    assert server.args == ("-m", "puffo_agent.mcp.puffo_core_server")
+    assert server.environment["PUFFO_CORE_SLUG"] == "bot-0001"
+    inline = json.loads(prepared.spec.environment["OPENCODE_CONFIG_CONTENT"])
+    instruction_path = Path(inline["instructions"][0])
+    assert instruction_path.read_text(encoding="utf-8") == "managed prompt"
+    if harness == "opencode":
+        assert inline["mcp"]["puffo"]["command"] == [
+            server.command,
+            *server.args,
+        ]
+    else:
+        assert "mcp" not in inline
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [[], ["pi"]])
+async def test_pi_runtime_uses_daemon_binary_resolver(
+    puffo_home, monkeypatch, command,
+):
+    """Web defaults and legacy bare argv must survive a service's narrow PATH."""
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(local_runtime, "resolve_pi_bin", lambda: "/opt/bin/pi")
+    config = AgentConfig(
+        id="pi-resolver",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="openai",
+            harness="pi",
+            harness_command=command,
+        ),
+        puffo_core=PuffoCoreConfig(
+            server_url="http://localhost:3000",
+            slug="bot-0001",
+            device_id="dev_1",
+            space_id="sp_test",
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(system_prompt="managed prompt")
+
+    assert prepared.harness_name == "pi"
+    assert prepared.spec.executable == "/opt/bin/pi"
+    assert prepared.spec.launch_args == ()
+    assert prepared.spec.mcp_servers == ()
 
 
 class _ResumeFallbackDriver(Driver):

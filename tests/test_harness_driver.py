@@ -1706,15 +1706,10 @@ async def test_start_turn_write_failure_leaves_no_turn_or_request_pending(
 
 
 @pytest.mark.asyncio
-async def test_codex_child_environment_merges_over_process_environment(
+async def test_codex_child_environment_does_not_reintroduce_ambient_values(
     monkeypatch,
 ):
-    """``RuntimeSpec.environment`` is a delta, not the child's whole env.
-
-    ``ClaudeCodeCliDriver`` merges it over ``os.environ``; Codex replaced the
-    environment outright, so any spec carrying only overrides would launch
-    ``codex app-server`` without PATH or HOME.
-    """
+    """The preparer supplies a complete sanitized child environment."""
     holder = {}
 
     def on_frame(frame):
@@ -1736,12 +1731,18 @@ async def test_codex_child_environment_merges_over_process_environment(
     monkeypatch.setenv("PUFFO_HARNESS_MARKER", "inherited")
     driver = CodexAppServerDriver()
     await driver.open(
-        RuntimeSpec("/workspace", environment={"CODEX_HOME": "/tmp/codex"})
+        RuntimeSpec(
+            "/workspace",
+            environment={
+                "CODEX_HOME": "/tmp/codex",
+                "PATH": os.environ["PATH"],
+            },
+        )
     )
     await driver.close()
 
     assert captured["env"]["CODEX_HOME"] == "/tmp/codex"
-    assert captured["env"]["PUFFO_HARNESS_MARKER"] == "inherited"
+    assert "PUFFO_HARNESS_MARKER" not in captured["env"]
     assert captured["env"]["PATH"] == os.environ["PATH"]
 
 

@@ -1,6 +1,7 @@
 """Protocol Drivers used by host-local and Docker Puffo runtimes."""
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Any
 
 from .driver import (
@@ -15,6 +16,22 @@ from .codex_driver import CodexAppServerDriver, CodexDriver
 from .claude_code_driver import ClaudeCodeCliDriver, ClaudeDriver
 from .opencode_driver import OpenCodeCliDriver, OpenCodeDriver
 from .acp_driver import AcpDriver, GenericAcpDriver
+from .pi_driver import (
+    PI_CAPABILITIES,
+    PiDriver,
+    PiToolBridgeUnavailableError,
+    verify_pi_tool_bridge,
+)
+
+_DRIVER_FACTORIES: dict[str, Callable[..., Driver]] = {
+    "acp": AcpDriver,
+    "claude-code": ClaudeCodeCliDriver,
+    "codex": CodexAppServerDriver,
+    "opencode": OpenCodeDriver,
+    "pi": PiDriver,
+}
+SUPPORTED_LOCAL_DRIVERS = frozenset(_DRIVER_FACTORIES)
+
 
 @dataclass(frozen=True)
 class UnsupportedDriver:
@@ -23,18 +40,14 @@ class UnsupportedDriver:
 
 
 def build_driver(name: str, **kwargs: Any) -> Driver | UnsupportedDriver:
-    """Construct only the two ratified Driver implementations.
+    """Construct only Driver implementations admitted for production use.
 
     Process placement is supplied separately through ``process_factory``.
     """
-    if name == "codex":
-        return CodexAppServerDriver(**kwargs)
-    if name == "opencode":
-        return OpenCodeDriver(**kwargs)
-    if name == "acp":
-        return AcpDriver(**kwargs)
-    if not name or name == "claude-code":
-        return ClaudeCodeCliDriver(**kwargs)
+    normalized_name = name or "claude-code"
+    factory = _DRIVER_FACTORIES.get(normalized_name)
+    if factory is not None:
+        return factory(**kwargs)
     return UnsupportedDriver(name)
 
 
@@ -46,6 +59,7 @@ __all__ = [
     "PermissionRef",
     "UnsupportedCapability",
     "UnsupportedDriver",
+    "SUPPORTED_LOCAL_DRIVERS",
     "CodexAppServerDriver",
     "CodexDriver",
     "ClaudeCodeCliDriver",
@@ -54,5 +68,9 @@ __all__ = [
     "OpenCodeDriver",
     "AcpDriver",
     "GenericAcpDriver",
+    "PiDriver",
+    "PI_CAPABILITIES",
+    "PiToolBridgeUnavailableError",
+    "verify_pi_tool_bridge",
     "build_driver",
 ]

@@ -500,10 +500,19 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
     provider = args.provider or ""
     from .runtime_matrix import resolve_effective_harness, validate_triple
 
-    harness = resolve_effective_harness(runtime_kind, provider, "")
+    harness = getattr(args, "harness", None) or resolve_effective_harness(
+        runtime_kind, provider, ""
+    )
     validation = validate_triple(runtime_kind, provider, harness)
     if not validation.ok:
         print(f"error: {validation.error}", file=sys.stderr)
+        return 2
+    harness_command = list(getattr(args, "harness_command", None) or [])
+    if runtime_kind == "cli-local" and harness == "acp" and not harness_command:
+        print(
+            "error: --harness acp requires --harness-command EXECUTABLE [ARG ...]",
+            file=sys.stderr,
+        )
         return 2
     role = (args.role or "").strip()
     role_short_raw = getattr(args, "role_short", None)
@@ -542,6 +551,7 @@ def cmd_agent_create(args: argparse.Namespace) -> int:
             api_key=args.api_key or "",
             model=args.model or "",
             harness=harness,
+            harness_command=harness_command,
         ),
         profile="profile.md",
         memory_dir="memory",
@@ -1069,6 +1079,9 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if args.harness is not None:
         cfg.runtime.harness = args.harness
         touched = True
+    if args.harness_command is not None:
+        cfg.runtime.harness_command = list(args.harness_command)
+        touched = True
     status, level_touched, inference_level_cleared = _apply_cli_inference_level(
         cfg, args
     )
@@ -1083,6 +1096,10 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
         print(f"  provider:         {cfg.runtime.provider or '(default)'}")
         print(
             f"  harness:          {cfg.runtime.harness}  (cli-local / cli-docker only)"
+        )
+        print(
+            "  harness_command:  "
+            + (" ".join(cfg.runtime.harness_command) or "(default)")
         )
         print(f"  model:            {cfg.runtime.model or '(default)'}")
         print(
@@ -1104,6 +1121,10 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if not result.ok:
         print(f"error: {result.error}", file=sys.stderr)
         return 2
+    command_error = _harness_command_error(cfg.runtime)
+    if command_error:
+        print(f"error: {command_error}", file=sys.stderr)
+        return 2
 
     cfg.save()
     print(f"agent {agent_id!r} runtime updated:")
@@ -1117,6 +1138,19 @@ def cmd_agent_runtime(args: argparse.Namespace) -> int:
     if is_daemon_alive():
         print("daemon will restart the worker on the next reconcile tick.")
     return 0
+
+
+def _harness_command_error(runtime: RuntimeConfig) -> str:
+    if (
+        runtime.kind == "cli-local"
+        and runtime.harness == "acp"
+        and not runtime.harness_command
+    ):
+        return (
+            "harness='acp' requires --harness-command "
+            "EXECUTABLE [ARG ...]"
+        )
+    return ""
 
 
 def cmd_agent_archive(args: argparse.Namespace) -> int:

@@ -113,3 +113,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "puffo_agent.portal.ui.assets" = ["*.png"]
+# The Pi tool bridge is TypeScript read at runtime and copied into the agent's
+# Pi home. Without this it is absent from an installed wheel and every Pi
+# session fails to install a bridge.
+"puffo_agent.agent.harness.pi_bridge" = ["*.ts"]
