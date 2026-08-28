@@ -21,7 +21,10 @@ from puffo_agent.agent.harness.driver import (
     TurnRef,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.local_runtime import LocalRuntimePreparer
+from puffo_agent.agent.harness.local_runtime import (
+    LocalRuntimePreparer,
+    select_native_session,
+)
 from puffo_agent.agent.harness.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
@@ -32,6 +35,7 @@ from puffo_agent.portal.state import (
     PuffoCoreConfig,
     RuntimeConfig,
     agent_codex_user_dir,
+    agent_dir,
     agent_home_dir,
     cli_session_json_path,
 )
@@ -45,6 +49,61 @@ def puffo_home(tmp_path, monkeypatch) -> Path:
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(home))
     monkeypatch.setattr(Path, "home", staticmethod(lambda: host))
     return home
+
+
+@pytest.mark.parametrize("harness_name", ["pi", "opencode", "acp"])
+def test_generic_harness_ignores_legacy_claude_session(
+    harness_name: str,
+):
+    native_session_id, migration_source = select_native_session(
+        harness_name=harness_name,
+        persisted_native_session_id="tagged-claude-session",
+        persisted_native_session_harness="claude-code",
+        legacy_native_session_id="legacy-claude-session",
+    )
+
+    assert native_session_id == ""
+    assert migration_source == "harness_changed"
+
+
+@pytest.mark.asyncio
+async def test_legacy_claude_file_cannot_reach_switched_opencode(
+    puffo_home, monkeypatch,
+):
+    import puffo_agent.agent.harness.local_runtime as local_runtime
+
+    monkeypatch.setattr(
+        local_runtime,
+        "resolve_opencode_bin",
+        lambda: "/opt/bin/opencode",
+    )
+    agent_id = "switched-agent"
+    config = AgentConfig(
+        id=agent_id,
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            harness="opencode",
+            model="deepseek/deepseek-chat",
+        ),
+    )
+    agent_dir(agent_id).mkdir(parents=True, exist_ok=True)
+    # Old Claude files can predate the model field, so model comparison
+    # cannot establish ownership of this session.
+    cli_session_json_path(agent_id).write_text(
+        json.dumps({"session_id": "claude-era-session"}),
+        encoding="utf-8",
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(
+        system_prompt="managed prompt",
+        persisted_native_session_id="claude-era-session",
+        persisted_native_session_harness="claude-code",
+    )
+
+    assert prepared.native_session_id == ""
+    assert prepared.migration_source == "harness_changed"
 
 
 @pytest.mark.asyncio

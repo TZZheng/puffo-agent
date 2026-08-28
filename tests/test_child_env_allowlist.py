@@ -89,26 +89,16 @@ def test_extra_allowed_admits_a_runtime_specific_name():
     assert env["CODEX_HOME"] == "/agents/a/.codex"
 
 
-@pytest.mark.parametrize("relpath", (
-    "src/puffo_agent/agent/harness/local_runtime.py",
-    "src/puffo_agent/agent/harness/claude_code_driver.py",
-    "src/puffo_agent/agent/harness/codex_driver.py",
-    "src/puffo_agent/agent/harness/opencode_driver.py",
-    "src/puffo_agent/agent/harness/acp_driver.py",
-))
-def test_harness_child_environment_boundary_never_rereads_ambient(relpath):
-    """Spec construction and real spawn must share one allowlist boundary.
+def _ambient_env_reads(path) -> list[int]:
+    """Line numbers where a module rebuilds the ambient child environment.
 
-    Sanitizing a RuntimeSpec is ineffective if a Driver merges ``os.environ``
-    back at spawn. SDK-owned default allowlists are also forbidden here: their
-    contents can drift independently of Puffo's credential contract.
+    Catches os.environ.copy() / dict(os.environ) / {**os.environ, ...} and
+    SDK-owned default_environment(), whose contents can drift independently
+    of Puffo's credential contract.
     """
-    path = _REPO_ROOT / relpath
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-
     offenders = []
     for node in ast.walk(tree):
-        # os.environ.copy() / dict(os.environ) / {**os.environ, ...}
         if isinstance(node, ast.Attribute) and node.attr == "environ":
             value = node.value
             if isinstance(value, ast.Name) and value.id == "os":
@@ -119,6 +109,61 @@ def test_harness_child_environment_boundary_never_rereads_ambient(relpath):
             and node.func.id == "default_environment"
         ):
             offenders.append(node.lineno)
+    return offenders
+
+
+# Modules allowed to read the ambient environment, and why. This is the whole
+# harness package rather than a list of drivers on purpose: a hand-written
+# inclusion list makes every module nobody thought of exempt by default, which
+# is the same shape as the deny-list this allowlist replaced. docker_runtime
+# was in exactly that position -- it reads os.environ and was never on the old
+# six-module list.
+AMBIENT_ENV_EXEMPTIONS = {
+    "src/puffo_agent/agent/harness/child_env.py":
+        "the allowlist boundary itself; it is what reads ambient",
+    "src/puffo_agent/agent/harness/docker_runtime.py":
+        "os.environ there is the host docker *client* env, not the agent "
+        "child's: the container's environment is set by `docker exec -e` "
+        "flags, and API keys travel by name so they stay out of argv",
+}
+
+
+def _harness_modules() -> list[str]:
+    return [
+        str(path.relative_to(_REPO_ROOT))
+        for path in sorted((_REPO_ROOT / "src/puffo_agent/agent/harness").rglob("*.py"))
+    ]
+
+
+def test_the_ambient_scan_actually_walks_the_harness_package():
+    """A directory walk that matches nothing would pass in silence."""
+    modules = _harness_modules()
+
+    assert "src/puffo_agent/agent/harness/local_runtime.py" in modules
+    assert "src/puffo_agent/agent/harness/pi_driver.py" in modules
+    assert len(modules) > 10
+
+
+@pytest.mark.parametrize("relpath", sorted(AMBIENT_ENV_EXEMPTIONS))
+def test_every_ambient_exemption_still_reads_ambient(relpath):
+    """An exemption for a module that stopped reading ambient is stale."""
+    assert _ambient_env_reads(_REPO_ROOT / relpath), (
+        f"{relpath} is exempted from the ambient-environment rule but no "
+        "longer reads os.environ; drop the exemption."
+    )
+
+
+@pytest.mark.parametrize("relpath", _harness_modules())
+def test_harness_child_environment_boundary_never_rereads_ambient(relpath):
+    """Spec construction and real spawn must share one allowlist boundary.
+
+    Sanitizing a RuntimeSpec is ineffective if a Driver merges ``os.environ``
+    back at spawn. SDK-owned default allowlists are also forbidden here: their
+    contents can drift independently of Puffo's credential contract.
+    """
+    if relpath in AMBIENT_ENV_EXEMPTIONS:
+        pytest.skip(AMBIENT_ENV_EXEMPTIONS[relpath])
+    offenders = _ambient_env_reads(_REPO_ROOT / relpath)
 
     assert not offenders, (
         f"{relpath} rebuilds ambient child env at line(s) {offenders}; "

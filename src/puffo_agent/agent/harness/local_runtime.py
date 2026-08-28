@@ -271,7 +271,12 @@ def select_native_session(
         and persisted_native_session_harness == harness_name
     ):
         return persisted_native_session_id, "runtime_event_outbox"
-    if legacy_native_session_id:
+    # Legacy session files predate generic Driver runtimes and belong only
+    # to the two harnesses that originally wrote them.  In particular,
+    # cli_session.json is a Claude Code file; feeding it to Pi/OpenCode/ACP
+    # would reintroduce a stale cross-harness resume after the tagged outbox
+    # correctly rejected the previous session.
+    if legacy_native_session_id and harness_name in {"codex", "claude-code"}:
         return legacy_native_session_id, "legacy_session_file"
     if persisted_native_session_id:
         return "", "harness_changed"
