@@ -311,6 +311,72 @@ async def test_manager_adopts_session_learned_by_per_turn_child():
 
 
 @pytest.mark.asyncio
+async def test_error_frame_detail_reaches_the_failed_turn():
+    """Provider errors stay distinguishable without leaking raw payloads."""
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda _command, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+    stream = driver.events()
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    proc.feed({
+        "type": "step_start",
+        "sessionID": "ses_1",
+        "part": {"messageID": "msg_1"},
+    })
+    await asyncio.wait_for(started, timeout=1)
+    proc.feed({
+        "type": "error",
+        "sessionID": "ses_1",
+        "error": {
+            "name": "UnknownError",
+            "data": {"message": "Unexpected server error. ref err_3bf8"},
+        },
+    })
+    proc.exit(1)
+    proc.eof()
+
+    events = await asyncio.wait_for(
+        _collect_through(stream, HarnessEventType.TURN_COMPLETED), timeout=1
+    )
+
+    failed_frame = next(
+        event
+        for event in events
+        if event.type is HarnessEventType.RUNTIME_FAILED
+    )
+    assert "Unexpected server error" in failed_frame.data.get("diagnostic", "")
+    terminal = events[-1]
+    assert terminal.data["outcome"] == "failed"
+    assert "Unexpected server error" in terminal.data.get("diagnostic", "")
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_acceptance_exit_carries_redacted_stderr_tail():
+    """Pre-acceptance stderr reaches the caller, but credentials do not."""
+    proc = _TurnProcess()
+    driver = OpenCodeDriver(lambda _command, _spec: proc)
+    await driver.open(RuntimeSpec("/workspace"))
+
+    started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
+    await asyncio.sleep(0)
+    proc.stderr.feed_data(
+        b"Session not found; rejected api_key=sk_live_abcdef1234567890\n"
+    )
+    proc.exit(1)
+    proc.eof()
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await asyncio.wait_for(started, timeout=1)
+
+    diagnostic = str(exc_info.value)
+    assert "Session not found" in diagnostic
+    assert "sk_live_abcdef1234567890" not in diagnostic
+    assert "[REDACTED]" in diagnostic
+    await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_close_kills_then_cancels_a_child_with_inherited_stdout(
     monkeypatch,
 ):

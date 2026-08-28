@@ -50,6 +50,7 @@ from ..driver import (
 )
 from .opencode_protocol import (
     build_opencode_run_command,
+    opencode_error_detail,
     normalize_opencode_frame,
 )
 from ..support.redaction import safe_provider_message
@@ -220,6 +221,7 @@ class OpenCodeDriver(Driver):
         self._active = TurnRef("")
         self._active_native_turn_id = ""
         self._turn_generation = 0
+        self._last_provider_error = ""
         self._turn_task: asyncio.Task[None] | None = None
         self._stderr_reader: asyncio.Task[bytes] | None = None
         self._accepted: asyncio.Future[tuple[str, str]] | None = None
@@ -286,6 +288,7 @@ class OpenCodeDriver(Driver):
         self._active_native_turn_id = ""
         self._provider_failed = False
         self._terminal_reason = ""
+        self._last_provider_error = ""
         self._turn_generation += 1
         generation = self._turn_generation
         self._accepted = asyncio.get_running_loop().create_future()
@@ -752,6 +755,10 @@ class OpenCodeDriver(Driver):
                     )
                     self._session_announced = True
                 self._accepted.set_result((native_session_id, native_turn_id))
+            if str(frame.get("type") or "") == "error":
+                detail = opencode_error_detail(frame)
+                if detail:
+                    self._last_provider_error = detail
             for event in normalize_opencode_frame(
                 frame,
                 session_ref=self._session_ref,
@@ -768,12 +775,31 @@ class OpenCodeDriver(Driver):
     ) -> None:
         if generation != self._turn_generation:
             return
+        # The child has exited (or been killed) by the time we get here, so
+        # its stderr is at EOF and the drain task finishes promptly. Collect
+        # the tail NOW: it often carries the only human-readable cause
+        # (e.g. "Error: Session not found") for a start that died before
+        # accepting the turn, and the exception below must include it.
+        stderr_tail = b""
+        if self._stderr_reader is not None:
+            results = await asyncio.gather(
+                self._stderr_reader, return_exceptions=True
+            )
+            self._stderr_reader = None
+            if results and isinstance(results[0], bytes):
+                stderr_tail = results[0]
+        diagnostic = self._last_provider_error
+        if not diagnostic and stderr_tail:
+            diagnostic = safe_provider_message(
+                stderr_tail.decode("utf-8", errors="replace")
+            )
         accepted = self._accepted
         if accepted is not None and not accepted.done():
+            cause = f": {diagnostic}" if diagnostic else ""
             accepted.set_exception(
                 RuntimeError(
                     "OpenCode exited before accepting the turn "
-                    f"(returncode={returncode})"
+                    f"(returncode={returncode}){cause}"
                 )
             )
         reason = self._terminal_reason
@@ -794,6 +820,8 @@ class OpenCodeDriver(Driver):
                     else "opencode_process_exit"
                 ),
             }
+            if diagnostic:
+                data["diagnostic"] = diagnostic
         else:
             type_ = HarnessEventType.TURN_COMPLETED
             data = {"outcome": "succeeded"}
@@ -813,9 +841,6 @@ class OpenCodeDriver(Driver):
                     native_turn_id=self._active_native_turn_id,
                     data=data,
                 )
-        if self._stderr_reader is not None:
-            await asyncio.gather(self._stderr_reader, return_exceptions=True)
-            self._stderr_reader = None
         self._proc = None
         self._active = TurnRef("")
         self._active_native_turn_id = ""
