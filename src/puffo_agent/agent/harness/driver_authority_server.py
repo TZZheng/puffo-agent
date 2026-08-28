@@ -209,7 +209,7 @@ class DriverAuthorityServer:
         with self._lock:
             if record.state is not _LeaseState.ISSUED:
                 return self._record_decision_locked(
-                    record, "hello", "denied", "endpoint_binding_mismatch"
+                    record, "hello", "denied", "endpoint_already_claimed"
                 )
             if self._claim_probe is not None:
                 self._claim_probe()

@@ -100,7 +100,7 @@ def test_endpoint_claim_is_single_use_and_reuse_is_audited() -> None:
         denied, fds = _request(client, {"version": 1, "op": "hello"})
         assert fds == []
         assert denied["state"] == "denied"
-        assert denied["reason_code"] == "endpoint_binding_mismatch"
+        assert denied["reason_code"] == "endpoint_already_claimed"
         assert denied["audit_id"].startswith("audit_")
         assert server.audit_records()[-1].audit_id == denied["audit_id"]
     finally:
@@ -146,10 +146,11 @@ def test_endpoint_claim_transition_cannot_be_interleaved() -> None:
             claimant.join(timeout=2)
             assert not claimant.is_alive()
 
+        assert probe_entries == 1
         assert sum("role" in response for response in responses) == 1
         denied = next(response for response in responses if "state" in response)
         assert denied["state"] == "denied"
-        assert denied["reason_code"] == "endpoint_binding_mismatch"
+        assert denied["reason_code"] == "endpoint_already_claimed"
     finally:
         release.set()
         endpoint.close()
