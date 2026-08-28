@@ -28,6 +28,7 @@ from pathlib import Path
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
+from ...tasks import spawn
 from ..errors import AgentAPIError
 from ..provider_failures import provider_failure_message
 from .driver import (
@@ -217,9 +218,10 @@ class PiDriver(Driver):
             # bridge this process never loaded.
             clear_ready_file(Path(ready_file))
         await self._start_process(spec)
-        self._reader = asyncio.create_task(self._read_loop())
-        self._stderr_reader = asyncio.create_task(
-            drain_subprocess_stream(getattr(self._proc, "stderr", None))
+        self._reader = spawn(self._read_loop(), name="pi.read_loop")
+        self._stderr_reader = spawn(
+            drain_subprocess_stream(getattr(self._proc, "stderr", None)),
+            name="pi.stderr_reader",
         )
         resumed = False
         if resume is not None and str(resume):
