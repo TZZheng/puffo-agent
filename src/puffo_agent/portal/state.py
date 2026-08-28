@@ -562,6 +562,10 @@ class RuntimeConfig:
     # ``hermes`` and ``gemini-cli`` remain named design-only values so stale
     # configs receive an explicit migration diagnostic.
     harness: str = "claude-code"
+    # cli-local generic harness argv. Required for ``acp`` so any ACP v1
+    # agent can be selected without adding a provider-specific Driver. The
+    # first item is the executable and remaining items are literal arguments.
+    harness_command: list[str] = field(default_factory=list)
     # Retained only so older agent.yml files round-trip without losing data.
     # Driver runtimes use the wall-time limit below instead.
     max_turns: int = 10
@@ -777,6 +781,24 @@ def _load_runtime_config(
             kind, resolve_effective_provider(kind, provider), harness
         )
         _validate_inference_level(agent_id, inference, effective)
+    command = raw.get("harness_command") or []
+    if not isinstance(command, list) or not all(
+        isinstance(item, str) and item for item in command
+    ):
+        raise RuntimeError(
+            f"agent {agent_id!r}: runtime.harness_command must be a list "
+            "of non-empty strings"
+        )
+    if (
+        kind == RUNTIME_CLI_LOCAL
+        and harness == "acp"
+        and not command
+        and not allow_invalid_runtime
+    ):
+        raise RuntimeError(
+            f"agent {agent_id!r}: runtime.harness='acp' requires a "
+            "non-empty runtime.harness_command argv"
+        )
     return RuntimeConfig(
         kind=kind,
         provider=provider,
@@ -791,6 +813,7 @@ def _load_runtime_config(
         permission_mode=raw.get("permission_mode", "bypassPermissions"),
         sandbox=raw.get("sandbox", "danger-full-access"),
         harness=harness,
+        harness_command=list(command),
         max_turns=int(raw.get("max_turns", 10)),
         task_timeout_seconds=float(raw.get("task_timeout_seconds", 1800.0)),
     )

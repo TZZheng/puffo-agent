@@ -153,8 +153,19 @@ def _add_agent_create(agent_sub, handlers: CommandHandlers) -> None:
     )
     create.add_argument(
         "--provider",
-        choices=["anthropic", "openai"],
+        choices=["anthropic", "google", "openai"],
         help="Model provider; selects the default harness",
+    )
+    create.add_argument(
+        "--harness",
+        choices=["acp", "claude-code", "codex", "opencode", "pi"],
+        help="Agent harness (defaults from provider)",
+    )
+    create.add_argument(
+        "--harness-command",
+        nargs="+",
+        metavar="ARGV",
+        help="cli-local ACP command argv, for example: opencode acp",
     )
     create.add_argument(
         "--api-key",
@@ -220,7 +231,7 @@ def _add_agent_runtime_parser(agent_sub, handlers: CommandHandlers) -> None:
     )
     runtime.add_argument(
         "--provider",
-        choices=["anthropic", "openai"],
+        choices=["anthropic", "google", "openai"],
         help=(
             "Model provider. anthropic (default) pairs with claude-code; "
             "openai pairs with codex on cli-local. Must match the selected "
@@ -262,17 +273,24 @@ def _add_agent_runtime_parser(agent_sub, handlers: CommandHandlers) -> None:
     )
     runtime.add_argument(
         "--harness",
-        choices=["claude-code", "codex"],
+        choices=["acp", "claude-code", "codex", "opencode", "pi"],
         help=(
             "cli-local / cli-docker: which agent engine runs inside the "
             "runtime. Claude Code pairs with Anthropic and Codex with OpenAI. "
             "Both cli-local and cli-docker use the same long-lived Drivers; "
             "cli-docker places the selected CLI in a per-Agent container. "
-            "Codex uses `codex app-server`; Claude Code uses stream-json. "
+            "Codex uses `codex app-server`; Claude Code uses stream-json; "
+            "Pi and OpenCode use their native JSON protocols. "
             "Auth comes from runtime.api_key or the matching operator-side "
             "CLI login. 'hermes' and 'gemini-cli' are "
             "design-only and rejected by config validation."
         ),
+    )
+    runtime.add_argument(
+        "--harness-command",
+        nargs="+",
+        metavar="ARGV",
+        help="cli-local harness command argv; required for generic ACP",
     )
     runtime.set_defaults(func=handlers["cmd_agent_runtime"])
 

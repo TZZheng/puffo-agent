@@ -263,6 +263,7 @@ def test_prepared_runtime_retries_transient_warm_before_releasing_gate():
         outbox = Mock()
         outbox.state.return_value = {}
         prepared = Mock()
+        prepared.harness_name = "pi"
         worker = SimpleNamespace(
             _adapter=adapter,
             _run_post_warm_gate=AsyncMock(),
@@ -288,6 +289,7 @@ def test_prepared_runtime_retries_transient_warm_before_releasing_gate():
         None,
         session_ref="logical-session",
         native_session_id="native-session",
+        native_session_harness="pi",
     )
     prepared.finalize_legacy_session_migration.assert_called_once_with()
     worker._run_post_warm_gate.assert_awaited_once_with("agent-a")
