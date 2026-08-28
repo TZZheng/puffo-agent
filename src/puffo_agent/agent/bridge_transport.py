@@ -315,10 +315,10 @@ async def _bridge_runtime_command(client, frame: dict) -> Any:
     The claimed ``operator_slug`` is checked against this client's
     configured operator; an agent with no operator configured has nobody
     who could grant runtime permissions over this wire, so it matches no
-    claim. See ``harness.runtime_commands`` for why the comparison is the
+    claim. See ``harness.runtime.runtime_commands`` for why the comparison is the
     client's to make.
     """
-    from .harness.runtime_commands import execute_runtime_command
+    from .harness.runtime.runtime_commands import execute_runtime_command
 
     command = frame.get("command")
     if not isinstance(command, dict):

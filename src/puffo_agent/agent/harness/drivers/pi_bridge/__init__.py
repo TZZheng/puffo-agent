@@ -21,7 +21,7 @@ import os
 import secrets
 from pathlib import Path
 
-from ..driver import McpServerSpec
+from ...driver import McpServerSpec
 
 BRIDGE_CONFIG_ENV = "PUFFO_PI_BRIDGE_CONFIG"
 BRIDGE_READY_FILE_ENV = "PUFFO_PI_BRIDGE_READY_FILE"

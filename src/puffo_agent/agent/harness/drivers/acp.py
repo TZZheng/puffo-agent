@@ -30,16 +30,16 @@ from acp.schema import (
     UsageUpdate,
     WaitForTerminalExitResponse,
 )
-from ...tasks import spawn
-from ..cli_bin import normalize_launch_argv
-from .cleanup_errors import (
+from ....tasks import spawn
+from ...cli_bin import normalize_launch_argv
+from ..support.cleanup_errors import (
     CLEANUP_TIMEOUT_SECONDS,
     collect_cleanup_errors,
     raise_collected_errors,
 )
-from ..provider_failures import PROVIDER_FAILURES, classify_provider_failure
+from ...provider_failures import PROVIDER_FAILURES, classify_provider_failure
 from .acp_presets import model_launch_args, operator_pinned_model
-from .driver import (
+from ..driver import (
     BusyDelivery,
     CancelCapability,
     CancelReceipt,
@@ -65,7 +65,7 @@ from .driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from .subprocess_io import (
+from ..support.subprocess_io import (
     drain_subprocess_stream_keeping_tail,
     process_group_spawn_kwargs,
     shutdown_process_tree,

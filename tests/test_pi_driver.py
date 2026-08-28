@@ -29,18 +29,18 @@ from puffo_agent.agent.harness.driver import (
     UnsupportedCapability,
 )
 from puffo_agent.agent.harness import build_driver
-from puffo_agent.agent.harness.pi_bridge import (
+from puffo_agent.agent.harness.drivers.pi_bridge import (
     BRIDGE_NONCE_ENV,
     BRIDGE_READY_FILE_ENV,
 )
-from puffo_agent.agent.harness.pi_driver import (
+from puffo_agent.agent.harness.drivers.pi import (
     PI_AGENT_DIR_ENV,
     PI_CAPABILITIES,
     PiDriver,
     PiToolBridgeUnavailableError,
     verify_pi_tool_bridge,
 )
-from puffo_agent.agent.harness.pi_protocol import (
+from puffo_agent.agent.harness.drivers.pi_protocol import (
     EXTENSION_UI_DIALOG_METHODS,
     EXTENSION_UI_FIRE_AND_FORGET_METHODS,
     build_pi_launch_command,

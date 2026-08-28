@@ -11,14 +11,14 @@ from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any
 
-from ..._proc import no_window_kwargs
-from ..errors import AgentAPIError, ProviderFailureError
-from ..provider_failures import (
+from ...._proc import no_window_kwargs
+from ...errors import AgentAPIError, ProviderFailureError
+from ...provider_failures import (
     classify_provider_failure,
     provider_failure,
     provider_failure_message,
 )
-from .driver import (
+from ..driver import (
     BusyDelivery,
     RuntimeLifecycle,
     CancelCapability,
@@ -46,7 +46,7 @@ from .driver import (
     TurnRef,
     TurnStarted,
 )
-from .jsonl_rpc import (
+from ..support.jsonl_rpc import (
     RpcFrameTooLarge,
     RpcRequestTimeout,
     await_rpc_response,
@@ -55,8 +55,8 @@ from .jsonl_rpc import (
     read_json_line,
     write_json_line,
 )
-from .subprocess_io import drain_subprocess_stream
-from ...tasks import spawn
+from ..support.subprocess_io import drain_subprocess_stream
+from ....tasks import spawn
 
 CODEX_CAPABILITIES = DriverCapabilities(
     session_resume=True,

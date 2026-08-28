@@ -3,14 +3,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from puffo_agent.agent.harness.cleanup_errors import (
+from puffo_agent.agent.harness.support.cleanup_errors import (
     CleanupTimeoutError,
     cleanup_errors,
     collect_cleanup_errors,
     raise_collected_errors,
     suppressed_primary_errors,
 )
-from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
+from puffo_agent.agent.harness.drivers.codex import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     Driver,
     HarnessEvent,
@@ -22,7 +22,7 @@ from puffo_agent.agent.harness.driver import (
     TurnRef,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.runtime_manager import (
+from puffo_agent.agent.harness.runtime.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
 )
@@ -251,7 +251,7 @@ async def test_cleanup_timeout_error_is_not_rewritten_as_collector_timeout():
 @pytest.mark.asyncio
 async def test_adapter_post_close_hook_cannot_block_close_forever(monkeypatch):
     monkeypatch.setattr(
-        "puffo_agent.agent.harness.runtime_manager.CLEANUP_TIMEOUT_SECONDS",
+        "puffo_agent.agent.harness.runtime.runtime_manager.CLEANUP_TIMEOUT_SECONDS",
         0.01,
     )
     release = asyncio.Event()

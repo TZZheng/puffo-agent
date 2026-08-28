@@ -15,7 +15,7 @@ from acp.schema import (
     TextContentBlock,
 )
 
-from puffo_agent.agent.harness.acp_driver import AcpDriver
+from puffo_agent.agent.harness.drivers.acp import AcpDriver
 from puffo_agent.agent.harness.driver import (
     HarnessEventType,
     RuntimeSpec,

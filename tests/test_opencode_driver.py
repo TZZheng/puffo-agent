@@ -8,7 +8,7 @@ import psutil
 import pytest
 
 from puffo_agent.agent.harness import build_driver
-from puffo_agent.agent.harness.cleanup_errors import cleanup_errors
+from puffo_agent.agent.harness.support.cleanup_errors import cleanup_errors
 from puffo_agent.agent.harness.driver import (
     BusyDelivery,
     HarnessEventType,
@@ -17,13 +17,13 @@ from puffo_agent.agent.harness.driver import (
     TurnInput,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.opencode_driver import (
+from puffo_agent.agent.harness.drivers.opencode import (
     OPENCODE_CAPABILITIES,
     OpenCodeDriver,
 )
-from puffo_agent.agent.harness.runtime_manager import RuntimeManager
-from puffo_agent.agent.harness.runtime_manager import RuntimeManagerAdapter
-from puffo_agent.agent.harness.subprocess_io import ProcessTreeShutdownError
+from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManager
+from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManagerAdapter
+from puffo_agent.agent.harness.support.subprocess_io import ProcessTreeShutdownError
 
 
 class _TurnProcess:
@@ -315,7 +315,7 @@ async def test_close_kills_then_cancels_a_child_with_inherited_stdout(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
+        "puffo_agent.agent.harness.drivers.opencode._SHUTDOWN_GRACE_SECONDS",
         0.01,
     )
     proc = _HungTurnProcess()
@@ -337,7 +337,7 @@ async def test_close_kills_then_cancels_a_child_with_inherited_stdout(
 
 
 def test_default_spawn_isolates_the_per_turn_process_group(monkeypatch):
-    from puffo_agent.agent.harness import subprocess_io
+    from puffo_agent.agent.harness.support import subprocess_io
 
     monkeypatch.setattr(subprocess_io.os, "name", "posix")
     kwargs = subprocess_io.process_group_spawn_kwargs()
@@ -348,7 +348,7 @@ def test_default_spawn_isolates_the_per_turn_process_group(monkeypatch):
 async def test_force_signal_targets_group_after_direct_child_has_exited(
     monkeypatch,
 ):
-    from puffo_agent.agent.harness import subprocess_io
+    from puffo_agent.agent.harness.support import subprocess_io
 
     class ExitedParent:
         pid = 4321
@@ -371,7 +371,7 @@ async def test_force_signal_targets_group_after_direct_child_has_exited(
 
 @pytest.mark.asyncio
 async def test_missing_process_group_falls_back_to_direct_child(monkeypatch):
-    from puffo_agent.agent.harness import subprocess_io
+    from puffo_agent.agent.harness.support import subprocess_io
 
     class UngroupedProcess:
         pid = 4321
@@ -398,7 +398,7 @@ async def test_missing_process_group_falls_back_to_direct_child(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_cancelled_waiter_is_not_process_exit_evidence():
-    from puffo_agent.agent.harness import subprocess_io
+    from puffo_agent.agent.harness.support import subprocess_io
 
     proc = type("RunningProcess", (), {"returncode": None})()
     waiter = asyncio.create_task(asyncio.sleep(60))
@@ -414,7 +414,7 @@ async def test_close_reaps_descendant_that_holds_inherited_stdout(
     tmp_path,
 ):
     monkeypatch.setattr(
-        "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
+        "puffo_agent.agent.harness.drivers.opencode._SHUTDOWN_GRACE_SECONDS",
         0.2,
     )
     child_script = (
@@ -468,7 +468,7 @@ async def test_close_reaps_descendant_that_holds_inherited_stdout(
 @pytest.mark.asyncio
 async def test_close_reports_transport_abandonment(monkeypatch):
     monkeypatch.setattr(
-        "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
+        "puffo_agent.agent.harness.drivers.opencode._SHUTDOWN_GRACE_SECONDS",
         0.01,
     )
     proc = _UncloseableTurnProcess()
@@ -491,7 +491,7 @@ async def test_cancelled_start_preserves_cancellation_and_shutdown_error(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        "puffo_agent.agent.harness.opencode_driver._SHUTDOWN_GRACE_SECONDS",
+        "puffo_agent.agent.harness.drivers.opencode._SHUTDOWN_GRACE_SECONDS",
         0.01,
     )
     proc = _UncloseableTurnProcess()

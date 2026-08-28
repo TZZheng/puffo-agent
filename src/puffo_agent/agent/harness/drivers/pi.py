@@ -28,10 +28,10 @@ from pathlib import Path
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from ...tasks import spawn
-from ..errors import AgentAPIError
-from ..provider_failures import provider_failure_message
-from .driver import (
+from ....tasks import spawn
+from ...errors import AgentAPIError
+from ...provider_failures import provider_failure_message
+from ..driver import (
     BusyDelivery,
     CancelCapability,
     CancelReceipt,
@@ -65,7 +65,7 @@ from .pi_bridge import (
     await_bridge_ready,
     clear_ready_file,
 )
-from .jsonl_rpc import (
+from ..support.jsonl_rpc import (
     RpcFrameTooLarge,
     RpcRequestTimeout,
     await_rpc_response,
@@ -74,7 +74,7 @@ from .jsonl_rpc import (
     read_json_line,
     write_json_line,
 )
-from .subprocess_io import (
+from ..support.subprocess_io import (
     drain_subprocess_stream,
     process_group_spawn_kwargs,
     shutdown_process_tree,

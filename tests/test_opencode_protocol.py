@@ -11,7 +11,7 @@ from puffo_agent.agent.harness.driver import (
     SessionRef,
     TurnRef,
 )
-from puffo_agent.agent.harness.opencode_protocol import (
+from puffo_agent.agent.harness.drivers.opencode_protocol import (
     build_opencode_run_command,
     normalize_opencode_frame,
 )

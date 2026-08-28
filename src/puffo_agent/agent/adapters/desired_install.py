@@ -20,7 +20,7 @@ from typing import Any
 
 from ...crypto.http_client import HttpError, PuffoCoreHttpClient
 from ...skill_ids import SKILL_ID_RE
-from ..harness.assets import (
+from ..harness.support.assets import (
     HarnessAssetsProfile,
     McpProjection,
     get_harness_assets_profile,

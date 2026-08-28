@@ -21,11 +21,11 @@ from puffo_agent.agent.harness.driver import (
     TurnRef,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.local_runtime import (
+from puffo_agent.agent.harness.runtime.local_runtime import (
     LocalRuntimePreparer,
     select_native_session,
 )
-from puffo_agent.agent.harness.runtime_manager import (
+from puffo_agent.agent.harness.runtime.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
 )
@@ -70,7 +70,7 @@ def test_generic_harness_ignores_legacy_claude_session(
 async def test_legacy_claude_file_cannot_reach_switched_opencode(
     puffo_home, monkeypatch,
 ):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
     monkeypatch.setattr(
         local_runtime,
@@ -110,7 +110,7 @@ async def test_legacy_claude_file_cannot_reach_switched_opencode(
 async def test_old_claude_agent_reuses_paths_and_imports_session(
     puffo_home, monkeypatch,
 ):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
     monkeypatch.setattr(
         local_runtime, "resolve_claude_bin", lambda: "/opt/bin/claude"
@@ -158,7 +158,7 @@ async def test_old_claude_agent_reuses_paths_and_imports_session(
 async def test_old_codex_agent_imports_session_with_matching_sandbox(
     puffo_home, monkeypatch,
 ):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
     monkeypatch.setattr(
         local_runtime, "resolve_codex_bin", lambda: "/opt/bin/codex"
@@ -205,7 +205,7 @@ async def test_old_codex_agent_imports_session_with_matching_sandbox(
 async def test_durable_session_resumes_across_prompt_refresh(
     puffo_home, monkeypatch,
 ):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
     monkeypatch.setattr(
         local_runtime, "resolve_claude_bin", lambda: "/opt/bin/claude"
@@ -244,7 +244,7 @@ async def test_durable_session_is_not_reused_after_harness_change(
     puffo_home, monkeypatch,
 ):
     """A Claude session ID must never be passed to OpenCode on restart."""
-    import puffo_agent.agent.harness.local_runtime as local_runtime
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
     monkeypatch.setattr(
         local_runtime, "resolve_opencode_bin", lambda: "/opt/bin/opencode"
@@ -293,7 +293,7 @@ async def test_generic_acp_command_projects_to_runtime_spec(puffo_home):
 
 @pytest.mark.asyncio
 async def test_opencode_uses_shared_binary_resolver(puffo_home, monkeypatch):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
     monkeypatch.setattr(
         local_runtime, "resolve_opencode_bin", lambda: "/opt/bin/opencode"
@@ -320,7 +320,7 @@ async def test_opencode_uses_shared_binary_resolver(puffo_home, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_pi_uses_shared_binary_resolver(puffo_home, monkeypatch):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
     monkeypatch.setattr(
         local_runtime, "resolve_pi_bin", lambda: "/opt/bin/pi"
@@ -353,7 +353,7 @@ async def test_pi_uses_shared_binary_resolver(puffo_home, monkeypatch):
 async def test_generic_runtime_projects_puffo_tools(
     puffo_home, monkeypatch, harness, command,
 ):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
     monkeypatch.setattr(
         local_runtime, "resolve_opencode_bin", lambda: "/opt/bin/opencode"
@@ -401,7 +401,7 @@ async def test_pi_runtime_uses_daemon_binary_resolver(
     puffo_home, monkeypatch, command,
 ):
     """Web defaults and legacy bare argv must survive a service's narrow PATH."""
-    import puffo_agent.agent.harness.local_runtime as local_runtime
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
 
     monkeypatch.setattr(local_runtime, "resolve_pi_bin", lambda: "/opt/bin/pi")
     config = AgentConfig(

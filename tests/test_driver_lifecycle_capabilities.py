@@ -1,7 +1,7 @@
 """Lifecycle and busy-delivery capability contracts."""
 
-from puffo_agent.agent.harness.claude_code_driver import claude_capabilities
-from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
+from puffo_agent.agent.harness.drivers.claude_code import claude_capabilities
+from puffo_agent.agent.harness.drivers.codex import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     BusyDelivery,
     CancelCapability,
@@ -15,7 +15,7 @@ from puffo_agent.agent.harness.driver import (
     SessionRef,
     SteerCapability,
 )
-from puffo_agent.agent.harness.runtime_manager import RuntimeManagerAdapter
+from puffo_agent.agent.harness.runtime.runtime_manager import RuntimeManagerAdapter
 
 
 def _shipped_capabilities():

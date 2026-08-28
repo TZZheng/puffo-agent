@@ -17,15 +17,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from ...macos.keychain import is_macos
-from ...mcp.config import (
+from ....macos.keychain import is_macos
+from ....mcp.config import (
     INFERENCE_LEVELS,
     default_python_executable,
     puffo_core_mcp_env,
     write_cli_mcp_config,
     write_codex_mcp_config,
 )
-from ...portal.state import (
+from ....portal.state import (
     AgentConfig,
     DaemonConfig,
     agent_claude_user_dir,
@@ -45,40 +45,40 @@ from ...portal.state import (
     sync_host_skills,
     strip_claude_api_key_from_settings,
 )
-from ...portal.workspace_layout import (
+from ....portal.workspace_layout import (
     AVAILABLE_SHARED_WORKSPACE_STATES,
     ensure_workspace_shared_link,
 )
-from ...portal.runtime_matrix import (
+from ....portal.runtime_matrix import (
     resolve_effective_harness,
     resolve_effective_provider,
 )
-from ..adapters.base import (
+from ...adapters.base import (
     STATUS_PREVIEW_CHARS,
     anthropic_base_url_env,
     is_silent,
 )
-from ..adapters.desired_install import run_spawn_install
-from ..cli_bin import (
+from ...adapters.desired_install import run_spawn_install
+from ...cli_bin import (
     resolve_claude_bin,
     resolve_codex_bin,
     resolve_opencode_bin,
     resolve_pi_bin,
 )
-from ..runtime_event_outbox import (
+from ...runtime_event_outbox import (
     RuntimeEventOutbox,
     RuntimeEventProjectingSink,
 )
-from ..runtime_events import RuntimeEventProjector, TrustedScope
-from . import SUPPORTED_LOCAL_DRIVERS, UnsupportedDriver, build_driver
-from .child_env import build_child_environment
-from .pi_bridge import (
+from ...runtime_events import RuntimeEventProjector, TrustedScope
+from .. import SUPPORTED_LOCAL_DRIVERS, UnsupportedDriver, build_driver
+from ..support.child_env import build_child_environment
+from ..drivers.pi_bridge import (
     build_bridge_environment,
     install_pi_tool_bridge,
     mint_bridge_nonce,
     ready_file_path,
 )
-from .driver import (
+from ..driver import (
     Driver,
     HarnessEvent,
     HarnessEventType,
@@ -87,7 +87,7 @@ from .driver import (
     SessionRef,
 )
 from .runtime_manager import RuntimeManager, RuntimeManagerAdapter
-from ...tasks import spawn
+from ....tasks import spawn
 
 logger = logging.getLogger(__name__)
 
@@ -614,7 +614,7 @@ class LocalRuntimePreparer:
                 "PUFFO_CLAUDE_BIN=/absolute/path/to/claude."
             )
         launch_args = ["--dangerously-skip-permissions"]
-        from ...portal.control.context_telemetry import (
+        from ....portal.control.context_telemetry import (
             claude_autocompact_tokens,
             configured_compact_pct,
         )
@@ -753,7 +753,7 @@ class LocalRuntimePreparer:
             executable,
         )
         self._log_host_access()
-        from ...portal.control.context_telemetry import configured_compact_pct
+        from ....portal.control.context_telemetry import configured_compact_pct
 
         compact_pct = configured_compact_pct(
             "codex", self.agent_cfg.env_overrides
@@ -864,7 +864,7 @@ def _normalized_tool_label(label: str) -> str:
 
 
 def _emit_status(agent_id: str, event: str, payload: dict[str, Any]) -> None:
-    from ...portal.control.reporter import get_reporter
+    from ....portal.control.reporter import get_reporter
 
     spawn(get_reporter().emit(agent_id, event, payload), name="reporter.emit")
 

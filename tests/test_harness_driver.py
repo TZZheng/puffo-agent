@@ -15,11 +15,11 @@ from puffo_agent.agent.message_store import (
     ReceiptDisposition,
 )
 from puffo_agent.agent.harness import UnsupportedDriver, build_driver
-from puffo_agent.agent.harness.claude_code_driver import (
+from puffo_agent.agent.harness.drivers.claude_code import (
     ClaudeCodeCliDriver,
     claude_capabilities,
 )
-from puffo_agent.agent.harness.codex_driver import (
+from puffo_agent.agent.harness.drivers.codex import (
     CODEX_CAPABILITIES,
     CodexAppServerDriver,
 )
@@ -39,7 +39,7 @@ from puffo_agent.agent.harness.driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.runtime_manager import (
+from puffo_agent.agent.harness.runtime.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
     RuntimeStateError,
@@ -1415,7 +1415,7 @@ async def test_claude_driver_prepends_normalized_launch_argv(monkeypatch):
     normalized executable prefix (the Windows wrapper block) followed by
     the untouched flags. On this host the real boundary passes the
     executable through, so the wiring + ordering both stay pinned."""
-    import puffo_agent.agent.harness.claude_code_driver as driver_mod
+    import puffo_agent.agent.harness.drivers.claude_code as driver_mod
 
     def make_factory(captured):
         def factory(args, _spec):
@@ -1924,8 +1924,8 @@ async def _feed_projection_events(driver, events):
 
 
 def _build_projection_adapter(tmp_path, driver, monkeypatch):
-    import puffo_agent.agent.harness.local_runtime as local_runtime
-    from puffo_agent.agent.harness.local_runtime import (
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
+    from puffo_agent.agent.harness.runtime.local_runtime import (
         PreparedLocalRuntime,
         build_local_runtime_adapter,
     )

@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable
 from typing import Any
 
-from ...tasks import spawn
+from ....tasks import spawn
 
 
 _CLEANUP_ERRORS_ATTR = "_puffo_cleanup_errors"

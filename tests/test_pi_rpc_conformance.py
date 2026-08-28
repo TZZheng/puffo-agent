@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from puffo_agent.agent.harness.pi_protocol import PI_EVENT_DISPATCH_KEYS
+from puffo_agent.agent.harness.drivers.pi_protocol import PI_EVENT_DISPATCH_KEYS
 from tests.fixtures.pi_rpc_0_84_3 import EVENTS
 
 

@@ -12,11 +12,11 @@ from .driver import (
     PermissionRef,
     UnsupportedCapability,
 )
-from .codex_driver import CodexAppServerDriver, CodexDriver
-from .claude_code_driver import ClaudeCodeCliDriver, ClaudeDriver
-from .opencode_driver import OpenCodeCliDriver, OpenCodeDriver
-from .acp_driver import AcpDriver, GenericAcpDriver
-from .pi_driver import (
+from .drivers.codex import CodexAppServerDriver, CodexDriver
+from .drivers.claude_code import ClaudeCodeCliDriver, ClaudeDriver
+from .drivers.opencode import OpenCodeCliDriver, OpenCodeDriver
+from .drivers.acp import AcpDriver, GenericAcpDriver
+from .drivers.pi import (
     PI_CAPABILITIES,
     PiDriver,
     PiToolBridgeUnavailableError,

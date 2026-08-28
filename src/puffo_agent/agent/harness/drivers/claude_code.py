@@ -11,10 +11,10 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from ..._proc import no_window_kwargs
-from ..cli_bin import normalize_launch_argv
-from ..provider_failures import classify_provider_failure
-from .driver import (
+from ...._proc import no_window_kwargs
+from ...cli_bin import normalize_launch_argv
+from ...provider_failures import classify_provider_failure
+from ..driver import (
     BusyDelivery,
     RuntimeLifecycle,
     CancelCapability,
@@ -41,8 +41,8 @@ from .driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from .subprocess_io import drain_subprocess_stream_keeping_tail
-from ...tasks import spawn
+from ..support.subprocess_io import drain_subprocess_stream_keeping_tail
+from ....tasks import spawn
 
 logger = logging.getLogger(__name__)
 

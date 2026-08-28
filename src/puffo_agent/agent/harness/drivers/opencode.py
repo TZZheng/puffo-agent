@@ -8,14 +8,14 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
-from ...tasks import spawn
-from ..cli_bin import normalize_launch_argv
-from .cleanup_errors import (
+from ....tasks import spawn
+from ...cli_bin import normalize_launch_argv
+from ..support.cleanup_errors import (
     CLEANUP_TIMEOUT_SECONDS,
     collect_cleanup_errors,
     raise_collected_errors,
 )
-from .driver import (
+from ..driver import (
     BusyDelivery,
     CancelCapability,
     CancelReceipt,
@@ -44,7 +44,7 @@ from .opencode_protocol import (
     build_opencode_run_command,
     normalize_opencode_frame,
 )
-from .subprocess_io import (
+from ..support.subprocess_io import (
     drain_subprocess_stream_keeping_tail,
     process_group_spawn_kwargs,
     shutdown_process_tree,

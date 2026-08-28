@@ -324,7 +324,7 @@ class StandardWorkerRun:
                 f"agent {worker.agent_cfg.id!r}: runtime kind {kind!r} "
                 "does not use the built-in Driver runtime"
             )
-        from ..agent.harness.local_runtime import LocalRuntimePreparer
+        from ..agent.harness.runtime.local_runtime import LocalRuntimePreparer
 
         return await self._prepare_driver_runtime(
             paths,
@@ -377,8 +377,8 @@ class StandardWorkerRun:
         """Bind a prepared runtime to the durable outbox and Runtime Manager."""
         worker = self.worker
         from ..agent.harness import build_driver
-        from ..agent.harness.docker_runtime import DockerRuntimePreparer
-        from ..agent.harness.local_runtime import build_local_runtime_adapter
+        from ..agent.harness.runtime.docker_runtime import DockerRuntimePreparer
+        from ..agent.harness.runtime.local_runtime import build_local_runtime_adapter
 
         session_ref = (
             persisted.get("session_ref", "")
@@ -414,7 +414,7 @@ class StandardWorkerRun:
         Only the Docker owner starts a container inside ``prepare``; the
         host-local preparer has nothing to tear down.
         """
-        from ..agent.harness.docker_runtime import DockerRuntimePreparer
+        from ..agent.harness.runtime.docker_runtime import DockerRuntimePreparer
 
         if not isinstance(preparer, DockerRuntimePreparer):
             return

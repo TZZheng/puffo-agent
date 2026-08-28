@@ -7,12 +7,12 @@ import pytest
 
 from puffo_agent.agent.errors import AgentAPIError, ProviderFailureError
 from puffo_agent.agent.adapters.base import TurnContext, TurnResult
-from puffo_agent.agent.harness.claude_code_driver import (
+from puffo_agent.agent.harness.drivers.claude_code import (
     ClaudeCodeCliDriver,
     _provider_error,
 )
-from puffo_agent.agent.harness.cleanup_errors import cleanup_errors
-from puffo_agent.agent.harness.codex_driver import CODEX_CAPABILITIES
+from puffo_agent.agent.harness.support.cleanup_errors import cleanup_errors
+from puffo_agent.agent.harness.drivers.codex import CODEX_CAPABILITIES
 from puffo_agent.agent.harness.driver import (
     CancelReceipt,
     CompactReceipt,
@@ -29,7 +29,7 @@ from puffo_agent.agent.harness.driver import (
     TurnStarted,
     UnsupportedCapability,
 )
-from puffo_agent.agent.harness.runtime_manager import (
+from puffo_agent.agent.harness.runtime.runtime_manager import (
     RuntimeManager,
     RuntimeManagerAdapter,
     RuntimeStateError,

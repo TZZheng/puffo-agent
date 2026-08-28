@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from ..shared_content import _strip_puffo_mcp_prefix_for_codex
+from ...shared_content import _strip_puffo_mcp_prefix_for_codex
 
 
 class SkillRoot(str, Enum):
