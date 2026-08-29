@@ -3,15 +3,17 @@
 Each harness exposes selectable models = aliases (the CLI resolves
 these to the latest model in the family at runtime, so they never go
 stale) + concrete versions. claude-code refreshes its concrete list
-from the live, account-authoritative ``/v1/models`` — so new models
-appear without a code change; codex reads its local CLI cache; the rest
-are static.
+from the live, account-authoritative ``/v1/models``; codex reads its
+local CLI cache; Pi and OpenCode ask their installed CLI for the
+operator-visible catalog; the rest are static.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
+import subprocess
 import threading
 import time
 import urllib.error
@@ -82,14 +84,23 @@ _STATIC: dict[str, tuple[ModelOption, ...]] = {
     ),
 }
 
-# Harnesses the catalog can answer for (claude-code + codex are dynamic).
-KNOWN_HARNESSES: tuple[str, ...] = ("claude-code", "codex", "gemini-cli", "hermes")
+# Harnesses the catalog can answer for. Pi/OpenCode deliberately use their
+# own effective local catalogs instead of borrowing Codex's model list.
+KNOWN_HARNESSES: tuple[str, ...] = (
+    "claude-code",
+    "codex",
+    "pi",
+    "opencode",
+    "gemini-cli",
+    "hermes",
+)
 
 _ANTHROPIC_MODELS_URL = "https://api.anthropic.com/v1/models"
 _CACHE_TTL_S = 3600.0
 _FETCH_TIMEOUT_S = 6.0
+_CLI_FETCH_TIMEOUT_S = 5.0
 
-# "claude-code" -> (fetched_at, concrete_models). Guarded by _lock.
+# harness -> (fetched_at, concrete_models). Guarded by _lock.
 _cache: dict[str, tuple[float, tuple[ModelOption, ...]]] = {}
 _lock = threading.Lock()
 
@@ -172,30 +183,142 @@ def _codex_models() -> tuple[ModelOption, ...]:
     return out or _CODEX_STATIC
 
 
+def _valid_cli_model_id(value: str) -> bool:
+    """True for a bounded, single-token model id safe to put on the wire."""
+    return bool(value) and len(value) <= 512 and bool(
+        re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9@][A-Za-z0-9@._:+/-]*", value)
+    )
+
+
+def _parse_pi_models(output: str) -> tuple[ModelOption, ...]:
+    """Parse ``pi --list-models``'s whitespace-delimited table.
+
+    Pi's model selector accepts the provider-qualified spelling. Keeping the
+    provider is required because different providers may expose the same
+    model id.
+    """
+    out: list[ModelOption] = []
+    seen: set[str] = set()
+    for raw in output.splitlines():
+        columns = raw.split()
+        if len(columns) < 6 or columns[:2] == ["provider", "model"]:
+            continue
+        if columns[4] not in {"yes", "no"} or columns[5] not in {"yes", "no"}:
+            continue
+        model_id = f"{columns[0]}/{columns[1]}"
+        if _valid_cli_model_id(model_id) and model_id not in seen:
+            seen.add(model_id)
+            out.append(ModelOption(model_id, model_id))
+    return tuple(out)
+
+
+def _parse_opencode_models(output: str) -> tuple[ModelOption, ...]:
+    """Parse ``opencode models``'s provider-qualified, one-id-per-line output."""
+    out: list[ModelOption] = []
+    seen: set[str] = set()
+    for raw in output.splitlines():
+        model_id = raw.strip()
+        if (
+            "/" in model_id
+            and _valid_cli_model_id(model_id)
+            and model_id not in seen
+        ):
+            seen.add(model_id)
+            out.append(ModelOption(model_id, model_id))
+    return tuple(out)
+
+
+def _fetch_cli_models(harness: str) -> tuple[ModelOption, ...] | None:
+    """Ask an installed harness for its effective local model catalog.
+
+    ``None`` distinguishes discovery failure from a valid result. Callers keep
+    serving a last-known-good catalog on transient CLI failures.
+    """
+    from .cli_bin import (
+        normalize_launch_argv,
+        resolve_opencode_bin,
+        resolve_pi_bin,
+    )
+
+    if harness == "pi":
+        executable = resolve_pi_bin()
+        arguments = ("--list-models",)
+        parser = _parse_pi_models
+    elif harness == "opencode":
+        executable = resolve_opencode_bin()
+        arguments = ("models",)
+        parser = _parse_opencode_models
+    else:
+        return None
+    if executable is None:
+        return None
+    try:
+        completed = subprocess.run(
+            [*normalize_launch_argv(executable), *arguments],
+            capture_output=True,
+            text=True,
+            timeout=_CLI_FETCH_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("%s model catalog command failed: %s", harness, exc)
+        return None
+    if completed.returncode != 0:
+        logger.debug(
+            "%s model catalog exited %s: %s",
+            harness,
+            completed.returncode,
+            completed.stderr.strip(),
+        )
+        return None
+    parsed = parser(completed.stdout)
+    return parsed or None
+
+
+def _cli_concrete(harness: str, *, fetch: bool) -> tuple[ModelOption, ...]:
+    now = time.time()
+    with _lock:
+        cached = _cache.get(harness)
+    if cached and now - cached[0] < _CACHE_TTL_S:
+        return cached[1]
+    if fetch:
+        live = _fetch_cli_models(harness)
+        if live is not None:
+            with _lock:
+                _cache[harness] = (now, live)
+            return live
+    return cached[1] if cached else ()
+
+
 def provider_models(harness: str, *, fetch: bool = False) -> list[ModelOption]:
     """Selectable models for ``harness``: daemon-default + aliases +
     concrete versions.
 
-    ``fetch`` only affects claude-code: when True it may hit
-    ``/v1/models`` synchronously (use off the UI thread — see
-    ``prefetch``); when False it serves the cache or the static
-    fallback without blocking. codex reads its local cache; the rest
-    are static.
+    ``fetch`` may perform synchronous discovery for claude-code, Pi, and
+    OpenCode (use off the UI thread — see ``prefetch``). When False it serves
+    cached/static data without blocking. codex reads its local cache; the
+    remaining harnesses are static.
     """
     if harness == "claude-code":
         # General aliases (opus/sonnet) sort after the concrete versions.
         return [_DAEMON_DEFAULT, *_claude_concrete(fetch=fetch), *_CLAUDE_ALIASES]
     if harness == "codex":
         return [_DAEMON_DEFAULT, *_codex_models()]
+    if harness in {"pi", "opencode"}:
+        return [_DAEMON_DEFAULT, *_cli_concrete(harness, fetch=fetch)]
     return [_DAEMON_DEFAULT, *_STATIC.get(harness, ())]
 
 
 def prefetch() -> threading.Thread:
-    """Warm the claude-code live list in a background thread (call once
-    at UI/daemon start so later ``provider_models`` reads hit cache).
+    """Warm dynamic catalogs in a background thread (call once at UI/daemon
+    start so later ``provider_models`` reads normally hit cache).
     Returns the thread; callers may ignore it."""
+    def _warm() -> None:
+        for harness in ("claude-code", "pi", "opencode"):
+            provider_models(harness, fetch=True)
+
     t = threading.Thread(
-        target=lambda: provider_models("claude-code", fetch=True),
+        target=_warm,
         daemon=True,
     )
     t.start()

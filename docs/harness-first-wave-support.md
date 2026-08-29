@@ -36,9 +36,11 @@ errors or free-text provider failures through Puffo's shared failure classifier.
 This is an error-normalization profile, not a private ACP wire extension.
 
 The Web model picker intentionally does not borrow Codex's model catalog or
-inference-level list for Pi, OpenCode, or generic ACP. Until a selected
-harness reports a negotiated catalog, the UI offers only an explicit custom
-model value and omits the inference selector.
+inference-level list for Pi, OpenCode, or generic ACP. Pi and OpenCode report
+the effective model catalog from their installed CLI (`pi --list-models` and
+`opencode models`); if that bounded discovery fails, the UI falls back to an
+explicit custom model value. Generic ACP still offers only a custom value
+because ACP v1 does not negotiate a model catalog.
 
 ## Verification evidence and limits
 

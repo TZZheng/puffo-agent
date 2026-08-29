@@ -510,7 +510,6 @@ def build_capabilities() -> dict:
     # legacy "acp" value has always been the *opencode* binary's status.
     # New consumers read harness_readiness and must not inherit this.
     cli_tools["acp"] = harness_readiness(resolve_opencode_bin, None).legacy
-    claude_ready = cli_tools["claude-code"] == "ready"
     providers = [
         {
             "provider": h,
@@ -518,7 +517,12 @@ def build_capabilities() -> dict:
                 {"id": o.id, "label": o.label, "alias": o.is_alias}
                 for o in provider_models(
                     h,
-                    fetch=h == "claude-code" and claude_ready,
+                    fetch=(
+                        h == "claude-code" and readiness[h].state == "ready"
+                    ) or (
+                        h in {"pi", "opencode"}
+                        and readiness[h].state != "unavailable"
+                    ),
                 )
                 if o.id
             ],

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 
 import pytest
 
@@ -100,6 +101,100 @@ def test_codex_fallback_on_bad_json(monkeypatch, tmp_path):
     cache.write_text("not json", encoding="utf-8")
     monkeypatch.setattr(mc.Path, "home", lambda: tmp_path)
     assert _ids(provider_models("codex"))[1:] == ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
+
+
+def test_parse_pi_models_qualifies_provider_and_deduplicates():
+    output = """provider   model              context  max-out  thinking  images
+anthropic  claude-sonnet-5   1M       128K     yes       yes
+openai     gpt-5.6-sol       1M       128K     yes       yes
+anthropic  claude-sonnet-5   1M       128K     yes       yes
+"""
+    assert _ids(mc._parse_pi_models(output)) == [
+        "anthropic/claude-sonnet-5",
+        "openai/gpt-5.6-sol",
+    ]
+
+
+def test_parse_pi_models_ignores_diagnostics_that_are_not_table_rows():
+    output = """warning: see https://example.test/models for help
+provider model context max-out thinking images
+anthropic sonnet 1M 1M yes yes
+"""
+    assert _ids(mc._parse_pi_models(output)) == ["anthropic/sonnet"]
+
+
+def test_parse_opencode_models_keeps_only_qualified_ids_and_deduplicates():
+    output = """opencode/nemotron-3.5-lightning-free
+not-a-qualified-id
+deepseek/deepseek-v4-pro
+opencode/nemotron-3.5-lightning-free
+"""
+    assert _ids(mc._parse_opencode_models(output)) == [
+        "opencode/nemotron-3.5-lightning-free",
+        "deepseek/deepseek-v4-pro",
+    ]
+
+
+def test_parse_opencode_models_ignores_urls_and_diagnostics():
+    output = "https://example.test/models\nwarning: catalog unavailable\nopencode/free\n"
+    assert _ids(mc._parse_opencode_models(output)) == ["opencode/free"]
+
+
+@pytest.mark.parametrize(
+    ("harness", "stdout", "expected_argv", "expected_ids"),
+    [
+        (
+            "pi",
+            "provider model context max-out thinking images\nanthropic sonnet 1M 1M yes yes\n",
+            ["/bin/pi", "--list-models"],
+            ["anthropic/sonnet"],
+        ),
+        (
+            "opencode",
+            "opencode/free\n",
+            ["/bin/opencode", "models"],
+            ["opencode/free"],
+        ),
+    ],
+)
+def test_fetch_cli_models_uses_resolved_binary(
+    monkeypatch, harness, stdout, expected_argv, expected_ids,
+):
+    from puffo_agent.agent import cli_bin
+
+    monkeypatch.setattr(cli_bin, "resolve_pi_bin", lambda: "/bin/pi")
+    monkeypatch.setattr(cli_bin, "resolve_opencode_bin", lambda: "/bin/opencode")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(mc.subprocess, "run", fake_run)
+    assert _ids(mc._fetch_cli_models(harness)) == expected_ids
+    assert calls[0][0] == expected_argv
+    assert calls[0][1]["timeout"] == mc._CLI_FETCH_TIMEOUT_S
+
+
+def test_cli_catalog_caches_last_good_result_on_later_failure(monkeypatch):
+    calls = {"n": 0}
+
+    def fetch(_harness):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return (ModelOption("opencode/free", "opencode/free"),)
+        return None
+
+    monkeypatch.setattr(mc, "_fetch_cli_models", fetch)
+    assert _ids(provider_models("opencode", fetch=True))[1:] == ["opencode/free"]
+    ts, models = mc._cache["opencode"]
+    mc._cache["opencode"] = (ts - mc._CACHE_TTL_S - 1, models)
+    assert _ids(provider_models("opencode", fetch=True))[1:] == ["opencode/free"]
+
+
+def test_cli_catalog_failure_without_cache_returns_only_default(monkeypatch):
+    monkeypatch.setattr(mc, "_fetch_cli_models", lambda _harness: None)
+    assert provider_models("pi", fetch=True) == [mc._DAEMON_DEFAULT]
 
 
 def test_unknown_harness_is_just_default():
