@@ -117,8 +117,8 @@ def test_opencode_preflight_rejects_model_missing_from_native_catalog(monkeypatc
     )
     monkeypatch.setattr(
         preflight,
-        "opencode_model_is_available",
-        lambda executable, model: False,
+        "opencode_model_status",
+        lambda executable, model: "model_not_available",
         raising=False,
     )
 
@@ -134,8 +134,12 @@ def test_opencode_preflight_rejects_model_missing_from_native_catalog(monkeypatc
     assert caught.value.fields == {
         "error_code": "harness_not_ready",
         "harness": "opencode",
-        "reason": "need_login",
+        "reason": "model_not_available",
     }
+    assert str(caught.value) == (
+        "OpenCode cannot access the selected model; refresh the model list "
+        "or choose another model"
+    )
 
 
 def test_opencode_preflight_accepts_model_in_native_catalog(monkeypatch):
@@ -144,8 +148,8 @@ def test_opencode_preflight_accepts_model_in_native_catalog(monkeypatch):
     )
     monkeypatch.setattr(
         preflight,
-        "opencode_model_is_available",
-        lambda executable, model: True,
+        "opencode_model_status",
+        lambda executable, model: "ready",
     )
 
     preflight.preflight_runtime(
@@ -155,3 +159,26 @@ def test_opencode_preflight_accepts_model_in_native_catalog(monkeypatch):
             model="deepseek/deepseek-v4-pro",
         )
     )
+
+
+def test_opencode_preflight_reports_missing_provider_as_login(monkeypatch):
+    monkeypatch.setattr(
+        preflight, "resolve_opencode_bin", lambda: "/opt/bin/opencode",
+    )
+    monkeypatch.setattr(
+        preflight,
+        "opencode_model_status",
+        lambda executable, model: "need_login",
+    )
+
+    with pytest.raises(ProvisionError) as caught:
+        preflight.preflight_runtime(
+            _runtime(
+                provider="deepseek",
+                harness="opencode",
+                model="deepseek/deepseek-v4-pro",
+            )
+        )
+
+    assert caught.value.fields["reason"] == "need_login"
+    assert str(caught.value) == "OpenCode sign-in required"

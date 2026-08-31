@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ...agent.cli_bin import resolve_opencode_bin, resolve_pi_bin
-from ...agent.opencode_auth import OpenCodeProbeError, opencode_model_is_available
+from ...agent.opencode_auth import OpenCodeProbeError, opencode_model_status
 from ...agent.pi_auth import PiAuthProbeError, check_pi_auth, pi_auth_target
 from ..runtime_matrix import (
     RUNTIME_CLI_LOCAL,
@@ -32,6 +32,10 @@ def _not_ready(
     message = {
         "not_installed": f"{label} is not installed",
         "need_login": f"{label} sign-in required",
+        "model_not_available": (
+            f"{label} cannot access the selected model; refresh the model "
+            "list or choose another model"
+        ),
         "credential_check_error": f"{label} credential check failed",
     }[reason]
     return ProvisionError(message, **fields)
@@ -49,11 +53,11 @@ def preflight_runtime(runtime: RuntimeConfig, *, agent_id: str = "") -> None:
         if not executable:
             raise _not_ready("opencode", "not_installed")
         try:
-            model_ready = opencode_model_is_available(executable, runtime.model)
+            model_status = opencode_model_status(executable, runtime.model)
         except OpenCodeProbeError as exc:
             raise _not_ready("opencode", "credential_check_error") from exc
-        if not model_ready:
-            raise _not_ready("opencode", "need_login")
+        if model_status != "ready":
+            raise _not_ready("opencode", model_status)
         return
 
     executable = resolve_pi_bin()

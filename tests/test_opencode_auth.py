@@ -10,6 +10,7 @@ from puffo_agent.agent.opencode_auth import (
     OpenCodeProbeError,
     list_opencode_models,
     opencode_model_is_available,
+    opencode_model_status,
 )
 
 
@@ -71,6 +72,26 @@ def test_selected_model_uses_provider_filtered_native_catalog(monkeypatch):
         "/opt/bin/opencode", "deepseek/deepseek-v4-pro",
     ) is True
     assert seen == [("/opt/bin/opencode", "deepseek")]
+
+
+def test_model_status_distinguishes_login_from_missing_model(monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.agent.opencode_auth.list_opencode_models",
+        lambda executable, *, provider="", timeout_seconds=5.0: (),
+    )
+    assert opencode_model_status(
+        "/opt/bin/opencode", "deepseek/deepseek-v4-pro",
+    ) == "need_login"
+
+    monkeypatch.setattr(
+        "puffo_agent.agent.opencode_auth.list_opencode_models",
+        lambda executable, *, provider="", timeout_seconds=5.0: (
+            "deepseek/deepseek-chat",
+        ),
+    )
+    assert opencode_model_status(
+        "/opt/bin/opencode", "deepseek/deepseek-v4-pro",
+    ) == "model_not_available"
 
 
 def test_unexpected_native_failure_is_not_misreported_as_logged_out(monkeypatch):

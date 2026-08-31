@@ -12,12 +12,18 @@ from __future__ import annotations
 
 import re
 import subprocess
+from typing import Literal
 
 from .harness.support.child_env import build_child_environment
 
 
 class OpenCodeProbeError(RuntimeError):
     """OpenCode could not produce a trustworthy model-access verdict."""
+
+
+OpenCodeModelStatus = Literal[
+    "ready", "need_login", "model_not_available",
+]
 
 
 _ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
@@ -63,13 +69,24 @@ def list_opencode_models(
     return tuple(models)
 
 
-def opencode_model_is_available(executable: str, model: str) -> bool:
-    """Whether the selected model is visible to the current OpenCode process."""
+def opencode_model_status(executable: str, model: str) -> OpenCodeModelStatus:
+    """Classify provider access separately from an unavailable model ID."""
     selected = model.strip()
     provider = selected.split("/", 1)[0] if "/" in selected else ""
     models = list_opencode_models(executable, provider=provider)
+    if not models:
+        return "need_login"
     if not selected:
-        return bool(models)
+        return "ready"
     if "/" in selected:
-        return selected in models
-    return any(candidate.rsplit("/", 1)[-1] == selected for candidate in models)
+        available = selected in models
+    else:
+        available = any(
+            candidate.rsplit("/", 1)[-1] == selected for candidate in models
+        )
+    return "ready" if available else "model_not_available"
+
+
+def opencode_model_is_available(executable: str, model: str) -> bool:
+    """Compatibility bool view of :func:`opencode_model_status`."""
+    return opencode_model_status(executable, model) == "ready"
