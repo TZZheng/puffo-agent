@@ -14,6 +14,8 @@ from ..runtime_matrix import (
 from ..state import RuntimeConfig, agent_dir, select_pi_auth_home
 from .provision import ProvisionError
 
+_MAX_NATIVE_REASON_CHARS = 200
+
 
 def _not_ready(reason: str, *, native_reason: str = "") -> ProvisionError:
     fields = {
@@ -22,7 +24,7 @@ def _not_ready(reason: str, *, native_reason: str = "") -> ProvisionError:
         "reason": reason,
     }
     if native_reason:
-        fields["native_reason"] = native_reason
+        fields["native_reason"] = native_reason[:_MAX_NATIVE_REASON_CHARS]
     message = {
         "not_installed": "Pi is not installed",
         "need_login": "Pi sign-in required",

@@ -83,3 +83,22 @@ def test_pi_preflight_returns_machine_readable_login_reason(tmp_path, monkeypatc
         "reason": "need_login",
         "native_reason": "credentials_not_configured",
     }
+
+
+def test_pi_preflight_bounds_native_reason_from_harness(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(preflight, "resolve_pi_bin", lambda: "/opt/bin/pi")
+    monkeypatch.setattr(
+        preflight,
+        "check_pi_auth",
+        lambda *args, **kwargs: PiAuthResult(
+            status="error",
+            provider="anthropic",
+            reason="x" * 201,
+        ),
+    )
+
+    with pytest.raises(ProvisionError) as caught:
+        preflight.preflight_runtime(_runtime())
+
+    assert caught.value.fields["native_reason"] == "x" * 200
