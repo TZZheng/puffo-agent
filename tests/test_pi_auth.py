@@ -10,6 +10,7 @@ import pytest
 from puffo_agent.agent.pi_auth import (
     PiAuthProbeError,
     check_pi_auth,
+    list_pi_models,
     pi_has_credentials,
 )
 from puffo_agent.portal.host_assets import sync_host_pi_auth_view
@@ -106,6 +107,34 @@ def test_empty_host_auth_is_logged_out_without_forking(tmp_path, monkeypatch):
         subprocess, "run", lambda *a, **k: pytest.fail("must not fork")
     )
     assert pi_has_credentials("/opt/bin/pi", home=tmp_path) is False
+
+
+def test_native_model_list_uses_same_private_config_view(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        seen.update(command=command, kwargs=kwargs)
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=(
+                "provider model context input modalities thinking\n"
+                "anthropic claude-sonnet-4-6 200k text yes\n"
+                "openai gpt-5.5 400k text yes\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    assert list_pi_models(
+        "/opt/bin/pi", config_dir=tmp_path,
+    ) == (
+        ("anthropic/claude-sonnet-4-6", "claude-sonnet-4-6 (anthropic)"),
+        ("openai/gpt-5.5", "gpt-5.5 (openai)"),
+    )
+    assert seen["command"] == ["/opt/bin/pi", "--list-models"]
+    assert seen["kwargs"]["env"]["PI_CODING_AGENT_DIR"] == str(tmp_path)
 
 
 def test_pi_auth_view_copies_private_host_credentials(tmp_path):

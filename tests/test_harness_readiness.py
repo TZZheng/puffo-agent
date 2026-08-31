@@ -61,6 +61,7 @@ def _patch_hosts(monkeypatch, *, opencode_path):
     monkeypatch.setattr(cli_bin, "resolve_pi_bin", lambda: "/bin/pi")
     monkeypatch.setattr(cli_bin, "pi_has_credentials", lambda *a, **k: False)
     monkeypatch.setattr(cli_bin, "resolve_opencode_bin", lambda: opencode_path)
+    monkeypatch.setattr(cli_bin, "opencode_has_accessible_models", lambda: True)
     monkeypatch.setattr(model_catalog, "KNOWN_HARNESSES", ())
     monkeypatch.setattr(
         model_catalog, "provider_models", lambda harness, *, fetch=False: []
@@ -84,7 +85,7 @@ def test_capabilities_report_truth_beside_frozen_legacy(monkeypatch):
         "claude-code": {"state": "ready", "reason": ""},
         "codex": {"state": "unavailable", "reason": "need_login"},
         "pi": {"state": "unavailable", "reason": "need_login"},
-        "opencode": {"state": "degraded", "reason": "credentials_unknown"},
+        "opencode": {"state": "ready", "reason": ""},
         "acp": {"state": "degraded", "reason": "target_probe_required"},
     }
 

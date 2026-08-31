@@ -153,6 +153,16 @@ def pi_has_credentials() -> bool:
     return native_pi_has_credentials(executable)
 
 
+def opencode_has_accessible_models() -> bool:
+    """Whether native OpenCode exposes at least one currently usable model."""
+    executable = resolve_opencode_bin()
+    if not executable:
+        return False
+    from .opencode_auth import list_opencode_models
+
+    return bool(list_opencode_models(executable))
+
+
 def _resolve(name: str, env_var: str, bundle_paths: list[Path]) -> str | None:
     # 1. Explicit operator override — always wins, read live.
     env_override = os.environ.get(env_var)

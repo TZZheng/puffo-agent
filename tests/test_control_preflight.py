@@ -12,11 +12,16 @@ from puffo_agent.portal.control.provision import ProvisionError
 from puffo_agent.portal.state import RuntimeConfig
 
 
-def _runtime(*, provider: str = "anthropic", model: str = "claude-sonnet-4-6"):
+def _runtime(
+    *,
+    provider: str = "anthropic",
+    harness: str = "pi",
+    model: str = "claude-sonnet-4-6",
+):
     return RuntimeConfig(
         kind="cli-local",
         provider=provider,
-        harness="pi",
+        harness=harness,
         model=model,
     )
 
@@ -102,3 +107,51 @@ def test_pi_preflight_bounds_native_reason_from_harness(tmp_path, monkeypatch):
         preflight.preflight_runtime(_runtime())
 
     assert caught.value.fields["native_reason"] == "x" * 200
+
+
+def test_opencode_preflight_rejects_model_missing_from_native_catalog(monkeypatch):
+    """A stale private model choice must fail before agent files are written."""
+    monkeypatch.setattr(
+        preflight, "resolve_opencode_bin", lambda: "/opt/bin/opencode",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        preflight,
+        "opencode_model_is_available",
+        lambda executable, model: False,
+        raising=False,
+    )
+
+    with pytest.raises(ProvisionError) as caught:
+        preflight.preflight_runtime(
+            _runtime(
+                provider="deepseek",
+                harness="opencode",
+                model="deepseek/deepseek-v4-pro",
+            )
+        )
+
+    assert caught.value.fields == {
+        "error_code": "harness_not_ready",
+        "harness": "opencode",
+        "reason": "need_login",
+    }
+
+
+def test_opencode_preflight_accepts_model_in_native_catalog(monkeypatch):
+    monkeypatch.setattr(
+        preflight, "resolve_opencode_bin", lambda: "/opt/bin/opencode",
+    )
+    monkeypatch.setattr(
+        preflight,
+        "opencode_model_is_available",
+        lambda executable, model: True,
+    )
+
+    preflight.preflight_runtime(
+        _runtime(
+            provider="deepseek",
+            harness="opencode",
+            model="deepseek/deepseek-v4-pro",
+        )
+    )

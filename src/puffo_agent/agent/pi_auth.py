@@ -126,3 +126,38 @@ def pi_has_credentials(executable: str, *, home: Path | None = None) -> bool:
         if result.status != "not_ready":
             raise PiAuthProbeError("Pi auth configuration is invalid")
     return False
+
+
+def list_pi_models(
+    executable: str,
+    *,
+    config_dir: Path,
+    timeout_seconds: float = 5.0,
+) -> tuple[tuple[str, str], ...]:
+    """Return ``(id, label)`` pairs from Pi's credential-aware model list."""
+    env = build_child_environment(
+        controlled={"PI_CODING_AGENT_DIR": str(config_dir)}
+    )
+    try:
+        completed = subprocess.run(
+            [executable, "--list-models"],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise PiAuthProbeError("Pi model list could not complete") from exc
+    if completed.returncode != 0:
+        raise PiAuthProbeError("Pi model list failed")
+
+    models: list[tuple[str, str]] = []
+    for line in completed.stdout.splitlines()[1:]:
+        columns = line.split()
+        if len(columns) < 2:
+            continue
+        provider, model = columns[0], columns[1]
+        model_id = f"{provider}/{model}"
+        models.append((model_id, f"{model} ({provider})"))
+    return tuple(models)

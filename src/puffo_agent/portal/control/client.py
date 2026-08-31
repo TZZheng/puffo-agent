@@ -491,6 +491,7 @@ def build_capabilities() -> dict:
         claude_has_credentials,
         codex_has_credentials,
         harness_readiness,
+        opencode_has_accessible_models,
         pi_has_credentials,
         resolve_claude_bin,
         resolve_codex_bin,
@@ -510,18 +511,22 @@ def build_capabilities() -> dict:
         "claude-code": harness_readiness(resolve_claude_bin, claude_has_credentials),
         "codex": harness_readiness(resolve_codex_bin, codex_has_credentials),
         "pi": harness_readiness(resolve_pi_bin, pi_has_credentials),
-        # OpenCode still has no local credential probe; report that honestly.
-        "opencode": harness_readiness(resolve_opencode_bin, None),
+        "opencode": harness_readiness(
+            resolve_opencode_bin, opencode_has_accessible_models,
+        ),
         # The ACP driver targets whatever executable the agent config
         # names (gemini, kimi, opencode …), so no single binary probe can
         # stand for it; admission is checked per-target at creation time.
         "acp": HarnessReadiness("degraded", "target_probe_required", "ready"),
     }
     cli_tools = {name: r.legacy for name, r in readiness.items()}
-    # Frozen wire quirk, kept byte-stable for old portal consumers: the
-    # legacy "acp" value has always been the *opencode* binary's status.
-    # New consumers read harness_readiness and must not inherit this.
-    cli_tools["acp"] = harness_readiness(resolve_opencode_bin, None).legacy
+    # Frozen wire quirks, kept byte-stable for old portal consumers:
+    # opencode historically meant binary-present (credentials unknown), and
+    # "acp" mirrored that opencode binary status. New consumers read
+    # harness_readiness and must not inherit either approximation.
+    legacy_opencode = harness_readiness(resolve_opencode_bin, None).legacy
+    cli_tools["opencode"] = legacy_opencode
+    cli_tools["acp"] = legacy_opencode
     claude_ready = cli_tools["claude-code"] == "ready"
     providers = [
         {
@@ -530,7 +535,11 @@ def build_capabilities() -> dict:
                 {"id": o.id, "label": o.label, "alias": o.is_alias}
                 for o in provider_models(
                     h,
-                    fetch=h == "claude-code" and claude_ready,
+                    fetch=(h == "claude-code" and claude_ready)
+                    or (
+                        h in {"pi", "opencode"}
+                        and readiness[h].state == "ready"
+                    ),
                 )
                 if o.id
             ],
