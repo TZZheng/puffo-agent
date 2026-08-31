@@ -397,8 +397,12 @@ async def test_generic_runtime_projects_puffo_tools(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("command", [[], ["pi"]])
-async def test_pi_runtime_uses_daemon_binary_resolver(
-    puffo_home, monkeypatch, command,
+@pytest.mark.parametrize(
+    ("model", "expected_args"),
+    [("", ("--provider", "openai")), ("anthropic/claude-opus-4-8", ())],
+)
+async def test_pi_runtime_uses_daemon_binary_resolver_and_native_targeting(
+    puffo_home, monkeypatch, command, model, expected_args,
 ):
     """Web defaults and legacy bare argv must survive a service's narrow PATH."""
     import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
@@ -410,6 +414,7 @@ async def test_pi_runtime_uses_daemon_binary_resolver(
             kind="cli-local",
             provider="openai",
             harness="pi",
+            model=model,
             harness_command=command,
         ),
         puffo_core=PuffoCoreConfig(
@@ -426,7 +431,7 @@ async def test_pi_runtime_uses_daemon_binary_resolver(
 
     assert prepared.harness_name == "pi"
     assert prepared.spec.executable == "/opt/bin/pi"
-    assert prepared.spec.launch_args == ()
+    assert prepared.spec.launch_args == expected_args
     assert prepared.spec.mcp_servers == ()
 
 

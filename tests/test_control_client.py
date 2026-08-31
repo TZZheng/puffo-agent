@@ -49,12 +49,20 @@ async def test_handle_rejects_replayed_nonce_and_bounds_set(monkeypatch):
     await mc._handle(ws, frame("c1", "N1"))
     assert executed == ["a1"]
     assert "N1" in mc._seen_nonces
-    assert ws.acks[-1] == {"type": "ack", "command_id": "c1"}
+    assert ws.acks[-1] == {
+        "type": "ack",
+        "command_id": "c1",
+        "result": {"ok": True},
+    }
 
     # replayed nonce → not executed again, but still acked so it stops redelivering
     await mc._handle(ws, frame("c2", "N1"))
     assert executed == ["a1"]
-    assert ws.acks[-1] == {"type": "ack", "command_id": "c2"}
+    assert ws.acks[-1] == {
+        "type": "ack",
+        "command_id": "c2",
+        "result": {"ok": False, "error_code": "command_rejected"},
+    }
 
     # a nonce older than the ts window is pruned on the next handled command
     mc._seen_nonces["OLD"] = 1_000_000 - cc.TS_WINDOW_MS - 1
@@ -131,8 +139,13 @@ async def test_create_without_pending_token_rejected(home):
 async def test_create_delegates_to_control_provisioner(home, monkeypatch):
     seen = {}
 
-    async def fake_provision(params, operator_key, *, materialize):
-        seen.update(params=params, operator_key=operator_key, materialize=materialize)
+    async def fake_provision(params, operator_key, *, preflight, materialize):
+        seen.update(
+            params=params,
+            operator_key=operator_key,
+            preflight=preflight,
+            materialize=materialize,
+        )
         return {"agent_id": "helper-1"}
 
     monkeypatch.setattr(
@@ -154,6 +167,46 @@ async def test_create_delegates_to_control_provisioner(home, monkeypatch):
     assert result == {"ok": True, "agent_slug": "helper-1"}
     assert seen["operator_key"] == "operator-key"
     assert seen["params"]["puffo_core"]["server_url"] == "https://relay.example"
+
+
+@pytest.mark.asyncio
+async def test_handle_ack_carries_the_exact_command_result(monkeypatch):
+    result = {
+        "ok": False,
+        "error": "Pi sign-in required",
+        "error_code": "harness_not_ready",
+        "harness": "pi",
+        "reason": "need_login",
+    }
+
+    async def fake_exec(*args, **kwargs):
+        return result
+
+    monkeypatch.setattr(cc, "execute_command", fake_exec)
+    monkeypatch.setattr(
+        cc,
+        "load_pairings",
+        lambda: {
+            "op": types.SimpleNamespace(
+                operator_root_pubkey="ROOT", server_url="https://s"
+            )
+        },
+    )
+    monkeypatch.setattr(
+        cc,
+        "decrypt_command",
+        lambda *args: {"op": "create", "agent_slug": None, "params": {}},
+    )
+    ws = _FakeWS()
+
+    await MachineControlClient(machine=object())._handle(
+        ws,
+        {"command_id": "create-1", "operator_slug": "op", "envelope": {}},
+    )
+
+    assert ws.acks == [
+        {"type": "ack", "command_id": "create-1", "result": result}
+    ]
 
 
 # ── usage-report snapshot loop ─────────────────────────────────────

@@ -59,6 +59,7 @@ def _patch_hosts(monkeypatch, *, opencode_path):
     monkeypatch.setattr(cli_bin, "resolve_codex_bin", lambda: "/bin/codex")
     monkeypatch.setattr(cli_bin, "codex_has_credentials", lambda: False)
     monkeypatch.setattr(cli_bin, "resolve_pi_bin", lambda: "/bin/pi")
+    monkeypatch.setattr(cli_bin, "pi_has_credentials", lambda *a, **k: False)
     monkeypatch.setattr(cli_bin, "resolve_opencode_bin", lambda: opencode_path)
     monkeypatch.setattr(model_catalog, "KNOWN_HARNESSES", ())
     monkeypatch.setattr(
@@ -75,14 +76,14 @@ def test_capabilities_report_truth_beside_frozen_legacy(monkeypatch):
     assert caps["cli_tools"] == {
         "claude-code": "ready",
         "codex": "need_login",
-        "pi": "ready",
+        "pi": "need_login",
         "opencode": "ready",
         "acp": "ready",
     }
     assert caps["harness_readiness"] == {
         "claude-code": {"state": "ready", "reason": ""},
         "codex": {"state": "unavailable", "reason": "need_login"},
-        "pi": {"state": "degraded", "reason": "credentials_unknown"},
+        "pi": {"state": "unavailable", "reason": "need_login"},
         "opencode": {"state": "degraded", "reason": "credentials_unknown"},
         "acp": {"state": "degraded", "reason": "target_probe_required"},
     }

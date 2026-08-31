@@ -143,6 +143,16 @@ def resolve_pi_bin() -> str | None:
     return _resolve("pi", "PUFFO_PI_BIN", [])
 
 
+def pi_has_credentials() -> bool:
+    """Ask the resolved Pi binary whether any host credential is ready."""
+    executable = resolve_pi_bin()
+    if not executable:
+        return False
+    from .pi_auth import pi_has_credentials as native_pi_has_credentials
+
+    return native_pi_has_credentials(executable)
+
+
 def _resolve(name: str, env_var: str, bundle_paths: list[Path]) -> str | None:
     # 1. Explicit operator override — always wins, read live.
     env_override = os.environ.get(env_var)

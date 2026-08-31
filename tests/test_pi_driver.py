@@ -257,6 +257,16 @@ def test_launch_command_never_disables_session_persistence():
     assert build_pi_launch_command(_spec())[:3] == ("pi", "--mode", "rpc")
 
 
+def test_launch_command_preserves_explicit_provider_and_model():
+    command = build_pi_launch_command(
+        _spec(model="gpt-5.5", launch_args=("--provider", "openai"))
+    )
+    assert command == (
+        "pi", "--mode", "rpc", "--model", "gpt-5.5",
+        "--provider", "openai",
+    )
+
+
 # -- exhaustive event normalization ----------------------------------------
 
 

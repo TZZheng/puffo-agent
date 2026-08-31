@@ -1,0 +1,85 @@
+"""Create-time Pi readiness checks stay fast, structured, and source-aligned."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from puffo_agent.agent.pi_auth import PiAuthResult
+from puffo_agent.portal.control import preflight
+from puffo_agent.portal.control.provision import ProvisionError
+from puffo_agent.portal.state import RuntimeConfig
+
+
+def _runtime(*, provider: str = "anthropic", model: str = "claude-sonnet-4-6"):
+    return RuntimeConfig(
+        kind="cli-local",
+        provider=provider,
+        harness="pi",
+        model=model,
+    )
+
+
+def test_pi_preflight_reports_missing_binary(monkeypatch):
+    monkeypatch.setattr(preflight, "resolve_pi_bin", lambda: None)
+
+    with pytest.raises(ProvisionError) as caught:
+        preflight.preflight_runtime(_runtime())
+
+    assert caught.value.reason == "Pi is not installed"
+    assert caught.value.fields == {
+        "error_code": "harness_not_ready",
+        "harness": "pi",
+        "reason": "not_installed",
+    }
+
+
+def test_pi_preflight_uses_qualified_model_as_authoritative_target(
+    tmp_path, monkeypatch,
+):
+    seen = {}
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(preflight, "resolve_pi_bin", lambda: "/opt/bin/pi")
+
+    def fake_check(executable, **kwargs):
+        seen.update(executable=executable, **kwargs)
+        return PiAuthResult(status="ready", provider="openai")
+
+    monkeypatch.setattr(preflight, "check_pi_auth", fake_check)
+
+    preflight.preflight_runtime(
+        _runtime(provider="anthropic", model="openai/gpt-5.5")
+    )
+
+    assert seen == {
+        "executable": "/opt/bin/pi",
+        "provider": "",
+        "model": "openai/gpt-5.5",
+        "config_dir": tmp_path / ".pi" / "agent",
+    }
+
+
+def test_pi_preflight_returns_machine_readable_login_reason(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(preflight, "resolve_pi_bin", lambda: "/opt/bin/pi")
+    monkeypatch.setattr(
+        preflight,
+        "check_pi_auth",
+        lambda *args, **kwargs: PiAuthResult(
+            status="not_ready",
+            provider="anthropic",
+            reason="credentials_not_configured",
+        ),
+    )
+
+    with pytest.raises(ProvisionError) as caught:
+        preflight.preflight_runtime(_runtime())
+
+    assert caught.value.reason == "Pi sign-in required"
+    assert caught.value.fields == {
+        "error_code": "harness_not_ready",
+        "harness": "pi",
+        "reason": "need_login",
+        "native_reason": "credentials_not_configured",
+    }

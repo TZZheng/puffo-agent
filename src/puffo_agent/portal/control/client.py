@@ -183,17 +183,24 @@ async def _create_agent_command(
     if isinstance(pc, dict):
         pc["server_url"] = server_url
 
+    from .preflight import preflight_runtime
     from .provision import ProvisionError, provision_agent_from_bundle
 
     async def _materialize(_ctx: dict) -> None:
         await _materialize_slug_binding(server_url, pending_token, slug_binding)
 
+    def _preflight(context: dict) -> None:
+        preflight_runtime(context["runtime"], agent_id=context["agent_id"])
+
     try:
         result = await provision_agent_from_bundle(
-            params, paired_root_pubkey, materialize=_materialize
+            params,
+            paired_root_pubkey,
+            preflight=_preflight,
+            materialize=_materialize,
         )
     except ProvisionError as exc:
-        return {"ok": False, "error": exc.reason}
+        return {"ok": False, "error": exc.reason, **exc.fields}
     except ControlError as exc:
         return {"ok": False, "error": str(exc)}
     return {"ok": True, "agent_slug": result["agent_id"]}
@@ -484,6 +491,7 @@ def build_capabilities() -> dict:
         claude_has_credentials,
         codex_has_credentials,
         harness_readiness,
+        pi_has_credentials,
         resolve_claude_bin,
         resolve_codex_bin,
         resolve_opencode_bin,
@@ -501,10 +509,8 @@ def build_capabilities() -> dict:
     readiness = {
         "claude-code": harness_readiness(resolve_claude_bin, claude_has_credentials),
         "codex": harness_readiness(resolve_codex_bin, codex_has_credentials),
-        # pi/opencode have no local credential store this daemon can
-        # inspect: three-state says so (degraded/credentials_unknown)
-        # instead of the old constant-True "ready".
-        "pi": harness_readiness(resolve_pi_bin, None),
+        "pi": harness_readiness(resolve_pi_bin, pi_has_credentials),
+        # OpenCode still has no local credential probe; report that honestly.
         "opencode": harness_readiness(resolve_opencode_bin, None),
         # The ACP driver targets whatever executable the agent config
         # names (gemini, kimi, opencode …), so no single binary probe can
@@ -636,6 +642,7 @@ class MachineControlClient:
     async def _handle(self, ws: aiohttp.ClientWebSocketResponse, frame: dict) -> None:
         command_id = frame.get("command_id")
         operator_slug = frame.get("operator_slug")
+        result: dict = {"ok": False, "error_code": "command_failed"}
         try:
             pairing = load_pairings().get(operator_slug)
             if pairing is None:
@@ -671,11 +678,16 @@ class MachineControlClient:
         except ControlError as exc:
             # Forged / malformed → never execute, but ack so it stops redelivering.
             log.warning("control: rejected command %s: %s", command_id, exc)
+            result = {"ok": False, "error_code": "command_rejected"}
         except Exception as exc:  # noqa: BLE001
             log.warning("control: command %s failed: %s", command_id, exc)
+            result = {"ok": False, "error_code": "command_failed"}
         if command_id:
             try:
-                await self._send(ws, {"type": "ack", "command_id": command_id})
+                await self._send(
+                    ws,
+                    {"type": "ack", "command_id": command_id, "result": result},
+                )
             except Exception as exc:  # noqa: BLE001
                 log.debug("control: ack %s failed: %s", command_id, exc)
 

@@ -41,6 +41,7 @@ from ....portal.state import (
     sync_host_codex_auth_view,
     sync_host_enabled_plugins,
     sync_host_mcp_servers,
+    sync_host_pi_auth_view,
     sync_host_plugins,
     sync_host_skills,
     strip_claude_api_key_from_settings,
@@ -440,6 +441,12 @@ class LocalRuntimePreparer:
                 "runtime.harness_command, for example "
                 "['opencode', 'acp']"
             )
+        if (
+            self.harness_name == "pi"
+            and "/" not in self.model
+            and "--provider" not in launch_args
+        ):
+            launch_args.extend(("--provider", self.provider))
         return executable, launch_args
 
     def _prepare_executable_configuration(
@@ -513,6 +520,12 @@ class LocalRuntimePreparer:
         """Install the bridge and mint fresh per-spec readiness evidence."""
         pi_home = agent_dir(self.agent_id) / ".pi" / "agent"
         install_pi_tool_bridge(pi_home)
+        auth_mode = sync_host_pi_auth_view(Path.home(), pi_home)
+        logger.info(
+            "agent %s: Pi credential projection mode=%s",
+            self.agent_id,
+            auth_mode,
+        )
         controlled = {"PI_CODING_AGENT_DIR": str(pi_home)}
         controlled.update(
             build_bridge_environment(
