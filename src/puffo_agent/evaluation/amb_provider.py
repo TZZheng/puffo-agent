@@ -53,6 +53,9 @@ class PuffoMemoryProvider:
     def initialize(self) -> None:
         """Satisfy AMB's pre-prepare lifecycle hook without side effects."""
 
+    def cleanup(self) -> None:
+        """Satisfy AMB's final lifecycle hook without owning external resources."""
+
     def prepare(
         self,
         store_dir: Path,
