@@ -435,6 +435,32 @@ async def test_pi_runtime_uses_daemon_binary_resolver_and_native_targeting(
     assert prepared.spec.mcp_servers == ()
 
 
+@pytest.mark.asyncio
+async def test_pi_runtime_forwards_selected_thinking_level(
+    puffo_home, monkeypatch,
+):
+    """A level admitted by the Pi catalog must reach the Pi child process."""
+    import puffo_agent.agent.harness.runtime.local_runtime as local_runtime
+
+    monkeypatch.setattr(local_runtime, "resolve_pi_bin", lambda: "/opt/bin/pi")
+    config = AgentConfig(
+        id="pi-thinking",
+        runtime=RuntimeConfig(
+            kind="cli-local",
+            provider="openai-codex",
+            harness="pi",
+            model="openai-codex/gpt-5.4-mini",
+            inference_level="high",
+        ),
+    )
+
+    prepared = await LocalRuntimePreparer(
+        DaemonConfig(), config
+    ).prepare(system_prompt="managed prompt")
+
+    assert prepared.spec.launch_args == ("--thinking", "high")
+
+
 class _ResumeFallbackDriver(Driver):
     def __init__(self):
         self.open_calls: list[str | None] = []

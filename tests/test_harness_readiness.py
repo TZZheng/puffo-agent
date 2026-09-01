@@ -107,3 +107,32 @@ def test_acp_readiness_is_not_keyed_to_the_opencode_binary(monkeypatch):
         "state": "degraded",
         "reason": "target_probe_required",
     }
+
+
+def test_capabilities_publish_model_specific_pi_thinking_levels(monkeypatch):
+    """The web must receive only thinking levels vouched for by Pi's catalog."""
+    _patch_hosts(monkeypatch, opencode_path=None)
+    monkeypatch.setattr(model_catalog, "KNOWN_HARNESSES", ("pi",))
+    monkeypatch.setattr(
+        model_catalog,
+        "provider_models",
+        lambda harness, *, fetch=False: [
+            model_catalog.ModelOption(
+                "openai-codex/gpt-5.4-mini",
+                "gpt-5.4-mini (openai-codex)",
+                supported_inference_levels=("off", "low", "high"),
+            )
+        ],
+    )
+
+    caps = build_capabilities()
+
+    assert caps["providers"] == [{
+        "provider": "pi",
+        "models": [{
+            "id": "openai-codex/gpt-5.4-mini",
+            "label": "gpt-5.4-mini (openai-codex)",
+            "alias": False,
+            "supported_inference_levels": ["off", "low", "high"],
+        }],
+    }]

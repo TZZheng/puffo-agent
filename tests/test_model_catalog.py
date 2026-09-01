@@ -131,7 +131,11 @@ def test_pi_catalog_uses_models_visible_to_native_cli(monkeypatch):
     monkeypatch.setattr(
         "puffo_agent.agent.pi_auth.list_pi_models",
         lambda executable, *, config_dir: (
-            ("anthropic/claude-sonnet-4-6", "claude-sonnet-4-6 (anthropic)"),
+            (
+                "anthropic/claude-sonnet-4-6",
+                "claude-sonnet-4-6 (anthropic)",
+                True,
+            ),
         ),
     )
     monkeypatch.setattr(
@@ -141,6 +145,9 @@ def test_pi_catalog_uses_models_visible_to_native_cli(monkeypatch):
     options = provider_models("pi", fetch=True)
     assert _ids(options)[1:] == ["anthropic/claude-sonnet-4-6"]
     assert options[1].label == "claude-sonnet-4-6 (anthropic)"
+    assert options[1].supported_inference_levels == (
+        "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    )
 
 
 def test_opencode_catalog_drops_logged_out_provider_after_short_ttl(monkeypatch):

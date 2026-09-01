@@ -44,6 +44,10 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
+class _DuplicateDelivery(ControlError):
+    pass
+
+
 def _is_already_archived(agent_slug: str) -> bool:
     # Matches any archived/<slug>-* suffix (-ws-/-del-/bare-stamp).
     root = archived_dir()
@@ -532,7 +536,20 @@ def build_capabilities() -> dict:
         {
             "provider": h,
             "models": [
-                {"id": o.id, "label": o.label, "alias": o.is_alias}
+                {
+                    "id": o.id,
+                    "label": o.label,
+                    "alias": o.is_alias,
+                    **(
+                        {
+                            "supported_inference_levels": list(
+                                o.supported_inference_levels
+                            )
+                        }
+                        if o.supported_inference_levels
+                        else {}
+                    ),
+                }
                 for o in provider_models(
                     h,
                     fetch=(h == "claude-code" and claude_ready)
@@ -604,8 +621,8 @@ class MachineControlClient:
                         {"type": "message", "operator_slug": operator_slug, "envelope": envelope},
                     )
 
-                get_reporter().set_sender(_report)
-                log.info("control: WS connected; agent.status sender ready")
+                reporter = get_reporter()
+                reporter_ready = False
                 try:
                     async for msg in ws:
                         if stop.is_set():
@@ -618,13 +635,21 @@ class MachineControlClient:
                             frame = json.loads(msg.data)
                         except ValueError:
                             continue
-                        if frame.get("type") == "command":
+                        if frame.get("type") == "connected":
+                            if not reporter_ready:
+                                reporter.set_sender(_report)
+                                reporter_ready = True
+                                log.info(
+                                    "control: WS connected; agent.status sender ready"
+                                )
+                        elif frame.get("type") == "command":
                             await self._handle(ws, frame)
                         elif frame.get("type") == "error":
                             log.warning("control: server rejected ws: %s", frame.get("reason"))
                             break
                 finally:
-                    get_reporter().set_sender(None)
+                    if reporter_ready:
+                        reporter.set_sender(None)
                     sender.cancel()
                     try:
                         await sender
@@ -659,7 +684,7 @@ class MachineControlClient:
             envelope = frame.get("envelope") or {}
             nonce = envelope.get("nonce")
             if nonce and nonce in self._seen_nonces:
-                raise ControlError("replayed nonce")
+                raise _DuplicateDelivery
             decrypted = decrypt_command(
                 envelope, self.machine, pairing.operator_root_pubkey, now_ms()
             )
@@ -684,6 +709,12 @@ class MachineControlClient:
                     "control: command %s op=%s failed: %s",
                     command_id, decrypted["op"], result.get("error"),
                 )
+        except _DuplicateDelivery:
+            log.debug(
+                "control: duplicate delivery suppressed for command %s",
+                command_id,
+            )
+            result = {"ok": False, "error_code": "command_rejected"}
         except ControlError as exc:
             # Forged / malformed → never execute, but ack so it stops redelivering.
             log.warning("control: rejected command %s: %s", command_id, exc)

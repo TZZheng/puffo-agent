@@ -133,8 +133,8 @@ def list_pi_models(
     *,
     config_dir: Path,
     timeout_seconds: float = 5.0,
-) -> tuple[tuple[str, str], ...]:
-    """Return ``(id, label)`` pairs from Pi's credential-aware model list."""
+) -> tuple[tuple[str, str, bool], ...]:
+    """Return model ids, labels, and thinking support from Pi's native list."""
     env = build_child_environment(
         controlled={"PI_CODING_AGENT_DIR": str(config_dir)}
     )
@@ -152,12 +152,29 @@ def list_pi_models(
     if completed.returncode != 0:
         raise PiAuthProbeError("Pi model list failed")
 
-    models: list[tuple[str, str]] = []
-    for line in completed.stdout.splitlines()[1:]:
-        columns = line.split()
-        if len(columns) < 2:
+    rows = [line.split() for line in completed.stdout.splitlines() if line.strip()]
+    if not rows:
+        return ()
+    header = [column.lower() for column in rows[0]]
+    try:
+        provider_index = header.index("provider")
+        model_index = header.index("model")
+        thinking_index = header.index("thinking")
+    except ValueError:
+        return ()
+
+    models: list[tuple[str, str, bool]] = []
+    thinking_offset = len(header) - thinking_index
+    required_index = max(provider_index, model_index)
+    for columns in rows[1:]:
+        if len(columns) <= required_index or len(columns) < thinking_offset:
             continue
-        provider, model = columns[0], columns[1]
+        provider, model = columns[provider_index], columns[model_index]
+        thinking = columns[-thinking_offset]
         model_id = f"{provider}/{model}"
-        models.append((model_id, f"{model} ({provider})"))
+        models.append((
+            model_id,
+            f"{model} ({provider})",
+            thinking.lower() == "yes",
+        ))
     return tuple(models)

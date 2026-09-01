@@ -447,6 +447,13 @@ class LocalRuntimePreparer:
             and "--provider" not in launch_args
         ):
             launch_args.extend(("--provider", self.provider))
+        inference_level = self.agent_cfg.runtime.inference_level
+        if (
+            self.harness_name == "pi"
+            and inference_level
+            and "--thinking" not in launch_args
+        ):
+            launch_args.extend(("--thinking", inference_level))
         return executable, launch_args
 
     def _prepare_executable_configuration(

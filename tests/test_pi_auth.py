@@ -130,8 +130,12 @@ def test_native_model_list_uses_same_private_config_view(tmp_path, monkeypatch):
     assert list_pi_models(
         "/opt/bin/pi", config_dir=tmp_path,
     ) == (
-        ("anthropic/claude-sonnet-4-6", "claude-sonnet-4-6 (anthropic)"),
-        ("openai/gpt-5.5", "gpt-5.5 (openai)"),
+        (
+            "anthropic/claude-sonnet-4-6",
+            "claude-sonnet-4-6 (anthropic)",
+            True,
+        ),
+        ("openai/gpt-5.5", "gpt-5.5 (openai)", True),
     )
     assert seen["command"] == ["/opt/bin/pi", "--list-models"]
     assert seen["kwargs"]["env"]["PI_CODING_AGENT_DIR"] == str(tmp_path)

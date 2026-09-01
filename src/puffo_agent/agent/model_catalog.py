@@ -27,6 +27,7 @@ class ModelOption:
     id: str  # the ``--model`` value; "" means the daemon default
     label: str  # combo-box display text
     is_alias: bool = False
+    supported_inference_levels: tuple[str, ...] = ()
 
 
 _DAEMON_DEFAULT = ModelOption("", "(daemon default)")
@@ -238,9 +239,18 @@ def _pi_models(*, fetch: bool) -> tuple[ModelOption, ...]:
         )
     except PiAuthProbeError:
         return _stale_models("pi")
-    return _store_models(
-        "pi", tuple(ModelOption(model_id, label) for model_id, label in models),
-    )
+    from ..mcp.config import PI_INFERENCE_LEVELS
+
+    return _store_models("pi", tuple(
+        ModelOption(
+            model_id,
+            label,
+            supported_inference_levels=(
+                PI_INFERENCE_LEVELS if supports_thinking else ("off",)
+            ),
+        )
+        for model_id, label, supports_thinking in models
+    ))
 
 
 def provider_models(harness: str, *, fetch: bool = False) -> list[ModelOption]:
