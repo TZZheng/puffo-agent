@@ -1,4 +1,7 @@
+import asyncio
 from pathlib import Path
+
+import pytest
 
 from puffo_agent.evaluation.amb_provider import PuffoBM25MemoryProvider, PuffoMemoryProvider
 
@@ -7,6 +10,18 @@ def test_amb_providers_support_the_initialize_lifecycle_hook():
     """Guards the AMB runner lifecycle before it calls prepare()."""
     assert PuffoMemoryProvider().initialize() is None
     assert PuffoBM25MemoryProvider().initialize() is None
+
+
+@pytest.mark.parametrize("provider", [PuffoMemoryProvider(), PuffoBM25MemoryProvider()])
+def test_provider_supports_amb_async_ingest_and_retrieve_hooks(tmp_path: Path, provider: PuffoMemoryProvider):
+    """Guards AMB's asynchronous ingestion and retrieval lifecycle."""
+    provider.prepare(tmp_path)
+
+    asyncio.run(provider.async_ingest([_document("target", "Alex needs hiking gear")]))
+    documents, raw = asyncio.run(provider.async_retrieve("hiking gear", k=1))
+
+    assert [document.id for document in documents] == ["target"]
+    assert raw == {"retrieval_mode": provider.retrieval_mode, "matched_note_paths": ["notes/target-0001.md"]}
 
 
 def test_bm25_retrieval_ranks_relevant_note_and_returns_full_body(tmp_path: Path):
