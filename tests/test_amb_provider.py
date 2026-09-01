@@ -1,6 +1,12 @@
 from pathlib import Path
 
-from puffo_agent.evaluation.amb_provider import PuffoMemoryProvider
+from puffo_agent.evaluation.amb_provider import PuffoBM25MemoryProvider, PuffoMemoryProvider
+
+
+def test_amb_providers_support_the_initialize_lifecycle_hook():
+    """Guards the AMB runner lifecycle before it calls prepare()."""
+    assert PuffoMemoryProvider().initialize() is None
+    assert PuffoBM25MemoryProvider().initialize() is None
 
 
 def test_bm25_retrieval_ranks_relevant_note_and_returns_full_body(tmp_path: Path):
