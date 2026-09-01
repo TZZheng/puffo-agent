@@ -49,6 +49,9 @@ class PuffoMemoryProvider:
         self._store: MemoryStore | None = None
         self._notes: list[_StoredNote] = []
 
+    def initialize(self) -> None:
+        """Satisfy AMB's pre-prepare lifecycle hook without side effects."""
+
     def prepare(
         self,
         store_dir: Path,
