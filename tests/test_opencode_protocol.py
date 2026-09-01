@@ -88,20 +88,27 @@ def test_completed_tool_frame_keeps_arguments_and_result_native_only():
         },
     }
 
-    [event] = normalize_opencode_frame(
+    started, completed = normalize_opencode_frame(
         frame,
         session_ref=SessionRef("logical"),
         turn_ref=TurnRef("turn-1"),
     )
 
-    assert event.type is HarnessEventType.TOOL_COMPLETED
-    assert event.data == {
+    assert started.type is HarnessEventType.TOOL_STARTED
+    assert started.data == {
+        "tool_call_ref": "prt_tool",
+        "label": "read_inbox",
+    }
+    assert completed.type is HarnessEventType.TOOL_COMPLETED
+    assert completed.data == {
         "tool_call_ref": "prt_tool",
         "label": "read_inbox",
         "outcome": "succeeded",
     }
-    assert "private result" not in repr(event.data)
-    assert event.native_diagnostic == frame
+    assert "private result" not in repr(started.data)
+    assert "private result" not in repr(completed.data)
+    assert started.native_diagnostic == frame
+    assert completed.native_diagnostic == frame
 
 
 def test_step_finish_updates_usage_but_is_not_turn_terminal():

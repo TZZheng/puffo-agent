@@ -99,12 +99,16 @@ def normalize_opencode_frame(
         state = part.get("state")
         state = state if isinstance(state, dict) else {}
         status = str(state.get("status") or "")
+        tool = {
+            "tool_call_ref": str(part.get("id") or ""),
+            "label": _tool_label(part),
+        }
         return (
+            event(HarnessEventType.TOOL_STARTED, tool),
             event(
                 HarnessEventType.TOOL_COMPLETED,
                 {
-                    "tool_call_ref": str(part.get("id") or ""),
-                    "label": _tool_label(part),
+                    **tool,
                     "outcome": "succeeded" if status == "completed" else "failed",
                 },
             ),

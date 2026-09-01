@@ -91,6 +91,7 @@ def normalize_pi_event(
     session_ref: SessionRef,
     turn_ref: TurnRef | None,
     native_session_id: str = "",
+    native_turn_id: str = "",
 ) -> tuple[HarnessEvent, ...]:
     """Normalize one documented Pi RPC event line.
 
@@ -108,6 +109,7 @@ def normalize_pi_event(
             session_ref=session_ref,
             turn_ref=turn_ref,
             native_session_id=native_session_id,
+            native_turn_id=native_turn_id,
             data=data,
             native_payload=frame,
         )
