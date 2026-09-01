@@ -74,6 +74,7 @@ PUFFO_CORE_TOOL_NAMES = (
     "add_dm_allowlist",
     "update_dm_blocklist",
     "refresh",
+    "monid_spend",
     # M3 memory tools (registered by mcp.memory_tools).
     "create_note",
     "patch_note",
