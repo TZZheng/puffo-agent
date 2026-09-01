@@ -6,6 +6,25 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.4] - 2026-09-01
+
+### Added
+
+- **Truthful Pi and OpenCode creation preflight.** The daemon reports native
+  harness readiness and live model catalogs, rejects unavailable providers or
+  exact models before provisioning identity state, and discovers standard
+  per-user OpenCode installations even under a narrow daemon `PATH`. Existing
+  ACP-over-OpenCode configurations continue to load unchanged. (#305)
+
+### Fixed
+
+- **Pi concurrent replies keep their admission identity across sub-turns.**
+  Stable native turn IDs now survive `agent_end` / `agent_start` boundaries so
+  competing held replies are not silently dropped. (#305)
+- **OpenCode tool activity reaches the UI.** Tool frames now project both
+  start and completion status, and unavailable selected models are reported
+  separately from missing provider authentication. (#305)
+
 ## [2.0.3] - 2026-08-27
 
 ### Added
@@ -4982,7 +5001,8 @@ First public PyPI release.
   future server-side regression that echoes the same cursor back
   bails instead of spinning.
 
-[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.3...HEAD
+[Unreleased]: https://github.com/puffo-ai/puffo-agent/compare/v2.0.4...HEAD
+[2.0.4]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.4
 [2.0.3]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.3
 [2.0.2]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.2
 [2.0.1]: https://github.com/puffo-ai/puffo-agent/releases/tag/v2.0.1
