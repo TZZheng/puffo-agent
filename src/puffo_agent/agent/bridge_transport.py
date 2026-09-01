@@ -58,6 +58,7 @@ from .client_support import (
 )
 from .inbound_attachments import (
     downscale_oversized_image,
+    is_image_attachment,
     is_safe_path_component,
     normalize_saved_image,
 )
@@ -1307,10 +1308,12 @@ async def _save_one_bridge_attachment(
     except OSError as exc:
         client._log.warning("bridge attachment save failed (%s): %s", target, exc)
         return None
-    normalized = await normalize_saved_image(
-        target=target,
-        image_edge_px=client._image_edge_px,
-        log=client._log,
-        scale_image=downscale_oversized_image,
-    )
+    normalized = target
+    if is_image_attachment(str(raw.get("mime_type") or ""), data):
+        normalized = await normalize_saved_image(
+            target=target,
+            image_edge_px=client._image_edge_px,
+            log=client._log,
+            scale_image=downscale_oversized_image,
+        )
     return (normalized, len(data)) if normalized is not None else None

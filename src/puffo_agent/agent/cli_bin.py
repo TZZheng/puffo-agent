@@ -133,14 +133,38 @@ def resolve_opencode_bin() -> str | None:
     """Return the absolute path of the ``opencode`` binary, or ``None``.
 
     ``PUFFO_OPENCODE_BIN`` is an expert deployment override for daemons whose
-    inherited PATH predates the OpenCode installation.
+    inherited PATH predates the OpenCode installation.  The bundle fallback
+    covers OpenCode's standard per-user installer location for launchd and
+    other services with a narrow PATH.
     """
-    return _resolve("opencode", "PUFFO_OPENCODE_BIN", [])
+    return _resolve(
+        "opencode", "PUFFO_OPENCODE_BIN", _opencode_bundle_paths(),
+    )
 
 
 def resolve_pi_bin() -> str | None:
     """Return the absolute path of the Pi coding-agent binary, or ``None``."""
     return _resolve("pi", "PUFFO_PI_BIN", [])
+
+
+def pi_has_credentials() -> bool:
+    """Ask the resolved Pi binary whether any host credential is ready."""
+    executable = resolve_pi_bin()
+    if not executable:
+        return False
+    from .pi_auth import pi_has_credentials as native_pi_has_credentials
+
+    return native_pi_has_credentials(executable)
+
+
+def opencode_has_accessible_models() -> bool:
+    """Whether native OpenCode exposes at least one currently usable model."""
+    executable = resolve_opencode_bin()
+    if not executable:
+        return False
+    from .opencode_auth import list_opencode_models
+
+    return bool(list_opencode_models(executable))
 
 
 def _resolve(name: str, env_var: str, bundle_paths: list[Path]) -> str | None:
@@ -425,6 +449,12 @@ def _hermes_bundle_paths() -> list[Path]:
         "/usr/local/bin/hermes",
         "/opt/homebrew/bin/hermes",
     )
+
+
+def _opencode_bundle_paths() -> list[Path]:
+    """OpenCode's documented per-user installer location."""
+    executable = "opencode.exe" if sys.platform == "win32" else "opencode"
+    return [Path.home() / ".opencode" / "bin" / executable]
 
 
 def _expand(*paths: str) -> list[Path]:

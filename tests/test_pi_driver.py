@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from puffo_agent.agent.adapters.base import TurnContext
 from puffo_agent.agent.harness.driver import (
     BusyDelivery,
     CompactRequest,
@@ -29,6 +30,10 @@ from puffo_agent.agent.harness.driver import (
     UnsupportedCapability,
 )
 from puffo_agent.agent.harness import build_driver
+from puffo_agent.agent.harness.runtime.runtime_manager import (
+    RuntimeManager,
+    RuntimeManagerAdapter,
+)
 from puffo_agent.agent.harness.drivers.pi_bridge import (
     BRIDGE_NONCE_ENV,
     BRIDGE_READY_FILE_ENV,
@@ -257,6 +262,16 @@ def test_launch_command_never_disables_session_persistence():
     assert build_pi_launch_command(_spec())[:3] == ("pi", "--mode", "rpc")
 
 
+def test_launch_command_preserves_explicit_provider_and_model():
+    command = build_pi_launch_command(
+        _spec(model="gpt-5.5", launch_args=("--provider", "openai"))
+    )
+    assert command == (
+        "pi", "--mode", "rpc", "--model", "gpt-5.5",
+        "--provider", "openai",
+    )
+
+
 # -- exhaustive event normalization ----------------------------------------
 
 
@@ -451,6 +466,7 @@ async def test_exactly_one_terminal_arrives_at_agent_settled():
     started = asyncio.create_task(driver.start_turn(TurnInput("hello")))
     await proc.answer_next()
     turn = await started
+    assert turn.native_turn_id == turn.turn_ref.value
 
     for frame in (
         {"type": "agent_start"},
@@ -473,6 +489,7 @@ async def test_exactly_one_terminal_arrives_at_agent_settled():
     terminals = [e for e in events if e.type == HarnessEventType.TURN_COMPLETED]
     assert len(terminals) == 1
     assert terminals[0].turn_ref == turn.turn_ref
+    assert terminals[0].native_turn_id == turn.native_turn_id
     assert terminals[0].data["outcome"] == "succeeded"
     # The terminal is last: nothing after agent_end pre-empted it.
     assert events[-1].type == HarnessEventType.TURN_COMPLETED
@@ -509,6 +526,114 @@ async def test_settled_run_without_an_active_turn_is_reported_autonomous():
     events = await _drain_events(driver, 1)
     assert events[0].type == HarnessEventType.AUTONOMOUS_COMPLETED
     await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_autonomous_run_has_a_correlatable_native_turn():
+    proc = FakePiProcess()
+    driver, _ = await _open(proc)
+    proc.push({"type": "agent_start"})
+    proc.push({
+        "type": "tool_execution_start",
+        "toolCallId": "call-1",
+        "toolName": "send_message",
+    })
+    proc.push({"type": "agent_settled"})
+
+    events = await _drain_events(driver, 3)
+    started, tool, completed = events
+    assert started.type == HarnessEventType.TURN_STARTED
+    assert started.turn_ref is not None
+    assert started.native_turn_id == started.turn_ref.value
+    assert tool.type == HarnessEventType.TOOL_STARTED
+    assert tool.native_turn_id == started.native_turn_id
+    assert completed.type == HarnessEventType.TURN_COMPLETED
+    assert completed.native_turn_id == started.native_turn_id
+    await driver.close()
+
+
+@pytest.mark.asyncio
+async def test_two_held_replies_survive_a_pi_subturn_boundary():
+    """Two competitive replies stay correlated across Pi's run boundary.
+
+    ``agent_end`` may be followed by another ``agent_start`` before the one
+    Puffo turn settles. This is the production race where both held sends
+    previously failed registration because Pi exposed no native turn id.
+    """
+    proc = FakePiProcess()
+    driver = PiDriver(
+        process_factory=_attesting_factory(proc), bridge_ready_timeout=1.0
+    )
+    manager = RuntimeManager(driver, _spec(task_timeout_seconds=2))
+    adapter = RuntimeManagerAdapter(manager)
+
+    opening = asyncio.create_task(manager.open())
+    await proc.answer_next()
+    await opening
+
+    turn_task = asyncio.create_task(adapter.run_turn(TurnContext(
+        system_prompt="contract",
+        messages=[{"role": "user", "content": "two inbound replies"}],
+    )))
+    await proc.answer_next()
+    for _ in range(500):
+        if manager.native_turn_id:
+            break
+        await asyncio.sleep(0)
+    else:
+        raise AssertionError("Pi turn never exposed a native turn id")
+
+    admitted: list[str] = []
+
+    async def record_admission(event):
+        admitted.append(event.planning_cycle_key)
+
+    replies = (
+        ("reply-a", "first competing reply", "receipt-a"),
+        ("reply-b", "second competing reply", "receipt-b"),
+    )
+    for cycle, text, receipt in replies:
+        adapter.register_continuation_callback(
+            record_admission,
+            cycle,
+            channel_id="ch-race",
+            tool_names=("send_message",),
+            tool_arguments={"channel": "ch-race", "text": text},
+            correlation_receipt=receipt,
+    )
+
+    def held_result_frame(index: int) -> dict:
+        _, text, receipt = replies[index]
+        return {
+            "type": "tool_execution_end",
+            "toolCallId": f"call-{index}",
+            "toolName": "mcp__puffo__send_message",
+            "isError": False,
+            "_puffo_internal": "tool_result",
+            "tool_call_id": f"call-{index}",
+            "tool_name": "send_message",
+            "arguments": {"channel": "ch-race", "text": text},
+            "result": (
+                f'[send_result state="held"] '
+                f'[puffo:model-visible-read:{receipt}]'
+            ),
+        }
+
+    proc.push({"type": "agent_start"})
+    proc.push(held_result_frame(0))
+    proc.push({"type": "agent_end", "willRetry": False})
+    proc.push({"type": "agent_start"})
+    proc.push(held_result_frame(1))
+    proc.push({"type": "agent_settled"})
+
+    await proc.answer_next()
+    result = await asyncio.wait_for(turn_task, timeout=2)
+    assert result.reply == ""
+    assert admitted == ["reply-a", "reply-b"]
+    assert manager.active_turn_ref is None
+    assert manager.native_turn_id == ""
+    assert not manager._continuation_admissions
+    await adapter.aclose()
 
 
 @pytest.mark.asyncio

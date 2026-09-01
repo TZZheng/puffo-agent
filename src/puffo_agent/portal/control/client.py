@@ -44,6 +44,10 @@ HTTP_TIMEOUT = aiohttp.ClientTimeout(total=30)
 HEARTBEAT_INTERVAL_SECONDS = 30.0
 
 
+class _DuplicateDelivery(ControlError):
+    pass
+
+
 def _is_already_archived(agent_slug: str) -> bool:
     # Matches any archived/<slug>-* suffix (-ws-/-del-/bare-stamp).
     root = archived_dir()
@@ -183,17 +187,24 @@ async def _create_agent_command(
     if isinstance(pc, dict):
         pc["server_url"] = server_url
 
+    from .preflight import preflight_runtime
     from .provision import ProvisionError, provision_agent_from_bundle
 
     async def _materialize(_ctx: dict) -> None:
         await _materialize_slug_binding(server_url, pending_token, slug_binding)
 
+    def _preflight(context: dict) -> None:
+        preflight_runtime(context["runtime"], agent_id=context["agent_id"])
+
     try:
         result = await provision_agent_from_bundle(
-            params, paired_root_pubkey, materialize=_materialize
+            params,
+            paired_root_pubkey,
+            preflight=_preflight,
+            materialize=_materialize,
         )
     except ProvisionError as exc:
-        return {"ok": False, "error": exc.reason}
+        return {"ok": False, "error": exc.reason, **exc.fields}
     except ControlError as exc:
         return {"ok": False, "error": str(exc)}
     return {"ok": True, "agent_slug": result["agent_id"]}
@@ -484,6 +495,8 @@ def build_capabilities() -> dict:
         claude_has_credentials,
         codex_has_credentials,
         harness_readiness,
+        opencode_has_accessible_models,
+        pi_has_credentials,
         resolve_claude_bin,
         resolve_codex_bin,
         resolve_opencode_bin,
@@ -501,30 +514,49 @@ def build_capabilities() -> dict:
     readiness = {
         "claude-code": harness_readiness(resolve_claude_bin, claude_has_credentials),
         "codex": harness_readiness(resolve_codex_bin, codex_has_credentials),
-        # pi/opencode have no local credential store this daemon can
-        # inspect: three-state says so (degraded/credentials_unknown)
-        # instead of the old constant-True "ready".
-        "pi": harness_readiness(resolve_pi_bin, None),
-        "opencode": harness_readiness(resolve_opencode_bin, None),
+        "pi": harness_readiness(resolve_pi_bin, pi_has_credentials),
+        "opencode": harness_readiness(
+            resolve_opencode_bin, opencode_has_accessible_models,
+        ),
         # The ACP driver targets whatever executable the agent config
         # names (gemini, kimi, opencode …), so no single binary probe can
         # stand for it; admission is checked per-target at creation time.
         "acp": HarnessReadiness("degraded", "target_probe_required", "ready"),
     }
     cli_tools = {name: r.legacy for name, r in readiness.items()}
-    # Frozen wire quirk, kept byte-stable for old portal consumers: the
-    # legacy "acp" value has always been the *opencode* binary's status.
-    # New consumers read harness_readiness and must not inherit this.
-    cli_tools["acp"] = harness_readiness(resolve_opencode_bin, None).legacy
+    # Frozen wire quirks, kept byte-stable for old portal consumers:
+    # opencode historically meant binary-present (credentials unknown), and
+    # "acp" mirrored that opencode binary status. New consumers read
+    # harness_readiness and must not inherit either approximation.
+    legacy_opencode = harness_readiness(resolve_opencode_bin, None).legacy
+    cli_tools["opencode"] = legacy_opencode
+    cli_tools["acp"] = legacy_opencode
     claude_ready = cli_tools["claude-code"] == "ready"
     providers = [
         {
             "provider": h,
             "models": [
-                {"id": o.id, "label": o.label, "alias": o.is_alias}
+                {
+                    "id": o.id,
+                    "label": o.label,
+                    "alias": o.is_alias,
+                    **(
+                        {
+                            "supported_inference_levels": list(
+                                o.supported_inference_levels
+                            )
+                        }
+                        if o.supported_inference_levels
+                        else {}
+                    ),
+                }
                 for o in provider_models(
                     h,
-                    fetch=h == "claude-code" and claude_ready,
+                    fetch=(h == "claude-code" and claude_ready)
+                    or (
+                        h in {"pi", "opencode"}
+                        and readiness[h].state == "ready"
+                    ),
                 )
                 if o.id
             ],
@@ -589,8 +621,8 @@ class MachineControlClient:
                         {"type": "message", "operator_slug": operator_slug, "envelope": envelope},
                     )
 
-                get_reporter().set_sender(_report)
-                log.info("control: WS connected; agent.status sender ready")
+                reporter = get_reporter()
+                reporter_ready = False
                 try:
                     async for msg in ws:
                         if stop.is_set():
@@ -603,13 +635,21 @@ class MachineControlClient:
                             frame = json.loads(msg.data)
                         except ValueError:
                             continue
-                        if frame.get("type") == "command":
+                        if frame.get("type") == "connected":
+                            if not reporter_ready:
+                                reporter.set_sender(_report)
+                                reporter_ready = True
+                                log.info(
+                                    "control: WS connected; agent.status sender ready"
+                                )
+                        elif frame.get("type") == "command":
                             await self._handle(ws, frame)
                         elif frame.get("type") == "error":
                             log.warning("control: server rejected ws: %s", frame.get("reason"))
                             break
                 finally:
-                    get_reporter().set_sender(None)
+                    if reporter_ready:
+                        reporter.set_sender(None)
                     sender.cancel()
                     try:
                         await sender
@@ -636,6 +676,7 @@ class MachineControlClient:
     async def _handle(self, ws: aiohttp.ClientWebSocketResponse, frame: dict) -> None:
         command_id = frame.get("command_id")
         operator_slug = frame.get("operator_slug")
+        result: dict = {"ok": False, "error_code": "command_failed"}
         try:
             pairing = load_pairings().get(operator_slug)
             if pairing is None:
@@ -643,7 +684,7 @@ class MachineControlClient:
             envelope = frame.get("envelope") or {}
             nonce = envelope.get("nonce")
             if nonce and nonce in self._seen_nonces:
-                raise ControlError("replayed nonce")
+                raise _DuplicateDelivery
             decrypted = decrypt_command(
                 envelope, self.machine, pairing.operator_root_pubkey, now_ms()
             )
@@ -668,14 +709,25 @@ class MachineControlClient:
                     "control: command %s op=%s failed: %s",
                     command_id, decrypted["op"], result.get("error"),
                 )
+        except _DuplicateDelivery:
+            log.debug(
+                "control: duplicate delivery suppressed for command %s",
+                command_id,
+            )
+            result = {"ok": False, "error_code": "command_rejected"}
         except ControlError as exc:
             # Forged / malformed → never execute, but ack so it stops redelivering.
             log.warning("control: rejected command %s: %s", command_id, exc)
+            result = {"ok": False, "error_code": "command_rejected"}
         except Exception as exc:  # noqa: BLE001
             log.warning("control: command %s failed: %s", command_id, exc)
+            result = {"ok": False, "error_code": "command_failed"}
         if command_id:
             try:
-                await self._send(ws, {"type": "ack", "command_id": command_id})
+                await self._send(
+                    ws,
+                    {"type": "ack", "command_id": command_id, "result": result},
+                )
             except Exception as exc:  # noqa: BLE001
                 log.debug("control: ack %s failed: %s", command_id, exc)
 

@@ -40,9 +40,9 @@ MAX_ROLE_SHORT_LEN = 32
 
 
 class ProvisionError(Exception):
-    def __init__(self, reason: str, **fields: Any) -> None:
-        super().__init__(reason)
-        self.reason = reason
+    def __init__(self, message: str, **fields: Any) -> None:
+        super().__init__(message)
+        self.reason = message
         self.fields = fields
 
 
@@ -333,9 +333,15 @@ def write_agent_from_context(context: dict) -> dict:
 
 
 async def provision_agent_from_bundle(
-    payload: dict, operator_root_key_b64: str, *, materialize=None,
+    payload: dict,
+    operator_root_key_b64: str,
+    *,
+    preflight=None,
+    materialize=None,
 ) -> dict:
     context = verify_agent_bundle(payload, operator_root_key_b64)
+    if preflight is not None:
+        preflight(context)
     if materialize is not None:
         await materialize(context)
     result = write_agent_from_context(context)

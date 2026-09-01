@@ -382,7 +382,7 @@ class PiDriver(Driver):
             self._active = TurnRef("")
             self._reset_turn()
             raise
-        return TurnStarted(local, "")
+        return TurnStarted(local, local.value)
 
     async def steer_turn(self, turn: TurnRef, input: TurnInput):
         self._require_active(turn)
@@ -546,11 +546,15 @@ class PiDriver(Driver):
         if type_ == TERMINAL_EVENT:
             await self._complete_turn(frame)
             return
+        if type_ == "agent_start" and not self._active.value:
+            self._active = TurnRef(f"turn_{uuid.uuid4().hex}")
+            self._reset_turn()
         for event in normalize_pi_event(
             frame,
             session_ref=self._session_ref,
             turn_ref=self._active if self._active.value else None,
             native_session_id=self._native_session_id,
+            native_turn_id=self._active.value,
         ):
             if event.type == HarnessEventType.CONTEXT_UPDATED:
                 self._turn_usage = dict(event.data)
@@ -662,6 +666,7 @@ class PiDriver(Driver):
                 session_ref=self._session_ref,
                 turn_ref=turn_ref,
                 native_session_id=self._native_session_id,
+                native_turn_id=(turn_ref.value if turn_ref is not None else ""),
                 data=data or {},
                 native_payload=native_payload,
             )

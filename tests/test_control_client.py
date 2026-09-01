@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import types
 
 import pytest
@@ -19,6 +21,70 @@ class _FakeWS:
 
     async def send_json(self, obj):
         self.acks.append(obj)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_frame", "connected_logged"),
+    [
+        ({"type": "error", "reason": "auth"}, False),
+        ({"type": "connected"}, True),
+    ],
+)
+async def test_control_logs_connected_only_after_server_acceptance(
+    monkeypatch, caplog, server_frame, connected_logged,
+):
+    """A successful HTTP upgrade is not yet an authenticated control session."""
+    class FakeSocket:
+        def __init__(self):
+            self.frames = [types.SimpleNamespace(
+                type=cc.aiohttp.WSMsgType.TEXT,
+                data=json.dumps(server_frame),
+            )]
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def send_json(self, obj):
+            return None
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if not self.frames:
+                raise StopAsyncIteration
+            return self.frames.pop(0)
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def ws_connect(self, *args, **kwargs):
+            return FakeSocket()
+
+    def fake_spawn(coro, *, name):
+        coro.close()
+        return asyncio.create_task(asyncio.sleep(0))
+
+    monkeypatch.setattr(
+        cc, "load_pairings", lambda: {"op": types.SimpleNamespace(server_url="https://s")},
+    )
+    monkeypatch.setattr(cc, "create_remote_http_session", lambda base: FakeSession())
+    monkeypatch.setattr(cc.machine_auth, "ws_connect_frame", lambda machine: {})
+    monkeypatch.setattr(cc, "build_capabilities", lambda: {})
+    monkeypatch.setattr(cc, "spawn", fake_spawn)
+    caplog.set_level(logging.INFO, logger=cc.log.name)
+
+    await MachineControlClient(machine=object())._connect_once(asyncio.Event())
+
+    assert ("control: WS connected" in caplog.text) is connected_logged
 
 
 @pytest.mark.asyncio
@@ -49,18 +115,58 @@ async def test_handle_rejects_replayed_nonce_and_bounds_set(monkeypatch):
     await mc._handle(ws, frame("c1", "N1"))
     assert executed == ["a1"]
     assert "N1" in mc._seen_nonces
-    assert ws.acks[-1] == {"type": "ack", "command_id": "c1"}
+    assert ws.acks[-1] == {
+        "type": "ack",
+        "command_id": "c1",
+        "result": {"ok": True},
+    }
 
     # replayed nonce → not executed again, but still acked so it stops redelivering
     await mc._handle(ws, frame("c2", "N1"))
     assert executed == ["a1"]
-    assert ws.acks[-1] == {"type": "ack", "command_id": "c2"}
+    assert ws.acks[-1] == {
+        "type": "ack",
+        "command_id": "c2",
+        "result": {"ok": False, "error_code": "command_rejected"},
+    }
 
     # a nonce older than the ts window is pruned on the next handled command
     mc._seen_nonces["OLD"] = 1_000_000 - cc.TS_WINDOW_MS - 1
     await mc._handle(ws, frame("c3", "N2"))
     assert "OLD" not in mc._seen_nonces
     assert "N2" in mc._seen_nonces
+
+
+@pytest.mark.asyncio
+async def test_duplicate_delivery_is_debug_not_rejection_warning(
+    monkeypatch, caplog,
+):
+    """Expected crash-recovery redelivery must not look like a security fault."""
+    monkeypatch.setattr(cc, "load_pairings", lambda: {
+        "op": types.SimpleNamespace(operator_root_pubkey="ROOT", server_url="https://s"),
+    })
+    monkeypatch.setattr(
+        cc, "decrypt_command",
+        lambda *args: {"op": "pause", "agent_slug": "a1", "params": {}},
+    )
+    mc = MachineControlClient(machine=object())
+    mc._seen_nonces["N1"] = 1
+    caplog.set_level(logging.DEBUG, logger=cc.log.name)
+
+    await mc._handle(
+        _FakeWS(),
+        {
+            "command_id": "c2",
+            "operator_slug": "op",
+            "envelope": {"nonce": "N1", "ts": 1},
+        },
+    )
+
+    assert "duplicate delivery suppressed" in caplog.text
+    assert not any(
+        record.levelno >= logging.WARNING and "replayed nonce" in record.message
+        for record in caplog.records
+    )
 
 
 @pytest.fixture
@@ -131,8 +237,13 @@ async def test_create_without_pending_token_rejected(home):
 async def test_create_delegates_to_control_provisioner(home, monkeypatch):
     seen = {}
 
-    async def fake_provision(params, operator_key, *, materialize):
-        seen.update(params=params, operator_key=operator_key, materialize=materialize)
+    async def fake_provision(params, operator_key, *, preflight, materialize):
+        seen.update(
+            params=params,
+            operator_key=operator_key,
+            preflight=preflight,
+            materialize=materialize,
+        )
         return {"agent_id": "helper-1"}
 
     monkeypatch.setattr(
@@ -154,6 +265,46 @@ async def test_create_delegates_to_control_provisioner(home, monkeypatch):
     assert result == {"ok": True, "agent_slug": "helper-1"}
     assert seen["operator_key"] == "operator-key"
     assert seen["params"]["puffo_core"]["server_url"] == "https://relay.example"
+
+
+@pytest.mark.asyncio
+async def test_handle_ack_carries_the_exact_command_result(monkeypatch):
+    result = {
+        "ok": False,
+        "error": "Pi sign-in required",
+        "error_code": "harness_not_ready",
+        "harness": "pi",
+        "reason": "need_login",
+    }
+
+    async def fake_exec(*args, **kwargs):
+        return result
+
+    monkeypatch.setattr(cc, "execute_command", fake_exec)
+    monkeypatch.setattr(
+        cc,
+        "load_pairings",
+        lambda: {
+            "op": types.SimpleNamespace(
+                operator_root_pubkey="ROOT", server_url="https://s"
+            )
+        },
+    )
+    monkeypatch.setattr(
+        cc,
+        "decrypt_command",
+        lambda *args: {"op": "create", "agent_slug": None, "params": {}},
+    )
+    ws = _FakeWS()
+
+    await MachineControlClient(machine=object())._handle(
+        ws,
+        {"command_id": "create-1", "operator_slug": "op", "envelope": {}},
+    )
+
+    assert ws.acks == [
+        {"type": "ack", "command_id": "create-1", "result": result}
+    ]
 
 
 # ── usage-report snapshot loop ─────────────────────────────────────

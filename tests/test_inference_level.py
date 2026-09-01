@@ -193,6 +193,9 @@ from puffo_agent.portal.state import refresh_model_flag_path  # noqa: E402
 def test_supported_levels_are_per_harness():
     assert supported_inference_levels("codex") == REASONING_EFFORTS
     assert supported_inference_levels("claude-code") == INFERENCE_LEVELS
+    assert supported_inference_levels("pi") == (
+        "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    )
     # codex has minimal but not xhigh; claude-code the reverse.
     assert "xhigh" not in supported_inference_levels("codex")
     assert "minimal" not in supported_inference_levels("claude-code")
