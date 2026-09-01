@@ -6,10 +6,12 @@ import pytest
 from puffo_agent.evaluation.amb_provider import PuffoBM25MemoryProvider, PuffoMemoryProvider
 
 
-def test_amb_providers_support_the_initialize_lifecycle_hook():
-    """Guards the AMB runner lifecycle before it calls prepare()."""
+def test_amb_providers_support_noop_lifecycle_hooks():
+    """Guards AMB's initialize and final cleanup lifecycle hooks."""
     assert PuffoMemoryProvider().initialize() is None
     assert PuffoBM25MemoryProvider().initialize() is None
+    assert PuffoMemoryProvider().cleanup() is None
+    assert PuffoBM25MemoryProvider().cleanup() is None
 
 
 @pytest.mark.parametrize("provider", [PuffoMemoryProvider(), PuffoBM25MemoryProvider()])
