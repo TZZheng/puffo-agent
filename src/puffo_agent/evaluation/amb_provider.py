@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 import shutil
@@ -74,6 +75,10 @@ class PuffoMemoryProvider:
                 store.create_memory_file(path, chunk)
                 self._notes.append(_StoredNote(document.id, path, document.user_id))
 
+    async def async_ingest(self, documents: list[AmbDocument]) -> None:
+        """Match AMB's asynchronous provider contract without coupling to AMB."""
+        await asyncio.to_thread(self.ingest, documents)
+
     def retrieve(
         self,
         query: str,
@@ -91,6 +96,16 @@ class PuffoMemoryProvider:
             "retrieval_mode": self.retrieval_mode,
             "matched_note_paths": [note.path for note in ranked],
         }
+
+    async def async_retrieve(
+        self,
+        query: str,
+        k: int = 10,
+        user_id: str | None = None,
+        query_timestamp: str | None = None,
+    ) -> tuple[list[AmbDocument], dict | None]:
+        """Match AMB's asynchronous provider contract without coupling to AMB."""
+        return await asyncio.to_thread(self.retrieve, query, k, user_id, query_timestamp)
 
     def _rank(self, query: str, notes: list[_StoredNote]) -> list[_StoredNote]:
         if self.retrieval_mode == "substring":
