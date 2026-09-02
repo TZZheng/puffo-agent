@@ -519,6 +519,11 @@ def _add_machine_commands(sub, handlers: CommandHandlers) -> None:
         action="store_true",
         help="Don't auto-open the link page in your browser.",
     )
+    machine_link.add_argument(
+        "--no-autostart",
+        action="store_true",
+        help="Do not register the daemon to start automatically after login.",
+    )
     machine_link.set_defaults(func=handlers["cmd_link"])
 
     machine_unlink = machine_sub.add_parser(
