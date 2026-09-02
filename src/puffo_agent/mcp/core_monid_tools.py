@@ -29,6 +29,17 @@ from ..crypto.http_client import HttpError
 
 logger = logging.getLogger(__name__)
 
+# Provenance is mandatory. A successful `monid_spend` result is stamped as
+# Monid-sourced (paid, real) so the model can attribute it; but only the model
+# writes the final answer, so on any failure we tell it that if it falls back to
+# its own knowledge or the web it MUST label that as non-Monid — never pass it
+# off as Monid data. Round-1 honesty gap: a web-stitched table shown as a result.
+# This is steering, not a hard block; a system-level rule is a separate follow-up.
+_LABEL_NON_MONID = (
+    "If you answer from your own knowledge or the web instead, you MUST clearly "
+    "label it as NOT a Monid result — never present non-Monid data as Monid data."
+)
+
 
 def _monid_error_message(exc: HttpError) -> str:
     """Pull the server's human-readable ``message`` out of a failed monid
@@ -94,8 +105,11 @@ def _register_monid_prepare(mcp: FastMCP, cfg: Any) -> None:
             query: What data you want, in natural language.
             limit: How many candidate capabilities to consider (1-25).
 
-        Returns the prepared capability as JSON. If nothing matches, it errors —
-        the capability may not be one Puffo allows, or does not exist.
+        Returns the prepared capability as JSON. If nothing matches, this
+        errors — the data is not available through Monid (the capability may
+        not exist, or is not one Puffo allows). You may still answer the user
+        from your own knowledge or the web, but you MUST clearly label that as
+        NOT a Monid result; never imply non-Monid data came from Monid.
         """
         if not query.strip():
             raise RuntimeError("query is required")
@@ -105,8 +119,13 @@ def _register_monid_prepare(mcp: FastMCP, cfg: Any) -> None:
                 "/v2/monid/prepare", {"query": query, "limit": limit}
             )
         except HttpError as exc:
+            # Any prepare failure (no allowlisted match OR a transient upstream
+            # error) means the data was not reached through Monid, so it must not
+            # be passed off as a Monid result (round-1 honesty gap). Answering
+            # from elsewhere is allowed as long as it is labeled non-Monid.
             raise RuntimeError(
-                f"monid prepare failed: {_monid_error_message(exc)}"
+                f"monid prepare failed: {_monid_error_message(exc)}\n"
+                f"Couldn't retrieve this via Monid. {_LABEL_NON_MONID}"
             ) from exc
 
         if not isinstance(data, dict):
@@ -150,7 +169,11 @@ def _register_monid_spend(mcp: FastMCP, cfg: Any) -> None:
             idempotency_key: Optional. Pass a stable value to make a retried call
                 safe — it reconciles the earlier attempt instead of paying twice.
 
-        Returns the provider's result and what the call cost.
+        Returns the provider's result and what the call cost, stamped
+        `via Monid · <provider>/<endpoint> · <cost>` — mark data you got this
+        way as Monid-sourced. Anything you instead answer from your own
+        knowledge or the web MUST be labeled as NOT a Monid result; never
+        present non-Monid data as a Monid result.
         """
         if not provider.strip() or not endpoint.strip():
             raise RuntimeError(
@@ -174,8 +197,12 @@ def _register_monid_spend(mcp: FastMCP, cfg: Any) -> None:
         try:
             data = await cfg.http_client.post("/v2/monid/spend", body)
         except HttpError as exc:
+            # A spend failure is usually a retryable input/schema mismatch — the
+            # error carries the schema to rebuild `input` and retry, so try that
+            # first. The label rule is the fallback: if you give up and answer
+            # from elsewhere, it must be marked non-Monid.
             raise RuntimeError(
-                f"monid spend failed: {_monid_error_message(exc)}"
+                f"monid spend failed: {_monid_error_message(exc)}\n{_LABEL_NON_MONID}"
             ) from exc
 
         if not isinstance(data, dict):
@@ -198,10 +225,14 @@ def _format_spend_result(data: dict[str, Any]) -> str:
             f"reconcile it (ledger {data.get('ledger_id', '?')}). No result yet."
         )
 
+    provider = data.get("provider", "?")
+    endpoint = data.get("endpoint", "?")
     cost = data.get("cost_micro")
     status = data.get("provider_http_status")
     output = data.get("output")
-    header = f"monid spend settled: cost {cost} micro-dollars"
+    # Provenance stamp: this is paid, real Monid data — so the model can attribute
+    # its source to the user and never conflate it with its own/web answers.
+    header = f"via Monid · {provider}{endpoint} · cost {cost} micro-dollars"
     if status is not None:
         header += f", provider status {status}"
     return header + "\nresult:\n" + json.dumps(output, indent=2, ensure_ascii=False)

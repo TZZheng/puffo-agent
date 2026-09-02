@@ -105,6 +105,38 @@ async def test_prepare_surfaces_server_error_message():
     assert "no allowlisted read-only capability" in str(excinfo.value)
 
 
+@pytest.mark.asyncio
+async def test_prepare_failure_mandates_labeling_non_monid_answers():
+    # A prepare failure (no allowlisted match OR a transient upstream error)
+    # means the data was not reached through Monid. Answering from elsewhere is
+    # allowed, but the directive mandates labeling it non-Monid so the model
+    # never passes a web/own-knowledge answer off as a Monid result (round-1
+    # honesty gap). Only the mapped message + directive surface — never the raw
+    # upstream body (map-don't-dump).
+    http = _FakeHttp(
+        post_error=HttpError(
+            400,
+            json.dumps(
+                {
+                    "error": "BAD_REQUEST",
+                    "message": "no allowlisted read-only capability matched the query",
+                    "debug": "upstream trace https://api.monid.ai/v1/discover xyz",
+                }
+            ),
+        )
+    )
+    mcp = _tools(http)
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "monid_prepare", {"query": "used tesla prices"})
+    msg = str(excinfo.value)
+    assert "Couldn't retrieve this via Monid" in msg
+    assert "label it as NOT a Monid result" in msg
+    # No raw upstream internals leak — only the mapped message + directive.
+    assert "debug" not in msg
+    assert "api.monid.ai" not in msg
+    assert "BAD_REQUEST" not in msg
+
+
 # ------------------------------- monid_spend -------------------------------
 
 
@@ -131,6 +163,9 @@ async def test_spend_forwards_and_formats_result():
             "max_cost_micro": 10000,
         },
     )
+    # Provenance stamp: a settled spend is marked Monid-sourced so the model can
+    # attribute it and not conflate it with its own/web answers.
+    assert "via Monid · indeed/get_company_profile" in text
     assert "cost 3000 micro-dollars" in text
     assert "provider status 200" in text
     assert "items" in text
@@ -221,7 +256,11 @@ async def test_spend_surfaces_server_error_message():
                 "max_cost_micro": 5000,
             },
         )
-    assert "not enabled for this agent" in str(excinfo.value)
+    msg = str(excinfo.value)
+    assert "not enabled for this agent" in msg
+    # A spend failure also carries the label rule: if the model gives up and
+    # answers from elsewhere, it must mark that non-Monid.
+    assert "NOT a Monid result" in msg
 
 
 @pytest.mark.asyncio
