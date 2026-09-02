@@ -33,8 +33,7 @@ logger = logging.getLogger(__name__)
 # Monid-sourced (paid, real) so the model can attribute it; but only the model
 # writes the final answer, so on any failure we tell it that if it falls back to
 # its own knowledge or the web it MUST label that as non-Monid — never pass it
-# off as Monid data. Round-1 honesty gap: a web-stitched table shown as a result.
-# This is steering, not a hard block; a system-level rule is a separate follow-up.
+# off as Monid data. This is prompt-level steering, not a hard block.
 _LABEL_NON_MONID = (
     "If you answer from your own knowledge or the web instead, you MUST clearly "
     "label it as NOT a Monid result — never present non-Monid data as Monid data."
@@ -119,10 +118,10 @@ def _register_monid_prepare(mcp: FastMCP, cfg: Any) -> None:
                 "/v2/monid/prepare", {"query": query, "limit": limit}
             )
         except HttpError as exc:
-            # Any prepare failure (no allowlisted match OR a transient upstream
+            # A prepare failure (no capability matched, or a transient upstream
             # error) means the data was not reached through Monid, so it must not
-            # be passed off as a Monid result (round-1 honesty gap). Answering
-            # from elsewhere is allowed as long as it is labeled non-Monid.
+            # be passed off as a Monid result. Answering from elsewhere is allowed
+            # as long as it is labeled non-Monid.
             raise RuntimeError(
                 f"monid prepare failed: {_monid_error_message(exc)}\n"
                 f"Couldn't retrieve this via Monid. {_LABEL_NON_MONID}"

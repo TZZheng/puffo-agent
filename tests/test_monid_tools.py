@@ -94,7 +94,7 @@ async def test_prepare_surfaces_server_error_message():
             json.dumps(
                 {
                     "error": "BAD_REQUEST",
-                    "message": "no allowlisted read-only capability matched the query",
+                    "message": "no spendable capability matched the query (a match may be a blocked write operation or have an unsupported price model)",
                 }
             ),
         )
@@ -102,24 +102,24 @@ async def test_prepare_surfaces_server_error_message():
     mcp = _tools(http)
     with pytest.raises(Exception) as excinfo:
         await _call(mcp, "monid_prepare", {"query": "buy a car"})
-    assert "no allowlisted read-only capability" in str(excinfo.value)
+    assert "no spendable capability matched the query" in str(excinfo.value)
 
 
 @pytest.mark.asyncio
 async def test_prepare_failure_mandates_labeling_non_monid_answers():
-    # A prepare failure (no allowlisted match OR a transient upstream error)
+    # A prepare failure (no capability matched, or a transient upstream error)
     # means the data was not reached through Monid. Answering from elsewhere is
     # allowed, but the directive mandates labeling it non-Monid so the model
-    # never passes a web/own-knowledge answer off as a Monid result (round-1
-    # honesty gap). Only the mapped message + directive surface — never the raw
-    # upstream body (map-don't-dump).
+    # never passes a web/own-knowledge answer off as a Monid result. Only the
+    # mapped message + directive surface — never the raw upstream body
+    # (map-don't-dump).
     http = _FakeHttp(
         post_error=HttpError(
             400,
             json.dumps(
                 {
                     "error": "BAD_REQUEST",
-                    "message": "no allowlisted read-only capability matched the query",
+                    "message": "no spendable capability matched the query (a match may be a blocked write operation or have an unsupported price model)",
                     "debug": "upstream trace https://api.monid.ai/v1/discover xyz",
                 }
             ),
