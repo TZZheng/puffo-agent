@@ -191,6 +191,9 @@ class PuffoCoreMessageClient:
                 bridge_client=bridge_client,
             )
         )
+        # Assignable post-construction (the Worker owns the health policy);
+        # picked up when ``run()`` builds the WS client.
+        self.transport_state_listener: Callable[[bool, int], None] | None = None
         bridge_connected = getattr(self._bridge, "add_connected_callback", None)
         if callable(bridge_connected):
             bridge_connected(self._notify_connected_callbacks)
@@ -283,6 +286,14 @@ class PuffoCoreMessageClient:
         self._ws.on_channel_update = self._handle_channel_update
         # Re-warms caches on every (re)connect, first connect included.
         self._ws.on_connect = self._on_ws_connect
+        # Worker-installed observer (see Worker._transport_state_listener):
+        # feeds reconnect-failure streaks into runtime.json health so a
+        # dead transport stops reporting "ok" (8/30 App Nap incident).
+        # getattr: legacy test seeds construct this client without
+        # __init__, same tolerance as the bridge callback above.
+        self._ws.on_transport_state = getattr(
+            self, "transport_state_listener", None
+        )
         await self.store.open()
         try:
             await self._ws.run()

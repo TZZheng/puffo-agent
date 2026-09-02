@@ -111,6 +111,13 @@ logger = logging.getLogger(__name__)
 
 RECONNECT_BACKOFF_SECONDS = 5.0
 
+# Consecutive WS reconnect failures before runtime.json health flips to
+# "server_unreachable". At the WS client's capped backoff this is a few
+# minutes of provable unreachability — late enough to skip network blips,
+# early enough that a wedged transport can't impersonate a healthy agent
+# for hours.
+_WS_DEGRADE_THRESHOLD = 5
+
 
 def _claude_cli_api_key(daemon_cfg: DaemonConfig, harness_name: str) -> str:
     if harness_name != "claude-code":
@@ -376,6 +383,46 @@ class Worker:
             "runtime.health = auth_failed",
             agent_id,
         )
+
+    def _transport_state_listener(self, agent_id: str):
+        """Feed WS reconnect streaks into runtime.json health.
+
+        Before this, a dead transport kept reporting health="ok" with a
+        fresh local heartbeat for hours (the 8/30 App Nap incident):
+        "process alive" was standing in for "server reachable". Only the
+        ok state is overwritten — auth_failed and the other specific
+        signals stay authoritative — and only the transport-set state is
+        cleared on recovery.
+        """
+
+        def note(healthy: bool, streak: int) -> None:
+            rt = self.runtime
+            if healthy:
+                if rt.health == "server_unreachable":
+                    rt.health = "ok"
+                    rt.error = ""
+                    rt.save(agent_id)
+                    logger.info(
+                        "agent %s: transport recovered; runtime.health "
+                        "server_unreachable → ok",
+                        agent_id,
+                    )
+                return
+            if streak < _WS_DEGRADE_THRESHOLD or rt.health != "ok":
+                return
+            rt.health = "server_unreachable"
+            rt.error = (
+                f"server unreachable: {streak} consecutive WS reconnect "
+                "failures"
+            )
+            rt.save(agent_id)
+            logger.warning(
+                "agent %s: %s; runtime.health ok → server_unreachable",
+                agent_id,
+                rt.error,
+            )
+
+        return note
 
     def _enter_auth_failed(self, agent_id: str) -> None:
         """Flip ``auth_failed`` + fire recovery (refresher kick + operator
@@ -1086,6 +1133,9 @@ class Worker:
                 self.agent_cfg,
                 agent_id,
                 daemon_cfg=self.daemon_cfg,
+            )
+            client.transport_state_listener = self._transport_state_listener(
+                agent_id
             )
             self._client = client
             reporter = self._build_status_reporter(client)

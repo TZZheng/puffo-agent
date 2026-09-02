@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
 import logging
 import os
@@ -22,6 +24,71 @@ class HttpError(Exception):
         self.status = status
         self.body = body
         super().__init__(f"HTTP {status}: {body}")
+
+
+_DEAD_EXECUTOR_MESSAGE = "cannot schedule new futures after shutdown"
+
+
+def _heal_dead_default_executor() -> None:
+    """Install a fresh default executor on the running loop.
+
+    Every aiohttp request rides the loop's default ThreadPoolExecutor
+    (threaded DNS, netrc lookup under ``trust_env``), and
+    ``websockets.connect`` does through ``loop.getaddrinfo``. After a
+    long process suspension (macOS App Nap — see the 8/30 incident) that
+    executor has been observed shut down while the loop itself keeps
+    running, which turns every subsequent request into
+    ``RuntimeError: cannot schedule new futures after shutdown`` forever;
+    nothing else ever recreates it. Replacing it is loop-global, so one
+    heal here also revives WS reconnects and any other transport on the
+    loop. The distinct 'Executor shutdown has been called' /
+    'after interpreter shutdown' errors mean an intentional teardown and
+    are deliberately not healed.
+    """
+    asyncio.get_running_loop().set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            thread_name_prefix="puffo-healed-executor"
+        )
+    )
+    logger.warning(
+        "default executor was shut down while the loop kept running; "
+        "installed a fresh one and rebuilding the HTTP session"
+    )
+
+
+class _HealedRequest:
+    """One aiohttp request attempt with a single dead-executor heal.
+
+    The dead-executor RuntimeError fires in the pre-connection stage
+    (threaded DNS / netrc lookup), before any bytes reach the wire, so
+    the one retry cannot double-send a request. Any other error — and a
+    second dead-executor failure after healing — propagates untouched.
+    """
+
+    def __init__(self, client: PuffoCoreHttpClient, method: str, url: str, kwargs: dict):
+        self._client = client
+        self._method = method
+        self._url = url
+        self._kwargs = kwargs
+        self._ctx = None
+
+    async def _enter_once(self):
+        http = await self._client._get_session()
+        self._ctx = http.request(self._method, self._url, **self._kwargs)
+        return await self._ctx.__aenter__()
+
+    async def __aenter__(self):
+        try:
+            return await self._enter_once()
+        except RuntimeError as exc:
+            if _DEAD_EXECUTOR_MESSAGE not in str(exc):
+                raise
+            _heal_dead_default_executor()
+            await self._client.close()
+            return await self._enter_once()
+
+    async def __aexit__(self, *exc_info):
+        return await self._ctx.__aexit__(*exc_info)
 
 
 class PuffoCoreHttpClient:
@@ -47,6 +114,9 @@ class PuffoCoreHttpClient:
         if self._session is None or self._session.closed:
             self._session = create_remote_http_session(self.server_url)
         return self._session
+
+    def _healed_request(self, method: str, url: str, **kwargs):
+        return _HealedRequest(self, method, url, kwargs)
 
     async def close(self) -> None:
         if self._session and not self._session.closed:
@@ -81,8 +151,8 @@ class PuffoCoreHttpClient:
             "POST", "/devices/subkeys", body,
         )
 
-        http = await self._get_session()
-        async with http.post(
+        async with self._healed_request(
+            "POST",
             f"{self.server_url}/devices/subkeys",
             data=body,
             headers=auth.to_dict(),
@@ -135,8 +205,9 @@ class PuffoCoreHttpClient:
         headers = auth.to_dict()
         url = f"{self.server_url}{path}"
 
-        http = await self._get_session()
-        async with http.request(method, url, data=body or None, headers=headers) as resp:
+        async with self._healed_request(
+            method, url, data=body or None, headers=headers
+        ) as resp:
             text = await resp.text()
             try:
                 data = json.loads(text)
@@ -171,8 +242,7 @@ class PuffoCoreHttpClient:
         auth = sign_request(signing_key, self.slug, signer_id, method, path, b"")
         headers = auth.to_dict()
         url = f"{self.server_url}{path}"
-        http = await self._get_session()
-        async with http.request(method, url, headers=headers) as resp:
+        async with self._healed_request(method, url, headers=headers) as resp:
             if resp.status == 401:
                 # Caller retries after a rotation.
                 raise HttpError(401, await resp.text())
@@ -244,8 +314,8 @@ class PuffoCoreHttpClient:
 
     async def post_unsigned(self, path: str, body: dict | None = None) -> Any:
         raw = json.dumps(body).encode() if body else b""
-        http = await self._get_session()
-        async with http.post(
+        async with self._healed_request(
+            "POST",
             f"{self.server_url}{path}",
             data=raw,
             headers=self._egress_headers({"content-type": "application/json"}),
@@ -266,8 +336,8 @@ class PuffoCoreHttpClient:
         request path in a scheduler or tool.
         """
         raw = json.dumps(body).encode() if body else b""
-        http = await self._get_session()
-        async with http.put(
+        async with self._healed_request(
+            "PUT",
             f"{self.server_url}{path}",
             data=raw,
             headers=self._egress_headers({"content-type": "application/json"}),
@@ -285,8 +355,8 @@ class PuffoCoreHttpClient:
         ``post_unsigned`` but carries an ``application/octet-stream`` body
         and no signature — the egress proxy supplies auth via
         ``x-sandbox-token``."""
-        http = await self._get_session()
-        async with http.post(
+        async with self._healed_request(
+            "POST",
             f"{self.server_url}{path}",
             data=body,
             headers=self._egress_headers(
@@ -302,8 +372,8 @@ class PuffoCoreHttpClient:
                 return text
 
     async def get_unsigned(self, path: str) -> Any:
-        http = await self._get_session()
-        async with http.get(
+        async with self._healed_request(
+            "GET",
             f"{self.server_url}{path}",
             headers=self._egress_headers(),
         ) as resp:
