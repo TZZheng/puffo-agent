@@ -60,8 +60,8 @@ def heal_if_dead_executor(exc: BaseException) -> bool:
     """Heal the loop's default executor iff ``exc`` is the dead-executor
     RuntimeError; returns whether it healed.
 
-    Shared by the HTTP retry wrapper and the WS reconnect loop: with a
-    valid subkey ``connect_once`` reaches ``websockets.connect`` (and its
+    Shared by the HTTP wrapper and the WS reconnect loop: with a valid
+    subkey ``connect_once`` reaches ``websockets.connect`` (and its
     ``loop.getaddrinfo``) without a single prior HTTP request, so the WS
     path cannot rely on an HTTP-side heal having happened first.
     """
@@ -71,13 +71,36 @@ def heal_if_dead_executor(exc: BaseException) -> bool:
     return True
 
 
-class _HealedRequest:
-    """One aiohttp request attempt with a single dead-executor heal.
+async def _probe_default_executor() -> bool:
+    """Run a no-op through the loop's default executor; heal if dead.
 
-    The dead-executor RuntimeError fires in the pre-connection stage
-    (threaded DNS / netrc lookup), before any bytes reach the wire, so
-    the one retry cannot double-send a request. Any other error — and a
-    second dead-executor failure after healing — propagates untouched.
+    ``run_in_executor(None, ...)`` is the same scheduling call aiohttp
+    makes for threaded DNS and ``trust_env`` netrc lookups, so a passing
+    probe means this request's own executor hops cannot raise the
+    shutdown error — short of a concurrent shutdown mid-request, which
+    is surfaced to the caller, never retried. Returns whether it healed.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, lambda: None)
+        return False
+    except RuntimeError as exc:
+        if not heal_if_dead_executor(exc):
+            raise
+        return True
+
+
+class _HealedRequest:
+    """One aiohttp request attempt, healed *before* any bytes go out.
+
+    A dead default executor is detected by a no-op probe and replaced
+    prior to sending; the pooled connections from before the suspension
+    are dropped with it. A dead-executor RuntimeError that still fires
+    mid-request is healed so the caller's next attempt works, then
+    re-raised — never replayed: aiohttp re-enters the executor on every
+    automatic-redirect hop, so past the first hop the original request
+    is already on the wire and a replay double-sends it (reproduced
+    live: POST → 307, hop-2 executor death, replayed POST).
     """
 
     def __init__(self, client: PuffoCoreHttpClient, method: str, url: str, kwargs: dict):
@@ -87,19 +110,17 @@ class _HealedRequest:
         self._kwargs = kwargs
         self._ctx = None
 
-    async def _enter_once(self):
-        http = await self._client._get_session()
-        self._ctx = http.request(self._method, self._url, **self._kwargs)
-        return await self._ctx.__aenter__()
-
     async def __aenter__(self):
-        try:
-            return await self._enter_once()
-        except RuntimeError as exc:
-            if not heal_if_dead_executor(exc):
-                raise
+        if await _probe_default_executor():
             await self._client.close()
-            return await self._enter_once()
+        try:
+            http = await self._client._get_session()
+            self._ctx = http.request(self._method, self._url, **self._kwargs)
+            return await self._ctx.__aenter__()
+        except RuntimeError as exc:
+            if heal_if_dead_executor(exc):
+                await self._client.close()
+            raise
 
     async def __aexit__(self, *exc_info):
         return await self._ctx.__aexit__(*exc_info)

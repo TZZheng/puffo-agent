@@ -1,9 +1,11 @@
 """Transport self-heal + honest health (8/30 App Nap incident).
 
-Two key behaviors:
+Key behaviors:
 - a dead default executor (RuntimeError: cannot schedule new futures
-  after shutdown) heals in-place: fresh executor + rebuilt session +
-  one retry, instead of failing every request forever;
+  after shutdown) is healed by a pre-send probe, so requests succeed
+  instead of failing forever — and a death mid-request is healed for
+  the next attempt but surfaced, never replayed (redirect hops mean
+  bytes may already be on the wire);
 - WS reconnect-failure streaks flip runtime.json health to
   "server_unreachable" and back, instead of reporting "ok" while the
   server is unreachable for hours.
@@ -43,19 +45,19 @@ class _FakeSession:
     def __init__(self, fail: bool):
         self._fail = fail
         self.closed = False
+        self.requests = 0
 
     def request(self, method, url, **kwargs):
+        self.requests += 1
         return _RequestCtx(self._fail)
 
     async def close(self):
         self.closed = True
 
 
-@pytest.mark.asyncio
-async def test_dead_default_executor_heals_and_request_succeeds(monkeypatch):
+def _fake_http_client(monkeypatch, sessions):
     client = PuffoCoreHttpClient.__new__(PuffoCoreHttpClient)
     client.server_url = "https://x"
-    sessions = [_FakeSession(fail=True), _FakeSession(fail=False)]
 
     async def fake_get_session():
         return sessions[0] if not sessions[0].closed else sessions[1]
@@ -63,15 +65,51 @@ async def test_dead_default_executor_heals_and_request_succeeds(monkeypatch):
     monkeypatch.setattr(client, "_get_session", fake_get_session)
     client._session = sessions[0]
     monkeypatch.setattr(client, "_egress_headers", lambda base=None: dict(base or {}))
+    return client
+
+
+@pytest.mark.asyncio
+async def test_dead_default_executor_heals_before_the_request(monkeypatch):
+    """The 8/30 shape: executor already dead when the request starts.
+    The pre-send probe heals it and the request goes through — no retry
+    involved, so nothing can double-send."""
+    import concurrent.futures
+
+    sessions = [_FakeSession(fail=False), _FakeSession(fail=False)]
+    client = _fake_http_client(monkeypatch, sessions)
 
     loop = asyncio.get_running_loop()
-    executor_before = loop._default_executor
+    dead = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    dead.shutdown()
+    loop.set_default_executor(dead)
 
     result = await client.get_unsigned("/ping")
 
     assert result == {"healed": True}
-    # The broken session was replaced, and the loop-global executor was
-    # renewed — that is what also revives WS reconnects.
+    # The pre-suspension session pool was dropped with the executor, and
+    # the loop-global executor was renewed — which also revives WS.
+    assert sessions[0].closed
+    assert sessions[1].requests == 1
+    assert loop._default_executor is not dead
+    assert loop._default_executor is not None
+
+
+@pytest.mark.asyncio
+async def test_mid_request_executor_death_heals_but_never_replays(monkeypatch):
+    """A dead-executor error after the request started means bytes may
+    already be on the wire (aiohttp redirect hops re-enter the executor),
+    so it must surface to the caller — healed for next time, not replayed."""
+    sessions = [_FakeSession(fail=True), _FakeSession(fail=False)]
+    client = _fake_http_client(monkeypatch, sessions)
+
+    loop = asyncio.get_running_loop()
+    executor_before = loop._default_executor
+
+    with pytest.raises(RuntimeError, match="cannot schedule new futures"):
+        await client.get_unsigned("/ping")
+
+    assert sessions[0].requests == 1
+    assert sessions[1].requests == 0
     assert sessions[0].closed
     assert loop._default_executor is not executor_before
     assert loop._default_executor is not None
