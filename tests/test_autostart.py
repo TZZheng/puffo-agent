@@ -204,6 +204,54 @@ def test_linux_disable_removes_unit_and_reloads():
     assert ["systemctl", "--user", "daemon-reload"] in run.calls
 
 
+def test_linux_disable_failure_keeps_unit_and_reports():
+    """A failed `disable --now` must not delete the unit and claim
+    success — that leaves a running service reported as removed."""
+    autostart.enable_linux(FakeRunner())
+    run = FakeRunner(
+        fail_prefixes=[["systemctl", "--user", "disable"]]
+    )
+    result = autostart.disable_linux(run)
+    assert not result.ok
+    assert autostart.systemd_unit_path().exists()
+    assert any("fake failure" in line for line in result.lines)
+
+
+def test_linux_disable_surfaces_daemon_reload_failure():
+    autostart.enable_linux(FakeRunner())
+    run = FakeRunner(
+        fail_prefixes=[["systemctl", "--user", "daemon-reload"]]
+    )
+    result = autostart.disable_linux(run)
+    assert not result.ok
+    # The unit itself was disabled and removed; the message must say
+    # what remains to be done rather than fail opaquely.
+    assert not autostart.systemd_unit_path().exists()
+    assert any("daemon-reload" in line for line in result.lines)
+
+
+def test_linux_disable_absent_unit_is_ok_even_without_user_manager():
+    run = FakeRunner(fail_prefixes=[["systemctl"]])
+    result = autostart.disable_linux(run)
+    assert result.ok
+    assert any("not enabled" in line for line in result.lines)
+
+
+def test_systemd_env_assignment_is_quoted_and_specifier_safe(tmp_path):
+    unit = autostart.systemd_unit(
+        ["/opt/py%thon", "-m", "puffo_agent.portal.cli", "start"],
+        {"PUFFO_AGENT_HOME": '/home/A User/di"r\\.puffo-agent'},
+    )
+    assert (
+        'Environment="PUFFO_AGENT_HOME=/home/A User/di\\"r\\\\.puffo-agent"'
+        in unit
+    )
+    # % is a systemd specifier in unit files; it must be doubled in
+    # both Environment and ExecStart or systemd expands it.
+    assert "py%%thon" in unit
+    assert autostart._unit_interpreter(unit) == "/opt/py%thon"
+
+
 def test_linux_status_distinguishes_enabled_active_and_stale():
     autostart.enable_linux(FakeRunner())
     state = autostart.status_linux(FakeRunner())

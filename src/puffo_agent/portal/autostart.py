@@ -217,8 +217,12 @@ def systemd_unit_path() -> Path:
 
 def systemd_unit(command: list[str], env: dict[str, str]) -> str:
     exec_start = " ".join(_systemd_quote(part) for part in command)
+    # The whole NAME=value assignment is one quoted token: an unquoted
+    # value with whitespace gets split into separate (broken)
+    # assignments by systemd.
     env_lines = "".join(
-        f"Environment={name}={value}\n" for name, value in sorted(env.items())
+        f"Environment={_systemd_quote(f'{name}={value}')}\n"
+        for name, value in sorted(env.items())
     )
     return (
         "[Unit]\n"
@@ -237,7 +241,10 @@ def systemd_unit(command: list[str], env: dict[str, str]) -> str:
 
 
 def _systemd_quote(part: str) -> str:
-    if not part or any(ch.isspace() or ch == '"' for ch in part):
+    # % first: it is a systemd specifier everywhere in a unit file
+    # (ExecStart and Environment alike) and would otherwise expand.
+    part = part.replace("%", "%%")
+    if not part or any(ch.isspace() or ch in '"\\' for ch in part):
         escaped = part.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
     return part
@@ -277,16 +284,32 @@ def enable_linux(run: Runner = _run, *, linger: bool = False) -> ActionResult:
 
 def disable_linux(run: Runner = _run) -> ActionResult:
     path = systemd_unit_path()
-    lines: list[str] = []
+    if not path.exists():
+        # Nothing configured; a failing systemctl here (e.g. no user
+        # manager at all) leaves nothing behind to report.
+        return ActionResult(True, ["autostart was not enabled"])
     proc = run(["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT_NAME])
-    if proc.returncode == 0:
-        lines.append("disabled systemd unit (a systemd-run daemon is stopped by this)")
-    if path.exists():
-        path.unlink()
-        run(["systemctl", "--user", "daemon-reload"])
-        lines.append(f"removed {path}")
-    if not lines:
-        lines.append("autostart was not enabled")
+    if proc.returncode != 0:
+        # Deleting the unit anyway would orphan a still-running /
+        # still-wanted service while reporting success.
+        return ActionResult(
+            False,
+            [
+                f"`systemctl --user disable --now` failed: {_failure_detail(proc)}; "
+                f"unit left in place at {path}"
+            ],
+        )
+    lines = ["disabled systemd unit (a systemd-run daemon is stopped by this)"]
+    path.unlink()
+    lines.append(f"removed {path}")
+    proc = run(["systemctl", "--user", "daemon-reload"])
+    if proc.returncode != 0:
+        lines.append(
+            f"`systemctl --user daemon-reload` failed: {_failure_detail(proc)}. "
+            "The unit is disabled and its file removed; run the reload "
+            "manually so systemd forgets the stale definition."
+        )
+        return ActionResult(False, lines)
     return ActionResult(True, lines)
 
 
@@ -320,8 +343,9 @@ def _unit_interpreter(unit_text: str) -> str | None:
             rest = line[len("ExecStart=") :].strip()
             try:
                 # _systemd_quote emits shell-compatible double-quoting,
-                # so shlex round-trips it (spaces, escaped quotes).
-                return shlex.split(rest)[0]
+                # so shlex round-trips it (spaces, escaped quotes); the
+                # %-specifier doubling is ours to undo.
+                return shlex.split(rest)[0].replace("%%", "%")
             except (ValueError, IndexError):
                 return None
     return None
