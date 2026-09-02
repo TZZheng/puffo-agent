@@ -112,10 +112,11 @@ logger = logging.getLogger(__name__)
 RECONNECT_BACKOFF_SECONDS = 5.0
 
 # Consecutive WS reconnect failures before runtime.json health flips to
-# "server_unreachable". At the WS client's capped backoff this is a few
-# minutes of provable unreachability — late enough to skip network blips,
-# early enough that a wedged transport can't impersonate a healthy agent
-# for hours.
+# "server_unreachable". With the WS client's 1s→30s doubling backoff the
+# fifth failure lands ~15s into an outage (~40s when each attempt burns a
+# connect timeout): a blip surviving one or two reconnects never flips,
+# while an operator checking `agent list` sees the truth within the
+# minute instead of "ok" for hours. One successful reconnect clears it.
 _WS_DEGRADE_THRESHOLD = 5
 
 
@@ -383,6 +384,22 @@ class Worker:
             "runtime.health = auth_failed",
             agent_id,
         )
+
+    def _build_wired_client(self):
+        """Construct the core client with the worker's observers attached.
+
+        Every runtime path must obtain its client here: one built straight
+        from ``_build_puffo_core_client`` carries no transport-state
+        listener, so WS reconnect streaks reach nobody and runtime.json
+        keeps saying "ok" while the agent is offline — the 8/30 incident's
+        health symptom.
+        """
+        agent_id = self.agent_cfg.id
+        client = _build_puffo_core_client(
+            self.agent_cfg, agent_id, daemon_cfg=self.daemon_cfg
+        )
+        client.transport_state_listener = self._transport_state_listener(agent_id)
+        return client
 
     def _transport_state_listener(self, agent_id: str):
         """Feed WS reconnect streaks into runtime.json health.
@@ -1129,14 +1146,7 @@ class Worker:
                 raise RuntimeError(
                     f"agent {agent_id!r}: puffo_core block in agent.yml is incomplete"
                 )
-            client = _build_puffo_core_client(
-                self.agent_cfg,
-                agent_id,
-                daemon_cfg=self.daemon_cfg,
-            )
-            client.transport_state_listener = self._transport_state_listener(
-                agent_id
-            )
+            client = self._build_wired_client()
             self._client = client
             reporter = self._build_status_reporter(client)
             identity = client.keystore.load_identity(client.slug)

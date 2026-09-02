@@ -13,7 +13,7 @@ import websockets
 import websockets.exceptions  # websockets>=16 lazy-loads submodules; bare `import websockets` doesn't bind `.exceptions`
 
 from .encoding import base64url_encode, generate_nonce
-from .http_client import PuffoCoreHttpClient
+from .http_client import PuffoCoreHttpClient, heal_if_dead_executor
 from .http_session import create_remote_ssl_context
 from .keystore import KeyStore, decode_secret
 from .primitives import Ed25519KeyPair
@@ -410,6 +410,24 @@ class PuffoCoreWsClient:
                     "[%s] WS reconnect category=transport exception=%s "
                     "retry_delay=%ds",
                     self.slug, type(exc).__name__, backoff,
+                )
+                self._note_reconnect_failure()
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+            except RuntimeError as exc:
+                if not self._running:
+                    break
+                # A valid subkey means connect_once() made no HTTP request
+                # before ``websockets.connect`` hit ``loop.getaddrinfo``,
+                # so the dead default executor must be healed here — the
+                # HTTP wrapper's heal never ran (8/30 incident).
+                healed = heal_if_dead_executor(exc)
+                logger.warning(
+                    "[%s] WS reconnect category=%s exception=%s "
+                    "retry_delay=%ds",
+                    self.slug,
+                    "dead_executor_healed" if healed else "unexpected",
+                    type(exc).__name__, backoff,
                 )
                 self._note_reconnect_failure()
                 await asyncio.sleep(backoff)

@@ -77,15 +77,72 @@ async def test_dead_default_executor_heals_and_request_succeeds(monkeypatch):
     assert loop._default_executor is not None
 
 
+@pytest.mark.asyncio
+async def test_ws_dns_dead_executor_heals_without_http(monkeypatch):
+    """Valid subkey: connect_once() makes no HTTP request before
+    websockets.connect hits loop.getaddrinfo, so the reconnect loop
+    itself must heal the dead executor for the next attempt to work."""
+    from puffo_agent.crypto import ws_client as ws_module
+
+    client = ws_module.PuffoCoreWsClient.__new__(ws_module.PuffoCoreWsClient)
+    client.slug = "s"
+    client.ws_url = "ws://x/subscribe"
+    client._ws = None
+    client.session_id = None
+    client.on_transport_state = None
+    client._reconnect_failures = 0
+
+    class _ValidSubkeyHttp:
+        async def _ensure_subkey(self):
+            return None
+
+    client.http_client = _ValidSubkeyHttp()
+
+    calls = {"n": 0}
+
+    def fake_connect(url, ssl=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("cannot schedule new futures after shutdown")
+        client._running = False
+        raise ConnectionError("stop the loop")
+
+    monkeypatch.setattr(ws_module.websockets, "connect", fake_connect)
+    monkeypatch.setattr(ws_module, "INITIAL_BACKOFF", 0)
+
+    loop = asyncio.get_running_loop()
+    executor_before = loop._default_executor
+    await client.run()
+
+    assert calls["n"] == 2
+    assert client._reconnect_failures >= 1
+    assert loop._default_executor is not None
+    assert loop._default_executor is not executor_before
+
+
 def test_ws_streaks_flip_health_to_server_unreachable_and_back(tmp_path, monkeypatch):
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path))
+    from types import SimpleNamespace
+
+    from puffo_agent.portal import worker as worker_module
     from puffo_agent.portal.state import RuntimeState, agent_dir
     from puffo_agent.portal.worker import _WS_DEGRADE_THRESHOLD, Worker
 
     agent_dir("a1").mkdir(parents=True)
     worker = Worker.__new__(Worker)
     worker.runtime = RuntimeState(status="running", health="ok")
-    note = worker._transport_state_listener("a1")
+    worker.agent_cfg = SimpleNamespace(id="a1")
+    worker.daemon_cfg = None
+    monkeypatch.setattr(
+        worker_module,
+        "_build_puffo_core_client",
+        lambda cfg, agent_id, daemon_cfg=None: SimpleNamespace(),
+    )
+    # Through the wiring seam both runtime paths use — a client built
+    # here must arrive with the listener attached, or streaks reach
+    # nobody (the standard daemon path shipped exactly that hole once).
+    note = worker._build_wired_client().transport_state_listener
+    assert note is not None
 
     for streak in range(1, _WS_DEGRADE_THRESHOLD):
         note(False, streak)

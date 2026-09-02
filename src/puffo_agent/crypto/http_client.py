@@ -52,8 +52,23 @@ def _heal_dead_default_executor() -> None:
     )
     logger.warning(
         "default executor was shut down while the loop kept running; "
-        "installed a fresh one and rebuilding the HTTP session"
+        "installed a fresh one"
     )
+
+
+def heal_if_dead_executor(exc: BaseException) -> bool:
+    """Heal the loop's default executor iff ``exc`` is the dead-executor
+    RuntimeError; returns whether it healed.
+
+    Shared by the HTTP retry wrapper and the WS reconnect loop: with a
+    valid subkey ``connect_once`` reaches ``websockets.connect`` (and its
+    ``loop.getaddrinfo``) without a single prior HTTP request, so the WS
+    path cannot rely on an HTTP-side heal having happened first.
+    """
+    if _DEAD_EXECUTOR_MESSAGE not in str(exc):
+        return False
+    _heal_dead_default_executor()
+    return True
 
 
 class _HealedRequest:
@@ -81,9 +96,8 @@ class _HealedRequest:
         try:
             return await self._enter_once()
         except RuntimeError as exc:
-            if _DEAD_EXECUTOR_MESSAGE not in str(exc):
+            if not heal_if_dead_executor(exc):
                 raise
-            _heal_dead_default_executor()
             await self._client.close()
             return await self._enter_once()
 
