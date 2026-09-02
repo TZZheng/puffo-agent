@@ -117,6 +117,51 @@ async def test_surfaces_server_error_message():
 
 
 @pytest.mark.asyncio
+async def test_surfaces_input_schema_so_the_model_can_retry():
+    # When the server rejects the input before spending, it returns the
+    # capability's own schema; the tool hands it back so the model can rebuild
+    # `input` and retry.
+    http = _FakeHttp(
+        post_error=HttpError(
+            400,
+            json.dumps(
+                {
+                    "error": "INVALID_INPUT",
+                    "message": (
+                        'input.body is required: Monid wraps a run\'s input as '
+                        '{"body": { … }}'
+                    ),
+                    "input_schema": {
+                        "body": {
+                            "type": "object",
+                            "required": ["input"],
+                            "properties": {
+                                "input": {
+                                    "type": "array",
+                                    "prefill": [
+                                        {"keyword": "Men Shoes", "domainCode": "com"}
+                                    ],
+                                }
+                            },
+                        },
+                        "bodyType": "json",
+                    },
+                }
+            ),
+        )
+    )
+    mcp = _tools(http)
+    with pytest.raises(Exception) as excinfo:
+        await _call(
+            mcp, {"query": "x", "input": {"keyword": "y"}, "max_cost_micro": 5000}
+        )
+    msg = str(excinfo.value)
+    assert "input.body is required" in msg
+    assert "Rebuild `input`" in msg  # the schema is included for a retry
+    assert '"required"' in msg
+
+
+@pytest.mark.asyncio
 async def test_not_registered_for_keyless_agents():
     # A keyless bridge agent cannot reach the subkey-gated spend route, so the
     # tool is simply not exposed for it — not registered, no error path.

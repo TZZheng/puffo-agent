@@ -25,13 +25,24 @@ logger = logging.getLogger(__name__)
 
 def _monid_error_message(exc: HttpError) -> str:
     """Pull the server's human-readable ``message`` out of a failed monid
-    response body (JSON ``{error, message}``), falling back to a terse
-    ``HTTP <status>``. Keeps the tool's error clean instead of a raw blob.
+    response body (JSON ``{error, message, input_schema?}``), falling back to a
+    terse ``HTTP <status>``. Keeps the tool's error clean instead of a raw blob.
+
+    When the server rejects the ``input`` before spending it returns the
+    capability's own ``input_schema``; that is appended so the model can rebuild
+    ``input`` to match and retry.
     """
     try:
         parsed = json.loads(exc.body)
         if isinstance(parsed, dict) and parsed.get("message"):
-            return str(parsed["message"])
+            message = str(parsed["message"])
+            schema = parsed.get("input_schema")
+            if schema is not None:
+                return (
+                    f"{message}\nRebuild `input` to match this schema and call "
+                    f"again:\n{json.dumps(schema, ensure_ascii=False)}"
+                )
+            return message
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
     return f"HTTP {exc.status}"
@@ -67,8 +78,15 @@ def register_monid_tools(mcp: FastMCP, cfg: Any) -> None:
         Args:
             query: What data you want, in natural language. Puffo discovers a
                 matching read-only capability for it.
-            input: The structured parameters for that capability (e.g. the
-                search terms or ids it needs).
+            input: The parameters for the chosen capability, in Monid's run
+                envelope: wrap them under `body` (Puffo forwards `input`
+                verbatim), i.e. `{"body": { ... }}`. For example, an Amazon
+                search takes an `input` array of query objects:
+                `{"body": {"input": [{"keyword": "Men Shoes", "domainCode":
+                "com", "sortBy": "recent", "maxPages": 1, "category":
+                "aps"}]}}`. If the shape does not match the capability's schema,
+                the error returns that schema — rebuild `input` to match it and
+                call again.
             max_cost_micro: Your hard ceiling for THIS one call, in
                 micro-dollars (1_000_000 = $1). Must be positive. If the
                 quoted price is above it, the call is rejected before any
