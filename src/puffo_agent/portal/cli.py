@@ -382,6 +382,25 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_autostart(args: argparse.Namespace) -> int:
+    """Register / unregister / inspect after-login daemon autostart."""
+    from . import autostart
+
+    if args.autostart_cmd == "enable":
+        result = autostart.enable(linger=getattr(args, "linger", False))
+    elif args.autostart_cmd == "disable":
+        result = autostart.disable()
+    else:
+        state = autostart.status()
+        for line in state.lines:
+            print(line)
+        return 0
+    stream = sys.stdout if result.ok else sys.stderr
+    for line in result.lines:
+        print(line, file=stream)
+    return 0 if result.ok else 1
+
+
 def cmd_version(args: argparse.Namespace) -> int:
     """Print installed version + install mode."""
     local = get_local_version()
