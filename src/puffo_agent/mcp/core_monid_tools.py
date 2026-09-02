@@ -75,6 +75,12 @@ def register_monid_tools(mcp: FastMCP, cfg: Any) -> None:
         balance, and your operator must have enabled Monid for you and set a
         cap first (otherwise this returns a "not enabled" error).
 
+        This tool is the ONLY way to reach Monid. Do NOT install or run a
+        Monid CLI, and never ask anyone for — or try to hold — your own Monid
+        API key: you neither have nor need one, the server holds it. If a call
+        fails, fix your `input` or ask the operator to raise the cap; do not
+        route around this tool.
+
         Args:
             query: What data you want, in natural language. Puffo discovers a
                 matching read-only capability for it.
