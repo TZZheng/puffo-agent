@@ -92,7 +92,14 @@ Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, check=False)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        # No launchctl/systemctl on this box (e.g. a non-systemd distro):
+        # report it like any failed call instead of tracebacking.
+        return subprocess.CompletedProcess(
+            cmd, 127, stdout="", stderr=f"{cmd[0]}: command not found"
+        )
 
 
 def _failure_detail(proc: subprocess.CompletedProcess) -> str:
@@ -212,7 +219,11 @@ def status_macos(run: Runner = _run) -> AutostartStatus:
 
 
 def systemd_unit_path() -> Path:
-    return Path.home() / ".config" / "systemd" / "user" / SYSTEMD_UNIT_NAME
+    # systemd reads user units from $XDG_CONFIG_HOME/systemd/user and,
+    # like systemd itself, a non-absolute XDG_CONFIG_HOME is ignored.
+    xdg = os.environ.get("XDG_CONFIG_HOME", "")
+    base = Path(xdg) if os.path.isabs(xdg) else Path.home() / ".config"
+    return base / "systemd" / "user" / SYSTEMD_UNIT_NAME
 
 
 def systemd_unit(command: list[str], env: dict[str, str]) -> str:
@@ -254,14 +265,26 @@ def enable_linux(run: Runner = _run, *, linger: bool = False) -> ActionResult:
     path = systemd_unit_path()
     content = systemd_unit(daemon_command(), _service_env())
     changed = not (path.exists() and path.read_text() == content)
+    # Queried before `enable --now` can start anything: an already-running
+    # service keeps executing the old definition until restarted below.
+    was_active = (
+        changed
+        and run(["systemctl", "--user", "is-active", SYSTEMD_UNIT_NAME]).returncode == 0
+    )
     if changed:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(content)
     lines = [f"wrote {path}" if changed else f"unit unchanged at {path}"]
-    for cmd in (
+    commands: list[list[str]] = [
         ["systemctl", "--user", "daemon-reload"],
         ["systemctl", "--user", "enable", "--now", SYSTEMD_UNIT_NAME],
-    ):
+    ]
+    if was_active:
+        # `enable --now` only starts an inactive unit — the launchd
+        # branch's bootout/bootstrap equivalent for a changed definition.
+        commands.append(["systemctl", "--user", "restart", SYSTEMD_UNIT_NAME])
+        lines.append("restarting the running service to apply the changed definition")
+    for cmd in commands:
         proc = run(cmd)
         if proc.returncode != 0:
             lines.append(
@@ -285,9 +308,26 @@ def enable_linux(run: Runner = _run, *, linger: bool = False) -> ActionResult:
 def disable_linux(run: Runner = _run) -> ActionResult:
     path = systemd_unit_path()
     if not path.exists():
-        # Nothing configured; a failing systemctl here (e.g. no user
-        # manager at all) leaves nothing behind to report.
-        return ActionResult(True, ["autostart was not enabled"])
+        # The unit file can be gone while systemd still runs the service
+        # (deleted by hand, an earlier config root, ...). "Not enabled"
+        # over a live daemon would be a lie — stop it. A failing
+        # is-active (including: no user manager at all) means nothing is
+        # running and nothing is left behind to report.
+        if run(["systemctl", "--user", "is-active", SYSTEMD_UNIT_NAME]).returncode != 0:
+            return ActionResult(True, ["autostart was not enabled"])
+        proc = run(["systemctl", "--user", "stop", SYSTEMD_UNIT_NAME])
+        if proc.returncode != 0:
+            return ActionResult(
+                False,
+                [
+                    f"no unit file at {path}, but the service is running and "
+                    f"`systemctl --user stop` failed: {_failure_detail(proc)}"
+                ],
+            )
+        return ActionResult(
+            True,
+            [f"no unit file at {path}; stopped the still-loaded service"],
+        )
     proc = run(["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT_NAME])
     if proc.returncode != 0:
         # Deleting the unit anyway would orphan a still-running /

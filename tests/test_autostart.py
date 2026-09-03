@@ -22,6 +22,8 @@ from puffo_agent.portal import autostart
 def isolated_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / ".puffo-agent"))
+    # A host XDG_CONFIG_HOME would point the unit path at the real config.
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     # Path.home() reads HOME on POSIX but USERPROFILE on Windows.
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
     return tmp_path
@@ -250,6 +252,61 @@ def test_systemd_env_assignment_is_quoted_and_specifier_safe(tmp_path):
     # both Environment and ExecStart or systemd expands it.
     assert "py%%thon" in unit
     assert autostart._unit_interpreter(unit) == "/opt/py%thon"
+
+
+def test_linux_enable_restarts_a_running_service_only_on_change():
+    """`enable --now` does not restart an active unit, so a changed
+    definition needs an explicit restart — and an unchanged one must
+    not bounce the running daemon."""
+    restart = ["systemctl", "--user", "restart", "puffo-agent.service"]
+
+    run = FakeRunner()  # is-active → 0: service already running
+    result = autostart.enable_linux(run)
+    assert result.ok
+    # Ordering: the restart must come after daemon-reload re-read the
+    # changed unit, or systemd restarts into the old definition.
+    assert run.calls.index(["systemctl", "--user", "daemon-reload"]) < run.calls.index(restart)
+
+    run = FakeRunner()
+    result = autostart.enable_linux(run)  # second run: definition unchanged
+    assert result.ok
+    assert restart not in run.calls
+
+
+def test_linux_disable_stops_a_loaded_service_despite_missing_unit_file():
+    """A hand-deleted unit file with the service still running must not
+    report "not enabled" over a live daemon."""
+    run = FakeRunner()  # is-active → 0: still running
+    result = autostart.disable_linux(run)
+    assert result.ok
+    assert ["systemctl", "--user", "stop", "puffo-agent.service"] in run.calls
+    assert any("stopped" in line for line in result.lines)
+
+    run = FakeRunner(fail_prefixes=[["systemctl", "--user", "stop"]])
+    result = autostart.disable_linux(run)
+    assert not result.ok
+    assert any("stop" in line and "failed" in line for line in result.lines)
+
+
+def test_missing_systemctl_reports_instead_of_tracebacking(monkeypatch):
+    def raise_missing(cmd, **kwargs):
+        raise FileNotFoundError(cmd[0])
+
+    monkeypatch.setattr(subprocess, "run", raise_missing)
+    result = autostart.enable_linux(autostart._run)
+    assert not result.ok
+    assert any("command not found" in line for line in result.lines)
+
+
+def test_systemd_unit_path_honors_absolute_xdg_config_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert autostart.systemd_unit_path() == (
+        tmp_path / "xdg" / "systemd" / "user" / "puffo-agent.service"
+    )
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative/config")  # ignored, like systemd
+    assert autostart.systemd_unit_path() == (
+        tmp_path / ".config" / "systemd" / "user" / "puffo-agent.service"
+    )
 
 
 def test_linux_status_distinguishes_enabled_active_and_stale():
