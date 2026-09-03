@@ -239,6 +239,49 @@ async def test_spend_automatic_key_makes_ambiguous_retry_safe_then_rotates():
 
 
 @pytest.mark.asyncio
+async def test_spend_definite_failure_releases_automatic_key_for_retry():
+    """A rejected, uncharged spend must not poison the repaired retry with the
+    server's permanently failed idempotency key."""
+    http = _FakeHttp(
+        response={
+            "ledger_id": "led_2",
+            "provider": "indeed",
+            "endpoint": "/get_company_profile",
+            "cost_micro": 3000,
+            "output": {"items": []},
+        },
+        post_error=HttpError(
+            402,
+            json.dumps(
+                {
+                    "error": "UPSTREAM_BALANCE_EXHAUSTED",
+                    "message": "upstream balance exhausted",
+                }
+            ),
+        ),
+    )
+    mcp = _tools(http)
+    args = {
+        "provider": "indeed",
+        "endpoint": "/get_company_profile",
+        "input": {"queryParams": {"company": "Google"}},
+        "max_cost_micro": 10000,
+    }
+
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "monid_spend", args)
+    first_key = http.calls[-1][2]["idempotency_key"]
+    message = str(excinfo.value)
+    assert "upstream balance exhausted" in message
+    assert "reuse idempotency key" not in message
+    assert "reconcile that idempotency key" not in message
+
+    http._post_error = None
+    await _call(mcp, "monid_spend", args)
+    assert http.calls[-1][2]["idempotency_key"] != first_key
+
+
+@pytest.mark.asyncio
 async def test_spend_full_retry_cache_fails_closed_without_evicting(monkeypatch):
     """A burst of unresolved spends must not evict an older retry key and
     reopen the duplicate-charge window."""
@@ -270,6 +313,30 @@ async def test_spend_full_retry_cache_fails_closed_without_evicting(monkeypatch)
 
     await _call(mcp, "monid_spend", args("C"))
     assert http.calls[-1][2]["idempotency_key"] != first_key
+
+
+@pytest.mark.asyncio
+async def test_spend_default_retry_cache_holds_multiple_unresolved_spends():
+    """The production cache must not silently collapse to a single unresolved
+    operation and block the next unrelated ambiguous spend."""
+    http = _FakeHttp(post_error=HttpError(200, "ambiguous upstream response"))
+    mcp = _tools(http)
+
+    for company in ("A", "B"):
+        with pytest.raises(Exception):
+            await _call(
+                mcp,
+                "monid_spend",
+                {
+                    "provider": "indeed",
+                    "endpoint": "/get_company_profile",
+                    "input": {"queryParams": {"company": company}},
+                    "max_cost_micro": 10000,
+                },
+            )
+
+    assert len(http.calls) == 2
+    assert len({call[2]["idempotency_key"] for call in http.calls}) == 2
 
 
 @pytest.mark.asyncio
@@ -369,6 +436,8 @@ async def test_spend_reports_pending_reconcile():
     )
     assert "still resolving upstream" in text
     assert "led_pending" in text
+    assert "retry the same arguments later" in text
+    assert "If it remains unresolved" in text
     first_key = http.calls[-1][2]["idempotency_key"]
     await _call(
         mcp,
@@ -381,6 +450,39 @@ async def test_spend_reports_pending_reconcile():
         },
     )
     assert http.calls[-1][2]["idempotency_key"] == first_key
+
+
+@pytest.mark.asyncio
+async def test_spend_formats_settled_replay_without_claiming_new_charge_or_output():
+    """A ledger replay has no retained provider output and must not be
+    presented as a newly charged Monid result containing JSON null."""
+    http = _FakeHttp(
+        response={
+            "ledger_id": "led_replay",
+            "provider": "indeed",
+            "endpoint": "/get_company_profile",
+            "cost_micro": 5000,
+            "already_settled": True,
+            "output": None,
+        }
+    )
+
+    text = await _call(
+        _tools(http),
+        "monid_spend",
+        {
+            "provider": "indeed",
+            "endpoint": "/get_company_profile",
+            "input": {"queryParams": {"company": "Google"}},
+            "max_cost_micro": 10000,
+        },
+    )
+
+    assert "already settled" in text
+    assert "did not charge again" in text
+    assert "earlier settled cost was 5000 micro-dollars" in text
+    assert "provider result is not available" in text
+    assert "result:\nnull" not in text
 
 
 @pytest.mark.asyncio

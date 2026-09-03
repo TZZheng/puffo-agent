@@ -216,17 +216,20 @@ def _register_monid_spend(mcp: FastMCP, cfg: Any) -> None:
             "max_cost_micro": max_cost_micro,
             "idempotency_key": wire_key,
         }
-
         try:
             data = await cfg.http_client.post("/v2/monid/spend", body)
         except HttpError as exc:
+            ambiguous = retry_keys._finish_http_error(
+                signature, wire_key, automatic=automatic_key, status=exc.status
+            )
             # A spend failure is usually a retryable input/schema mismatch — the
             # error carries the schema to rebuild `input` and retry, so try that
             # first. The label rule is the fallback: if you give up and answer
             # from elsewhere, it must be marked non-Monid.
+            retry_guidance = f"{_spend_retry_guidance(wire_key)}\n" if ambiguous else ""
             raise RuntimeError(
                 f"monid spend failed: {_monid_error_message(exc)}\n"
-                f"{_spend_retry_guidance(wire_key)}\n{_LABEL_NON_MONID}"
+                f"{retry_guidance}{_LABEL_NON_MONID}"
             ) from exc
 
         if not isinstance(data, dict):
@@ -278,8 +281,22 @@ class _SpendRetryKeys:
         pending: bool,
     ) -> None:
         if automatic and not pending and self._keys.get(signature) == key:
-            # A settled lookup must not suppress a later intentional repeat.
+            # A known final outcome must not suppress a later intentional repeat.
             self._keys.pop(signature, None)
+
+    def _finish_http_error(
+        self,
+        signature: str,
+        key: str,
+        *,
+        automatic: bool,
+        status: int,
+    ) -> bool:
+        """Release definite failures and report whether the outcome is ambiguous."""
+        ambiguous = 200 <= status < 300
+        if not ambiguous:
+            self.finish(signature, key, automatic=automatic, pending=False)
+        return ambiguous
 
 
 def _spend_signature(
@@ -325,8 +342,18 @@ def _format_spend_result(data: dict[str, Any]) -> str:
     """
     if _is_pending_spend_response(data):
         return (
-            "monid spend is still resolving upstream; your operator will "
-            f"reconcile it (ledger {data.get('ledger_id', '?')}). No result yet."
+            "monid spend is still resolving upstream; retry the same arguments "
+            "later. If it remains unresolved, ask your operator to reconcile it "
+            f"(ledger {data.get('ledger_id', '?')}). No result yet."
+        )
+
+    if data.get("already_settled"):
+        return (
+            "This Monid spend was already settled before this retry; this call "
+            "did not charge again. The earlier settled cost was "
+            f"{data.get('cost_micro')} micro-dollars (ledger "
+            f"{data.get('ledger_id', '?')}). The provider result is not available "
+            "from the ledger replay, so do not present its null output as data."
         )
 
     provider = data.get("provider", "?")
