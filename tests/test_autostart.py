@@ -8,6 +8,7 @@ user session.
 
 from __future__ import annotations
 
+import os
 import plistlib
 import subprocess
 import sys
@@ -94,6 +95,12 @@ def test_macos_enable_writes_plist_and_bootstraps():
     assert path.exists()
     assert ["launchctl", "bootstrap"] == run.calls[-1][:2]
     assert str(path) in run.calls[-1]
+    # The wiring, not just the formatter: what enable actually wrote
+    # must carry the effective home and the enable-time PATH (generic /
+    # ACP runtimes spawn bare commands that skip the CLI resolver).
+    env = plistlib.loads(path.read_bytes())["EnvironmentVariables"]
+    assert env["PUFFO_AGENT_HOME"] == str(autostart.home_dir())
+    assert env["PATH"] == os.environ["PATH"]
 
 
 def test_macos_enable_is_idempotent_when_loaded_and_current():
@@ -175,6 +182,11 @@ def test_linux_enable_writes_unit_and_enables_now():
     assert ["systemctl", "--user", "daemon-reload"] in run.calls
     assert ["systemctl", "--user", "enable", "--now", "puffo-agent.service"] in run.calls
     assert not any(cmd[0] == "loginctl" for cmd in run.calls)
+    # As on macOS: the unit enable actually wrote must carry the
+    # effective home and the enable-time PATH.
+    unit = autostart.systemd_unit_path().read_text()
+    assert f"PUFFO_AGENT_HOME={autostart.home_dir()}" in unit
+    assert "PATH=" in unit
 
 
 def test_linux_enable_linger_is_best_effort():
@@ -385,11 +397,30 @@ def test_windows_enable_registers_quoted_command(monkeypatch, fake_winreg):
     assert any("console window" in line for line in result.lines)
 
 
-def test_windows_enable_refuses_unpersistable_home_override(fake_winreg):
+def test_windows_enable_refuses_only_a_diverging_home_override(monkeypatch, fake_winreg):
+    # A session-only override that login won't see → refuse, actionably.
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(Path.home() / "elsewhere"))
     result = autostart.enable_windows()
     assert not result.ok
     assert any("setx" in line for line in result.lines)
     assert autostart.WINDOWS_RUN_VALUE not in fake_winreg.values
+
+    # After the suggested `setx`, the variable still exists in every
+    # shell — the persisted value matching the effective one must
+    # enable, not repeat the refusal forever.
+    fake_winreg.values["PUFFO_AGENT_HOME"] = str(Path.home() / "elsewhere")
+    result = autostart.enable_windows()
+    assert result.ok
+    assert autostart.WINDOWS_RUN_VALUE in fake_winreg.values
+
+
+def test_windows_enable_accepts_override_equal_to_login_default(fake_winreg):
+    # The autouse fixture sets PUFFO_AGENT_HOME to <tmp>/.puffo-agent —
+    # present, but identical to what login resolves. "Is the variable
+    # set" would refuse this; only actual divergence may.
+    result = autostart.enable_windows()
+    assert result.ok
+    assert autostart.WINDOWS_RUN_VALUE in fake_winreg.values
 
 
 def test_windows_prefers_pythonw_sibling(tmp_path, monkeypatch):

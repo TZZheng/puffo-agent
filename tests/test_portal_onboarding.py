@@ -213,10 +213,13 @@ def test_cmd_link_no_autostart_flag_skips_registration(monkeypatch):
     parser = cli.build_parser()
     args = parser.parse_args(["machine", "link", "--no-autostart", "--not-open"])
     monkeypatch.setattr(cli, "is_daemon_ready", lambda: True)
+    # Record instead of raise: _enable_autostart_after_link swallows any
+    # exception into a warning, so a raising probe cannot fail this test.
+    called = []
     monkeypatch.setattr(
         autostart,
         "enable",
-        lambda: (_ for _ in ()).throw(AssertionError("autostart must stay disabled")),
+        lambda: called.append(True) or autostart.ActionResult(True),
     )
 
     async def _fake_run_link(url, name, open_browser=True, code=None):
@@ -224,6 +227,7 @@ def test_cmd_link_no_autostart_flag_skips_registration(monkeypatch):
 
     monkeypatch.setattr(link, "run_link", _fake_run_link)
     assert args.func(args) == 0
+    assert called == []
 
 
 def test_cmd_link_autostart_failure_keeps_link_successful(monkeypatch, capsys):

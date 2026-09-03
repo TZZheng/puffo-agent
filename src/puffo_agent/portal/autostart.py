@@ -66,7 +66,15 @@ def _service_env() -> dict[str, str]:
     # shell export the user enabled from, and "defaulted at enable time,
     # different default at boot" is exactly the class of silent
     # divergence this feature must not introduce.
-    return {"PUFFO_AGENT_HOME": str(home_dir())}
+    env = {"PUFFO_AGENT_HOME": str(home_dir())}
+    # Login services get a minimal PATH. Known harness CLIs ride
+    # cli_bin's broader-than-PATH resolver, but generic/ACP runtime
+    # configs spawn bare commands (``opencode acp``, ...) exactly as
+    # written — persist the enable-time PATH so those still resolve.
+    path = os.environ.get("PATH")
+    if path:
+        env["PATH"] = path
+    return env
 
 
 # ── result / status types ────────────────────────────────────────────────────
@@ -411,16 +419,36 @@ def windows_run_command() -> list[str]:
     return command
 
 
+def _windows_login_home() -> Path:
+    """The PUFFO_AGENT_HOME a login-started daemon will see: the
+    persisted per-user value if any (where ``setx`` writes), else the
+    default. Comparing against the current effective home — not against
+    "is the variable set" — is what keeps ``setx`` + re-run from being
+    refused forever."""
+    winreg = _load_winreg()
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            value, _ = winreg.QueryValueEx(key, "PUFFO_AGENT_HOME")
+    except (FileNotFoundError, OSError):
+        value = ""
+    if str(value):
+        return Path(str(value)).expanduser()
+    return Path.home() / ".puffo-agent"
+
+
 def enable_windows() -> ActionResult:
-    if os.environ.get("PUFFO_AGENT_HOME"):
-        # Run-key entries carry no per-entry environment; an override
-        # enabled here would silently start the daemon against the
-        # default home at next login. Refuse rather than diverge.
+    login_home = _windows_login_home()
+    if login_home != home_dir():
+        # Run-key entries carry no per-entry environment; enabling under
+        # a session-only override would silently start the daemon
+        # against a different home at next login. Refuse rather than
+        # diverge.
         return ActionResult(
             False,
             [
-                "PUFFO_AGENT_HOME is overridden in this environment; a Run-key "
-                "entry cannot carry it. Persist it first (`setx "
+                f"PUFFO_AGENT_HOME resolves to {home_dir()} here but would "
+                f"resolve to {login_home} at login; a Run-key entry cannot "
+                "carry the override. Persist it first (`setx "
                 "PUFFO_AGENT_HOME ...`) or unset it, then re-run "
                 "`puffo-agent autostart enable`."
             ],
