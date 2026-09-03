@@ -166,6 +166,16 @@ class DriverAuthorityServer:
             while True:
                 request = self._recv_frame(record)
                 response, child = self._handle_request(record, request)
+                # Correlation is stamped here, at the one point every response
+                # passes through on its way to the wire. A peer that matches
+                # responses to requests by call_id rejects any reply that omits
+                # it, and this server has ten leaf response paths; threading a
+                # parameter through each one means a path added later can drop
+                # the echo silently. Only a request that correlates gets a
+                # correlation key back.
+                request_call_id = request.get("call_id")
+                if isinstance(request_call_id, str):
+                    response["call_id"] = request_call_id
                 try:
                     self._send_frame(record.server_socket, response, child=child)
                 finally:
@@ -218,15 +228,12 @@ class DriverAuthorityServer:
                 self._claim_probe()
             record.state = _LeaseState.CLAIMED
             binding = record.binding
-        response = {
+        return {
             "version": PROTOCOL_VERSION,
             "role": binding.role,
             "launch_id": binding.launch_id,
             "capability": binding.capability,
         }
-        if call_id is not None:
-            response["call_id"] = call_id
-        return response
 
     def _authorize_derived_launch(
         self, record: _EndpointRecord, request: dict[str, Any], *, call_id: str | None = None
@@ -336,15 +343,12 @@ class DriverAuthorityServer:
                 call_id,
             )
         )
-        response = {
+        return {
             "version": PROTOCOL_VERSION,
             "state": state,
             "reason_code": reason_code,
             "audit_id": audit_id,
         }
-        if call_id is not None:
-            response["call_id"] = call_id
-        return response
 
     @staticmethod
     def _send_frame(

@@ -494,12 +494,38 @@ def _root_client(server: DriverAuthorityServer, launch_id: str) -> socket.socket
     return _client(server.issue_root(launch_id=launch_id))
 
 
-def _every_answered_request(launch_id: str) -> list[dict[str, Any]]:
-    """One request per response path the server can take, hello first."""
+def _derived_client(server: DriverAuthorityServer, root: socket.socket) -> socket.socket:
+    """A claimed derived (non-root) endpoint, for the nested-denial path."""
+    _hello(root)  # the root endpoint must be claimed before it can derive
+    grant, fds = _request(
+        root,
+        {
+            "version": 1,
+            "op": "authorize_derived_launch",
+            "call_id": str(uuid.uuid4()),
+            "launch_id": _ROOT_LAUNCH_ID,
+            "capability": "daemon",
+        },
+    )
+    assert grant["state"] == "granted", grant
+    assert len(fds) == 1, fds
+    child = socket.socket(fileno=fds[0])
+    _hello(child)
+    return child
+
+
+_ROOT_LAUNCH_ID = "root-echo"
+
+
+def _paths_on_a_fresh_root(launch_id: str) -> list[dict[str, Any]]:
+    """Requests answered on a root endpoint, in order; hello claims it.
+
+    The second entry deliberately runs before any hello elsewhere in the
+    suite: ``_unclaimed_endpoint_request`` covers the pre-claim branch.
+    """
     return [
         {"version": 1, "op": "hello"},
-        # Second hello: the endpoint is single-use, so this is the denied path.
-        {"version": 1, "op": "hello"},
+        {"version": 1, "op": "hello"},  # endpoint_already_claimed
         {"version": 99, "op": "hello"},  # malformed_request
         {"version": 1, "op": "no_such_operation"},  # unsupported_operation
         {
@@ -534,14 +560,23 @@ def _every_answered_request(launch_id: str) -> list[dict[str, Any]]:
 def test_every_response_echoes_the_request_call_id() -> None:
     """A correlating peer rejects any response that drops its ``call_id``.
 
-    Asserted over every response path rather than the two that happened to
-    break LingTai, so a response constructor added later cannot reintroduce
-    the omission on a path nobody enumerated.
+    Ten leaf response paths reach the wire. Eight are reachable on a fresh
+    root endpoint; the other two need different endpoint state, so they get
+    their own cases below rather than being quietly absent:
+    ``test_unclaimed_endpoint_response_echoes_call_id`` (a non-hello request
+    before the endpoint is claimed) and
+    ``test_nested_derived_launch_denial_echoes_call_id`` (a derived endpoint
+    asking to derive again).
+
+    The guarantee itself does not come from this enumeration: the echo is
+    stamped once in ``_serve`` before ``_send_frame``, so a response path
+    added later is covered by construction. These cases prove that stamp is
+    live on every path we can name.
     """
     server = DriverAuthorityServer()
-    client = _root_client(server, "root-echo")
+    client = _root_client(server, _ROOT_LAUNCH_ID)
     try:
-        for request in _every_answered_request("root-echo"):
+        for request in _paths_on_a_fresh_root(_ROOT_LAUNCH_ID):
             call_id = str(uuid.uuid4())
             response, fds = _request(client, {**request, "call_id": call_id})
             _close_fds(fds)
@@ -554,12 +589,69 @@ def test_every_response_echoes_the_request_call_id() -> None:
         server.close()
 
 
+def test_unclaimed_endpoint_response_echoes_call_id() -> None:
+    """A non-hello request before the endpoint is claimed is still a response."""
+    server = DriverAuthorityServer()
+    client = _root_client(server, "root-unclaimed")
+    try:
+        call_id = str(uuid.uuid4())
+        response, fds = _request(
+            client,
+            {
+                "version": 1,
+                "op": "authorize_provider_call",
+                "call_id": call_id,
+                "launch_id": "root-unclaimed",
+                "provider": "llm",
+                "capability": "root",
+            },
+        )
+        _close_fds(fds)
+        assert response["reason_code"] == "endpoint_binding_mismatch"
+        assert response.get("call_id") == call_id, response
+    finally:
+        client.close()
+        server.close()
+
+
+def test_nested_derived_launch_denial_echoes_call_id() -> None:
+    """A derived endpoint asking to derive again is denied -- and correlated."""
+    server = DriverAuthorityServer()
+    root = _root_client(server, _ROOT_LAUNCH_ID)
+    child = None
+    try:
+        child = _derived_client(server, root)
+        call_id = str(uuid.uuid4())
+        response, fds = _request(
+            child,
+            {
+                "version": 1,
+                "op": "authorize_derived_launch",
+                "call_id": call_id,
+                "launch_id": "anything",
+                "capability": "daemon",
+            },
+        )
+        _close_fds(fds)
+        assert response["reason_code"] == "nested_derived_launch_denied"
+        assert response.get("call_id") == call_id, response
+    finally:
+        if child is not None:
+            child.close()
+        root.close()
+        server.close()
+
+
 def test_response_omits_call_id_when_the_request_did_not_correlate() -> None:
-    """Requests that send no ``call_id`` keep their existing response shape."""
+    """Requests that send no ``call_id`` keep their existing response shape.
+
+    An uncorrelated request must not receive an invented or null correlation
+    key; two existing tests assert hello responses by exact dict equality.
+    """
     server = DriverAuthorityServer()
     client = _root_client(server, "root-uncorrelated")
     try:
-        for request in _every_answered_request("root-uncorrelated"):
+        for request in _paths_on_a_fresh_root("root-uncorrelated"):
             response, fds = _request(client, request)
             _close_fds(fds)
             assert "call_id" not in response, (
