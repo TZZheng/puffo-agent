@@ -225,11 +225,16 @@ def _register_monid_spend(mcp: FastMCP, cfg: Any) -> None:
             # first. The label rule is the fallback: if you give up and answer
             # from elsewhere, it must be marked non-Monid.
             raise RuntimeError(
-                f"monid spend failed: {_monid_error_message(exc)}\n{_LABEL_NON_MONID}"
+                f"monid spend failed: {_monid_error_message(exc)}\n"
+                f"{_spend_retry_guidance(wire_key)}\n{_LABEL_NON_MONID}"
             ) from exc
 
         if not isinstance(data, dict):
-            raise RuntimeError(f"unexpected monid response: {data!r}")
+            raise RuntimeError(
+                "unexpected monid response: the spend may have succeeded, but "
+                "the response was not an object\n"
+                f"{_spend_retry_guidance(wire_key)}"
+            )
         result = _format_spend_result(data)
         retry_keys.finish(
             signature,
@@ -252,10 +257,14 @@ class _SpendRetryKeys:
             return _wire_idempotency_key(self._agent_slug, explicit_key), False
         key = self._keys.get(signature)
         if key is None:
+            if len(self._keys) >= _RETRY_KEY_CACHE_LIMIT:
+                raise RuntimeError(
+                    "automatic Monid retry state is full with unresolved spends; "
+                    "retry one of those spends, or pass an explicit idempotency_key "
+                    "for this logical operation"
+                )
             key = _wire_idempotency_key(self._agent_slug, f"auto:{uuid.uuid4()}")
             self._keys[signature] = key
-            if len(self._keys) > _RETRY_KEY_CACHE_LIMIT:
-                self._keys.popitem(last=False)
         else:
             self._keys.move_to_end(signature)
         return key, True
@@ -291,6 +300,14 @@ def _wire_idempotency_key(agent_slug: str, key: str) -> str:
     """Put caller keys in the agent's namespace before the server's global
     idempotency index sees them."""
     return f"{agent_slug}:{key}"
+
+
+def _spend_retry_guidance(wire_key: str) -> str:
+    return (
+        "Retry the same arguments to reuse idempotency key "
+        f"{wire_key}. If the charge state remains unclear, ask your operator "
+        "to reconcile that idempotency key."
+    )
 
 
 def _is_pending_spend_response(data: dict[str, Any]) -> bool:

@@ -31,11 +31,11 @@ class _FakeHttp:
         return self._response
 
 
-def _tools(http):
+def _tools(http, *, slug="agent-monid-test"):
     cfg = SimpleNamespace(
         http_client=http,
         keyless=http.keyless,
-        slug="agent-monid-test",
+        slug=slug,
     )
     mcp = FastMCP("test")
     register_monid_tools(mcp, cfg)
@@ -226,6 +226,9 @@ async def test_spend_automatic_key_makes_ambiguous_retry_safe_then_rotates():
     assert "ambiguous HTTP 200 response" in message
     assert "secret upstream" not in message
     first_key = http.calls[-1][2]["idempotency_key"]
+    assert first_key in message
+    assert "operator" in message
+    assert "reconcile" in message
 
     http._post_error = None
     await _call(mcp, "monid_spend", args)
@@ -236,8 +239,73 @@ async def test_spend_automatic_key_makes_ambiguous_retry_safe_then_rotates():
 
 
 @pytest.mark.asyncio
+async def test_spend_full_retry_cache_fails_closed_without_evicting(monkeypatch):
+    """A burst of unresolved spends must not evict an older retry key and
+    reopen the duplicate-charge window."""
+    monkeypatch.setattr("puffo_agent.mcp.core_monid_tools._RETRY_KEY_CACHE_LIMIT", 2)
+    http = _FakeHttp(post_error=HttpError(200, "ambiguous upstream response"))
+    mcp = _tools(http)
+
+    def args(company):
+        return {
+            "provider": "indeed",
+            "endpoint": "/get_company_profile",
+            "input": {"queryParams": {"company": company}},
+            "max_cost_micro": 10000,
+        }
+
+    for company in ("A", "B"):
+        with pytest.raises(Exception):
+            await _call(mcp, "monid_spend", args(company))
+    first_key = http.calls[0][2]["idempotency_key"]
+
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "monid_spend", args("C"))
+    assert "unresolved" in str(excinfo.value)
+    assert len(http.calls) == 2
+
+    http._post_error = None
+    await _call(mcp, "monid_spend", args("A"))
+    assert http.calls[-1][2]["idempotency_key"] == first_key
+
+    await _call(mcp, "monid_spend", args("C"))
+    assert http.calls[-1][2]["idempotency_key"] != first_key
+
+
+@pytest.mark.asyncio
+async def test_spend_namespaces_explicit_keys_by_agent():
+    first_http = _FakeHttp(
+        response={"provider": "indeed", "endpoint": "/profile", "cost_micro": 1}
+    )
+    second_http = _FakeHttp(
+        response={"provider": "indeed", "endpoint": "/profile", "cost_micro": 1}
+    )
+    args = {
+        "provider": "indeed",
+        "endpoint": "/profile",
+        "input": {},
+        "max_cost_micro": 1,
+        "idempotency_key": "same-logical-operation",
+    }
+
+    await _call(_tools(first_http, slug="agent-a"), "monid_spend", args)
+    await _call(_tools(second_http, slug="agent-b"), "monid_spend", args)
+
+    assert first_http.calls[-1][2]["idempotency_key"] == (
+        "agent-a:same-logical-operation"
+    )
+    assert second_http.calls[-1][2]["idempotency_key"] == (
+        "agent-b:same-logical-operation"
+    )
+    assert (
+        first_http.calls[-1][2]["idempotency_key"]
+        != (second_http.calls[-1][2]["idempotency_key"])
+    )
+
+
+@pytest.mark.asyncio
 async def test_spend_rejects_non_object_success_response():
-    http = _FakeHttp(response=["not", "an", "object"])
+    http = _FakeHttp(response=["secret provider response body"])
     mcp = _tools(http)
     with pytest.raises(Exception) as excinfo:
         await _call(
@@ -250,7 +318,10 @@ async def test_spend_rejects_non_object_success_response():
                 "max_cost_micro": 10000,
             },
         )
-    assert "unexpected monid response" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "unexpected monid response" in message
+    assert "secret provider response body" not in message
+    assert http.calls[-1][2]["idempotency_key"] in message
 
 
 @pytest.mark.asyncio
