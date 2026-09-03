@@ -282,6 +282,43 @@ async def test_spend_definite_failure_releases_automatic_key_for_retry():
 
 
 @pytest.mark.asyncio
+async def test_spend_server_failure_retains_automatic_key_for_settled_replay():
+    """A 5xx may arrive after the server settled the ledger, so its retry must
+    reuse the key and reach the non-charging already-settled replay."""
+    http = _FakeHttp(
+        response={
+            "ledger_id": "led_settled_before_502",
+            "provider": "indeed",
+            "endpoint": "/get_company_profile",
+            "cost_micro": 3000,
+            "already_settled": True,
+            "output": None,
+        },
+        post_error=HttpError(502, "provider failed after billing"),
+    )
+    mcp = _tools(http)
+    args = {
+        "provider": "indeed",
+        "endpoint": "/get_company_profile",
+        "input": {"queryParams": {"company": "Google"}},
+        "max_cost_micro": 10000,
+    }
+
+    with pytest.raises(Exception) as excinfo:
+        await _call(mcp, "monid_spend", args)
+    first_key = http.calls[-1][2]["idempotency_key"]
+    message = str(excinfo.value)
+    assert first_key in message
+    assert "reuse idempotency key" in message
+
+    http._post_error = None
+    text = await _call(mcp, "monid_spend", args)
+    assert http.calls[-1][2]["idempotency_key"] == first_key
+    assert "already settled" in text
+    assert "did not charge again" in text
+
+
+@pytest.mark.asyncio
 async def test_spend_full_retry_cache_fails_closed_without_evicting(monkeypatch):
     """A burst of unresolved spends must not evict an older retry key and
     reopen the duplicate-charge window."""

@@ -292,8 +292,12 @@ class _SpendRetryKeys:
         automatic: bool,
         status: int,
     ) -> bool:
-        """Release definite failures and report whether the outcome is ambiguous."""
-        ambiguous = 200 <= status < 300
+        """Release rejected 4xx spends and retain possibly settled outcomes."""
+        # The server can settle a provider charge before surfacing its failure
+        # as 502. Retain that key so the retry reaches the already-settled replay
+        # instead of opening a second paid reservation. Rejected 4xx spends are
+        # safe to release; a stale failed key then self-heals through 409.
+        ambiguous = not 400 <= status < 500
         if not ambiguous:
             self.finish(signature, key, automatic=automatic, pending=False)
         return ambiguous
