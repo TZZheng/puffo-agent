@@ -518,10 +518,13 @@ _ROOT_LAUNCH_ID = "root-echo"
 
 
 def _paths_on_a_fresh_root(launch_id: str) -> list[dict[str, Any]]:
-    """Requests answered on a root endpoint, in order; hello claims it.
+    """Requests answered on a root endpoint, in order; the first hello claims it.
 
-    The second entry deliberately runs before any hello elsewhere in the
-    suite: ``_unclaimed_endpoint_request`` covers the pre-claim branch.
+    Every entry after that runs against a claimed endpoint, so this list
+    reaches eight of the ten leaf response paths. The pre-claim branch and
+    the nested-derived denial need different endpoint state and are covered
+    by ``test_unclaimed_endpoint_response_echoes_call_id`` and
+    ``test_nested_derived_launch_denial_echoes_call_id``.
     """
     return [
         {"version": 1, "op": "hello"},
