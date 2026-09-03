@@ -154,9 +154,12 @@ class PuffoCoreHttpClient:
         return _HealedRequest(self, method, url, kwargs)
 
     async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+        # Detach before awaiting: a concurrent _get_session() during the
+        # await may install a fresh session, which a post-await
+        # ``self._session = None`` would orphan with a live connector.
+        session, self._session = self._session, None
+        if session is not None and not session.closed:
+            await session.close()
 
     def _load_signing_key(self) -> tuple[Ed25519KeyPair, str]:
         sess = self.keystore.load_session(self.slug)

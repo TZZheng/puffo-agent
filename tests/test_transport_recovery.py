@@ -182,6 +182,11 @@ def test_ws_streaks_flip_health_to_server_unreachable_and_back(tmp_path, monkeyp
     note = worker._build_wired_client().transport_state_listener
     assert note is not None
 
+    # The threshold is policy, not plumbing: 5 failures ≈ 15-40s of
+    # backoff before `agent list` stops claiming "ok". Restated here so
+    # a drive-by change has to touch a test that says so.
+    assert _WS_DEGRADE_THRESHOLD == 5
+
     for streak in range(1, _WS_DEGRADE_THRESHOLD):
         note(False, streak)
     assert worker.runtime.health == "ok"
@@ -203,3 +208,57 @@ def test_ws_streaks_flip_health_to_server_unreachable_and_back(tmp_path, monkeyp
     assert worker.runtime.health == "auth_failed"
     note(True, 0)
     assert worker.runtime.health == "auth_failed"
+
+
+def test_heal_only_fires_on_the_designated_dead_executor_message():
+    """Intentional-teardown RuntimeErrors must not heal: installing a
+    fresh executor there would fight a shutdown in progress. Only the
+    suspended-loop shape ("after shutdown") is treated."""
+    from puffo_agent.crypto.http_client import heal_if_dead_executor
+
+    assert not heal_if_dead_executor(
+        RuntimeError("Executor shutdown has been called")
+    )
+    assert not heal_if_dead_executor(
+        RuntimeError("cannot schedule new futures after interpreter shutdown")
+    )
+    assert not heal_if_dead_executor(RuntimeError("boom"))
+
+
+@pytest.mark.asyncio
+async def test_concurrent_close_keeps_a_mid_close_replacement_session(monkeypatch):
+    """close() detaches its session before awaiting: a _get_session()
+    racing the await installs a replacement, and a post-await
+    ``self._session = None`` would orphan it with a live connector."""
+
+    class _SlowCloseSession:
+        def __init__(self):
+            self.closed = False
+            self.close_started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def close(self):
+            # aiohttp reads as closed from the start of close(), before
+            # the connector teardown awaits.
+            self.closed = True
+            self.close_started.set()
+            await self.release.wait()
+
+    old = _SlowCloseSession()
+    replacement = _FakeSession(fail=False)
+    monkeypatch.setattr(
+        "puffo_agent.crypto.http_client.create_remote_http_session",
+        lambda url: replacement,
+    )
+    client = PuffoCoreHttpClient.__new__(PuffoCoreHttpClient)
+    client.server_url = "https://x"
+    client._session = old
+
+    close_task = asyncio.create_task(client.close())
+    await old.close_started.wait()
+    assert await client._get_session() is replacement
+    old.release.set()
+    await close_task
+
+    assert client._session is replacement
+    assert not replacement.closed
