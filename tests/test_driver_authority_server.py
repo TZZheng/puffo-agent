@@ -255,6 +255,63 @@ def test_provider_calls_are_adjudicated_independently_with_readable_audit_ids() 
         server.close()
 
 
+def test_protocol_responses_echo_request_call_id() -> None:
+    """LingTai correlates every authority response to its request."""
+
+    server = DriverAuthorityServer()
+    root = _client(server.issue_root(launch_id="root-call-id"))
+    child: socket.socket | None = None
+    try:
+        root_hello_id = uuid.uuid4().hex
+        root_hello, fds = _request(
+            root, {"version": 1, "op": "hello", "call_id": root_hello_id}
+        )
+        assert fds == []
+        assert root_hello["call_id"] == root_hello_id
+
+        launch_id = uuid.uuid4().hex
+        launch, child_fds = _request(
+            root,
+            {
+                "version": 1,
+                "op": "authorize_derived_launch",
+                "call_id": launch_id,
+                "launch_id": "root-call-id",
+                "capability": "daemon",
+            },
+        )
+        assert launch["call_id"] == launch_id
+        child = socket.socket(fileno=child_fds.pop())
+
+        child_hello_id = uuid.uuid4().hex
+        child_hello, fds = _request(
+            child, {"version": 1, "op": "hello", "call_id": child_hello_id}
+        )
+        assert fds == []
+        assert child_hello["call_id"] == child_hello_id
+
+        provider_id = uuid.uuid4().hex
+        provider, fds = _request(
+            child,
+            {
+                "version": 1,
+                "op": "authorize_provider_call",
+                "call_id": provider_id,
+                "launch_id": child_hello["launch_id"],
+                "provider": "llm",
+                "capability": "daemon",
+            },
+        )
+        assert fds == []
+        assert provider["call_id"] == provider_id
+    finally:
+        _close_fds(child_fds if "child_fds" in locals() else [])
+        if child is not None:
+            child.close()
+        root.close()
+        server.close()
+
+
 def test_root_can_issue_one_hop_but_derived_cannot_issue_nested_child() -> None:
     server = DriverAuthorityServer()
     root = _client(server.issue_root(launch_id="root-parent"))
