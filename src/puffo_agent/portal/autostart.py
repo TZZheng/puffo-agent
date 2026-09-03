@@ -71,9 +71,15 @@ def _service_env() -> dict[str, str]:
     # cli_bin's broader-than-PATH resolver, but generic/ACP runtime
     # configs spawn bare commands (``opencode acp``, ...) exactly as
     # written — persist the enable-time PATH so those still resolve.
-    path = os.environ.get("PATH")
-    if path:
-        env["PATH"] = path
+    # Absolute entries only: an empty or relative entry resolves from
+    # the cwd, which an interactive shell controls but a daemon doesn't.
+    entries = [
+        entry
+        for entry in os.environ.get("PATH", "").split(os.pathsep)
+        if entry and os.path.isabs(entry)
+    ]
+    if entries:
+        env["PATH"] = os.pathsep.join(entries)
     return env
 
 

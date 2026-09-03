@@ -8,7 +8,6 @@ user session.
 
 from __future__ import annotations
 
-import os
 import plistlib
 import subprocess
 import sys
@@ -87,7 +86,11 @@ def test_systemd_unit_quotes_interpreter_and_restarts_on_failure(tmp_path):
 # ── macOS ────────────────────────────────────────────────────────────────────
 
 
-def test_macos_enable_writes_plist_and_bootstraps():
+def test_macos_enable_writes_plist_and_bootstraps(monkeypatch):
+    # A deliberately dirty PATH: empty entries and a relative one mean
+    # "resolve from the cwd" — a planting vector for a daemon whose cwd
+    # the user doesn't control. Only absolute entries may persist.
+    monkeypatch.setenv("PATH", "/usr/bin::relative/bin:/opt/tools/bin:")
     run = FakeRunner()
     result = autostart.enable_macos(run)
     assert result.ok
@@ -100,7 +103,7 @@ def test_macos_enable_writes_plist_and_bootstraps():
     # ACP runtimes spawn bare commands that skip the CLI resolver).
     env = plistlib.loads(path.read_bytes())["EnvironmentVariables"]
     assert env["PUFFO_AGENT_HOME"] == str(autostart.home_dir())
-    assert env["PATH"] == os.environ["PATH"]
+    assert env["PATH"] == "/usr/bin:/opt/tools/bin"
 
 
 def test_macos_enable_is_idempotent_when_loaded_and_current():
