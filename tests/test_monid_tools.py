@@ -482,6 +482,7 @@ async def test_spend_formats_settled_replay_without_claiming_new_charge_or_outpu
     assert "did not charge again" in text
     assert "earlier settled cost was 5000 micro-dollars" in text
     assert "provider result is not available" in text
+    assert "again after this replay is a new paid operation" in text
     assert "result:\nnull" not in text
 
 

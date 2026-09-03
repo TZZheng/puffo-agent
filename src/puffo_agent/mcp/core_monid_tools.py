@@ -353,7 +353,8 @@ def _format_spend_result(data: dict[str, Any]) -> str:
             "did not charge again. The earlier settled cost was "
             f"{data.get('cost_micro')} micro-dollars (ledger "
             f"{data.get('ledger_id', '?')}). The provider result is not available "
-            "from the ledger replay, so do not present its null output as data."
+            "from the ledger replay, so do not present its null output as data. "
+            "Calling the capability again after this replay is a new paid operation."
         )
 
     provider = data.get("provider", "?")
