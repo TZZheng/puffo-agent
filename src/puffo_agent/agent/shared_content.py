@@ -1464,16 +1464,21 @@ def write_agents_md(codex_dir: Path, content: str) -> Path:
     return path
 
 
-# Codex-only: its condensed tool surface can hide the (still-callable) monid
-# tools, so codex agents need the nudge; Claude already surfaces them.
+# Codex-only: codex free-searches first, so it needs a push to PREFER monid for
+# gated data; naming concrete categories (not vague adjectives) curbs overspend.
 _CODEX_MONID_GUIDANCE = """\
 ## Paid data (monid)
 
-When a task needs paid or external data, use the monid tools rather than \
-guessing or giving up: call `monid_prepare` to price the request, and once it \
-is within budget call `monid_spend` to execute, honoring the returned price \
-ceiling. These tools remain available even if a condensed tool list does not \
-surface them.
+Use the monid tools FIRST for these specific kinds of data — social posts and \
+timelines, live prices, company or people records, or anything behind a login \
+or paywall — before falling back to free web search. Free or built-in search \
+of these sources is often stale, partial, or blocked (rate limits, 403s); \
+never present a free-scraped result as authoritative when monid can retrieve \
+the real one. Flow: call `monid_prepare` to price the request, then if within \
+budget call `monid_spend`, honoring the returned price ceiling. For other, \
+low-stakes facts that free search covers reliably, free search is fine — monid \
+is for data that free access cannot reliably get. These tools remain available \
+even if a condensed tool list does not surface them.
 """
 
 
