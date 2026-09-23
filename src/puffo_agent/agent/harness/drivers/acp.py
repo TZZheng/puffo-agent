@@ -700,14 +700,7 @@ class AcpDriver(Driver):
             self._conn = None
         proc, self._proc = self._proc, None
         await collect_cleanup_errors(
-            shutdown_process_tree(
-                proc,
-                waiter=self._watcher,
-                timeout=_SHUTDOWN_GRACE_SECONDS,
-                task_name="acp.shutdown_wait",
-            ),
-            errors,
-            timeout=CLEANUP_TIMEOUT_SECONDS,
+            self._release_transport(proc), errors, timeout=CLEANUP_TIMEOUT_SECONDS
         )
         current = asyncio.current_task()
         tasks = tuple(
@@ -741,6 +734,15 @@ class AcpDriver(Driver):
             self._events.put(None), errors, timeout=CLEANUP_TIMEOUT_SECONDS
         )
         raise_collected_errors("ACP driver close failed", errors)
+
+    async def _release_transport(self, proc: Any) -> None:
+        """End whatever ``_spawn`` returned. Here that is our own child."""
+        await shutdown_process_tree(
+            proc,
+            waiter=self._watcher,
+            timeout=_SHUTDOWN_GRACE_SECONDS,
+            task_name="acp.shutdown_wait",
+        )
 
     async def _watch_process(self, proc: Any) -> None:
         returncode = await proc.wait()
