@@ -193,6 +193,30 @@ async def test_acp_open_negotiates_v1_and_loads_or_creates_session():
 
 
 @pytest.mark.asyncio
+async def test_resume_without_load_support_falls_back_to_a_fresh_session_at_once():
+    """An agent that never offered session/load cannot resume on a later try
+    either, so the runtime must not spend its retry streak finding that out."""
+    from puffo_agent.agent.harness.runtime.runtime_manager import (
+        _native_resume_is_unavailable,
+    )
+
+    harness = _Harness(can_load=False)
+    driver = AcpDriver(
+        harness.process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    try:
+        with pytest.raises(RuntimeError) as refused:
+            await driver.open(
+                RuntimeSpec("/workspace", executable="agent"), SessionRef("saved")
+            )
+    finally:
+        await driver.close()
+    assert _native_resume_is_unavailable(refused.value)
+    assert [name for name, _ in harness.conn.calls] == ["initialize"]
+
+
+@pytest.mark.asyncio
 async def test_prompt_admission_updates_and_response_form_one_terminal():
     harness = _Harness()
     driver = AcpDriver(

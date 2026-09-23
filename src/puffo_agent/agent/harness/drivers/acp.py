@@ -150,6 +150,20 @@ class ValidatedLaunchPlan:
 AUTH_REQUIRED_CODE = -32000
 
 
+class SessionLoadUnsupported(RuntimeError):
+    """The agent never offered session/load, so no saved session can resume.
+
+    Classified like a rejected resume so the runtime opens a fresh session at
+    once. Left unclassified, it would be retried as if it might pass next time,
+    which for an agent without the capability it never does.
+    """
+
+    error_code = "invalid_resume"
+
+    def __init__(self) -> None:
+        super().__init__("ACP agent does not support session/load")
+
+
 def acp_capabilities(*, session_resume: bool) -> DriverCapabilities:
     return DriverCapabilities(
         session_resume=session_resume,
@@ -315,7 +329,7 @@ class AcpDriver(Driver):
         self._capabilities = acp_capabilities(session_resume=can_load)
         if resume is not None:
             if not can_load:
-                raise RuntimeError("ACP agent does not support session/load")
+                raise SessionLoadUnsupported()
             await self._conn.load_session(
                 cwd=launch.plan.cwd,
                 session_id=str(resume),
