@@ -64,6 +64,7 @@ class ResidentAgentStandIn:
         self.hellos: list[dict] = []
         self.descriptor_counts: list[int] = []
         self.provider_decisions: list[dict] = []
+        self.authority_hellos: list[dict] = []
         self.after_disconnect: list[str] = []
         self.disconnects = 0
         # Set by the test when the probe after a disconnect should run, so it
@@ -109,6 +110,7 @@ class ResidentAgentStandIn:
             verdict = self.verdict(hello)
             if verdict.get("ok") and authority is not None:
                 claimed = _authority_request(authority, {"version": 1, "op": "hello"})
+                self.authority_hellos.append(claimed)
                 self.provider_decisions.append(
                     _authority_request(
                         authority,
@@ -249,6 +251,11 @@ async def test_attach_opens_a_session_and_hands_over_the_authority(socket_dir, n
     assert hello["runtime_id"] == "puffo-runtime-1"
     assert hello["registry"] == str(target.registry)
     assert agent.descriptor_counts == [1]
+    # The descriptor itself says which runtime it was issued for, so the Agent
+    # does not have to take the frame's word for it.
+    [identity] = agent.authority_hellos
+    assert identity["runtime_id"] == "puffo-runtime-1"
+    assert identity["launch_id"] == hello["launch_id"]
     # The provider call the Agent made over the received descriptor landed in
     # Puffo's own authority, bound to this connection's launch.
     [decision] = agent.provider_decisions

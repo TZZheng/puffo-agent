@@ -11,6 +11,9 @@ over differently. A spawned child inherits one end of an authority socketpair
 at exec time; an attached Agent receives it over the connection instead, as
 SCM_RIGHTS on the first frame. The authority is therefore scoped to this
 connection: when the connection ends, the Agent has no Puffo authority left.
+The endpoint is also bound to the runtime: its hello answers with the
+``runtime_id`` Puffo issued it for, so an Agent can refuse a descriptor that
+was meant for a different runtime, whoever relayed it.
 
 Handshake (agreed with LingTai Dev, Lingtai<>Puffo 219779):
 
@@ -125,7 +128,9 @@ class AcpAttachDriver(AcpDriver):
         authority = DriverAuthorityServer()
         launch_id = f"launch_{uuid.uuid4().hex}"
         try:
-            endpoint = authority.issue_root(launch_id=launch_id)
+            endpoint = authority.issue_root(
+                launch_id=launch_id, runtime_id=self.target.runtime_id
+            )
             try:
                 sock = await asyncio.to_thread(
                     _handshake, self.target, launch_id, endpoint.fileno()
