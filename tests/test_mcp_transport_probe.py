@@ -609,6 +609,7 @@ def test_initial_prepare_pins_generation_before_first_probe(
 
         class _StubPreparer:
             agent_id = "t"
+            agent_cfg = SimpleNamespace(runtime=SimpleNamespace(lingtai_attach=False))
 
         prepared = PreparedLocalRuntime(
             harness_name="codex",

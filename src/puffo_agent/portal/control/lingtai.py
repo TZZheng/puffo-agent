@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ...agent.harness.support.cleanup_errors import collect_cleanup_errors, raise_collected_errors
 from ...agent.harness.support.subprocess_io import (
@@ -14,6 +16,9 @@ from ...agent.harness.support.subprocess_io import (
 )
 from ...tasks import spawn
 from ..state import home_dir
+
+if TYPE_CHECKING:
+    from ...agent.harness.drivers.acp_attach import AttachTarget
 
 
 @dataclass(frozen=True)
@@ -75,15 +80,84 @@ async def revoke_lingtai(launch: LingtaiLaunch) -> None:
     ])
 
 
+_MAX_REGISTRY_BYTES = 1024 * 1024
+
+
+async def resolve_attach_target(harness_command: list[str]) -> AttachTarget:
+    """Find the socket of the LingTai Agent this ``puffo-v1`` argv names.
+
+    The runtime id and registry come from the argv provision wrote. The
+    registry says which directory the runtime lives in, and LingTai itself
+    turns that directory into a socket path, so the naming rule stays on
+    LingTai's side. Nothing here is trusted: the Agent checks the runtime id,
+    registry and directory again when Puffo attaches.
+    """
+    from ...agent.harness.drivers.acp import _lingtai_constrained_profile
+    from ...agent.harness.drivers.acp_attach import AttachTarget
+
+    command = tuple(harness_command)
+    if _lingtai_constrained_profile(command) != "puffo-v1":
+        raise ValueError("LingTai attach needs a puffo-v1 harness command")
+    runtime_id = _last_option(command, "--runtime-id")
+    registry = _last_option(command, "--registry")
+    if not runtime_id or not registry or not Path(registry).is_absolute():
+        raise ValueError("LingTai harness command lacks --runtime-id or an absolute --registry")
+    agent_dir = _registered_agent_dir(Path(registry), runtime_id)
+    output = await _run(Path(command[0]), agent_dir, ["acp-socket-path", str(agent_dir)],
+                        capture=True)
+    lines = output.decode("utf-8", errors="replace").splitlines()
+    if len(lines) != 1 or not Path(lines[0]).is_absolute():
+        raise ValueError("LingTai acp-socket-path did not print one absolute path")
+    return AttachTarget(socket_path=Path(lines[0]), runtime_id=runtime_id,
+                        registry=Path(registry))
+
+
+def _last_option(command: tuple[str, ...], flag: str) -> str:
+    # argparse keeps the last occurrence; read the same value LingTai would.
+    value = ""
+    for index, arg in enumerate(command):
+        if arg == flag and index + 1 < len(command):
+            value = command[index + 1]
+        elif arg.startswith(flag + "="):
+            value = arg.removeprefix(flag + "=")
+    return value
+
+
+def _registered_agent_dir(registry: Path, runtime_id: str) -> Path:
+    try:
+        with registry.open("rb") as stream:
+            data = stream.read(_MAX_REGISTRY_BYTES + 1)
+    except OSError as exc:
+        raise ValueError(f"LingTai registry is unreadable: {exc.strerror}") from None
+    if len(data) > _MAX_REGISTRY_BYTES:
+        raise ValueError("LingTai registry exceeds its size limit")
+    try:
+        runtimes = json.loads(data).get("runtimes")
+        directory = runtimes[runtime_id]["agent_dir"]
+    except (ValueError, AttributeError, KeyError, TypeError):
+        raise ValueError(f"LingTai registry has no agent directory for {runtime_id}") from None
+    if not isinstance(directory, str) or not Path(directory).is_absolute():
+        raise ValueError(f"LingTai registry has no agent directory for {runtime_id}")
+    return Path(directory)
+
+
 async def _command(launch: LingtaiLaunch, args: list[str]) -> None:
+    await _run(launch.executable, launch.workspace, args)
+
+
+async def _run(executable: Path, cwd: Path, args: list[str], *, capture: bool = False) -> bytes:
+    # Captured output is buffered up to the stream limit while stderr is read;
+    # a command that prints far more stalls and ends in the timeout.
     process = await asyncio.create_subprocess_exec(
-        str(launch.executable), *args, cwd=launch.workspace,
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        str(executable), *args, cwd=cwd,
+        stdout=asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
         limit=8193,
         **process_group_spawn_kwargs(),
     )
     waiter = spawn(process.wait(), name="lingtai.command.wait")
     errors: list[BaseException] = []
+    output = b""
     try:
         async with asyncio.timeout(30):
             assert process.stderr is not None
@@ -93,12 +167,18 @@ async def _command(launch: LingtaiLaunch, args: list[str]) -> None:
             except asyncio.IncompleteReadError as exc:
                 error = exc.partial
             code = await asyncio.shield(waiter)
+            if capture:
+                assert process.stdout is not None
+                output = await process.stdout.read()
     except BaseException as exc:
         errors.append(exc)
     await _close_command(process, waiter, errors)
     if code:
         detail = error.decode("utf-8", errors="replace").strip()
         raise ValueError(detail or f"LingTai command failed with exit code {code}")
+    if len(output) > 8192:
+        raise ValueError("LingTai output exceeded the size limit")
+    return output
 
 
 async def _close_command(process, waiter: asyncio.Task, errors: list[BaseException]) -> None:
