@@ -83,26 +83,30 @@ async def provision_lingtai(launch: LingtaiLaunch) -> None:
 
 
 async def resident_lingtai_available(launch: LingtaiLaunch) -> bool:
-    """Select attach only when the selected source has a live local ACP socket."""
+    """Select spawn only for an absent socket; reject ambiguous resident failures."""
+    output = await _run(
+        launch.executable, launch.workspace,
+        ["acp-socket-path", str(launch.agent_dir)], capture=True,
+    )
+    lines = output.decode("utf-8", errors="strict").splitlines()
+    if len(lines) != 1 or not Path(lines[0]).is_absolute():
+        raise ValueError("LingTai acp-socket-path did not print one absolute path")
+    path = Path(lines[0])
     try:
-        output = await _run(
-            launch.executable, launch.workspace,
-            ["acp-socket-path", str(launch.agent_dir)], capture=True,
-        )
-        lines = output.decode("utf-8", errors="strict").splitlines()
-        if len(lines) != 1 or not Path(lines[0]).is_absolute():
-            return False
-        path = Path(lines[0])
-        if not stat.S_ISSOCK(os.lstat(path).st_mode):
-            return False
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISSOCK(mode):
+        raise ValueError("LingTai resident ACP path is not a socket")
+    try:
         _, writer = await asyncio.wait_for(
             asyncio.open_unix_connection(str(path)), timeout=1,
         )
-        writer.close()
-        await writer.wait_closed()
-        return True
-    except (OSError, ValueError, UnicodeError, TimeoutError):
-        return False
+    except (OSError, TimeoutError) as exc:
+        raise ValueError("LingTai resident ACP socket is unavailable") from exc
+    writer.close()
+    await writer.wait_closed()
+    return True
 
 
 async def revoke_lingtai(launch: LingtaiLaunch) -> None:

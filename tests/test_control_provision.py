@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +13,7 @@ from puffo_agent.crypto.canonical import canonicalize_for_signing
 from puffo_agent.crypto.encoding import base64url_decode, base64url_encode
 from puffo_agent.crypto.primitives import Ed25519KeyPair
 from puffo_agent.portal.control import certs, provision
+from puffo_agent.portal.control import lingtai as lingtai_control
 from puffo_agent.portal.control.provision import (
     ProvisionError,
     provision_agent_from_bundle,
@@ -549,6 +553,11 @@ def lingtai_creation(tmp_path, monkeypatch):
 
     monkeypatch.setattr(provision, "provision_lingtai", register)
     monkeypatch.setattr(provision, "revoke_lingtai", revoke)
+
+    async def no_resident(_launch):
+        return False
+
+    monkeypatch.setattr(provision, "resident_lingtai_available", no_resident)
     return payload, operator, associations
 
 
@@ -567,6 +576,77 @@ async def test_lingtai_load_selects_attach_for_running_source(
     result = await provision_agent_from_bundle(payload, operator)
     assert result["runtime"].lingtai_attach is resident
     assert AgentConfig.load(result["agent_id"]).runtime.lingtai_attach is resident
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="resident ACP socket requires POSIX")
+async def test_lingtai_probe_rejects_existing_socket_that_cannot_accept(monkeypatch):
+    """A transient resident failure must not persist spawn mode for an occupied source."""
+    with tempfile.TemporaryDirectory(prefix="pa-", dir="/tmp") as directory:
+        root = Path(directory)
+        path = root / "resident.sock"
+        launch = lingtai_control.LingtaiLaunch(
+            executable=root / "lingtai", agent_dir=root, workspace=root,
+            registry=root / "registry.json", runtime_id="puffo-test",
+        )
+
+        async def socket_path(*_args, **_kwargs):
+            return f"{path}\n".encode()
+
+        monkeypatch.setattr(lingtai_control, "_run", socket_path)
+        listener = socket.socket(socket.AF_UNIX)
+        listener.bind(str(path))
+        try:
+            with pytest.raises(ValueError, match="resident ACP socket is unavailable"):
+                await lingtai_control.resident_lingtai_available(launch)
+        finally:
+            listener.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="resident ACP socket requires POSIX")
+async def test_lingtai_probe_distinguishes_listening_and_absent_socket(monkeypatch):
+    """Only a genuinely absent socket selects spawn; a reachable resident selects attach."""
+    with tempfile.TemporaryDirectory(prefix="pa-", dir="/tmp") as directory:
+        root = Path(directory)
+        path = root / "resident.sock"
+        launch = lingtai_control.LingtaiLaunch(
+            executable=root / "lingtai", agent_dir=root, workspace=root,
+            registry=root / "registry.json", runtime_id="puffo-test",
+        )
+
+        async def socket_path(*_args, **_kwargs):
+            return f"{path}\n".encode()
+
+        monkeypatch.setattr(lingtai_control, "_run", socket_path)
+        assert await lingtai_control.resident_lingtai_available(launch) is False
+        path.write_text("not a socket")
+        with pytest.raises(ValueError, match="resident ACP path is not a socket"):
+            await lingtai_control.resident_lingtai_available(launch)
+        path.unlink()
+        server = await asyncio.start_unix_server(lambda _reader, writer: writer.close(), str(path))
+        try:
+            assert await lingtai_control.resident_lingtai_available(launch) is True
+        finally:
+            server.close()
+            await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_lingtai_probe_failure_revokes_binding_before_materialization(
+    lingtai_creation, monkeypatch,
+):
+    """An ambiguous resident must not leave a bound Agent saved in spawn mode."""
+    payload, operator, associations = lingtai_creation
+
+    async def failed_probe(_launch):
+        raise ValueError("LingTai resident ACP socket is unavailable")
+
+    monkeypatch.setattr(provision, "resident_lingtai_available", failed_probe)
+    with pytest.raises(ProvisionError, match="resident ACP socket is unavailable"):
+        await provision_agent_from_bundle(payload, operator)
+    assert not associations
+    assert not (Path(os.environ["PUFFO_AGENT_HOME"]) / "agents/helper-1234/agent.yml").exists()
 
 
 @pytest.mark.asyncio
