@@ -84,10 +84,7 @@ async def provision_lingtai(launch: LingtaiLaunch) -> None:
 
 async def resident_lingtai_available(launch: LingtaiLaunch) -> bool:
     """Select spawn only for an absent socket; reject ambiguous resident failures."""
-    output = await _run(
-        launch.executable, launch.workspace,
-        ["acp-socket-path", str(launch.agent_dir)], capture=True,
-    )
+    output = await _socket_path_output(launch.executable, launch.workspace, launch.agent_dir)
     lines = output.decode("utf-8", errors="strict").splitlines()
     if len(lines) != 1 or not Path(lines[0]).is_absolute():
         raise ValueError("LingTai acp-socket-path did not print one absolute path")
@@ -142,13 +139,27 @@ async def resolve_attach_target(harness_command: list[str]) -> AttachTarget:
     if not runtime_id or not registry or not Path(registry).is_absolute():
         raise ValueError("LingTai harness command lacks --runtime-id or an absolute --registry")
     agent_dir = _registered_agent_dir(Path(registry), runtime_id)
-    output = await _run(Path(command[0]), agent_dir, ["acp-socket-path", str(agent_dir)],
-                        capture=True)
+    output = await _socket_path_output(Path(command[0]), agent_dir, agent_dir)
     lines = output.decode("utf-8", errors="replace").splitlines()
     if len(lines) != 1 or not Path(lines[0]).is_absolute():
         raise ValueError("LingTai acp-socket-path did not print one absolute path")
     return AttachTarget(socket_path=Path(lines[0]), runtime_id=runtime_id,
                         registry=Path(registry))
+
+
+async def _socket_path_output(executable: Path, cwd: Path, agent_dir: Path) -> bytes:
+    try:
+        return await _run(executable, cwd, ["acp-socket-path", str(agent_dir)], capture=True)
+    except ValueError as exc:
+        # Older LingTai binaries do not know this subcommand. Keep this distinct
+        # from an existing socket that cannot accept connections: restarting an
+        # old binary cannot add the attach capability.
+        if "invalid choice: 'acp-socket-path'" in str(exc):
+            raise ValueError(
+                "LingTai kernel 1.0.9 or newer is required for Load Agent attach; "
+                "upgrade the LingTai kernel, then retry import"
+            ) from exc
+        raise
 
 
 def _last_option(command: tuple[str, ...], flag: str) -> str:

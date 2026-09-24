@@ -19,7 +19,9 @@ import yaml
 
 from puffo_agent.agent.harness.drivers.acp_attach import AcpAttachDriver
 from puffo_agent.portal import state
-from puffo_agent.portal.control.lingtai import resolve_attach_target
+from puffo_agent.portal.control.lingtai import (
+    LingtaiLaunch, resident_lingtai_available, resolve_attach_target,
+)
 
 RUNTIME_ID = "puffo-0123456789abcdef"
 
@@ -51,6 +53,8 @@ def lingtai_install(tmp_path):
         "    sys.exit(2)\n"
         "if mode == 'fail':\n"
         "    sys.stderr.write('no such agent\\n'); sys.exit(1)\n"
+        "if mode == 'old':\n"
+        "    sys.stderr.write(\"lingtai-agent: error: argument command: invalid choice: 'acp-socket-path'\\n\"); sys.exit(2)\n"
         "if mode == 'two':\n"
         "    print('/tmp/a.sock'); print('/tmp/b.sock'); sys.exit(0)\n"
         "if mode == 'relative':\n"
@@ -132,6 +136,20 @@ async def test_lingtai_error_output_is_reported(lingtai_install):
     lingtai_install.mode("fail")
 
     with pytest.raises(ValueError, match="no such agent"):
+        await resolve_attach_target(_argv(lingtai_install.exe, lingtai_install.registry))
+
+
+@pytest.mark.asyncio
+async def test_old_kernel_gets_upgrade_prompt_on_import_and_attach(lingtai_install, tmp_path):
+    lingtai_install.mode("old")
+    launch = LingtaiLaunch(
+        executable=lingtai_install.exe, agent_dir=lingtai_install.agent_dir,
+        workspace=tmp_path, registry=lingtai_install.registry, runtime_id=RUNTIME_ID,
+    )
+
+    with pytest.raises(ValueError, match="kernel 1.0.9 or newer is required"):
+        await resident_lingtai_available(launch)
+    with pytest.raises(ValueError, match="kernel 1.0.9 or newer is required"):
         await resolve_attach_target(_argv(lingtai_install.exe, lingtai_install.registry))
 
 
