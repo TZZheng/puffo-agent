@@ -122,6 +122,10 @@ class AcpLaunchPlan:
 
 _VALIDATED_LAUNCH_TOKEN = object()
 _SHUTDOWN_GRACE_SECONDS = 3.0
+# How long a finished prompt waits for session/update notifications that
+# arrived before its response. Handling them is local work, so this bound only
+# matters when the SDK dropped one (e.g. it failed validation).
+_UPDATE_SETTLE_SECONDS = 5.0
 
 
 class ValidatedLaunchPlan:
@@ -196,7 +200,10 @@ class _PuffoAcpClient:
     async def session_update(
         self, session_id: str, update: Any, **kwargs: Any
     ) -> None:
-        await self.driver._session_update(session_id, update)
+        try:
+            await self.driver._session_update(session_id, update)
+        finally:
+            await self.driver._update_handled()
 
     async def write_text_file(self, **kwargs: Any) -> None:
         raise RequestError.method_not_found("fs/write_text_file")
@@ -286,6 +293,9 @@ class AcpDriver(Driver):
         self._spawn_warnings: tuple[str, ...] = ()
         self._driver_authority: DriverAuthorityServer | None = None
         self._closed = False
+        self._updates_received = 0
+        self._updates_handled = 0
+        self._updates_changed = asyncio.Condition()
 
     def current_capabilities(self) -> DriverCapabilities:
         return self._capabilities
@@ -312,11 +322,13 @@ class AcpDriver(Driver):
             name="acp.stderr",
         )
         client = _PuffoAcpClient(self)
+        self._updates_received = 0
+        self._updates_handled = 0
         self._conn = self.connection_factory(
             client,
             self._proc.stdin,
             self._proc.stdout,
-            observers=[self._observe_stream],
+            observers=[self._observe_stream, self._count_update],
         )
         initialized = await self._initialize()
         if initialized.protocol_version != PROTOCOL_VERSION:
@@ -620,6 +632,7 @@ class AcpDriver(Driver):
                 },
             )
             return
+        await self._settle_updates()
         stop_reason = str(response.stop_reason)
         outcome = "succeeded" if stop_reason == "end_turn" else "failed"
         if stop_reason == "cancelled":
@@ -765,6 +778,48 @@ class AcpDriver(Driver):
                 HarnessEventType.RUNTIME_EXITED,
                 turn=self._active if self._active.value else None,
                 data={"returncode": returncode},
+            )
+
+    def _count_update(self, event: StreamEvent) -> None:
+        # Synchronous on purpose: the SDK calls observers from its receive
+        # loop in wire order, so this count already includes every update that
+        # preceded a response by the time that response settles its request.
+        # An async observer runs later as its own task, so the count would
+        # then hold only as long as the loop keeps running tasks in order.
+        if (
+            event.direction is StreamDirection.INCOMING
+            and event.message.get("method") == "session/update"
+        ):
+            self._updates_received += 1
+
+    async def _update_handled(self) -> None:
+        async with self._updates_changed:
+            self._updates_handled += 1
+            self._updates_changed.notify_all()
+
+    async def _settle_updates(self) -> None:
+        """Wait until the updates that preceded the prompt response are handled.
+
+        The SDK gives every notification its own task but settles a response
+        inline, so text sent immediately before the end of a turn would
+        otherwise be handled after the turn completed: the turn's reply comes
+        out empty and the text arrives belonging to no turn.
+        """
+        target = self._updates_received
+        try:
+            async with asyncio.timeout(_UPDATE_SETTLE_SECONDS):
+                async with self._updates_changed:
+                    await self._updates_changed.wait_for(
+                        lambda: self._updates_handled >= target
+                    )
+        except TimeoutError:
+            # Treat the missing ones as lost so later turns do not each wait
+            # out the bound behind them.
+            self._updates_handled = max(self._updates_handled, target)
+            await self._emit(
+                HarnessEventType.RUNTIME_WARNING,
+                turn=self._active if self._active.value else None,
+                data={"code": "session_updates_unsettled"},
             )
 
     async def _observe_stream(self, event: StreamEvent) -> None:

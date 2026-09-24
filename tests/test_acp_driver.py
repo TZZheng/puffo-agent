@@ -1045,3 +1045,146 @@ async def test_initialize_failure_does_not_wait_for_stderr_eof():
     finally:
         harness.proc.stderr.feed_eof()
         await driver.close()
+
+
+_BACK_TO_BACK_AGENT = r'''
+import json, sys
+
+CHUNKS = int(sys.argv[1])
+for raw in sys.stdin:
+    message = json.loads(raw)
+    if "id" not in message:
+        continue
+    method = message.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": 1, "agentCapabilities": {}}
+    elif method == "session/new":
+        result = {"sessionId": "s1"}
+    elif method == "session/prompt":
+        # The final text and the end of the turn leave in one write, the way
+        # an Agent that answers only once the turn is done sends them.
+        frames = [
+            {"jsonrpc": "2.0", "method": "session/update", "params": {
+                "sessionId": "s1",
+                "update": {"sessionUpdate": "agent_message_chunk",
+                           "content": {"type": "text", "text": "part%d " % i}}}}
+            for i in range(CHUNKS)
+        ]
+        frames.append({"jsonrpc": "2.0", "id": message["id"],
+                       "result": {"stopReason": "end_turn"}})
+        sys.stdout.write("".join(json.dumps(f) + "\n" for f in frames))
+        sys.stdout.flush()
+        continue
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}) + "\n")
+    sys.stdout.flush()
+'''
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunks", [1, 20])
+async def test_text_sent_just_before_the_turn_ends_belongs_to_that_turn(tmp_path, chunks):
+    """The ACP SDK hands each notification to its own task but settles a
+    response inline, so a chunk followed at once by the prompt result used to
+    reach Puffo after the turn had already completed: the reply was empty and
+    the text arrived with no turn."""
+    script = tmp_path / "agent.py"
+    script.write_text(_BACK_TO_BACK_AGENT)
+    driver = AcpDriver()
+    await driver.open(RuntimeSpec(
+        str(tmp_path), executable=sys.executable, launch_args=(str(script), str(chunks)),
+    ))
+    try:
+        seen = []
+        for _ in range(3):
+            events = driver.events()
+            started = await driver.start_turn(TurnInput("hello"))
+
+            async def until_done():
+                turn_events = []
+                async for event in events:
+                    turn_events.append(event)
+                    if event.type in (HarnessEventType.TURN_COMPLETED,
+                                      HarnessEventType.TURN_ABANDONED):
+                        return turn_events
+
+            seen.append((started.turn_ref, await asyncio.wait_for(until_done(), timeout=10)))
+    finally:
+        await driver.close()
+    expected = "".join("part%d " % i for i in range(chunks))
+    for turn, turn_events in seen:
+        assert turn_events[-1].type is HarnessEventType.TURN_COMPLETED
+        deltas = [e for e in turn_events if e.type is HarnessEventType.ASSISTANT_DELTA]
+        assert "".join(e.data["text"] for e in deltas) == expected
+        assert all(e.turn_ref == turn for e in deltas)
+
+
+_DROPPED_UPDATE_AGENT = r'''
+import json, sys
+
+prompts = 0
+for raw in sys.stdin:
+    message = json.loads(raw)
+    if "id" not in message:
+        continue
+    method = message.get("method")
+    frames = []
+    if method == "initialize":
+        result = {"protocolVersion": 1, "agentCapabilities": {}}
+    elif method == "session/new":
+        result = {"sessionId": "s1"}
+    elif method == "session/prompt":
+        prompts += 1
+        if prompts == 1:
+            # Not a valid update: the SDK rejects it before Puffo sees it.
+            frames.append({"jsonrpc": "2.0", "method": "session/update",
+                           "params": {"sessionId": "s1", "update": {"sessionUpdate": "bogus"}}})
+        frames.append({"jsonrpc": "2.0", "method": "session/update", "params": {
+            "sessionId": "s1", "update": {"sessionUpdate": "agent_message_chunk",
+                                          "content": {"type": "text", "text": "ok%d" % prompts}}}})
+        result = {"stopReason": "end_turn"}
+    else:
+        result = {}
+    frames.append({"jsonrpc": "2.0", "id": message["id"], "result": result})
+    sys.stdout.write("".join(json.dumps(f) + "\n" for f in frames))
+    sys.stdout.flush()
+'''
+
+
+@pytest.mark.asyncio
+async def test_an_update_the_sdk_drops_delays_one_turn_only(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "puffo_agent.agent.harness.drivers.acp._UPDATE_SETTLE_SECONDS", 0.5
+    )
+    script = tmp_path / "agent.py"
+    script.write_text(_DROPPED_UPDATE_AGENT)
+    driver = AcpDriver()
+    await driver.open(RuntimeSpec(str(tmp_path), executable=sys.executable,
+                                  launch_args=(str(script),)))
+    turns = []
+    try:
+        for _ in range(2):
+            events = driver.events()
+            began = time.monotonic()
+            await driver.start_turn(TurnInput("hello"))
+
+            async def until_done():
+                seen = []
+                async for event in events:
+                    seen.append(event)
+                    if event.type is HarnessEventType.TURN_COMPLETED:
+                        return seen
+
+            seen = await asyncio.wait_for(until_done(), timeout=10)
+            turns.append((time.monotonic() - began, seen))
+    finally:
+        await driver.close()
+    (_, first), (second_elapsed, second) = turns
+    warnings = [e.data.get("code") for e in first if e.type is HarnessEventType.RUNTIME_WARNING]
+    assert warnings == ["session_updates_unsettled"]
+    assert [e.data["text"] for e in first if e.type is HarnessEventType.ASSISTANT_DELTA] == ["ok1"]
+    # The lost update is written off, so the next turn does not wait it out.
+    assert not [e for e in second if e.type is HarnessEventType.RUNTIME_WARNING]
+    assert [e.data["text"] for e in second if e.type is HarnessEventType.ASSISTANT_DELTA] == ["ok2"]
+    assert second_elapsed < 0.5
