@@ -472,6 +472,9 @@ async def test_lingtai_browser_create_preserves_workspace_and_registry(tmp_path,
     )
     executable.chmod(0o700)
     _run_python_cli_fixture(monkeypatch, executable)
+    async def no_resident(_launch):
+        return False
+    monkeypatch.setattr(provision, "resident_lingtai_available", no_resident)
     payload, operator = _payload()
     payload.update(role="", role_short="", profile="# Helper\n")
     payload["runtime"] = {
@@ -547,6 +550,23 @@ def lingtai_creation(tmp_path, monkeypatch):
     monkeypatch.setattr(provision, "provision_lingtai", register)
     monkeypatch.setattr(provision, "revoke_lingtai", revoke)
     return payload, operator, associations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resident", [False, True])
+async def test_lingtai_load_selects_attach_for_running_source(
+    lingtai_creation, monkeypatch, resident,
+):
+    """Loading an occupied LingTai source must not launch a second Agent."""
+    payload, operator, _ = lingtai_creation
+
+    async def detect(_launch):
+        return resident
+
+    monkeypatch.setattr(provision, "resident_lingtai_available", detect)
+    result = await provision_agent_from_bundle(payload, operator)
+    assert result["runtime"].lingtai_attach is resident
+    assert AgentConfig.load(result["agent_id"]).runtime.lingtai_attach is resident
 
 
 @pytest.mark.asyncio

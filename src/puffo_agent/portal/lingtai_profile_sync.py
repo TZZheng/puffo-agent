@@ -5,6 +5,7 @@ import asyncio
 import logging
 from pathlib import Path
 
+from .control.lingtai import lingtai_registry_path
 from .control.lingtai_profile import _read_source_object, is_lingtai_runtime, read_source_profile
 from .state import AgentConfig, discover_agents, home_dir
 
@@ -20,8 +21,12 @@ def _source_directory(command: list[str]) -> Path | None:
         elif arg.startswith(("--registry=", "--runtime-id=")):
             key, value = arg.split("=", 1)
             flags[key] = value
-    registry = home_dir().resolve() / "lingtai" / "runtime-registry.json"
-    if flags.get("--registry") != str(registry) or not flags.get("--runtime-id"):
+    registry = Path(flags.get("--registry", ""))
+    trusted = {
+        lingtai_registry_path(),
+        home_dir().resolve() / "lingtai" / "runtime-registry.json",
+    }
+    if registry not in trusted or not flags.get("--runtime-id"):
         return None
     try:
         document = _read_source_object(registry)

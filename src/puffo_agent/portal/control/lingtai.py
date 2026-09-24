@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,6 @@ from ...agent.harness.support.subprocess_io import (
     abandon_process_transport, process_group_spawn_kwargs, shutdown_process_tree,
 )
 from ...tasks import spawn
-from ..state import home_dir
 
 if TYPE_CHECKING:
     from ...agent.harness.drivers.acp_attach import AttachTarget
@@ -34,6 +34,15 @@ class LingtaiLaunch:
             str(self.executable), "acp", "--profile", "puffo-v1",
             "--runtime-id", self.runtime_id, "--registry", str(self.registry),
         ]
+
+
+def lingtai_registry_path() -> Path:
+    """Match the registry selected by an ordinary LingTai resident launch."""
+    override = os.environ.get("LINGTAI_PUFFO_V0_REGISTRY")
+    path = Path(override) if override else Path.home() / ".lingtai" / "puffo-v0" / "runtime-registry.json"
+    if not path.is_absolute() or ".." in path.parts or path.parent == path.parent.parent:
+        raise ValueError("LingTai registry must be an absolute path in a dedicated directory")
+    return path
 
 
 def parse_lingtai_launch(raw: object) -> LingtaiLaunch | None:
@@ -60,7 +69,7 @@ def parse_lingtai_launch(raw: object) -> LingtaiLaunch | None:
         raise ValueError("LingTai workspace must be an existing directory")
     return LingtaiLaunch(
         **paths,
-        registry=home_dir().resolve() / "lingtai" / "runtime-registry.json",
+        registry=lingtai_registry_path(),
         runtime_id="puffo-" + uuid.uuid4().hex,
     )
 
@@ -71,6 +80,29 @@ async def provision_lingtai(launch: LingtaiLaunch) -> None:
         "--agent-dir", str(launch.agent_dir), "--workspace", str(launch.workspace),
         "--registry", str(launch.registry),
     ])
+
+
+async def resident_lingtai_available(launch: LingtaiLaunch) -> bool:
+    """Select attach only when the selected source has a live local ACP socket."""
+    try:
+        output = await _run(
+            launch.executable, launch.workspace,
+            ["acp-socket-path", str(launch.agent_dir)], capture=True,
+        )
+        lines = output.decode("utf-8", errors="strict").splitlines()
+        if len(lines) != 1 or not Path(lines[0]).is_absolute():
+            return False
+        path = Path(lines[0])
+        if not stat.S_ISSOCK(os.lstat(path).st_mode):
+            return False
+        _, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(str(path)), timeout=1,
+        )
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except (OSError, ValueError, UnicodeError, TimeoutError):
+        return False
 
 
 async def revoke_lingtai(launch: LingtaiLaunch) -> None:
