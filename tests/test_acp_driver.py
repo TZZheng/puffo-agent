@@ -230,6 +230,51 @@ async def test_wire_ordered_update_finishes_before_prompt_terminal():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    RequestError.internal_error({"detail": "model call failed"}),
+    ConnectionResetError("agent went away"),
+], ids=["error-response", "transport-error"])
+async def test_wire_ordered_update_finishes_before_a_failed_prompt_terminal(failure):
+    """A failed prompt ends the turn too, so it waits for earlier updates the
+    same way a successful one does: text the Agent sent before its error
+    belongs to the turn, not to no turn at all."""
+    harness = _Harness()
+    driver = AcpDriver(
+        harness.process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    await driver.open(RuntimeSpec("/workspace", executable="agent"))
+    stream = driver.events()
+    await driver.start_turn(TurnInput("hello"))
+    harness.observers[1](StreamEvent(
+        StreamDirection.INCOMING,
+        {"jsonrpc": "2.0", "method": "session/update", "params": {}},
+    ))
+    harness.conn.prompt_result.set_exception(failure)
+    await asyncio.sleep(0.01)
+    assert driver._active.value, "the failed prompt must wait for the earlier update"
+
+    await harness.client.session_update(
+        "acp_session",
+        AgentMessageChunk(
+            session_update="agent_message_chunk",
+            content=TextContentBlock(type="text", text="partial answer"),
+        ),
+    )
+    events = await asyncio.wait_for(
+        _collect_through(stream, HarnessEventType.TURN_ABANDONED), timeout=1
+    )
+    types = [event.type for event in events]
+    assert types.index(HarnessEventType.ASSISTANT_DELTA) < types.index(
+        HarnessEventType.TURN_ABANDONED
+    )
+    delta = events[types.index(HarnessEventType.ASSISTANT_DELTA)]
+    abandoned = events[types.index(HarnessEventType.TURN_ABANDONED)]
+    assert delta.turn_ref is not None and delta.turn_ref == abandoned.turn_ref
+    await driver.close()
+
+
+@pytest.mark.asyncio
 async def test_resume_without_load_support_falls_back_to_a_fresh_session_at_once():
     """An agent that never offered session/load cannot resume on a later try
     either, so the runtime must not spend its retry streak finding that out."""

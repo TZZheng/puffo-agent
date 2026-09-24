@@ -607,6 +607,7 @@ class AcpDriver(Driver):
                     status=None, diagnostic=detail
                 )
             failure = PROVIDER_FAILURES.get(error_code)
+            await self._settle_updates()
             await self._finish_turn(
                 turn,
                 HarnessEventType.TURN_ABANDONED,
@@ -621,6 +622,7 @@ class AcpDriver(Driver):
             )
             return
         except Exception as exc:
+            await self._settle_updates()
             await self._finish_turn(
                 turn,
                 HarnessEventType.TURN_ABANDONED,
@@ -803,7 +805,9 @@ class AcpDriver(Driver):
         The SDK gives every notification its own task but settles a response
         inline, so text sent immediately before the end of a turn would
         otherwise be handled after the turn completed: the turn's reply comes
-        out empty and the text arrives belonging to no turn.
+        out empty and the text arrives belonging to no turn. An error response
+        or a failed request ends the turn the same way, so every path that
+        finishes a turn after prompt() returns or raises waits here first.
         """
         target = self._updates_received
         try:
