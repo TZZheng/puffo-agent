@@ -597,7 +597,10 @@ async def test_lingtai_probe_rejects_existing_socket_that_cannot_accept(monkeypa
         listener = socket.socket(socket.AF_UNIX)
         listener.bind(str(path))
         try:
-            with pytest.raises(ValueError, match="resident ACP socket is unavailable"):
+            with pytest.raises(
+                ValueError,
+                match="resident ACP socket is unavailable; start or restart the LingTai Agent, then retry import",
+            ):
                 await lingtai_control.resident_lingtai_available(launch)
         finally:
             listener.close()

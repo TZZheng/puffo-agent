@@ -103,7 +103,10 @@ async def resident_lingtai_available(launch: LingtaiLaunch) -> bool:
             asyncio.open_unix_connection(str(path)), timeout=1,
         )
     except (OSError, TimeoutError) as exc:
-        raise ValueError("LingTai resident ACP socket is unavailable") from exc
+        raise ValueError(
+            "LingTai resident ACP socket is unavailable; start or restart "
+            "the LingTai Agent, then retry import"
+        ) from exc
     writer.close()
     await writer.wait_closed()
     return True
