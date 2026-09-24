@@ -135,6 +135,7 @@ class _Harness:
 
     def connection_factory(self, client, _stdin, _stdout, **kwargs):
         self.client = client
+        self.observers = kwargs["observers"]
         self.conn = _FakeConnection(
             client,
             kwargs["observers"][0],
@@ -190,6 +191,42 @@ async def test_acp_open_negotiates_v1_and_loads_or_creates_session():
     assert result.resumed is True
     assert resumed_harness.conn.calls[-1][0] == "load_session"
     await resumed.close()
+
+
+@pytest.mark.asyncio
+async def test_wire_ordered_update_finishes_before_prompt_terminal():
+    """The ACP SDK can resolve a response before dispatching an earlier update."""
+    harness = _Harness()
+    driver = AcpDriver(
+        harness.process_factory,
+        connection_factory=harness.connection_factory,
+    )
+    await driver.open(RuntimeSpec("/workspace", executable="agent"))
+    stream = driver.events()
+    await driver.start_turn(TurnInput("hello"))
+    harness.observers[1](StreamEvent(
+        StreamDirection.INCOMING,
+        {"jsonrpc": "2.0", "method": "session/update", "params": {}},
+    ))
+    harness.conn.prompt_result.set_result(PromptResponse(stop_reason="end_turn"))
+    await asyncio.sleep(0.01)
+    assert driver._active.value, "the prompt must wait for the earlier update"
+
+    await harness.client.session_update(
+        "acp_session",
+        AgentMessageChunk(
+            session_update="agent_message_chunk",
+            content=TextContentBlock(type="text", text="answer"),
+        ),
+    )
+    events = await asyncio.wait_for(
+        _collect_through(stream, HarnessEventType.TURN_COMPLETED), timeout=1
+    )
+    types = [event.type for event in events]
+    assert types.index(HarnessEventType.ASSISTANT_DELTA) < types.index(
+        HarnessEventType.TURN_COMPLETED
+    )
+    await driver.close()
 
 
 @pytest.mark.asyncio
