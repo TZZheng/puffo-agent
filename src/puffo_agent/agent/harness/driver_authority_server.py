@@ -63,6 +63,11 @@ class _EndpointBinding:
     depth: int
     capability: str | None
     provider: str = "llm"
+    # The LingTai runtime this launch is for, when the Driver knows it. An
+    # attached Agent receives the endpoint over a socket rather than at exec,
+    # so it checks this against its own registration instead of trusting the
+    # connection that delivered the descriptor to say which runtime it is.
+    runtime_id: str | None = None
 
     @property
     def provider_capability(self) -> str:
@@ -112,12 +117,18 @@ class DriverAuthorityServer:
         self._audits: deque[AuthorityAuditRecord] = deque(maxlen=MAX_AUDIT_RECORDS)
         self._closed = False
 
-    def issue_root(self, *, launch_id: str) -> IssuedAuthorityEndpoint:
+    def issue_root(
+        self, *, launch_id: str, runtime_id: str | None = None
+    ) -> IssuedAuthorityEndpoint:
         """Create and start the endpoint for one root ACP process launch."""
 
         if not launch_id:
             raise ValueError("root launch_id must be non-empty")
-        binding = _EndpointBinding(launch_id, "root", None, 0, None)
+        if runtime_id is not None and not runtime_id:
+            raise ValueError("runtime_id, when given, must be non-empty")
+        binding = _EndpointBinding(
+            launch_id, "root", None, 0, None, runtime_id=runtime_id
+        )
         record, child = self._issue_endpoint(binding)
         try:
             self._start_record(record)
@@ -287,12 +298,15 @@ class DriverAuthorityServer:
             if binding.role == "derived":
                 record.claim_deadline_monotonic = None
                 record.server_socket.settimeout(None)
-        return {
+        identity = {
             "version": PROTOCOL_VERSION,
             "role": binding.role,
             "launch_id": binding.launch_id,
             "capability": binding.capability,
         }
+        if binding.runtime_id is not None:
+            identity["runtime_id"] = binding.runtime_id
+        return identity
 
     def _authorize_derived_launch(
         self, record: _EndpointRecord, request: dict[str, Any], *, call_id: str | None = None
@@ -318,6 +332,7 @@ class DriverAuthorityServer:
             parent_launch_id=binding.launch_id,
             depth=1,
             capability=capability,
+            runtime_id=binding.runtime_id,
         )
         try:
             child_record, child_endpoint = self._issue_endpoint(child_binding)

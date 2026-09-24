@@ -35,7 +35,10 @@ from ..state import (
 )
 from .certs import CertError, verify_device_cert, verify_identity_cert, verify_slug_binding
 from .lingtai_profile import validate_import_profile
-from .lingtai import LingtaiLaunch, parse_lingtai_launch, provision_lingtai, revoke_lingtai
+from .lingtai import (
+    LingtaiLaunch, parse_lingtai_launch, provision_lingtai,
+    resident_lingtai_available, revoke_lingtai,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -392,6 +395,7 @@ async def provision_agent_from_bundle(
             validate_import_profile(payload, launch.agent_dir)
             try:
                 await provision_lingtai(launch)
+                context["runtime"].lingtai_attach = await resident_lingtai_available(launch)
             except BaseException:
                 # Registration may be committed before the CLI exits. A lost
                 # result must revoke this attempt's binding before a retry.

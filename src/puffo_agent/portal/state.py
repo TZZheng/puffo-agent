@@ -631,6 +631,11 @@ class RuntimeConfig:
     # agent can be selected without adding a provider-specific Driver. The
     # first item is the executable and remaining items are literal arguments.
     harness_command: list[str] = field(default_factory=list)
+    # cli-local LingTai (``harness_command`` selects ``puffo-v1``): connect to
+    # the Agent LingTai already runs instead of starting one. The process, its
+    # lock and its directory stay LingTai's; Puffo opens and closes only the
+    # connection. See agent/harness/drivers/acp_attach.py.
+    lingtai_attach: bool = False
     # Retained only so older agent.yml files round-trip without losing data.
     # Driver runtimes use the wall-time limit below instead.
     max_turns: int = 10
@@ -869,6 +874,23 @@ def _load_runtime_config(
             f"agent {agent_id!r}: runtime.harness='acp' requires a "
             "non-empty runtime.harness_command argv"
         )
+    attach = raw.get("lingtai_attach", False)
+    if not isinstance(attach, bool):
+        raise RuntimeError(
+            f"agent {agent_id!r}: runtime.lingtai_attach must be true or false"
+        )
+    if attach and not allow_invalid_runtime:
+        from ..agent.harness.drivers.acp import _lingtai_constrained_profile
+
+        if (
+            kind != RUNTIME_CLI_LOCAL
+            or harness != "acp"
+            or _lingtai_constrained_profile(tuple(command)) != "puffo-v1"
+        ):
+            raise RuntimeError(
+                f"agent {agent_id!r}: runtime.lingtai_attach requires the "
+                "cli-local acp harness with a LingTai puffo-v1 harness_command"
+            )
     return RuntimeConfig(
         kind=kind,
         provider=provider,
@@ -885,6 +907,7 @@ def _load_runtime_config(
         sandbox=raw.get("sandbox", "danger-full-access"),
         harness=harness,
         harness_command=list(command),
+        lingtai_attach=attach,
         max_turns=int(raw.get("max_turns", 10)),
         task_timeout_seconds=float(raw.get("task_timeout_seconds", 1800.0)),
     )

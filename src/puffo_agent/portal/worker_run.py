@@ -431,6 +431,25 @@ class StandardWorkerRun:
             await self._abort_docker_preparation(preparer)
             raise
 
+    async def _attach_driver(self, prepared: Any) -> Any:
+        """Connect to the LingTai Agent already running, never start one.
+
+        Config loading already requires cli-local, the acp harness and a
+        puffo-v1 argv; this checks what the prepared runtime turned into.
+        """
+        from ..agent.harness.drivers.acp_attach import AcpAttachDriver
+        from ..agent.harness.runtime.docker_runtime import DockerRuntimePreparer
+        from .control.lingtai import resolve_attach_target
+
+        if prepared.harness_name != "acp" or isinstance(
+            prepared.preparer, DockerRuntimePreparer
+        ):
+            raise RuntimeError("LingTai attach runs only on the cli-local acp harness")
+        target = await resolve_attach_target(
+            prepared.preparer.agent_cfg.runtime.harness_command
+        )
+        return AcpAttachDriver(target)
+
     async def _bind_driver_runtime(
         self,
         outbox: Any,
@@ -456,7 +475,10 @@ class StandardWorkerRun:
         )
         driver = None
         cleanup = None
-        if isinstance(preparer := prepared.preparer, DockerRuntimePreparer):
+        # Read from the config this runtime was prepared from.
+        if prepared.preparer.agent_cfg.runtime.lingtai_attach:
+            driver = await self._attach_driver(prepared)
+        elif isinstance(preparer := prepared.preparer, DockerRuntimePreparer):
             driver = build_driver(
                 prepared.harness_name,
                 process_factory=preparer.process_factory,

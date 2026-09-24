@@ -30,7 +30,10 @@ async def test_worker_activity_reaches_local_snapshot_before_reporter(local_home
     worker = SimpleNamespace(runtime=RuntimeState(status="running"))
     prepared = SimpleNamespace(
         native_session_id="", harness_name="codex",
-        preparer=SimpleNamespace(agent_id="desktop-test"),
+        preparer=SimpleNamespace(
+            agent_id="desktop-test",
+            agent_cfg=SimpleNamespace(runtime=SimpleNamespace(lingtai_attach=False)),
+        ),
         spec=SimpleNamespace(mcp_generation=""),
     )
     await StandardWorkerRun(worker)._bind_driver_runtime(

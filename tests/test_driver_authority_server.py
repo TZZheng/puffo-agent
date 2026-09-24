@@ -137,6 +137,47 @@ def test_endpoint_claim_is_single_use_and_reuse_is_audited() -> None:
         server.close()
 
 
+def test_runtime_bound_endpoint_names_its_runtime_and_children_inherit_it() -> None:
+    """An attached Agent gets the descriptor over a socket, not at exec, so the
+    descriptor has to say which runtime it was issued for."""
+
+    server = DriverAuthorityServer()
+    root = _client(server.issue_root(launch_id="root-rt", runtime_id="puffo-rt-1"))
+    child = None
+    child_fds: list[int] = []
+    try:
+        identity = _hello(root)
+        assert identity["runtime_id"] == "puffo-rt-1"
+        assert identity["launch_id"] == "root-rt"
+        _, child_fds = _request(
+            root,
+            {
+                "version": 1,
+                "op": "authorize_derived_launch",
+                "call_id": uuid.uuid4().hex,
+                "launch_id": "root-rt",
+                "capability": "daemon",
+            },
+        )
+        child = socket.socket(fileno=child_fds.pop())
+        assert _hello(child)["runtime_id"] == "puffo-rt-1"
+    finally:
+        _close_fds(child_fds)
+        if child is not None:
+            child.close()
+        root.close()
+        server.close()
+
+
+def test_runtime_id_cannot_be_empty_when_given() -> None:
+    server = DriverAuthorityServer()
+    try:
+        with pytest.raises(ValueError):
+            server.issue_root(launch_id="root-empty", runtime_id="")
+    finally:
+        server.close()
+
+
 def test_endpoint_claim_transition_cannot_be_interleaved() -> None:
     """A second claimant cannot reach the ISSUED-to-CLAIMED decision gap."""
 

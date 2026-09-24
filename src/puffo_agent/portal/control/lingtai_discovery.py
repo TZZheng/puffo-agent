@@ -14,12 +14,19 @@ from pathlib import Path
 
 from ...agent.harness.support.subprocess_io import process_group_spawn_kwargs
 from ...tasks import spawn
-from .lingtai import _close_command
+from .lingtai import _close_command, lingtai_registry_path
 from ..state import AgentConfig, discover_agents, home_dir
 from .ownership import is_owner
 
 _MAX_OUTPUT = 1024 * 1024
 _MAX_ROOTS = 16
+# Mirror LingTai's most-constraining-first discovery state order when two
+# registries describe one source. An unknown state is treated as restrictive.
+_STATE_RANK = {
+    "integrity_failed": 0, "shape_mismatch": 1,
+    "policy_version_mismatch": 2, "stale_binding": 3,
+    "bound": 4, "revoked": 5, "available": 6,
+}
 
 
 def _absolute(value: object, field: str, *, resolve: bool = True) -> Path:
@@ -63,17 +70,28 @@ def _known_paths(operator: str) -> tuple[list[Path], list[Path], list[str]]:
 
 def _registry_entries() -> dict:
     # Location hints only; LingTai's discover remains the authority on state.
-    path = home_dir().resolve() / "lingtai" / "runtime-registry.json"
-    try:
-        with path.open("rb") as stream:
-            data = stream.read(_MAX_OUTPUT + 1)
-        if len(data) > _MAX_OUTPUT:
-            return {}
-        payload = json.loads(data)
-        entries = payload.get("runtimes") if isinstance(payload, dict) else None
-        return entries if isinstance(entries, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    found = {}
+    for path in _registries():
+        try:
+            with path.open("rb") as stream:
+                data = stream.read(_MAX_OUTPUT + 1)
+            if len(data) > _MAX_OUTPUT:
+                continue
+            payload = json.loads(data)
+            entries = payload.get("runtimes") if isinstance(payload, dict) else None
+            if isinstance(entries, dict):
+                found.update(entries)
+        except (OSError, ValueError):
+            continue
+    return found
+
+
+def _registries() -> list[Path]:
+    # Keep pre-attach Puffo bindings discoverable while new imports use the
+    # resident's own registry. Both paths are read-only during discovery.
+    return list(dict.fromkeys([
+        home_dir().resolve() / "lingtai" / "runtime-registry.json", lingtai_registry_path(),
+    ]))
 
 
 def _unique_executables(paths: list[str]) -> list[str]:
@@ -248,24 +266,43 @@ async def _discover(params: dict, operator: str) -> dict:
     }
     if not executable:
         return _bounded_result(result)
-    registry = home_dir().resolve() / "lingtai" / "runtime-registry.json"
     agents = {}
+    failed_roots: list[Path] = []
     # A single request has a bounded total budget even with many known roots.
     try:
         async with asyncio.timeout(25):
             for root in roots:
-                try:
-                    rows = await _query(executable, root, registry)
-                    for row in rows:
-                        try:
-                            agent = _normalize(row, root)
-                            agents[agent["agent_dir"]] = agent
-                        except (OSError, ValueError):
-                            result["warnings"].append("invalid_candidate")
-                except (OSError, ValueError, TimeoutError):
-                    result["warnings"].append("discovery_failed")
+                for registry in _registries():
+                    try:
+                        rows = await _query(executable, root, registry)
+                        for row in rows:
+                            try:
+                                agent = _normalize(row, root)
+                                existing = agents.get(agent["agent_dir"])
+                                if existing:
+                                    if (existing["status"] != agent["status"]
+                                            and existing["status"] != "available"
+                                            and agent["status"] != "available"):
+                                        result["warnings"].append("registry_conflict")
+                                    if _STATE_RANK.get(existing["status"], -1) <= _STATE_RANK.get(agent["status"], -1):
+                                        continue
+                                agents[agent["agent_dir"]] = agent
+                            except (OSError, ValueError):
+                                result["warnings"].append("invalid_candidate")
+                    except (OSError, ValueError, TimeoutError):
+                        result["warnings"].append("discovery_failed")
+                        failed_roots.append(root)
     except TimeoutError:
         result["warnings"].append("discovery_timeout")
+        failed_roots.extend(roots)
+    # If one registry could not be inspected, its binding might be hidden by
+    # another registry's "available" row. Never offer that source for import.
+    agents = {
+        directory: agent for directory, agent in agents.items()
+        if agent["status"] != "available" or not any(
+            Path(directory).is_relative_to(root) for root in failed_roots
+        )
+    }
     result["agents"] = list(agents.values())
     return _bounded_result(result)
 

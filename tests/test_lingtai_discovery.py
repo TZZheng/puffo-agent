@@ -478,3 +478,103 @@ async def test_executable_aliases_keep_selected_launch_path(tmp_path, monkeypatc
     launch = parse_lingtai_launch({'executable': str(alias), 'agent_dir': str(tmp_path),
                                   'workspace': str(tmp_path)})
     assert launch.argv()[0] == str(alias)
+
+
+def test_running_source_uses_kernel_default_registry_not_puffo_home(tmp_path, monkeypatch):
+    """A default resident must accept Puffo's provisioned attach registry."""
+    from puffo_agent.portal.control.lingtai import parse_lingtai_launch
+
+    monkeypatch.delenv("LINGTAI_PUFFO_V0_REGISTRY", raising=False)
+    monkeypatch.setenv("PUFFO_AGENT_HOME", str(tmp_path / "puffo"))
+    executable = tmp_path / "lingtai-agent"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    (tmp_path / "init.json").write_text("{}")
+    launch = parse_lingtai_launch({
+        "executable": str(executable), "agent_dir": str(tmp_path),
+        "workspace": str(tmp_path),
+    })
+    assert launch is not None
+    assert launch.registry == Path.home() / ".lingtai/puffo-v0/runtime-registry.json"
+
+
+def test_running_source_honors_registry_override(tmp_path, monkeypatch):
+    """A resident launched with a configured registry needs that same path."""
+    from puffo_agent.portal.control.lingtai import parse_lingtai_launch
+
+    registry = tmp_path / "custom" / "runtime-registry.json"
+    monkeypatch.setenv("LINGTAI_PUFFO_V0_REGISTRY", str(registry))
+    executable = tmp_path / "lingtai-agent"
+    executable.write_text("#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    (tmp_path / "init.json").write_text("{}")
+    launch = parse_lingtai_launch({
+        "executable": str(executable), "agent_dir": str(tmp_path),
+        "workspace": str(tmp_path),
+    })
+    assert launch is not None
+    assert launch.registry == registry
+
+
+@pytest.mark.asyncio
+async def test_legacy_binding_is_not_hidden_by_new_registry_availability(tmp_path, monkeypatch):
+    """A second registry's available row must not offer an already bound source."""
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    (agent / "init.json").write_text("{}")
+    legacy, current = tmp_path / "legacy.json", tmp_path / "current.json"
+    monkeypatch.setattr(discovery, "_registries", lambda: [legacy, current])
+    monkeypatch.setattr(discovery, "_known_paths", lambda operator: ([], [], []))
+    monkeypatch.setattr(discovery, "_executable_paths", lambda known: [sys.executable])
+
+    async def query(_executable, _root, registry):
+        state = "bound" if registry == legacy else "available"
+        return [{"agent_dir": str(agent), "status": state,
+                 "runtime_id": "existing" if state == "bound" else None}]
+
+    monkeypatch.setattr(discovery, "_query", query)
+    result = await discovery.discover_lingtai({"root": str(tmp_path)}, operator="owner")
+    assert result["agents"][0]["status"] == "bound"
+
+
+@pytest.mark.asyncio
+async def test_failed_registry_cannot_make_source_appear_available(tmp_path, monkeypatch):
+    """An unreadable legacy binding must not be mistaken for an unbound source."""
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    (agent / "init.json").write_text("{}")
+    legacy, current = tmp_path / "legacy.json", tmp_path / "current.json"
+    monkeypatch.setattr(discovery, "_registries", lambda: [legacy, current])
+    monkeypatch.setattr(discovery, "_known_paths", lambda operator: ([], [], []))
+    monkeypatch.setattr(discovery, "_executable_paths", lambda known: [sys.executable])
+
+    async def query(_executable, _root, registry):
+        if registry == legacy:
+            raise ValueError("unreadable registry")
+        return [{"agent_dir": str(agent), "status": "available"}]
+
+    monkeypatch.setattr(discovery, "_query", query)
+    result = await discovery.discover_lingtai({"root": str(tmp_path)}, operator="owner")
+    assert result["agents"] == []
+    assert "discovery_failed" in result["warnings"]
+
+
+@pytest.mark.asyncio
+async def test_conflicting_registry_states_report_more_restrictive_one(tmp_path, monkeypatch):
+    """A stale old binding cannot be softened by a live new binding."""
+    agent = tmp_path / "agent"
+    agent.mkdir()
+    (agent / "init.json").write_text("{}")
+    legacy, current = tmp_path / "legacy.json", tmp_path / "current.json"
+    monkeypatch.setattr(discovery, "_registries", lambda: [legacy, current])
+    monkeypatch.setattr(discovery, "_known_paths", lambda operator: ([], [], []))
+    monkeypatch.setattr(discovery, "_executable_paths", lambda known: [sys.executable])
+
+    async def query(_executable, _root, registry):
+        state = "stale_binding" if registry == legacy else "bound"
+        return [{"agent_dir": str(agent), "status": state, "runtime_id": str(registry)}]
+
+    monkeypatch.setattr(discovery, "_query", query)
+    result = await discovery.discover_lingtai({"root": str(tmp_path)}, operator="owner")
+    assert result["agents"][0]["status"] == "stale_binding"
+    assert "registry_conflict" in result["warnings"]
